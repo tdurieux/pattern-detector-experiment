@@ -1,0 +1,280 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.wicket.protocol.http.servlet;
+
+import java.io.IOException;
+
+import javax.servlet.http.Cookie;
+import javax.servlet.http.HttpServletResponse;
+
+import org.apache.wicket.WicketRuntimeException;
+import org.apache.wicket.request.http.WebResponse;
+import org.apache.wicket.util.lang.Args;
+import org.apache.wicket.util.time.Time;
+
+/**
+ * WebResponse that wraps a {@link ServletWebResponse}.
+ * 
+ * @author Matej Knopp
+ */
+public class ServletWebResponse extends WebResponse
+{
+	private final HttpServletResponse httpServletResponse;
+	private final ServletWebRequest webRequest;
+
+	private boolean redirect = false;
+
+	/**
+	 * Construct.
+	 * 
+	 * @param webRequest
+	 * @param httpServletResponse
+	 */
+	public ServletWebResponse(ServletWebRequest webRequest, HttpServletResponse httpServletResponse)
+	{
+		Args.notNull(webRequest, "webRequest");
+		Args.notNull(httpServletResponse, "httpServletResponse");
+
+		this.httpServletResponse = httpServletResponse;
+		this.webRequest = webRequest;
+	}
+
+	@Override
+	public void addCookie(Cookie cookie)
+	{
+		httpServletResponse.addCookie(cookie);
+	}
+
+	@Override
+	public void clearCookie(Cookie cookie)
+	{
+		cookie.setMaxAge(0);
+		cookie.setValue(null);
+		addCookie(cookie);
+	}
+
+	@Override
+	public void setContentLength(long length)
+	{
+		httpServletResponse.addHeader("Content-Length", Long.toString(length));
+	}
+
+	@Override
+	public void setContentType(String mimeType)
+	{
+		httpServletResponse.setContentType(mimeType);
+	}
+
+	@Override
+	public void setDateHeader(String name, Time date)
+	{
+		Args.notNull(date, "date");
+		httpServletResponse.setDateHeader(name, date.getMilliseconds());
+	}
+
+	@Override
+	public void setHeader(String name, String value)
+	{
+		httpServletResponse.setHeader(name, value);
+	}
+
+	@Override
+	public void addHeader(String name, String value)
+	{
+		httpServletResponse.addHeader(name, value);
+	}
+
+	@Override
+	public void write(CharSequence sequence)
+	{
+		try
+		{
+			httpServletResponse.getWriter().append(sequence);
+		}
+		catch (IOException e)
+		{
+			throw new ResponseIOException(e);
+		}
+	}
+
+	@Override
+	public void write(byte[] array)
+	{
+		try
+		{
+			httpServletResponse.getOutputStream().write(array);
+		}
+		catch (IOException e)
+		{
+			throw new ResponseIOException(e);
+		}
+	}
+
+	@Override
+	public void write(byte[] array, int offset, int length)
+	{
+		try
+		{
+			httpServletResponse.getOutputStream().write(array, offset, length);
+		}
+		catch (IOException e)
+		{
+			throw new ResponseIOException(e);
+		}
+	}
+
+
+	@Override
+	public void setStatus(int sc)
+	{
+		httpServletResponse.setStatus(sc);
+	}
+
+	@Override
+	public void sendError(int sc, String msg)
+	{
+		try
+		{
+			if (msg == null)
+			{
+				httpServletResponse.sendError(sc);
+			}
+			else
+			{
+				httpServletResponse.sendError(sc, msg);
+			}
+		}
+		catch (IOException e)
+		{
+			throw new WicketRuntimeException(e);
+		}
+	}
+
+	@Override
+	public String encodeURL(CharSequence url)
+	{
+		Args.notNull(url, "url");
+		if (url.length() > 0 && url.charAt(0) == '?')
+		{
+			// there is a bug in apache tomcat 5.5 where tomcat doesn't put sessionid to url
+			// when the URL starts with '?'. So we prepend the URL with ./ and remove it
+			// afterwards (unless some container prepends session id before './' or mangles
+			// the URL otherwise
+
+			String encoded = httpServletResponse.encodeURL("./" + url.toString());
+			if (encoded.startsWith("./"))
+			{
+				return encoded.substring(2);
+			}
+			else
+			{
+				return encoded;
+			}
+		}
+		else
+		{
+			return httpServletResponse.encodeURL(url.toString());
+		}
+	}
+
+	@Override
+	public String encodeRedirectURL(CharSequence url)
+	{
+		return httpServletResponse.encodeRedirectURL(url.toString());
+	}
+
+	@Override
+	public void sendRedirect(String url)
+	{
+		try
+		{
+			redirect = true;
+			url = encodeRedirectURL(url);
+
+			// wicket redirects should never be cached
+			disableCaching();
+
+			if (webRequest.isAjax())
+			{
+				httpServletResponse.addHeader("Ajax-Location", url);
+
+				/*
+				 * usually the Ajax-Location header is enough and we do not need to the redirect url
+				 * into the response, but sometimes the response is processed via an iframe (eg
+				 * using multipart ajax handling) and the headers are not available because XHR is
+				 * not used and that is the only way javascript has access to response headers.
+				 */
+				httpServletResponse.getWriter().write(
+					"<ajax-response><redirect><![CDATA[" + url + "]]></redirect></ajax-response>");
+
+				setContentType("text/xml;charset=" +
+					webRequest.getContainerRequest().getCharacterEncoding());
+				disableCaching();
+			}
+			else
+			{
+				if (url.startsWith("./"))
+				{
+					/*
+					 * WICKET-4260 Tomcat does not canonalize urls, which leads to problems with IE
+					 * when url is relative and starts with a dot
+					 */
+					url = url.substring(2);
+				}
+				httpServletResponse.sendRedirect(url);
+			}
+		}
+		catch (IOException e)
+		{
+			throw new WicketRuntimeException(e);
+		}
+	}
+
+	@Override
+	public boolean isRedirect()
+	{
+		return redirect;
+	}
+
+	@Override
+	public void flush()
+	{
+		try
+		{
+			httpServletResponse.flushBuffer();
+		}
+		catch (IOException e)
+		{
+			throw new ResponseIOException(e);
+		}
+	}
+
+	@Override
+	public void reset()
+	{
+		super.reset();
+		httpServletResponse.reset();
+		redirect = false;
+	}
+
+	@Override
+	public HttpServletResponse getContainerResponse()
+	{
+		return httpServletResponse;
+	}
+
+}

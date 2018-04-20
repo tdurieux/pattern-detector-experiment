@@ -1,0 +1,109 @@
+diff --git a/server/base/src/main/java/org/apache/accumulo/server/init/Initialize.java b/server/base/src/main/java/org/apache/accumulo/server/init/Initialize.java
+index 0a681c4..9b952ba 100644
+--- a/server/base/src/main/java/org/apache/accumulo/server/init/Initialize.java
++++ b/server/base/src/main/java/org/apache/accumulo/server/init/Initialize.java
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Arrays;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Locale;
+@@ -31,6 +32,8 @@
+ import org.apache.accumulo.core.Constants;
+ import org.apache.accumulo.core.cli.Help;
+ import org.apache.accumulo.core.client.AccumuloSecurityException;
++import org.apache.accumulo.core.client.IteratorSetting;
++import org.apache.accumulo.core.client.IteratorSetting.Column;
+ import org.apache.accumulo.core.client.impl.Namespaces;
+ import org.apache.accumulo.core.client.impl.thrift.ThriftSecurityException;
+ import org.apache.accumulo.core.conf.AccumuloConfiguration;
+@@ -41,6 +44,8 @@
+ import org.apache.accumulo.core.data.Value;
+ import org.apache.accumulo.core.file.FileOperations;
+ import org.apache.accumulo.core.file.FileSKVWriter;
++import org.apache.accumulo.core.iterators.Combiner;
++import org.apache.accumulo.core.iterators.IteratorUtil.IteratorScope;
+ import org.apache.accumulo.core.iterators.user.VersioningIterator;
+ import org.apache.accumulo.core.master.state.tables.TableState;
+ import org.apache.accumulo.core.master.thrift.MasterGoalState;
+@@ -65,10 +70,12 @@
+ import org.apache.accumulo.server.fs.VolumeManager;
+ import org.apache.accumulo.server.fs.VolumeManagerImpl;
+ import org.apache.accumulo.server.iterators.MetadataBulkLoadFilter;
++import org.apache.accumulo.server.replication.StatusCombiner;
+ import org.apache.accumulo.server.security.AuditedSecurityOperation;
+ import org.apache.accumulo.server.security.SystemCredentials;
+ import org.apache.accumulo.server.tables.TableManager;
+ import org.apache.accumulo.server.tablets.TabletTime;
++import org.apache.accumulo.server.util.ReplicationTableUtil;
+ import org.apache.accumulo.server.util.TablePropUtil;
+ import org.apache.accumulo.server.zookeeper.ZooReaderWriter;
+ import org.apache.hadoop.conf.Configuration;
+@@ -566,6 +573,23 @@ public static void initMetadataConfig(String tableId) throws IOException {
+   protected static void initMetadataConfig() throws IOException {
+     initMetadataConfig(RootTable.ID);
+     initMetadataConfig(MetadataTable.ID);
++
++    // ACCUMULO-3077 Set the combiner on accumulo.metadata during init to reduce the likelihood of a race
++    // condition where a tserver compacts away Status updates because it didn't see the Combiner configured
++    IteratorSetting setting = new IteratorSetting(9, ReplicationTableUtil.COMBINER_NAME, StatusCombiner.class);
++    Combiner.setColumns(setting, Collections.singletonList(new Column(MetadataSchema.ReplicationSection.COLF)));
++    try {
++      for (IteratorScope scope : IteratorScope.values()) {
++        String root = String.format("%s%s.%s", Property.TABLE_ITERATOR_PREFIX, scope.name().toLowerCase(), setting.getName());
++        for (Entry<String,String> prop : setting.getOptions().entrySet()) {
++          TablePropUtil.setTableProperty(MetadataTable.ID, root + ".opt." + prop.getKey(), prop.getValue());
++        }
++        TablePropUtil.setTableProperty(MetadataTable.ID, root, setting.getPriority() + "," + setting.getIteratorClass());
++      }
++    } catch (Exception e) {
++      log.fatal("Error talking to ZooKeeper", e);
++      throw new IOException(e);
++    }
+   }
+ 
+   private static void setMetadataReplication(int replication, String reason) throws IOException {
+diff --git a/server/base/src/main/java/org/apache/accumulo/server/util/ReplicationTableUtil.java b/server/base/src/main/java/org/apache/accumulo/server/util/ReplicationTableUtil.java
+index 2a9774d..ab5ee86 100644
+--- a/server/base/src/main/java/org/apache/accumulo/server/util/ReplicationTableUtil.java
++++ b/server/base/src/main/java/org/apache/accumulo/server/util/ReplicationTableUtil.java
+@@ -187,7 +187,7 @@ public static void updateLogs(Credentials creds, KeyExtent extent, Collection<Lo
+    */
+   public static void updateFiles(Credentials creds, KeyExtent extent, Collection<String> files, Status stat) {
+     if (log.isDebugEnabled()) {
+-      log.debug("Updating replication for " + extent + " with " + files + " using " + ProtobufUtil.toString(stat));
++      log.debug("Updating replication status for " + extent + " with " + files + " using " + ProtobufUtil.toString(stat));
+     }
+     // TODO could use batch writer, would need to handle failure and retry like update does - ACCUMULO-1294
+     if (files.isEmpty()) {
+diff --git a/server/tserver/src/main/java/org/apache/accumulo/tserver/log/TabletServerLogger.java b/server/tserver/src/main/java/org/apache/accumulo/tserver/log/TabletServerLogger.java
+index b4f14ec..26e6891 100644
+--- a/server/tserver/src/main/java/org/apache/accumulo/tserver/log/TabletServerLogger.java
++++ b/server/tserver/src/main/java/org/apache/accumulo/tserver/log/TabletServerLogger.java
+@@ -276,8 +276,8 @@ private int write(final Collection<CommitSession> sessions, boolean mincFinish,
+                   logs.add(logger.getFileName());
+                 }
+                 Status status = StatusUtil.fileCreated(System.currentTimeMillis());
+-                log.debug("Writing " + ProtobufUtil.toString(status) + " to replication table for " + logs);
+-                // Got some new WALs, note this in the replication table
++                log.debug("Writing " + ProtobufUtil.toString(status) + " to metadata table for " + logs);
++                // Got some new WALs, note this in the metadata table
+                 ReplicationTableUtil.updateFiles(SystemCredentials.get(), commitSession.getExtent(), logs, status);
+               }
+             }
+diff --git a/server/tserver/src/main/java/org/apache/accumulo/tserver/tablet/DatafileManager.java b/server/tserver/src/main/java/org/apache/accumulo/tserver/tablet/DatafileManager.java
+index 5b46b7b..78a2ed6 100644
+--- a/server/tserver/src/main/java/org/apache/accumulo/tserver/tablet/DatafileManager.java
++++ b/server/tserver/src/main/java/org/apache/accumulo/tserver/tablet/DatafileManager.java
+@@ -424,6 +424,9 @@ void bringMinorCompactionOnline(FileRef tmpDatafile, FileRef newDatafile, FileRe
+       // This WAL could still be in use by other Tablets *from the same table*, so we can only mark that there is data to replicate,
+       // but it is *not* closed
+       if (replicate) {
++        if (log.isDebugEnabled()) {
++          log.debug("Recording that data has been ingested into " + tablet.getExtent() + " using " + logFileOnly);
++        }
+         ReplicationTableUtil.updateFiles(SystemCredentials.get(), tablet.getExtent(), logFileOnly, StatusUtil.openWithUnknownLength());
+       }
+     } finally {
