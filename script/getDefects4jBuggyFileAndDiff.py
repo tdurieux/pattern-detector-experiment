@@ -72,7 +72,7 @@ def get_diff(project, bug_id, source):
         output = str(e.output)
     output = output[output.index("---"):]
     project_path = os.path.join(project.lower(), "%s_%s" % (project.lower(), bug_id))
-    return output.replace(os.path.join(defects4j_fix_checkout_path, project_path), "").replace(os.path.join(defects4j_checkout_path, project_path), "");
+    return output.replace(os.path.join(defects4j_fix_checkout_path, source), "").replace(os.path.join(defects4j_checkout_path, source), "");
 
 def main():
     commit_id = {}
@@ -89,17 +89,7 @@ def main():
             bug_output_path = os.path.join(root, 'benchmark', 'defects4j', project.lower() +"_" + str(bug_id))
             
             intersection_folder = None
-            for changed_class in changed_classes:
-                class_name = changed_class.replace(".", "/") + ".java"
-                if intersection_folder is None:
-                    intersection_folder = class_name
-                else:
-                    intersection_folder = str_intersection(intersection_folder, class_name)
-                class_path = os.path.join(source, class_name)
-                file_output_path = os.path.join(bug_output_path, "buggy-version", class_name)
-                if not os.path.exists(os.path.dirname(file_output_path)):
-                    os.makedirs(os.path.dirname(file_output_path))
-                shutil.copy(os.path.join(defects4j_checkout_path, class_path), file_output_path)
+            
             with open(os.path.join(bug_output_path, "path.diff"), 'w+') as fd:
                 fd.write(get_diff(project, bug_id, source))
 if __name__ == '__main__':
