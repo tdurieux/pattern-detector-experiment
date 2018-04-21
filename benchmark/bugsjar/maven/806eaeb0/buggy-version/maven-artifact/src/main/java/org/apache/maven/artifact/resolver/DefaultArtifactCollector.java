@@ -81,7 +81,7 @@ public class DefaultArtifactCollector
 
                     if ( node.filterTrail( filter ) )
                     {
-                        // If it was optional and not a direct dependency,
+                        // If it was optional and not a direct dependency, 
                         // we don't add it or its children, just allow the update of the version and scope
                         if ( node.isChildOfRootNode() || !artifact.isOptional() )
                         {
@@ -137,7 +137,18 @@ public class DefaultArtifactCollector
                     VersionRange previousRange = previous.getArtifact().getVersionRange();
                     VersionRange currentRange = node.getArtifact().getVersionRange();
 
-                    if ( previousRange != null && currentRange != null )
+                    // TODO: why do we force the version on it? what if they don't match?
+                    if ( previousRange == null )
+                    {
+                        // version was already resolved
+                        node.getArtifact().setVersion( previous.getArtifact().getVersion() );
+                    }
+                    else if ( currentRange == null )
+                    {
+                        // version was already resolved
+                        previous.getArtifact().setVersion( node.getArtifact().getVersion() );
+                    }
+                    else
                     {
                         // TODO: shouldn't need to double up on this work, only done for simplicity of handling recommended
                         // version but the restriction is identical
@@ -174,8 +185,7 @@ public class DefaultArtifactCollector
 
                     // TODO: should this be part of mediation?
                     // previous one is more dominant
-                    ResolutionNode nearest;
-                    ResolutionNode farthest;
+                    ResolutionNode nearest, farthest;
                     if ( previous.getDepth() <= node.getDepth() )
                     {
                         nearest = previous;
@@ -187,9 +197,11 @@ public class DefaultArtifactCollector
                         farthest = previous;
                     }
 
+                    /* if we need to update scope of nearest to use farthest scope */
                     if ( checkScopeUpdate( farthest, nearest, listeners ) )
                     {
-                        // if we need to update scope of nearest to use farthest scope, use the nearest version, but farthest scope
+                        fireEvent( ResolutionListener.UPDATE_SCOPE, listeners, nearest, farthest.getArtifact() );
+                        /* we need nearest version but farthest scope */
                         nearest.disable();
                         farthest.getArtifact().setVersion( nearest.getArtifact().getVersion() );
                     }
@@ -309,14 +321,13 @@ public class DefaultArtifactCollector
     }
 
     /**
-     * Check if the scope needs to be updated.
+     * Check if the scope of the nearest needs to be updated with the scope of the farthest.
      * <a href="http://docs.codehaus.org/x/IGU#DependencyMediationandConflictResolution-Scoperesolution">More info</a>.
-     *
-     * @param farthest  farthest resolution node
-     * @param nearest   nearest resolution node
+     * @param farthest farthest resolution node
+     * @param nearest nearest resolution node
      * @param listeners
      */
-    boolean checkScopeUpdate( ResolutionNode farthest, ResolutionNode nearest, List listeners )
+    private boolean checkScopeUpdate( ResolutionNode farthest, ResolutionNode nearest, List listeners )
     {
         boolean updateScope = false;
         Artifact farthestArtifact = farthest.getArtifact();
@@ -341,16 +352,6 @@ public class DefaultArtifactCollector
             updateScope = false;
 
             fireEvent( ResolutionListener.UPDATE_SCOPE_CURRENT_POM, listeners, nearest, farthestArtifact );
-        }
-
-        if ( updateScope )
-        {
-            fireEvent( ResolutionListener.UPDATE_SCOPE, listeners, nearest, farthestArtifact );
-
-            // previously we cloned the artifact, but it is more effecient to just update the scope
-            // if problems are later discovered that the original object needs its original scope value, cloning may
-            // again be appropriate
-            nearestArtifact.setScope( farthestArtifact.getScope() );
         }
 
         return updateScope;

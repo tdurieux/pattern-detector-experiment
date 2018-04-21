@@ -240,7 +240,8 @@ public class NodeImpl<T extends NodeDelegate> extends ItemImpl<T> implements Nod
                 String ntName = primaryNodeTypeName;
                 if (ntName == null) {
                     DefinitionProvider dp = getDefinitionProvider();
-                    NodeDefinition def = dp.getDefinition(parent.getTree(), oakName);
+                    String childName = getOakName(PathUtils.getName(relPath));
+                    NodeDefinition def = dp.getDefinition(parent.getTree(), childName);
                     ntName = def.getDefaultPrimaryTypeName();
                     if (ntName == null) {
                         throw new ConstraintViolationException(

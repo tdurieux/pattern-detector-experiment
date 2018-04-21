@@ -371,8 +371,6 @@ public abstract class AbstractInputFormat<K,V> implements InputFormat<K,V> {
         log.debug("Authorizations are: " + authorizations);
         if (tableConfig.isOfflineScan()) {
           scanner = new OfflineScanner(instance, new Credentials(principal, token), split.getTableId(), authorizations);
-        } else if (instance instanceof MockInstance) {
-          scanner = instance.getConnector(principal, token).createScanner(split.getTableName(), authorizations);
         } else {
           scanner = new ScannerImpl(instance, new Credentials(principal, token), split.getTableId(), authorizations);
         }
@@ -384,7 +382,7 @@ public abstract class AbstractInputFormat<K,V> implements InputFormat<K,V> {
           log.info("Using local iterators");
           scanner = new ClientSideIteratorScanner(scanner);
         }
-        setupIterators(job, scanner, split.getTableName());
+        setupIterators(job, scanner, split.getTableId());
       } catch (Exception e) {
         throw new IOException(e);
       }
@@ -462,11 +460,7 @@ public abstract class AbstractInputFormat<K,V> implements InputFormat<K,V> {
       TabletLocator tl;
       try {
         // resolve table name to id once, and use id from this point forward
-        Instance instance = getInstance(job);
-        if (instance instanceof MockInstance)
-          tableId = "";
-        else
-          tableId = Tables.getTableId(instance, tableName);
+        tableId = Tables.getTableId(getInstance(job), tableName);
         if (tableConfig.isOfflineScan()) {
           binnedRanges = binOfflineTable(job, tableId, ranges);
           while (binnedRanges == null) {
@@ -475,6 +469,7 @@ public abstract class AbstractInputFormat<K,V> implements InputFormat<K,V> {
             binnedRanges = binOfflineTable(job, tableId, ranges);
           }
         } else {
+          Instance instance = getInstance(job);
           tl = getTabletLocator(job, tableId);
           // its possible that the cache could contain complete, but old information about a tables tablets... so clear it
           tl.invalidateCache();

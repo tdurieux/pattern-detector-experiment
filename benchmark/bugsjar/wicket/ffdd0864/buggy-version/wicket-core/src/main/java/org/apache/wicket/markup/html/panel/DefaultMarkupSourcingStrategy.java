@@ -78,24 +78,26 @@ public final class DefaultMarkupSourcingStrategy extends AbstractMarkupSourcingS
 	{
 		// If the sourcing strategy did not provide one, than ask the component.
 		// Get the markup for the container
-		IMarkupFragment containerMarkup = container.getMarkup();
-		if (containerMarkup == null)
+		IMarkupFragment markup = container.getMarkup();
+		if (markup == null)
 		{
 			return null;
 		}
 
 		if (child == null)
 		{
-			return containerMarkup;
+			return markup;
 		}
-		
+
 		// Find the child's markup
-		IMarkupFragment childMarkup = containerMarkup.find(child.getId());
-		if (childMarkup != null)
+		markup = markup.find(child.getId());
+		if (markup != null)
 		{
-			return childMarkup;
+			return markup;
 		}
 		
-		return searchMarkupInTransparentResolvers(container, containerMarkup, child);
+		markup = searchMarkupInTransparentResolvers(container, child);
+		
+		return markup;
 	}
 }

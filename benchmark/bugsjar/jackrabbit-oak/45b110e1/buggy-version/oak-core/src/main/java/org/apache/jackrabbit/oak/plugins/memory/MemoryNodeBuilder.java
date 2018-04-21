@@ -254,9 +254,7 @@ public class MemoryNodeBuilder implements NodeBuilder {
             writeState = parent.getWriteState(name);
             if (writeState == null) {
                 if (exists()) {
-                    NodeState writeBase =
-                            parent.writeState.base.getChildNode(name);
-                    writeState = new MutableNodeState(writeBase);
+                    writeState = new MutableNodeState(baseState);
                 }
                 else {
                     writeState = new MutableNodeState(null);

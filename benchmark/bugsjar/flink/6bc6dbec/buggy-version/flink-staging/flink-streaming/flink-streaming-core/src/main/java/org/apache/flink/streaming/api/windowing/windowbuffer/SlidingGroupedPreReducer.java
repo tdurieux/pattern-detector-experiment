@@ -143,7 +143,6 @@ public abstract class SlidingGroupedPreReducer<T> extends SlidingPreReducer<T> {
 	@Override
 	protected void resetCurrent() {
 		currentReducedMap = null;
-		elementsSinceLastPreAggregate = 0;
 	}
 
 	@Override

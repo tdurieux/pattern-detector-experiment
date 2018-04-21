@@ -137,26 +137,18 @@ public interface RealDistribution {
     double getSupportUpperBound();
 
     /**
-     * Whether or not the lower bound of support is in the domain of the density
-     * function.  Returns true iff {@code getSupporLowerBound()} is finite and
-     * {@code density(getSupportLowerBound())} returns a non-NaN, non-infinite
-     * value.
+     * Use this method to get information about whether the lower bound
+     * of the support is inclusive or not.
      *
-     * @return true if the lower bound of support is finite and the density 
-     * function returns a non-NaN, non-infinite value there
-     * @deprecated to be removed in 4.0
+     * @return whether the lower bound of the support is inclusive or not
      */
     boolean isSupportLowerBoundInclusive();
 
     /**
-     * Whether or not the upper bound of support is in the domain of the density
-     * function.  Returns true iff {@code getSupportUpperBound()} is finite and
-     * {@code density(getSupportUpperBound())} returns a non-NaN, non-infinite
-     * value.
+     * Use this method to get information about whether the upper bound
+     * of the support is inclusive or not.
      *
-     * @return true if the upper bound of support is finite and the density 
-     * function returns a non-NaN, non-infinite value there
-     * @deprecated to be removed in 4.0
+     * @return whether the upper bound of the support is inclusive or not
      */
     boolean isSupportUpperBoundInclusive();
 

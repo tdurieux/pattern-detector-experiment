@@ -161,9 +161,4 @@ public class MutableThreadContextStack implements ThreadContextStack {
     public boolean retainAll(final Collection<?> objects) {
         return list.retainAll(objects);
     }
-    
-    @Override
-    public String toString() {
-        return String.valueOf(list);
-    }
 }

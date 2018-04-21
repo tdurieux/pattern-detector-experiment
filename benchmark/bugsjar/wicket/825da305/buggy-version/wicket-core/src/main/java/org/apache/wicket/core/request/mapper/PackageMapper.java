@@ -139,8 +139,7 @@ public class PackageMapper extends AbstractBookmarkableMapper
 			PageComponentInfo info = getPageComponentInfo(url);
 
 			// load the page class
-			String name = url.getSegments().get(mountSegments.length);
-			String className = cleanClassName(name);
+			String className = url.getSegments().get(mountSegments.length);
 
 			if (isValidClassName(className) == false)
 			{

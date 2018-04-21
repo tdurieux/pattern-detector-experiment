@@ -200,10 +200,18 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
         final AtomicExchange result = new AtomicExchange();
         final Iterable<ProcessorExchangePair> pairs;
 
+        // multicast uses fine grained error handling on the output processors
+        // so use try .. catch to cater for this
+        boolean exhaust = false;
         try {
             boolean sync = true;
 
             pairs = createProcessorExchangePairs(exchange);
+
+            // after we have created the processors we consider the exchange as exhausted if an unhandled
+            // exception was thrown, (used in the catch block)
+            // if the processors is working in Streaming model, the exchange could not be processed at this point.
+            exhaust = !isStreaming();
 
             if (isParallelProcessing()) {
                 // ensure an executor is set when running in parallel
@@ -220,16 +228,15 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
             }
         } catch (Throwable e) {
             exchange.setException(e);
-            // unexpected exception was thrown, maybe from iterator etc. so do not regard as exhausted
             // and do the done work
-            doDone(exchange, null, callback, true, false);
+            doDone(exchange, null, callback, true, exhaust);
             return true;
         }
 
         // multicasting was processed successfully
         // and do the done work
         Exchange subExchange = result.get() != null ? result.get() : null;
-        doDone(exchange, subExchange, callback, true, true);
+        doDone(exchange, subExchange, callback, true, exhaust);
         return true;
     }
 
@@ -301,8 +308,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
                             // throw caused exception
                             if (subExchange.getException() != null) {
                                 // wrap in exception to explain where it failed
-                                CamelExchangeException cause = new CamelExchangeException("Parallel processing failed for number " + number, subExchange, subExchange.getException());
-                                subExchange.setException(cause);
+                                throw new CamelExchangeException("Parallel processing failed for number " + number, subExchange, subExchange.getException());
                             }
                         }
 
@@ -521,14 +527,14 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
             if (stopOnException && !continueProcessing) {
                 if (subExchange.getException() != null) {
                     // wrap in exception to explain where it failed
-                    CamelExchangeException cause = new CamelExchangeException("Sequential processing failed for number " + total.get(), subExchange, subExchange.getException());
-                    subExchange.setException(cause);
+                    throw new CamelExchangeException("Sequential processing failed for number " + total.get(), subExchange, subExchange.getException());
+                } else {
+                    // we want to stop on exception, and the exception was handled by the error handler
+                    // this is similar to what the pipeline does, so we should do the same to not surprise end users
+                    // so we should set the failed exchange as the result and be done
+                    result.set(subExchange);
+                    return true;
                 }
-                // we want to stop on exception, and the exception was handled by the error handler
-                // this is similar to what the pipeline does, so we should do the same to not surprise end users
-                // so we should set the failed exchange as the result and be done
-                result.set(subExchange);
-                return true;
             }
 
             LOG.trace("Sequential processing complete for number {} exchange: {}", total, subExchange);

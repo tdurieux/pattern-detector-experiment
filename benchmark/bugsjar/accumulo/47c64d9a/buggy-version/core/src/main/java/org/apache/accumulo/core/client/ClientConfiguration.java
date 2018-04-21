@@ -302,12 +302,8 @@ public class ClientConfiguration extends CompositeConfiguration {
   public Map<String,String> getAllPropertiesWithPrefix(ClientProperty property) {
     checkType(property, PropertyType.PREFIX);
 
-    Map<String,String> propMap = new HashMap<>();
-    String prefix = property.getKey();
-    if (prefix.endsWith(".")) {
-      prefix = prefix.substring(0, prefix.length() - 1);
-    }
-    Iterator<?> iter = this.getKeys(prefix);
+    Map<String,String> propMap = new HashMap<String,String>();
+    Iterator<?> iter = this.getKeys(property.getKey());
     while (iter.hasNext()) {
       String p = (String) iter.next();
       propMap.put(p, getString(p));

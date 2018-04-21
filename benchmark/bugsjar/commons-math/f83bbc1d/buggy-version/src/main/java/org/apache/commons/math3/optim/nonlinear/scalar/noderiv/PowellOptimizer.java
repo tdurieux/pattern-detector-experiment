@@ -188,8 +188,9 @@ public class PowellOptimizer
         double[] x = guess;
         double fVal = computeObjectiveValue(x);
         double[] x1 = x.clone();
+        int iter = 0;
         while (true) {
-            incrementIterationCount();
+            ++iter;
 
             double fX = fVal;
             double fX2 = 0;
@@ -223,7 +224,7 @@ public class PowellOptimizer
             final PointValuePair current = new PointValuePair(x, fVal);
             if (!stop) { // User-defined stopping criteria.
                 if (checker != null) {
-                    stop = checker.converged(getIterations(), previous, current);
+                    stop = checker.converged(iter, previous, current);
                 }
             }
             if (stop) {

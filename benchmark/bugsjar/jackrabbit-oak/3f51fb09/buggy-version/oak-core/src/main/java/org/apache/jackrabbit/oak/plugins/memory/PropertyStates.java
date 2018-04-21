@@ -32,7 +32,6 @@ import org.apache.jackrabbit.oak.api.Blob;
 import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.plugins.value.Conversions;
-import org.apache.jackrabbit.oak.plugins.value.ValueImpl;
 
 import static org.apache.jackrabbit.oak.api.Type.STRINGS;
 
@@ -53,11 +52,10 @@ public final class PropertyStates {
      */
     @Nonnull
     public static PropertyState createProperty(String name, Value value) throws RepositoryException {
-
         int type = value.getType();
         switch (type) {
             case PropertyType.STRING:
-                return StringPropertyState.stringProperty(name, getString(value, type));
+                return StringPropertyState.stringProperty(name, value.getString());
             case PropertyType.BINARY:
                 return BinaryPropertyState.binaryProperty(name, value);
             case PropertyType.LONG:
@@ -71,7 +69,7 @@ public final class PropertyStates {
             case PropertyType.DECIMAL:
                 return DecimalPropertyState.decimalProperty(name, value.getDecimal());
             default:
-                return new GenericPropertyState(name, getString(value, type), Type.fromTag(type, false));
+                return new GenericPropertyState(name, value.getString(), Type.fromTag(type, false));
         }
     }
 
@@ -98,7 +96,7 @@ public final class PropertyStates {
             case PropertyType.STRING:
                 List<String> strings = Lists.newArrayList();
                 for (Value value : values) {
-                    strings.add(getString(value, type));
+                    strings.add(value.getString());
                 }
                 return MultiStringPropertyState.stringProperty(name, strings);
             case PropertyType.BINARY:
@@ -140,21 +138,9 @@ public final class PropertyStates {
             default:
                 List<String> vals = Lists.newArrayList();
                 for (Value value : values) {
-                    vals.add(getString(value, type));
+                    vals.add(value.getString());
                 }
                 return new MultiGenericPropertyState(name, vals, Type.fromTag(type, true));
-        }
-    }
-
-    private static String getString(Value value, int type) throws RepositoryException {
-        if (value instanceof ValueImpl) {
-            return ((ValueImpl) value).getOakString();
-        }
-        else if (type == PropertyType.NAME || type == PropertyType.PATH) {
-            throw new IllegalArgumentException("Cannot create name of path property state from Value " +
-                    "of class '" + value.getClass() + '\'');
-        } else {
-            return value.getString();
         }
     }
 

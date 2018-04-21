@@ -62,7 +62,7 @@ public abstract class StreamTask<OUT, O extends StreamOperator<OUT>> extends Abs
 
 	protected volatile boolean isRunning = false;
 
-	protected List<StreamingRuntimeContext> contexts;
+	protected StreamingRuntimeContext context;
 
 	protected ClassLoader userClassLoader;
 	
@@ -73,26 +73,21 @@ public abstract class StreamTask<OUT, O extends StreamOperator<OUT>> extends Abs
 	public StreamTask() {
 		streamOperator = null;
 		superstepListener = new SuperstepEventListener();
-		contexts = new ArrayList<StreamingRuntimeContext>();
 	}
 
 	@Override
 	public void registerInputOutput() {
 		this.userClassLoader = getUserCodeClassLoader();
 		this.configuration = new StreamConfig(getTaskConfiguration());
+		this.context = createRuntimeContext(getEnvironment().getTaskName());
 		this.stateHandleProvider = getStateHandleProvider();
 
 		outputHandler = new OutputHandler<OUT>(this);
 
 		streamOperator = configuration.getStreamOperator(userClassLoader);
-		
 		if (streamOperator != null) {
-			//Create context of the head operator
-			StreamingRuntimeContext headContext = createRuntimeContext(configuration);
-			this.contexts.add(headContext);
-
 			// IterationHead and IterationTail don't have an Operator...
-			streamOperator.setup(outputHandler.getOutput(), headContext);
+			streamOperator.setup(outputHandler.getOutput(), this.context);
 		}
 
 		hasChainedOperators = !outputHandler.getChainedOperators().isEmpty();
@@ -102,10 +97,10 @@ public abstract class StreamTask<OUT, O extends StreamOperator<OUT>> extends Abs
 		return getEnvironment().getTaskName();
 	}
 
-	public StreamingRuntimeContext createRuntimeContext(StreamConfig conf) {
+	public StreamingRuntimeContext createRuntimeContext(String taskName) {
 		Environment env = getEnvironment();
-		return new StreamingRuntimeContext(conf.getStreamOperator(userClassLoader).getClass()
-				.getSimpleName(), env, getUserCodeClassLoader(), getExecutionConfig());
+		return new StreamingRuntimeContext(taskName, env, getUserCodeClassLoader(),
+				getExecutionConfig());
 	}
 	
 	private StateHandleProvider<Serializable> getStateHandleProvider() {

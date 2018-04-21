@@ -17,13 +17,13 @@
 package wicket.feedback;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 
 import wicket.Component;
 import wicket.Page;
-import wicket.Session;
 import wicket.model.IModel;
 
 /**
@@ -51,9 +51,8 @@ public class FeedbackMessagesModel implements IModel
 	 * Constructor. Creates a model for all feedback messages on the page.
 	 * 
 	 * @param component
-	 *            The component where the page will be get from for which
-	 *            messages will be displayed usually the same page as the one
-	 *            feedbackpanel is attached to
+	 *            The component where the page will be get from for which messages will be displayed 
+	 *            usually the same page as the one feedbackpanel is attached to
 	 */
 	public FeedbackMessagesModel(Component component)
 	{
@@ -88,7 +87,7 @@ public class FeedbackMessagesModel implements IModel
 	{
 		return filter;
 	}
-
+	
 	/**
 	 * @return The current sorting comparator
 	 */
@@ -105,7 +104,13 @@ public class FeedbackMessagesModel implements IModel
 		if (messages == null)
 		{
 			// Get filtered messages from page where component lives
-			messages = Session.get().getFeedbackMessages().messages(filter);
+			List pageMessages = component.getPage().getFeedbackMessages().messages(filter);
+
+			List sessionMessages = component.getSession().getFeedbackMessages().messages(filter);
+
+			messages = new ArrayList(pageMessages.size() + sessionMessages.size());
+			messages.addAll(pageMessages);
+			messages.addAll(sessionMessages);
 
 			// Sort the list before returning it
 			if (sortingComparator != null)
@@ -159,7 +164,7 @@ public class FeedbackMessagesModel implements IModel
 	{
 		return messages;
 	}
-
+	
 	/**
 	 * 
 	 * @see wicket.model.IModel#setObject(java.lang.Object)
@@ -167,7 +172,7 @@ public class FeedbackMessagesModel implements IModel
 	public void setObject(Object object)
 	{
 	}
-
+	
 	/**
 	 * 
 	 * @see wicket.model.IDetachable#detach()

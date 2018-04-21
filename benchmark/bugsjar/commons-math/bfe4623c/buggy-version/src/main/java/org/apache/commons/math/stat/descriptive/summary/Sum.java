@@ -24,8 +24,7 @@ import org.apache.commons.math.stat.descriptive.AbstractStorelessUnivariateStati
 /**
   * Returns the sum of the available values.
  * <p>
- * If there are no values in the dataset, then 0 is returned. 
- * If any of the values are
+ * If there are no values in the dataset, or any of the values are
  * <code>NaN</code>, then <code>NaN</code> is returned.</p>
  * <p>
  * <strong>Note that this implementation is not synchronized.</strong> If
@@ -53,7 +52,7 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
      */
     public Sum() {
         n = 0;
-        value = 0;
+        value = Double.NaN;
     }
 
     /**
@@ -71,7 +70,11 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
      */
     @Override
     public void increment(final double d) {
-        value += d;
+        if (n == 0) {
+            value = d;
+        } else {
+            value += d;
+        }
         n++;
     }
 
@@ -95,13 +98,13 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
      */
     @Override
     public void clear() {
-        value = 0;
+        value = Double.NaN;
         n = 0;
     }
 
     /**
      * The sum of the entries in the specified portion of
-     * the input array, or 0 if the designated subarray
+     * the input array, or <code>Double.NaN</code> if the designated subarray
      * is empty.
      * <p>
      * Throws <code>IllegalArgumentException</code> if the array is null.</p>
@@ -109,14 +112,14 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
      * @param values the input array
      * @param begin index of the first array element to include
      * @param length the number of elements to include
-     * @return the sum of the values or 0 if length = 0
+     * @return the sum of the values or Double.NaN if length = 0
      * @throws IllegalArgumentException if the array is null or the array index
      *  parameters are not valid
      */
     @Override
     public double evaluate(final double[] values, final int begin, final int length) {
         double sum = Double.NaN;
-        if (test(values, begin, length, true)) {
+        if (test(values, begin, length)) {
             sum = 0.0;
             for (int i = begin; i < begin + length; i++) {
                 sum += values[i];
@@ -127,7 +130,7 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
 
     /**
      * The weighted sum of the entries in the specified portion of
-     * the input array, or 0 if the designated subarray
+     * the input array, or <code>Double.NaN</code> if the designated subarray
      * is empty.
      * <p>
      * Throws <code>IllegalArgumentException</code> if any of the following are true:
@@ -148,14 +151,14 @@ public class Sum extends AbstractStorelessUnivariateStatistic implements Seriali
      * @param weights the weights array
      * @param begin index of the first array element to include
      * @param length the number of elements to include
-     * @return the sum of the values or 0 if length = 0
+     * @return the sum of the values or Double.NaN if length = 0
      * @throws IllegalArgumentException if the parameters are not valid
      * @since 2.1
      */
     public double evaluate(final double[] values, final double[] weights,
                            final int begin, final int length) {
         double sum = Double.NaN;
-        if (test(values, weights, begin, length, true)) {
+        if (test(values, weights, begin, length)) {
             sum = 0.0;
             for (int i = begin; i < begin + length; i++) {
                 sum += values[i] * weights[i];

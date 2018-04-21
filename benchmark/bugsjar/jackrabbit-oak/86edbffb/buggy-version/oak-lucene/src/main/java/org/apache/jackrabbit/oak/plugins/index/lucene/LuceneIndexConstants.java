@@ -25,7 +25,7 @@ public interface LuceneIndexConstants {
 
     String INDEX_DATA_CHILD_NAME = ":data";
 
-    Version VERSION = Version.LUCENE_47;
+    Version VERSION = Version.LUCENE_46;
 
     Analyzer ANALYZER = new OakAnalyzer(VERSION);
 

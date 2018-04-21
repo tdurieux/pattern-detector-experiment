@@ -575,8 +575,7 @@ public class XMLTokenExpressionIterator extends ExpressionAdapter implements Nam
             try {
                 nextToken = getNextToken();
             } catch (XMLStreamException e) {
-                nextToken = null;
-                throw new RuntimeException(e);
+                //
             }
             return o;
         }

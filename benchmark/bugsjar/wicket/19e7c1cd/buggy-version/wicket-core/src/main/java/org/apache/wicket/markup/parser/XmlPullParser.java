@@ -17,9 +17,9 @@
 package org.apache.wicket.markup.parser;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.StringReader;
 import java.text.ParseException;
 
 import org.apache.wicket.markup.parser.XmlTag.TagType;
@@ -48,9 +48,10 @@ public final class XmlPullParser implements IXmlPullParser
 	public static final String SCRIPT = "script";
 
 	/**
-	 * The encoding of the XML.
+	 * Reads the xml data from an input stream and converts the chars according to its encoding
+	 * (<?xml ... encoding="..." ?>)
 	 */
-	private String encoding;
+	private XmlReader xmlReader;
 
 	/**
 	 * A XML independent reader which loads the whole source data into memory and which provides
@@ -83,7 +84,7 @@ public final class XmlPullParser implements IXmlPullParser
 	@Override
 	public final String getEncoding()
 	{
-		return encoding;
+		return xmlReader.getEncoding();
 	}
 
 	@Override
@@ -543,10 +544,7 @@ public final class XmlPullParser implements IXmlPullParser
 	@Override
 	public void parse(final CharSequence string) throws IOException
 	{
-		Args.notNull(string, "string");
-
-		this.input = new FullyBufferedReader(new StringReader(string.toString()));
-		this.encoding = null;
+		parse(new ByteArrayInputStream(string.toString().getBytes()), null);
 	}
 
 	/**
@@ -556,8 +554,6 @@ public final class XmlPullParser implements IXmlPullParser
 	 * @param in
 	 *            The input stream to read and parse
 	 * @throws IOException
-	 * 
-	 * @see {@link #parse(InputStream, String)}
 	 */
 	@Override
 	public void parse(final InputStream in) throws IOException
@@ -567,9 +563,7 @@ public final class XmlPullParser implements IXmlPullParser
 	}
 
 	/**
-	 * Reads and parses markup from an input stream.
-	 * <p>
-	 * Note: The input is closed after parsing.
+	 * Reads and parses markup from an input stream
 	 * 
 	 * @param inputStream
 	 *            The input stream to read and parse
@@ -584,14 +578,13 @@ public final class XmlPullParser implements IXmlPullParser
 
 		try
 		{
-			XmlReader xmlReader = new XmlReader(new BufferedInputStream(inputStream, 4000),
-				encoding);
-			this.input = new FullyBufferedReader(xmlReader);
-			this.encoding = xmlReader.getEncoding();
+			xmlReader = new XmlReader(new BufferedInputStream(inputStream, 4000), encoding);
+			input = new FullyBufferedReader(xmlReader);
 		}
 		finally
 		{
 			IOUtils.closeQuietly(inputStream);
+			IOUtils.closeQuietly(xmlReader);
 		}
 	}
 

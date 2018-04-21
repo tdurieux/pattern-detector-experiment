@@ -342,7 +342,7 @@ public class WebPageRenderer extends PageRenderer
 			|| ((isOnePassRender() && notForcedRedirect(getRedirectPolicy())) || (targetUrl
 				.equals(currentUrl) && notNewAndNotStatelessPage(isNewPageInstance(),
 				isPageStateless()))) || (targetUrl.equals(currentUrl) && isRedirectToRender())
-			|| (shouldPreserveClientUrl(cycle) && notForcedRedirect(getRedirectPolicy()));
+			|| shouldPreserveClientUrl(cycle);
 	}
 
 	private static boolean notNewAndNotStatelessPage(boolean newPageInstance, boolean pageStateless)

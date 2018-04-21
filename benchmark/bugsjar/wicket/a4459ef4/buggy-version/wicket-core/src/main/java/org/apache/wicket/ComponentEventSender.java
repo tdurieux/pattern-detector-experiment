@@ -164,10 +164,6 @@ final class ComponentEventSender implements IEventSource
 		{
 			Visits.visitPostOrder(cursor, new ComponentEventVisitor(event, dispatcher));
 		}
-		else
-		{
-			dispatcher.dispatchEvent(cursor, event);
-		}
 		if (event.isStop())
 		{
 			return;

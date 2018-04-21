@@ -1117,7 +1117,7 @@ public class MongoMK implements MicroKernel {
      * 
      * @param nodeMap the document
      * @param changeRev the revision of the current change
-     * @param handler the conflict handler, which is called for concurrent changes
+     * @param handler the conflict handler, which is called for un-committed revisions
      *                preceding <code>before</code>.
      * @return the revision, or null if deleted
      */
@@ -1152,7 +1152,7 @@ public class MongoMK implements MicroKernel {
                 if (!propRev.equals(changeRev)) {
                     if (!isValidRevision(
                             propRev, changeRev, nodeMap, new HashSet<Revision>())) {
-                        handler.concurrentModification(propRev);
+                        handler.uncommittedModification(propRev);
                     } else {
                         newestRev = propRev;
                     }

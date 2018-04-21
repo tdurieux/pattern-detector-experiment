@@ -60,7 +60,7 @@ public class DiffBuilder {
         if (before == null) {
             if (after != null) {
                 buff.tag('+').key(path).object();
-                toJson(buff, after, depth);
+                toJson(buff, after);
                 return buff.endObject().newline().toString();
             } else {
                 // path doesn't exist in the specified revisions
@@ -117,7 +117,7 @@ public class DiffBuilder {
                     addedNodes.put(after, p);
                     buff.tag('+').
                             key(p).object();
-                    toJson(buff, after, depth);
+                    toJson(buff, after);
                     buff.endObject().newline();
                 }
             }
@@ -215,7 +215,7 @@ public class DiffBuilder {
                     if (p.startsWith(pathFilter)) {
                         buff.tag('+').
                                 key(p).object();
-                        toJson(buff, after, depth);
+                        toJson(buff, after);
                         buff.endObject().newline();
                     }
                 }
@@ -267,16 +267,14 @@ public class DiffBuilder {
         return buff.toString();
     }
 
-    private void toJson(JsopBuilder builder, NodeState node, int depth) {
+    private void toJson(JsopBuilder builder, NodeState node) {
         for (PropertyState property : node.getProperties()) {
             builder.key(property.getName()).encodedValue(property.getEncodedValue());
         }
-        if (depth != 0) {
-            for (ChildNode entry : node.getChildNodeEntries(0, -1)) {
-                builder.key(entry.getName()).object();
-                toJson(builder, entry.getNode(), depth < 0 ? depth : depth - 1);
-                builder.endObject();
-            }
+        for (ChildNode entry : node.getChildNodeEntries(0, -1)) {
+            builder.key(entry.getName()).object();
+            toJson(builder, entry.getNode());
+            builder.endObject();
         }
     }
 }

@@ -797,11 +797,6 @@ public class Execution implements Serializable {
 				return false;
 			}
 
-			if (current == CANCELING) {
-				cancelingComplete();
-				return false;
-			}
-
 			if (transitionState(current, FAILED, t)) {
 				// success (in a manner of speaking)
 				this.failureCause = t;

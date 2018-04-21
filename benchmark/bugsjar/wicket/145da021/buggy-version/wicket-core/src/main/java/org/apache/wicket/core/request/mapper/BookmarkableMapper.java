@@ -24,7 +24,6 @@ import org.apache.wicket.request.Request;
 import org.apache.wicket.request.Url;
 import org.apache.wicket.request.component.IRequestablePage;
 import org.apache.wicket.request.mapper.ICompoundRequestMapper;
-import org.apache.wicket.request.mapper.IRequestMapperDelegate;
 import org.apache.wicket.request.mapper.info.PageComponentInfo;
 import org.apache.wicket.request.mapper.parameter.IPageParametersEncoder;
 import org.apache.wicket.request.mapper.parameter.PageParameters;
@@ -120,7 +119,7 @@ public class BookmarkableMapper extends AbstractBookmarkableMapper
 						if (!pageClass.equals(application.getHomePage()))
 						{
 							// WICKET-5094 only enforce mount if page is mounted
-							if (isPageMounted(pageClass, application.getRootRequestMapperAsCompound()))
+							if (isPageMounted(pageClass, application))
 							{
 								return null;
 							}
@@ -138,32 +137,19 @@ public class BookmarkableMapper extends AbstractBookmarkableMapper
 		return null;
 	}
 
-	private boolean isPageMounted(Class<? extends IRequestablePage> pageClass, ICompoundRequestMapper compoundMapper)
+	private boolean isPageMounted(Class<? extends IRequestablePage> pageClass, Application application)
 	{
-		for (IRequestMapper requestMapper : compoundMapper)
-		{
-			while (requestMapper instanceof IRequestMapperDelegate)
-			{
-				requestMapper = ((IRequestMapperDelegate)requestMapper).getDelegateMapper();
-			}
+		ICompoundRequestMapper applicationMappers = application.getRootRequestMapperAsCompound();
 
-			if (requestMapper instanceof ICompoundRequestMapper)
+		for (IRequestMapper requestMapper : applicationMappers)
+		{
+			if (requestMapper instanceof AbstractBookmarkableMapper  && requestMapper != this)
 			{
-				if (isPageMounted(pageClass, (ICompoundRequestMapper)requestMapper))
+				AbstractBookmarkableMapper mapper = (AbstractBookmarkableMapper) requestMapper;
+
+				if (mapper.checkPageClass(pageClass))
 				{
 					return true;
-				}
-			}
-			else
-			{
-				if (requestMapper instanceof AbstractBookmarkableMapper  && requestMapper != this)
-				{
-					AbstractBookmarkableMapper mapper = (AbstractBookmarkableMapper) requestMapper;
-
-					if (mapper.checkPageClass(pageClass))
-					{
-						return true;
-					}
 				}
 			}
 		}

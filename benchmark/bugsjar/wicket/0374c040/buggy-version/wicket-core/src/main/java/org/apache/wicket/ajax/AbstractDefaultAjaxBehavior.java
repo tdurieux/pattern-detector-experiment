@@ -504,28 +504,30 @@ public abstract class AbstractDefaultAjaxBehavior extends AbstractAjaxBehavior
 		sb.append("var attrs = ");
 		sb.append(attrsJson);
 		sb.append(";\n");
-		JSONArray jsonArray = new JSONArray();
+		sb.append("var params = {");
+		boolean first = true;
 		for (CallbackParameter curExtraParameter : extraParameters)
 		{
 			if (curExtraParameter.getAjaxParameterName() != null)
 			{
-				try
-				{
-					JSONObject object = new JSONObject();
-					object.put("name", curExtraParameter.getAjaxParameterName());
-					object.put("value", new JsonFunction(curExtraParameter.getAjaxParameterCode()));
-					jsonArray.put(object);
-				}
-				catch (JSONException e)
-				{
-					throw new WicketRuntimeException(e);
-				}
+				if (!first)
+					sb.append(',');
+				else
+					first = false;
+				sb.append('\'').append(curExtraParameter.getAjaxParameterName()).append("': ")
+					.append(curExtraParameter.getAjaxParameterCode());
 			}
 		}
-		sb.append("var params = ").append(jsonArray).append(";\n");
-		sb.append("attrs.").append(AjaxAttributeName.EXTRA_PARAMETERS)
-				.append(" = params.concat(attrs.")
-				.append(AjaxAttributeName.EXTRA_PARAMETERS).append(");\n");
+		sb.append("};\n");
+		if (attributes.getExtraParameters().isEmpty())
+		{
+			sb.append("attrs.").append(AjaxAttributeName.EXTRA_PARAMETERS).append(" = params;\n");
+		}
+		else
+		{
+			sb.append("attrs.").append(AjaxAttributeName.EXTRA_PARAMETERS).append(" = Wicket.merge(attrs.")
+					.append(AjaxAttributeName.EXTRA_PARAMETERS).append(", params);\n");
+		}
 		sb.append("Wicket.Ajax.ajax(attrs);\n");
 		return sb;
 	}

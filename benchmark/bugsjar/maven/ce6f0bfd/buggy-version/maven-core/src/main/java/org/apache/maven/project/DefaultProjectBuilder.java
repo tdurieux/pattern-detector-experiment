@@ -807,10 +807,12 @@ public class DefaultProjectBuilder
                 {
                     Artifact artifact = repositorySystem.createDependencyArtifact( d );
 
-                    if ( artifact != null )
+                    if ( artifact == null )
                     {
-                        map.put( d.getManagementKey(), artifact );
+                        map = Collections.emptyMap();
                     }
+
+                    map.put( d.getManagementKey(), artifact );
                 }
             }
             else

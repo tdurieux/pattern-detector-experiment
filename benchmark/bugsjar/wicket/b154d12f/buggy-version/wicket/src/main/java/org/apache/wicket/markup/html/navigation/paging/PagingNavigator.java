@@ -119,8 +119,7 @@ public class PagingNavigator extends Panel
 			@Override
 			public boolean isEnabled()
 			{
-				return super.isEnabled() && PagingNavigator.this.isEnabled() &&
-					PagingNavigator.this.isEnableAllowed();
+				return PagingNavigator.this.isEnabled() && PagingNavigator.this.isEnableAllowed();
 			}
 		};
 	}
@@ -146,11 +145,9 @@ public class PagingNavigator extends Panel
 			@Override
 			public boolean isEnabled()
 			{
-				return super.isEnabled() && PagingNavigator.this.isEnabled() &&
-					PagingNavigator.this.isEnableAllowed();
+				return PagingNavigator.this.isEnabled() && PagingNavigator.this.isEnableAllowed();
 			}
 		};
-
 	}
 
 	/**
@@ -172,8 +169,7 @@ public class PagingNavigator extends Panel
 			@Override
 			public boolean isEnabled()
 			{
-				return super.isEnabled() && PagingNavigator.this.isEnabled() &&
-					PagingNavigator.this.isEnableAllowed();
+				return PagingNavigator.this.isEnabled() && PagingNavigator.this.isEnableAllowed();
 			}
 		};
 	}

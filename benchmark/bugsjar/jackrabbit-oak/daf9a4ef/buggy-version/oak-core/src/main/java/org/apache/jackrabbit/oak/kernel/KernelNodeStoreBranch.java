@@ -80,10 +80,8 @@ class KernelNodeStoreBranch implements NodeStoreBranch {
 
     @Override
     public void setRoot(NodeState newRoot) {
-        if (!currentRoot.equals(newRoot)) {
-            currentRoot = newRoot;
-            commit(buildJsop());
-        }
+        currentRoot = newRoot;
+        commit(buildJsop());
     }
 
     @Override

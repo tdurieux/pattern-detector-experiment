@@ -335,7 +335,7 @@ public class DocumentMK {
             throw new DocumentStoreException("Not a branch revision: " + ancestorRevisionId);
         }
         try {
-            return nodeStore.reset(branch, ancestor).toString();
+            return nodeStore.reset(branch, ancestor, null).toString();
         } catch (DocumentStoreException e) {
             throw new DocumentStoreException(e);
         }

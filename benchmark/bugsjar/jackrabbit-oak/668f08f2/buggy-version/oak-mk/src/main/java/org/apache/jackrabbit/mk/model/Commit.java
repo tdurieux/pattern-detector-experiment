@@ -31,7 +31,5 @@ public interface Commit {
 
     public String getMsg();
 
-    public String getChanges();
-
     void serialize(Binding binding) throws Exception;
 }

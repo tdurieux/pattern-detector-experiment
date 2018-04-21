@@ -163,8 +163,6 @@ public class KeyedCEPPatternOperator<IN, KEY> extends AbstractCEPPatternOperator
 				processEvent(nfa, streamRecord.getValue(), streamRecord.getTimestamp());
 			}
 		}
-
-		output.emitWatermark(mark);
 	}
 
 	@Override

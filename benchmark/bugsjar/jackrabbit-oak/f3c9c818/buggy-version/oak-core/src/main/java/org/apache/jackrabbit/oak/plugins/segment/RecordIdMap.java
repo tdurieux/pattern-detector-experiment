@@ -29,11 +29,8 @@ import javax.annotation.Nonnull;
  * A memory optimised map of {@code short} key to {@link RecordId} values.
  */
 public class RecordIdMap {
-    private static final short[] NO_KEYS = new short[0];
-    private static final RecordId[] NO_VALUES = new RecordId[0];
-
-    private short[] keys = NO_KEYS;
-    private RecordId[] values = NO_VALUES;
+    private short[] keys;
+    private RecordId[] values;
 
     /**
      * Associates {@code key} with {@code value} if not already present
@@ -42,7 +39,7 @@ public class RecordIdMap {
      * @return  {@code true} if added, {@code false} if already present
      */
     public boolean put(short key, @Nonnull RecordId value) {
-        if (keys.length == 0) {
+        if (keys == null) {
             keys = new short[1];
             values = new RecordId[1];
             keys[0] = key;
@@ -93,7 +90,7 @@ public class RecordIdMap {
      * @return  {@code true} iff {@code key} is present.
      */
     public boolean containsKey(short key) {
-        return binarySearch(keys, key) >= 0;
+        return keys != null && binarySearch(keys, key) >= 0;
     }
 
     /**
@@ -108,7 +105,6 @@ public class RecordIdMap {
      * the natural ordering of shorts.
      * @param index
      * @return the key at {@code index}
-     * @throws ArrayIndexOutOfBoundsException if not {@code 0 <= index < size()}
      */
     public short getKey(int index) {
         return keys[index];
@@ -119,7 +115,6 @@ public class RecordIdMap {
      * the natural ordering of shorts.
      * @param index
      * @return the value at {@code index}
-     * @throws ArrayIndexOutOfBoundsException if not {@code 0 <= index < size()}
      */
     @Nonnull
     public RecordId getRecordId(int index) {

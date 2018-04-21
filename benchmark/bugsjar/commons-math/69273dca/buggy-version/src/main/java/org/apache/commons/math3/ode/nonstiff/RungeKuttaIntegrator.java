@@ -119,19 +119,7 @@ public abstract class RungeKuttaIntegrator extends AbstractIntegrator {
 
     // set up integration control objects
     stepStart = equations.getTime();
-    if (forward) {
-        if (stepStart + step >= t) {
-            stepSize = t - stepStart;
-        } else {
-            stepSize = step;
-        }
-    } else {
-        if (stepStart - step <= t) {
-            stepSize = t - stepStart;
-        } else {
-            stepSize = -step;
-        }
-    }
+    stepSize  = forward ? step : -step;
     initIntegration(equations.getTime(), y0, t);
 
     // main integration loop

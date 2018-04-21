@@ -16,11 +16,11 @@
  */
 package org.apache.wicket.request.mapper;
 
-import org.apache.wicket.protocol.http.WebApplication;
 import org.apache.wicket.request.Request;
 import org.apache.wicket.request.Url;
 import org.apache.wicket.request.component.IRequestablePage;
 import org.apache.wicket.request.mapper.info.PageComponentInfo;
+import org.apache.wicket.request.mapper.mount.MountMapper;
 import org.apache.wicket.request.mapper.parameter.IPageParametersEncoder;
 import org.apache.wicket.request.mapper.parameter.PageParameters;
 import org.apache.wicket.request.mapper.parameter.PageParametersEncoder;
@@ -30,14 +30,10 @@ import org.apache.wicket.util.lang.PackageName;
 /**
  * A request mapper that mounts all bookmarkable pages in a given package.
  * <p>
- * To mount this mapper onto a path use the {@link WebApplication#mountPackage(String, Class)}, ex:
+ * To mount this mapper onto a path use the {@link MountMapper}, ex:
  * 
  * <pre>
- * MyApp#init() {
- * 
- *   super.init();
- *   mountPackage(&quot;/my/path&quot;, MyPage.class);
- * }
+ * new MountMapper(&quot;/my/path&quot;, new packageMapper(PackageName.forClass(MyPage.class)));
  * </pre>
  * 
  * will result in urls like {@code /my/path/MyPage}
@@ -100,19 +96,10 @@ public class PackageMapper extends AbstractBookmarkableMapper
 	protected Url buildUrl(UrlInfo info)
 	{
 		Class<? extends IRequestablePage> pageClass = info.getPageClass();
-		PackageName pageClassPackageName = PackageName.forClass(pageClass);
-		if (pageClassPackageName.equals(packageName))
+		if (PackageName.forClass(pageClass).equals(packageName))
 		{
 			Url url = new Url();
-
-			String fullyQualifiedClassName = pageClass.getName();
-			String packageRelativeClassName = fullyQualifiedClassName;
-			int packageNameLength = packageName.getName().length();
-			if (packageNameLength > 0)
-			{
-				packageRelativeClassName = fullyQualifiedClassName.substring(packageNameLength + 1);
-			}
-			url.getSegments().add(packageRelativeClassName);
+			url.getSegments().add(pageClass.getSimpleName());
 			encodePageComponentInfo(url, info.getPageComponentInfo());
 			return encodePageParameters(url, info.getPageParameters(), pageParametersEncoder);
 		}

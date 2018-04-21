@@ -662,7 +662,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final void debug(final String message)
 	{
-		Session.get().getFeedbackMessages().debug(this, message);
+		getPage().getFeedbackMessages().debug(this, message);
 	}
 
 	/**
@@ -685,7 +685,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final void error(final Serializable message)
 	{
-		Session.get().getFeedbackMessages().error(this, message);
+		getPage().getFeedbackMessages().error(this, message);
 	}
 
 	/**
@@ -696,7 +696,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final void fatal(final String message)
 	{
-		Session.get().getFeedbackMessages().fatal(this, message);
+		getPage().getFeedbackMessages().fatal(this, message);
 	}
 
 	/**
@@ -825,7 +825,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final FeedbackMessage getFeedbackMessage()
 	{
-		return Session.get().getFeedbackMessages().messageForComponent(this);
+		return getPage().getFeedbackMessages().messageForComponent(this);
 	}
 
 	/**
@@ -1216,7 +1216,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final boolean hasErrorMessage()
 	{
-		return Session.get().getFeedbackMessages().hasErrorMessageFor(this);
+		return getPage().getFeedbackMessages().hasErrorMessageFor(this);
 	}
 
 	/**
@@ -1224,7 +1224,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final boolean hasFeedbackMessage()
 	{
-		return Session.get().getFeedbackMessages().hasMessageFor(this);
+		return getPage().getFeedbackMessages().hasMessageFor(this);
 	}
 
 	/**
@@ -1235,7 +1235,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final void info(final String message)
 	{
-		Session.get().getFeedbackMessages().info(this, message);
+		getPage().getFeedbackMessages().info(this, message);
 	}
 
 	/**
@@ -2376,7 +2376,7 @@ public abstract class Component implements IClusterable
 	 */
 	public final void warn(final String message)
 	{
-		Session.get().getFeedbackMessages().warn(this, message);
+		getPage().getFeedbackMessages().warn(this, message);
 	}
 
 	/**

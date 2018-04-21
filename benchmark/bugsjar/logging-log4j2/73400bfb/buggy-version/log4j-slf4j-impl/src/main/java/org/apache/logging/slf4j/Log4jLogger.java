@@ -29,7 +29,6 @@ import org.apache.logging.log4j.message.SimpleMessage;
 import org.apache.logging.log4j.spi.ExtendedLogger;
 import org.slf4j.Marker;
 import org.slf4j.MarkerFactory;
-import org.slf4j.impl.StaticMarkerBinder;
 import org.slf4j.spi.LocationAwareLogger;
 
 /**
@@ -376,14 +375,7 @@ public class Log4jLogger implements LocationAwareLogger, Serializable {
     }
 
     private static org.apache.logging.log4j.Marker getMarker(final Marker marker) {
-        if (marker == null) {
-            return null;
-        } else if (marker instanceof Log4jMarker) {
-            return ((Log4jMarker) marker).getLog4jMarker();
-        } else {
-            final Log4jMarkerFactory factory = (Log4jMarkerFactory) StaticMarkerBinder.SINGLETON.getMarkerFactory();
-            return ((Log4jMarker) factory.getMarker(marker)).getLog4jMarker();
-        }
+        return marker != null ? ((org.apache.logging.slf4j.Log4jMarker) marker).getLog4jMarker() : null;
     }
 
     @Override

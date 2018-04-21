@@ -1811,12 +1811,15 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	protected void onAfterRenderChildren()
 	{
 		// Loop through child components
-		for (Component child : this)
+		final Iterator<? extends Component> iter = iterator();
+		while (iter.hasNext())
 		{
+			// Get next child
+			final Component child = iter.next();
+
 			// Call end request on the child
 			child.afterRender();
 		}
-
 		super.onAfterRenderChildren();
 	}
 

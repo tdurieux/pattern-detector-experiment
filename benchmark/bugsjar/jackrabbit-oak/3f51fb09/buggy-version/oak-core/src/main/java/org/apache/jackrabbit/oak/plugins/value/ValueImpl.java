@@ -73,15 +73,6 @@ public class ValueImpl implements Value {
         this(checkSingleValued(property), 0, namePathMapper);
     }
 
-    /**
-     * Same as {@link #getString()} unless that names and paths are returned in their
-     * Oak representation instead of being mapped to their JCR representation.
-     * @return  A String representation of the value of this property.
-     */
-    public String getOakString() {
-        return propertyState.getValue(Type.STRING, index);
-    }
-
     private static PropertyState checkSingleValued(PropertyState property) {
         checkArgument(!property.isArray());
         return property;
@@ -217,9 +208,9 @@ public class ValueImpl implements Value {
 
         switch (getType()) {
             case PropertyType.NAME:
-                return namePathMapper.getJcrName(getOakString());
+                return namePathMapper.getJcrName(propertyState.getValue(Type.STRING, index));
             case PropertyType.PATH:
-                String s = getOakString();
+                String s = propertyState.getValue(Type.STRING, index);
                 if (s.startsWith("[") && s.endsWith("]")) {
                     // identifier paths are returned as-is (JCR 2.0, 3.4.3.1)
                     return s;
@@ -227,7 +218,7 @@ public class ValueImpl implements Value {
                     return namePathMapper.getJcrPath(s);
                 }
             default:
-                return getOakString();
+                return propertyState.getValue(Type.STRING, index);
         }
     }
 
@@ -282,13 +273,13 @@ public class ValueImpl implements Value {
             return propertyState.getValue(Type.BINARY, index).hashCode();
         }
         else {
-            return getOakString().hashCode();
+            return propertyState.getValue(Type.STRING, index).hashCode();
         }
     }
 
     @Override
     public String toString() {
-        return getOakString();
+        return propertyState.getValue(Type.STRING, index);
     }
 
     private static int compare(PropertyState p1, int i1, PropertyState p2, int i2) {

@@ -50,39 +50,130 @@ public class CommitBuilder {
         this.store = store;
     }
 
-    public void addNode(String parentNodePath, String nodeName, NodeTree node) throws Exception {
-        Change change = new AddNode(parentNodePath, nodeName, node);
-        change.apply();
+    public void addNode(String parentNodePath, String nodeName) throws Exception {
+        addNode(parentNodePath, nodeName, Collections.<String, String>emptyMap());
+    }
+
+    public void addNode(String parentNodePath, String nodeName, Map<String, String> properties) throws Exception {
+        MutableNode modParent = getOrCreateStagedNode(parentNodePath);
+        if (modParent.getChildNodeEntry(nodeName) != null) {
+            throw new Exception("there's already a child node with name '" + nodeName + "'");
+        }
+        String newPath = PathUtils.concat(parentNodePath, nodeName);
+        MutableNode newChild = new MutableNode(store, newPath);
+        newChild.getProperties().putAll(properties);
+
+        // id will be computed on commit
+        modParent.add(new ChildNode(nodeName, null));
+        staged.put(newPath, newChild);
         // update change log
-        changeLog.add(change);
+        changeLog.add(new AddNode(parentNodePath, nodeName, properties));
     }
 
     public void removeNode(String nodePath) throws NotFoundException, Exception {
-        Change change = new RemoveNode(nodePath);
-        change.apply();
+        String parentPath = PathUtils.getParentPath(nodePath);
+        String nodeName = PathUtils.getName(nodePath);
+
+        MutableNode parent = getOrCreateStagedNode(parentPath);
+        if (parent.remove(nodeName) == null) {
+            throw new NotFoundException(nodePath);
+        }
+
+        // update staging area
+        removeStagedNodes(nodePath);
+
         // update change log
-        changeLog.add(change);
+        changeLog.add(new RemoveNode(nodePath));
     }
 
     public void moveNode(String srcPath, String destPath) throws NotFoundException, Exception {
-        Change change = new MoveNode(srcPath, destPath);
-        change.apply();
+        if (PathUtils.isAncestor(srcPath, destPath)) {
+            throw new Exception("target path cannot be descendant of source path: " + destPath);
+        }
+
+        String srcParentPath = PathUtils.getParentPath(srcPath);
+        String srcNodeName = PathUtils.getName(srcPath);
+
+        String destParentPath = PathUtils.getParentPath(destPath);
+        String destNodeName = PathUtils.getName(destPath);
+
+        MutableNode srcParent = getOrCreateStagedNode(srcParentPath);
+        if (srcParentPath.equals(destParentPath)) {
+            if (srcParent.getChildNodeEntry(destNodeName) != null) {
+                throw new Exception("node already exists at move destination path: " + destPath);
+            }
+            if (srcParent.rename(srcNodeName, destNodeName) == null) {
+                throw new NotFoundException(srcPath);
+            }
+        } else {
+            ChildNode srcCNE = srcParent.remove(srcNodeName);
+            if (srcCNE == null) {
+                throw new NotFoundException(srcPath);
+            }
+
+            MutableNode destParent = getOrCreateStagedNode(destParentPath);
+            if (destParent.getChildNodeEntry(destNodeName) != null) {
+                throw new Exception("node already exists at move destination path: " + destPath);
+            }
+            destParent.add(new ChildNode(destNodeName, srcCNE.getId()));
+        }
+
+        // update staging area
+        moveStagedNodes(srcPath, destPath);
+
         // update change log
-        changeLog.add(change);
+        changeLog.add(new MoveNode(srcPath, destPath));
     }
 
     public void copyNode(String srcPath, String destPath) throws NotFoundException, Exception {
-        Change change = new CopyNode(srcPath, destPath);
-        change.apply();
+        String srcParentPath = PathUtils.getParentPath(srcPath);
+        String srcNodeName = PathUtils.getName(srcPath);
+
+        String destParentPath = PathUtils.getParentPath(destPath);
+        String destNodeName = PathUtils.getName(destPath);
+
+        MutableNode srcParent = getOrCreateStagedNode(srcParentPath);
+        ChildNode srcCNE = srcParent.getChildNodeEntry(srcNodeName);
+        if (srcCNE == null) {
+            throw new NotFoundException(srcPath);
+        }
+
+        MutableNode destParent = getOrCreateStagedNode(destParentPath);
+        destParent.add(new ChildNode(destNodeName, srcCNE.getId()));
+
+        if (srcCNE.getId() == null) {
+            // a 'new' node is being copied
+
+            // update staging area
+            copyStagedNodes(srcPath, destPath);
+        }
+
         // update change log
-        changeLog.add(change);
+        changeLog.add(new CopyNode(srcPath, destPath));
     }
 
     public void setProperty(String nodePath, String propName, String propValue) throws Exception {
-        Change change = new SetProperty(nodePath, propName, propValue);
-        change.apply();
+        MutableNode node = getOrCreateStagedNode(nodePath);
+
+        Map<String, String> properties = node.getProperties();
+        if (propValue == null) {
+            properties.remove(propName);
+        } else {
+            properties.put(propName, propValue);
+        }
+
         // update change log
-        changeLog.add(change);
+        changeLog.add(new SetProperty(nodePath, propName, propValue));
+    }
+
+    public void setProperties(String nodePath, Map<String, String> properties) throws Exception {
+        MutableNode node = getOrCreateStagedNode(nodePath);
+
+        node.getProperties().clear();
+        node.getProperties().putAll(properties);
+
+        // update change log
+        changeLog.add(new SetProperties(nodePath, properties));
     }
 
     public Id /* new revId */ doCommit() throws Exception {
@@ -99,7 +190,9 @@ public class CommitBuilder {
             // clear staging area
             staged.clear();
             // replay change log on new base revision
-            for (Change change : changeLog) {
+            // copy log in order to avoid concurrent modifications
+            List<Change> log = new ArrayList<Change>(changeLog);
+            for (Change change : log) {
                 change.apply();
             }
         }
@@ -129,28 +222,18 @@ public class CommitBuilder {
             newCommit.setParentId(baseRevId);
             newCommit.setCommitTS(System.currentTimeMillis());
             newCommit.setMsg(msg);
-            StringBuilder diff = new StringBuilder();
-            for (Change change : changeLog) {
-                if (diff.length() > 0) {
-                    diff.append('\n');
-                }
-                diff.append(change.asDiff());
-            }
-            newCommit.setChanges(diff.toString());
             newCommit.setRootNodeId(rootNodeId);
             newRevId = store.putHeadCommit(newCommit);
         } finally {
             store.unlockHead();
         }
 
-        // reset instance
+        // reset instance in order to be reusable
         staged.clear();
         changeLog.clear();
 
         return newRevId;
     }
-
-    //--------------------------------------------------------< inner classes >
 
     MutableNode getOrCreateStagedNode(String nodePath) throws Exception {
         MutableNode node = staged.get(nodePath);
@@ -335,79 +418,23 @@ public class CommitBuilder {
     }
 
     //--------------------------------------------------------< inner classes >
-
-    public static class NodeTree {
-        public Map<String, String> props = new HashMap<String, String>();
-        public Map<String, NodeTree> nodes = new HashMap<String, NodeTree>();
-
-        void toJson(StringBuffer buf) {
-            toJson(buf, this);
-        }
-
-        private static void toJson(StringBuffer buf, NodeTree node) {
-            buf.append('{');
-            for (String name : node.props.keySet()) {
-                if (buf.charAt(buf.length() - 1) != '{')  {
-                    buf.append(',');
-                }
-                buf.append('"').append(name).append("\":").append(node.props.get(name));
-            }
-            for (String name : node.nodes.keySet()) {
-                if (buf.charAt(buf.length() - 1) != '{')  {
-                    buf.append(',');
-                }
-                buf.append('"').append(name).append("\":");
-                toJson(buf, node.nodes.get(name));
-            }
-            buf.append('}');
-        }
-    }
-
     abstract class Change {
         abstract void apply() throws Exception;
-        abstract String asDiff();
     }
 
     class AddNode extends Change {
         String parentNodePath;
         String nodeName;
-        NodeTree node;
+        Map<String, String> properties;
 
-        AddNode(String parentNodePath, String nodeName, NodeTree node) {
+        AddNode(String parentNodePath, String nodeName, Map<String, String> properties) {
             this.parentNodePath = parentNodePath;
             this.nodeName = nodeName;
-            this.node = node;
+            this.properties = properties;
         }
 
-        @Override
         void apply() throws Exception {
-            recursiveAddNode(parentNodePath, nodeName, node);
-        }
-
-        @Override
-        String asDiff() {
-            StringBuffer diff = new StringBuffer("+");
-            diff.append('"').append(PathUtils.concat(parentNodePath, nodeName)).append("\":");
-            node.toJson(diff);
-            return diff.toString();
-        }
-
-        private void recursiveAddNode(String parentPath, String name, NodeTree node) throws Exception {
-            MutableNode modParent = getOrCreateStagedNode(parentPath);
-            if (modParent.getChildNodeEntry(name) != null) {
-                throw new Exception("there's already a child node with name '" + name + "'");
-            }
-            String newPath = PathUtils.concat(parentPath, name);
-            MutableNode newChild = new MutableNode(store, newPath);
-            newChild.getProperties().putAll(node.props);
-
-            // id will be computed on commit
-            modParent.add(new ChildNode(name, null));
-            staged.put(newPath, newChild);
-
-            for (String childName : node.nodes.keySet()) {
-                recursiveAddNode(PathUtils.concat(parentPath, name), childName, node.nodes.get(childName));
-            }
+            addNode(parentNodePath, nodeName, properties);
         }
     }
 
@@ -418,25 +445,8 @@ public class CommitBuilder {
             this.nodePath = nodePath;
         }
 
-        @Override
         void apply() throws Exception {
-            String parentPath = PathUtils.getParentPath(nodePath);
-            String nodeName = PathUtils.getName(nodePath);
-
-            MutableNode parent = getOrCreateStagedNode(parentPath);
-            if (parent.remove(nodeName) == null) {
-                throw new NotFoundException(nodePath);
-            }
-
-            // update staging area
-            removeStagedNodes(nodePath);
-        }
-
-        @Override
-        String asDiff() {
-            StringBuffer diff = new StringBuffer("-");
-            diff.append('"').append(nodePath).append('"');
-            return diff.toString();
+            removeNode(nodePath);
         }
     }
 
@@ -449,48 +459,8 @@ public class CommitBuilder {
             this.destPath = destPath;
         }
 
-        @Override
         void apply() throws Exception {
-            if (PathUtils.isAncestor(srcPath, destPath)) {
-                throw new Exception("target path cannot be descendant of source path: " + destPath);
-            }
-
-            String srcParentPath = PathUtils.getParentPath(srcPath);
-            String srcNodeName = PathUtils.getName(srcPath);
-
-            String destParentPath = PathUtils.getParentPath(destPath);
-            String destNodeName = PathUtils.getName(destPath);
-
-            MutableNode srcParent = getOrCreateStagedNode(srcParentPath);
-            if (srcParentPath.equals(destParentPath)) {
-                if (srcParent.getChildNodeEntry(destNodeName) != null) {
-                    throw new Exception("node already exists at move destination path: " + destPath);
-                }
-                if (srcParent.rename(srcNodeName, destNodeName) == null) {
-                    throw new NotFoundException(srcPath);
-                }
-            } else {
-                ChildNode srcCNE = srcParent.remove(srcNodeName);
-                if (srcCNE == null) {
-                    throw new NotFoundException(srcPath);
-                }
-
-                MutableNode destParent = getOrCreateStagedNode(destParentPath);
-                if (destParent.getChildNodeEntry(destNodeName) != null) {
-                    throw new Exception("node already exists at move destination path: " + destPath);
-                }
-                destParent.add(new ChildNode(destNodeName, srcCNE.getId()));
-            }
-
-            // update staging area
-            moveStagedNodes(srcPath, destPath);
-        }
-
-        @Override
-        String asDiff() {
-            StringBuffer diff = new StringBuffer(">");
-            diff.append('"').append(srcPath).append("\":\"").append(destPath).append('"');
-            return diff.toString();
+            moveNode(srcPath, destPath);
         }
     }
 
@@ -503,36 +473,8 @@ public class CommitBuilder {
             this.destPath = destPath;
         }
 
-        @Override
         void apply() throws Exception {
-            String srcParentPath = PathUtils.getParentPath(srcPath);
-            String srcNodeName = PathUtils.getName(srcPath);
-
-            String destParentPath = PathUtils.getParentPath(destPath);
-            String destNodeName = PathUtils.getName(destPath);
-
-            MutableNode srcParent = getOrCreateStagedNode(srcParentPath);
-            ChildNode srcCNE = srcParent.getChildNodeEntry(srcNodeName);
-            if (srcCNE == null) {
-                throw new NotFoundException(srcPath);
-            }
-
-            MutableNode destParent = getOrCreateStagedNode(destParentPath);
-            destParent.add(new ChildNode(destNodeName, srcCNE.getId()));
-
-            if (srcCNE.getId() == null) {
-                // a 'new' node is being copied
-
-                // update staging area
-                copyStagedNodes(srcPath, destPath);
-            }
-        }
-
-        @Override
-        String asDiff() {
-            StringBuffer diff = new StringBuffer("*");
-            diff.append('"').append(srcPath).append("\":\"").append(destPath).append('"');
-            return diff.toString();
+            copyNode(srcPath, destPath);
         }
     }
 
@@ -547,23 +489,22 @@ public class CommitBuilder {
             this.propValue = propValue;
         }
 
-        @Override
         void apply() throws Exception {
-            MutableNode node = getOrCreateStagedNode(nodePath);
+            setProperty(nodePath, propName, propValue);
+        }
+    }
 
-            Map<String, String> properties = node.getProperties();
-            if (propValue == null) {
-                properties.remove(propName);
-            } else {
-                properties.put(propName, propValue);
-            }
+    class SetProperties extends Change {
+        String nodePath;
+        Map<String, String> properties;
+
+        SetProperties(String nodePath, Map<String, String> properties) {
+            this.nodePath = nodePath;
+            this.properties = properties;
         }
 
-        @Override
-        String asDiff() {
-            StringBuffer diff = new StringBuffer("^");
-            diff.append('"').append(PathUtils.concat(nodePath, propName)).append("\":").append(propValue);
-            return diff.toString();
+        void apply() throws Exception {
+            setProperties(nodePath, properties);
         }
     }
 }

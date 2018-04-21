@@ -1255,37 +1255,36 @@ public class MockHttpServletRequest implements HttpServletRequest
 					.get(clazz);
 
 				String auto = component.getRequestCycle().urlFor(component, rli).toString();
-
-				// check for crypted strategy
-				if (auto.startsWith("?x="))
+				int idx = auto.indexOf(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME);
+				if (idx >= 0)
 				{
-					auto = auto.substring(3);
-					parameters.put("x", auto);
-					parameters.remove(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME);
+					auto = auto.substring(idx +
+						WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME.length() + 1);
 				}
 				else
 				{
-					int idx = auto.indexOf(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME);
+					// additional check for crypted strategy
+					idx = auto.indexOf("x=6*");
 					if (idx >= 0)
 					{
-						auto = auto.substring(idx +
-							WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME.length() + 1);
+						auto = auto.substring(idx + 4);
 					}
-					else
-					{
-						idx = auto.indexOf("&");
-						if (idx >= 0)
-						{
-							auto = auto.substring(0, idx);
-						}
-					}
-					parameters.put(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME, auto);
 				}
+
+				idx = auto.indexOf("&");
+				if (idx >= 0)
+				{
+					auto = auto.substring(0, idx);
+				}
+
+				parameters.put(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME, auto);
+
 			}
 			catch (Exception e)
 			{
 				// noop
 			}
+
 
 			if (component.isStateless() && component.getPage().isBookmarkable())
 			{

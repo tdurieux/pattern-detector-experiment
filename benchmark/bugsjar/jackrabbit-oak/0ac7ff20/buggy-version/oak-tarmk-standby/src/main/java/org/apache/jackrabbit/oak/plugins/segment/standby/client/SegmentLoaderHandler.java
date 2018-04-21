@@ -133,7 +133,7 @@ public class SegmentLoaderHandler extends ChannelInboundHandlerAdapter
     @Override
     public Segment readSegment(final String id) {
         ctx.writeAndFlush(newGetSegmentReq(this.clientID, id));
-        return getSegment(id);
+        return getSegment();
     }
 
     @Override
@@ -145,18 +145,15 @@ public class SegmentLoaderHandler extends ChannelInboundHandlerAdapter
 
     // implementation of RemoteSegmentLoader
 
-    public Segment getSegment(final String id) {
+    public Segment getSegment() {
         boolean interrupted = false;
         try {
             for (;;) {
                 try {
+                    // log.debug("polling segment");
                     Segment s = segment.poll(timeoutMs, TimeUnit.MILLISECONDS);
-                    if (s == null) {
-                        return null;
-                    }
-                    if (s.getSegmentId().toString().equals(id)) {
-                        return s;
-                    }
+                    // log.debug("returning segment " + s.getSegmentId());
+                    return s;
                 } catch (InterruptedException ignore) {
                     interrupted = true;
                 }

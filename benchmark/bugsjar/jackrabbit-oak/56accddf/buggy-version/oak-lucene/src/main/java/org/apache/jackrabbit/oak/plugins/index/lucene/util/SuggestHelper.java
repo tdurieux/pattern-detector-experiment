@@ -66,10 +66,8 @@ public class SuggestHelper {
             tempDir = Files.createTempDir();
             File tempSubChild = new File(tempDir, "non-existing-sub-child");
 
-            if (reader.getDocCount(FieldNames.SUGGEST) > 0) {
-                Dictionary dictionary = new LuceneDictionary(reader, FieldNames.SUGGEST);
-                getLookup(directory, analyzer, tempSubChild).build(dictionary);
-            }
+            Dictionary dictionary = new LuceneDictionary(reader, FieldNames.SUGGEST);
+            getLookup(directory, analyzer, tempSubChild).build(dictionary);
         } catch (RuntimeException e) {
             log.debug("could not update the suggester", e);
         } finally {

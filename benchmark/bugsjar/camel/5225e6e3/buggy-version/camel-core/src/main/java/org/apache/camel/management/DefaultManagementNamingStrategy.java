@@ -254,13 +254,11 @@ public class DefaultManagementNamingStrategy implements ManagementNamingStrategy
         buffer.append(domainName).append(":");
         buffer.append(KEY_CONTEXT + "=").append(getContextId(context)).append(",");
         buffer.append(KEY_TYPE + "=" + TYPE_THREAD_POOL + ",");
-
-        String name = id;
+        buffer.append(KEY_NAME + "=").append(id);
         if (sourceId != null) {
             // provide source id if we know it, this helps end user to know where the pool is used
-            name = name + "(" + sourceId + ")";
+            buffer.append("(").append(sourceId).append(")");
         }
-        buffer.append(KEY_NAME + "=").append(ObjectName.quote(name));
         return createObjectName(buffer);
     }
 

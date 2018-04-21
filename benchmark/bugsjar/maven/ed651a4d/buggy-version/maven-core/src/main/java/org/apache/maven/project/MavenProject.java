@@ -504,11 +504,7 @@ public class MavenProject
     {
         List<String> list = new ArrayList<String>( getArtifacts().size() + 1 );
 
-        String d = getBuild().getOutputDirectory();
-        if ( d != null )
-        {
-            list.add( d );
-        }
+        list.add( getBuild().getOutputDirectory() );
 
         for ( Artifact a : getArtifacts() )
         {                        
@@ -584,17 +580,9 @@ public class MavenProject
     {
         List<String> list = new ArrayList<String>( getArtifacts().size() + 2 );
 
-        String d = getBuild().getTestOutputDirectory();
-        if ( d != null )
-        {
-            list.add( d );
-        }
+        list.add( getBuild().getTestOutputDirectory() );
 
-        d = getBuild().getOutputDirectory();
-        if ( d != null )
-        {
-            list.add( d );
-        }
+        list.add( getBuild().getOutputDirectory() );
         
         for ( Artifact a : getArtifacts() )
         {            
@@ -656,11 +644,7 @@ public class MavenProject
     {
         List<String> list = new ArrayList<String>( getArtifacts().size() + 1 );
 
-        String d = getBuild().getOutputDirectory();
-        if ( d != null )
-        {
-            list.add( d );
-        }
+        list.add( getBuild().getOutputDirectory() );
 
         for ( Artifact a : getArtifacts() )
         {
@@ -733,11 +717,7 @@ public class MavenProject
     {
         List<String> list = new ArrayList<String>( getArtifacts().size() );
 
-        String d = getBuild().getOutputDirectory();
-        if ( d != null )
-        {
-            list.add( d );
-        }
+        list.add( getBuild().getOutputDirectory() );
 
         for ( Artifact a : getArtifacts() )
         {

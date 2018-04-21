@@ -267,8 +267,7 @@ public class DataStoreBlobStore implements DataStore, BlobStore, GarbageCollecta
             public boolean apply(DataIdentifier input) {
                 try {
                     DataRecord dr = delegate.getRecord(input);
-                    if(dr != null && (maxLastModifiedTime <=0
-                            || dr.getLastModified() < maxLastModifiedTime)){
+                    if(dr != null && dr.getLastModified() < maxLastModifiedTime){
                         return true;
                     }
                 } catch (DataStoreException e) {

@@ -254,18 +254,12 @@ public final class ExpressionBuilder {
     /**
      * Returns an expression for the outbound message headers
      *
-     * @return an expression object which will return the headers, will be <tt>null</tt> if the
-     * exchange is not out capable.
+     * @return an expression object which will return the headers
      */
     public static Expression outHeadersExpression() {
         return new ExpressionAdapter() {
             public Object evaluate(Exchange exchange) {
-                // only get out headers if the MEP is out capable
-                if (ExchangeHelper.isOutCapable(exchange)) {
-                    return exchange.getOut().getHeaders();
-                } else {
-                    return null;
-                }
+                return exchange.getOut().getHeaders();
             }
 
             @Override

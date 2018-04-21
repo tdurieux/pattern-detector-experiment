@@ -21,7 +21,6 @@ import java.util.List;
 
 import javax.annotation.Nonnull;
 
-import org.apache.jackrabbit.oak.commons.PathUtils;
 import org.apache.jackrabbit.oak.plugins.identifier.IdentifierManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +77,7 @@ public class NamePathMapperImpl implements NamePathMapper {
 
     @Override
     @Nonnull
-    public String getJcrPath(final String oakPath) {
+    public String getJcrPath(String oakPath) {
         final List<String> elements = new ArrayList<String>();
 
         if ("/".equals(oakPath)) {
@@ -104,18 +103,11 @@ public class NamePathMapperImpl implements NamePathMapper {
 
             @Override
             public boolean parent() {
-                int prevIdx = elements.size() - 1;
-                String prevElem = prevIdx >= 0 ? elements.get(prevIdx) : null;
-
-                if (prevElem == null || PathUtils.denotesParent(prevElem)) {
+                if (elements.isEmpty() || "..".equals(elements.get(elements.size() - 1))) {
                     elements.add("..");
                     return true;
                 }
-                if (prevElem.isEmpty()) {
-                    throw new IllegalArgumentException("Absolute path escapes root: " + oakPath);
-                }
-
-                elements.remove(prevElem);
+                elements.remove(elements.size() - 1);
                 return true;
             }
 
@@ -158,7 +150,7 @@ public class NamePathMapperImpl implements NamePathMapper {
         return jcrPath.toString();
     }
 
-    private String getOakPath(final String jcrPath, final boolean keepIndex) {
+    private String getOakPath(String jcrPath, final boolean keepIndex) {
         if ("/".equals(jcrPath)) {
             // avoid the need to special case the root path later on
             return "/";
@@ -245,19 +237,11 @@ public class NamePathMapperImpl implements NamePathMapper {
 
             @Override
             public boolean parent() {
-                int prevIdx = elements.size() - 1;
-                String prevElem = prevIdx >= 0 ? elements.get(prevIdx) : null;
-
-                if (prevElem == null || PathUtils.denotesParent(prevElem)) {
+                if (elements.isEmpty() || "..".equals(elements.get(elements.size() - 1))) {
                     elements.add("..");
                     return true;
                 }
-                if (prevElem.isEmpty()) {
-                    parseErrors.append("Absolute path escapes root: ").append(jcrPath);
-                    return false;
-                }
-
-                elements.remove(prevElem);
+                elements.remove(elements.size() - 1);
                 return true;
             }
 

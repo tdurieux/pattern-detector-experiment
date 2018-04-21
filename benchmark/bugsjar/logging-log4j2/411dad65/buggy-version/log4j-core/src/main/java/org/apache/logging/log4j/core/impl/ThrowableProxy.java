@@ -500,7 +500,7 @@ public class ThrowableProxy implements Serializable {
                 if (clazz != null) {
                     return clazz;
                 }
-            } catch (final Throwable ignore) {
+            } catch (final Exception ignore) {
                 // Ignore exception.
             }
         }

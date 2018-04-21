@@ -195,11 +195,9 @@ public class SimpleFunctionExpression extends LiteralExpression {
         String remainder = ifStartsWithReturnRemainder("bodyAs", function);
         if (remainder != null) {
             String type = ObjectHelper.between(remainder, "(", ")");
-            remainder = ObjectHelper.after(remainder, ")");
-            if (type == null || ObjectHelper.isNotEmpty(remainder)) {
+            if (type == null) {
                 throw new SimpleParserException("Valid syntax: ${bodyAs(type)} was: " + function, token.getIndex());
             }
-            
             type = StringHelper.removeQuotes(type);
             return ExpressionBuilder.bodyExpression(type);
         }
@@ -207,8 +205,7 @@ public class SimpleFunctionExpression extends LiteralExpression {
         remainder = ifStartsWithReturnRemainder("mandatoryBodyAs", function);
         if (remainder != null) {
             String type = ObjectHelper.between(remainder, "(", ")");
-            remainder = ObjectHelper.after(remainder, ")");
-            if (type == null || ObjectHelper.isNotEmpty(remainder)) {
+            if (type == null) {
                 throw new SimpleParserException("Valid syntax: ${mandatoryBodyAs(type)} was: " + function, token.getIndex());
             }
             type = StringHelper.removeQuotes(type);

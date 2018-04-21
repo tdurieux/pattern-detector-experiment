@@ -18,7 +18,7 @@ def copy_buggy_files(project, bug_id, changed_files):
     bug_output_path = os.path.join(root, 'benchmark', 'bugsjar', project.lower(), bug_id)
 
     repo = os.path.join(bugsjar_repositories, project)
-    cmd = "cd %s; git checkout -- .; git checkout %s;" % (repo, bug_id)
+    cmd = "cd %s; git checkout -- .; git checkout %s~1;" % (repo, bug_id)
     subprocess.call(cmd, shell=True)
     for changed_file in changed_files:
         file_path = os.path.join(repo, changed_file[1:])

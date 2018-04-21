@@ -18,7 +18,7 @@ package org.apache.wicket.request.parameter;
 
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashSet;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -55,7 +55,7 @@ public class UrlRequestParametersAdapter implements IRequestParameters
 	 */
 	public Set<String> getParameterNames()
 	{
-		Set<String> result = new LinkedHashSet<String>();
+		Set<String> result = new HashSet<String>();
 		for (QueryParameter parameter : url.getQueryParameters())
 		{
 			result.add(parameter.getName());

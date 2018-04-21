@@ -23,14 +23,12 @@ import org.apache.wicket.application.IComponentOnAfterRenderListener;
 import org.apache.wicket.markup.ComponentTag;
 import org.apache.wicket.markup.MarkupException;
 import org.apache.wicket.markup.MarkupStream;
-import org.apache.wicket.markup.html.WebMarkupContainer;
+import org.apache.wicket.markup.html.TransparentWebMarkupContainer;
 import org.apache.wicket.markup.html.basic.EnclosureContainer;
 import org.apache.wicket.markup.html.form.Form;
 import org.apache.wicket.markup.html.form.FormComponent;
 import org.apache.wicket.markup.html.form.IFormSubmittingComponent;
 import org.apache.wicket.markup.parser.filter.EnclosureHandler;
-import org.apache.wicket.markup.resolver.ComponentResolvers;
-import org.apache.wicket.markup.resolver.IComponentResolver;
 import org.apache.wicket.request.Response;
 import org.apache.wicket.request.cycle.RequestCycle;
 import org.apache.wicket.response.NullResponse;
@@ -84,7 +82,7 @@ import org.slf4j.LoggerFactory;
  * @author Juergen Donnerstag
  * @since 1.3
  */
-public class Enclosure extends WebMarkupContainer implements IComponentResolver
+public class Enclosure extends TransparentWebMarkupContainer
 {
 	private static final long serialVersionUID = 1L;
 
@@ -116,25 +114,6 @@ public class Enclosure extends WebMarkupContainer implements IComponentResolver
 	}
 
 	/**
-	 * @see org.apache.wicket.Component#onInitialize()
-	 */
-	@Override
-	protected void onInitialize()
-	{
-		super.onInitialize();
-
-		// enclosure's parent container
-		MarkupContainer container = getEnclosureParent();
-
-		// clear the cache
-		childComponent = null;
-
-		// get Child Component. If not "added", ask a resolver to find it.
-		childComponent = getChildComponent(new MarkupStream(getMarkup()), container);
-		checkChildComponent(childComponent);
-	}
-
-	/**
 	 * Get the real parent container
 	 * 
 	 * @return enclosure's parent markup container
@@ -142,7 +121,7 @@ public class Enclosure extends WebMarkupContainer implements IComponentResolver
 	private MarkupContainer getEnclosureParent()
 	{
 		MarkupContainer parent = getParent();
-		while ((parent != null) && parent.isAuto())
+		while (parent.isAuto())
 		{
 			parent = parent.getParent();
 		}
@@ -160,11 +139,16 @@ public class Enclosure extends WebMarkupContainer implements IComponentResolver
 	 *      org.apache.wicket.markup.ComponentTag)
 	 */
 	@Override
-	protected void onComponentTagBody(final MarkupStream markupStream, final ComponentTag openTag)
+	protected void onComponentTagBody(MarkupStream markupStream, ComponentTag openTag)
 	{
-		// TODO this is where I wish we had something like "enum(TAG, BODY, NONE, ALL) isVisible()"
+		// enclosure's parent container
+		MarkupContainer container = getEnclosureParent();
+
+		Component controller = container.get(childId.toString());
+		checkChildComponent(controller);
+
 		// set the enclosure visibility
-		boolean visible = childComponent.determineVisibility();
+		boolean visible = controller.determineVisibility();
 
 		// We want to know which components are rendered inside the enclosure
 		final IComponentOnAfterRenderListener listener = new EnclosureListener(this);
@@ -202,59 +186,6 @@ public class Enclosure extends WebMarkupContainer implements IComponentResolver
 	}
 
 	/**
-	 * @param markupStream
-	 * @param container
-	 * @return The component associated with the
-	 */
-	private Component getChildComponent(final MarkupStream markupStream, MarkupContainer container)
-	{
-		Component controller = container.get(childId.toString());
-		if (controller == null)
-		{
-			int orgIndex = markupStream.getCurrentIndex();
-			try
-			{
-				while (markupStream.hasMore())
-				{
-					markupStream.next();
-					if (markupStream.skipUntil(ComponentTag.class))
-					{
-						ComponentTag tag = markupStream.getTag();
-						if ((tag != null) && (tag.isOpen() || tag.isOpenClose()))
-						{
-							if (childId.equals(tag.getId()))
-							{
-								controller = ComponentResolvers.resolveByComponentHierarchy(
-									container, markupStream, tag);
-								break;
-							}
-						}
-					}
-				}
-			}
-			finally
-			{
-				markupStream.setCurrentIndex(orgIndex);
-			}
-		}
-		return controller;
-	}
-
-	/**
-	 * 
-	 * @see org.apache.wicket.markup.resolver.IComponentResolver#resolve(org.apache.wicket.MarkupContainer,
-	 *      org.apache.wicket.markup.MarkupStream, org.apache.wicket.markup.ComponentTag)
-	 */
-	public Component resolve(MarkupContainer container, MarkupStream markupStream, ComponentTag tag)
-	{
-		if (childId.equals(tag.getId()))
-		{
-			return childComponent;
-		}
-		return getEnclosureParent().get(tag.getId());
-	}
-
-	/**
 	 * 
 	 * @param controller
 	 */
@@ -287,7 +218,6 @@ public class Enclosure extends WebMarkupContainer implements IComponentResolver
 		/**
 		 * @see org.apache.wicket.application.IComponentOnBeforeRenderListener#onBeforeRender(org.apache.wicket.Component)
 		 */
-		@SuppressWarnings("unchecked")
 		public void onAfterRender(final Component component)
 		{
 			if (log.isWarnEnabled())

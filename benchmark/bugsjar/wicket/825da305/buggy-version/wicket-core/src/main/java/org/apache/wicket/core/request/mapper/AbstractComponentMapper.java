@@ -130,28 +130,9 @@ public abstract class AbstractComponentMapper extends AbstractMapper implements 
 	 */
 	protected Class<? extends IRequestablePage> getPageClass(String name)
 	{
-		String cleanedClassName = cleanClassName(name);
-		return WicketObjects.resolveClass(cleanedClassName);
-	}
+		Args.notEmpty(name, "name");
 
-	/**
-	 * Cleans the class name from any extra information that may be there.
-	 *
-	 * @param className
-	 *              The raw class name parsed from the url
-	 * @return The cleaned class name
-	 */
-	protected String cleanClassName(String className)
-	{
-		Args.notEmpty(className, "className");
-
-		if (Strings.indexOf(className, ';') > -1)
-		{
-			// remove any path parameters set manually by the user. WICKET-5500
-			className = Strings.beforeFirst(className, ';');
-		}
-
-		return className;
+		return WicketObjects.resolveClass(name);
 	}
 
 	/**

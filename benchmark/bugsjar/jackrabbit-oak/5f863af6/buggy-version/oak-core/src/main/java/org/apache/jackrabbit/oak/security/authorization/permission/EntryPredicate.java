@@ -37,7 +37,6 @@ final class EntryPredicate implements Predicate<PermissionEntry> {
 
     private final String parentPath;
     private final Tree parent;
-    private final boolean respectParent;
 
     public EntryPredicate(@Nonnull Tree tree, @Nullable PropertyState property,
                           boolean respectParent) {
@@ -65,7 +64,6 @@ final class EntryPredicate implements Predicate<PermissionEntry> {
             parentPath = null;
             parent = null;
         }
-        this.respectParent = parent != null || parentPath != null;
     }
 
     @CheckForNull
@@ -75,22 +73,25 @@ final class EntryPredicate implements Predicate<PermissionEntry> {
 
     @Override
     public boolean apply(@Nullable PermissionEntry entry) {
-        return apply(entry, true);
-    }
-
-    public boolean apply(@Nullable PermissionEntry entry, boolean respectParent) {
         if (entry == null) {
             return false;
         }
-        respectParent &= this.respectParent;
-
         if (tree != null) {
-            return entry.matches(tree, property) || (respectParent && parent != null && entry.matches(parent, null));
+            return entry.matches(tree, property) || applyToParent(entry);
         } else if (path != null) {
-            return entry.matches(path) || (respectParent && parentPath != null && entry.matches(parentPath));
+            return entry.matches(path) || applyToParent(entry);
         } else {
             return entry.matches();
         }
     }
 
+    private boolean applyToParent(@Nonnull PermissionEntry entry) {
+        if (parent != null) {
+            return entry.matches(parent, null);
+        } else if (parentPath != null) {
+            return entry.matches(parentPath);
+        } else {
+            return false;
+        }
+    }
 }

@@ -83,7 +83,7 @@ public final class WicketMessageTagHandler extends AbstractMarkupFilter
 		final String wicketMessageAttribute = tag.getAttributes().getString(
 			getWicketMessageAttrName());
 
-		if (Strings.isEmpty(wicketMessageAttribute) == false)
+		if ((wicketMessageAttribute != null) && (wicketMessageAttribute.trim().length() > 0))
 		{
 			// check if this tag is raw markup
 			if (tag.getId() == null)
@@ -165,7 +165,7 @@ public final class WicketMessageTagHandler extends AbstractMarkupFilter
 		// localize any raw markup that has wicket:message attrs
 		if ((tag != null) && (tag.getId().startsWith(WICKET_MESSAGE_CONTAINER_ID)))
 		{
-			Component wc;
+			Component wc = null;
 			int autoIndex = container.getPage().getAutoIndex();
 			String id = WICKET_MESSAGE_CONTAINER_ID + autoIndex;
 

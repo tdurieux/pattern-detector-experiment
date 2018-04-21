@@ -487,19 +487,33 @@ public class MockHttpServletRequest implements HttpServletRequest
 	 */
 	public ServletInputStream getInputStream() throws IOException
 	{
-		byte[] request = buildRequest();
-
-		// Ok lets make an input stream to return
-		final ByteArrayInputStream bais = new ByteArrayInputStream(request);
-
-		return new ServletInputStream()
+		if (uploadedFiles != null && uploadedFiles.size() > 0)
 		{
-			@Override
-			public int read()
+			byte[] request = buildRequest();
+
+			// Ok lets make an input stream to return
+			final ByteArrayInputStream bais = new ByteArrayInputStream(request);
+
+			return new ServletInputStream()
 			{
-				return bais.read();
-			}
-		};
+				@Override
+				public int read()
+				{
+					return bais.read();
+				}
+			};
+		}
+		else
+		{
+			return new ServletInputStream()
+			{
+				@Override
+				public int read()
+				{
+					return -1;
+				}
+			};
+		}
 	}
 
 	/**

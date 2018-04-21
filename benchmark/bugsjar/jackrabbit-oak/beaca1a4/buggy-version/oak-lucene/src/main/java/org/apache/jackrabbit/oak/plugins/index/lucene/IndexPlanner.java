@@ -36,7 +36,6 @@ import org.apache.jackrabbit.oak.query.fulltext.FullTextExpression;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextTerm;
 import org.apache.jackrabbit.oak.query.fulltext.FullTextVisitor;
 import org.apache.jackrabbit.oak.spi.query.Filter;
-import org.apache.jackrabbit.oak.spi.query.QueryIndex;
 import org.apache.lucene.index.IndexReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,7 +43,6 @@ import org.slf4j.LoggerFactory;
 import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Lists.newArrayListWithCapacity;
 import static com.google.common.collect.Maps.newHashMap;
-import static org.apache.jackrabbit.JcrConstants.JCR_SCORE;
 import static org.apache.jackrabbit.oak.commons.PathUtils.getAncestorPath;
 import static org.apache.jackrabbit.oak.commons.PathUtils.getDepth;
 import static org.apache.jackrabbit.oak.commons.PathUtils.getParentPath;
@@ -158,8 +156,7 @@ class IndexPlanner {
         //Fulltext expression can also be like jcr:contains(jcr:content/metadata/@format, 'image')
 
         List<OrderEntry> sortOrder = createSortOrder(indexingRule);
-        boolean canSort = canHandleSorting(sortOrder);
-        if (!indexedProps.isEmpty() || canSort || ft != null || evalPathRestrictions) {
+        if (!indexedProps.isEmpty() || !sortOrder.isEmpty() || ft != null || evalPathRestrictions) {
             //TODO Need a way to have better cost estimate to indicate that
             //this index can evaluate more propertyRestrictions natively (if more props are indexed)
             //For now we reduce cost per entry
@@ -192,20 +189,6 @@ class IndexPlanner {
         //by NodeType index
 
         return null;
-    }
-
-    private boolean canHandleSorting(List<OrderEntry> sortOrder) {
-        if (sortOrder.isEmpty()){
-            return false;
-        }
-
-        //If jcr:score is the only sort order then opt out
-        if (sortOrder.size() == 1
-                && JCR_SCORE.equals(sortOrder.get(0).getPropertyName())){
-            return false;
-        }
-
-        return true;
     }
 
     private boolean canEvalAllFullText(final IndexingRule indexingRule, FullTextExpression ft) {

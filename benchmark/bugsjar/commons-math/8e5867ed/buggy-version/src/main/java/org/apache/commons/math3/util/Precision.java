@@ -491,7 +491,8 @@ public class Precision {
                 unscaled = FastMath.floor(unscaled);
             } else {
                 // The following equality test is intentional and needed for rounding purposes
-                if (FastMath.floor(unscaled) / 2.0 == FastMath.floor(FastMath.floor(unscaled) / 2.0)) { // even
+                if (FastMath.floor(unscaled) / 2.0 == FastMath.floor(Math
+                    .floor(unscaled) / 2.0)) { // even
                     unscaled = FastMath.floor(unscaled);
                 } else { // odd
                     unscaled = FastMath.ceil(unscaled);
@@ -515,10 +516,7 @@ public class Precision {
             }
             break;
         case BigDecimal.ROUND_UP :
-            // do not round if the discarded fraction is equal to zero
-            if (unscaled != FastMath.floor(unscaled)) {
-                unscaled = FastMath.ceil(FastMath.nextAfter(unscaled, Double.POSITIVE_INFINITY));
-            }
+            unscaled = FastMath.ceil(FastMath.nextAfter(unscaled,  Double.POSITIVE_INFINITY));
             break;
         default :
             throw new MathIllegalArgumentException(LocalizedFormats.INVALID_ROUNDING_METHOD,

@@ -137,13 +137,13 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
     public Directory wrapForRead(String indexPath, IndexDefinition definition,
             Directory remote) throws IOException {
         Directory local = createLocalDirForIndexReader(indexPath, definition);
-        return new CopyOnReadDirectory(remote, local, prefetchEnabled, indexPath, getSharedWorkingSet(indexPath));
+        return new CopyOnReadDirectory(remote, local, prefetchEnabled, indexPath, getSharedWorkingSet(definition));
     }
 
     public Directory wrapForWrite(IndexDefinition definition, Directory remote, boolean reindexMode) throws IOException {
         Directory local = createLocalDirForIndexWriter(definition);
         return new CopyOnWriteDirectory(remote, local, reindexMode,
-                getIndexPathForLogging(definition), getSharedWorkingSet(definition.getIndexPathFromConfig()));
+                getIndexPathForLogging(definition), getSharedWorkingSet(definition));
     }
 
     @Override
@@ -238,7 +238,9 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
      * @param defn index definition for which the directory is being created
      * @return a set to maintain the state of new files being created by the COW Directory
      */
-    private Set<String> getSharedWorkingSet(String indexPath){
+    private Set<String> getSharedWorkingSet(IndexDefinition defn){
+        String indexPath = defn.getIndexPathFromConfig();
+
         Set<String> sharedSet;
         synchronized (sharedWorkingSetMap){
             sharedSet = sharedWorkingSetMap.get(indexPath);

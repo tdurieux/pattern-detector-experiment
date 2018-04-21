@@ -278,20 +278,18 @@ public class SimpleKernelImpl extends MicroKernelWrapperBase implements MicroKer
                 break;
             }
             case '*': {
+                // TODO is it really required?
                 // TODO possibly support target position notation
+                // TODO support copy in wrappers, index,...
                 t.read(':');
                 String target = t.readString();
+                diff.tag('*').key(path).value(target);
                 if (!PathUtils.isAbsolute(target)) {
                     target = PathUtils.concat(rootPath, target);
                 }
-                diff.tag('*').key(path).value(target);
-                String to = PathUtils.relativize("/", target);
                 NodeImpl node = data.getNode(from);
-                JsopStream json = new JsopStream();
-                node.append(json, Integer.MAX_VALUE, 0, Integer.MAX_VALUE, false);
-                json.read('{');
-                NodeImpl n2 = NodeImpl.parse(nodeMap, json, rev);
-                data = data.cloneAndAddChildNode(to, false, null, n2, rev);
+                String to = PathUtils.relativize("/", target);
+                data = data.cloneAndAddChildNode(to, false, null, node, rev);
                 break;
             }
             default:
@@ -557,7 +555,6 @@ public class SimpleKernelImpl extends MicroKernelWrapperBase implements MicroKer
         }
     }
 
-    @Override
     public String toString() {
         return "simple:" + name;
     }

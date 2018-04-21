@@ -251,12 +251,7 @@ public class CompoundRequestMapper implements ICompoundRequestMapper
 
 		for (IRequestMapper mapper : this)
 		{
-			if (mapper instanceof ICompoundRequestMapper)
-			{
-				ICompoundRequestMapper inner = (ICompoundRequestMapper) mapper;
-				inner.unmount(path);
-			}
-			else if (mapper.mapRequest(request) != null)
+			if (mapper.mapRequest(request) != null)
 			{
 				remove(mapper);
 			}

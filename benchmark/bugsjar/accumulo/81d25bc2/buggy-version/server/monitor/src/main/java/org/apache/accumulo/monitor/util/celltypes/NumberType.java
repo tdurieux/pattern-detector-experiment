@@ -20,7 +20,7 @@ import static org.apache.accumulo.core.util.NumUtil.bigNumberForQuantity;
 
 public class NumberType<T extends Number> extends CellType<T> {
   
-  protected final T warnMin, warnMax, errMin, errMax;
+  private T warnMin, warnMax, errMin, errMax;
   
   public NumberType(T warnMin, T warnMax, T errMin, T errMax) {
     this.warnMin = warnMin;

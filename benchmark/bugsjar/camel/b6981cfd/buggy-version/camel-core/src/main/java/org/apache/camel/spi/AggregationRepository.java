@@ -32,9 +32,6 @@ public interface AggregationRepository {
      * Add the given {@link Exchange} under the correlation key.
      * <p/>
      * Will replace any existing exchange.
-     * <p/>
-     * <b>Important:</b> This method is <b>not</b> invoked if only one exchange was completed, and therefore
-     * the exchange does not need to be added to a repository, as its completed immediately.
      *
      * @param camelContext   the current CamelContext
      * @param key            the correlation key
@@ -45,8 +42,6 @@ public interface AggregationRepository {
 
     /**
      * Gets the given exchange with the correlation key
-     * <p/>
-     * This method is always invoked for any incoming exchange in the aggregator.
      *
      * @param camelContext   the current CamelContext
      * @param key            the correlation key
@@ -57,9 +52,6 @@ public interface AggregationRepository {
     /**
      * Removes the exchange with the given correlation key, which should happen
      * when an {@link Exchange} is completed
-     * <p/>
-     * <b>Important:</b> This method is <b>not</b> invoked if only one exchange was completed, and therefore
-     * the exchange does not need to be added to a repository, as its completed immediately.
      *
      * @param camelContext   the current CamelContext
      * @param key            the correlation key
@@ -69,8 +61,6 @@ public interface AggregationRepository {
 
     /**
      * Confirms the completion of the {@link Exchange}.
-     * <p/>
-     * This method is always invoked.
      *
      * @param camelContext  the current CamelContext
      * @param exchangeId    exchange id to confirm

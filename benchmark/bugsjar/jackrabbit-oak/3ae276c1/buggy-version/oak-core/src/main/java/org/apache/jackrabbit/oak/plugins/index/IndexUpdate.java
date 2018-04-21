@@ -19,7 +19,6 @@ package org.apache.jackrabbit.oak.plugins.index;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.collect.Lists.newArrayList;
 import static com.google.common.collect.Lists.newArrayListWithCapacity;
-import static org.apache.jackrabbit.oak.api.Type.BOOLEAN;
 import static org.apache.jackrabbit.oak.commons.PathUtils.concat;
 import static org.apache.jackrabbit.oak.plugins.index.IndexConstants.ASYNC_PROPERTY_NAME;
 import static org.apache.jackrabbit.oak.plugins.index.IndexConstants.ASYNC_REINDEX_VALUE;
@@ -109,7 +108,7 @@ public class IndexUpdate implements Editor {
     @Override
     public void enter(NodeState before, NodeState after)
             throws CommitFailedException {
-        collectIndexEditors(builder.getChildNode(INDEX_DEFINITIONS_NAME), before);
+        collectIndexEditors(builder.getChildNode(INDEX_DEFINITIONS_NAME));
 
         // no-op when reindex is empty
         CommitFailedException exception = EditorDiff.process(
@@ -123,30 +122,17 @@ public class IndexUpdate implements Editor {
         }
     }
 
-    private boolean shouldReindex(NodeBuilder definition, NodeState before,
-            String name) {
-        PropertyState ps = definition.getProperty(REINDEX_PROPERTY_NAME);
-        if (ps != null && ps.getValue(BOOLEAN)) {
-            return true;
-        }
-        // reindex in the case this is a new node, even though the reindex flag
-        // might be set to 'false' (possible via content import)
-        return !before.getChildNode(INDEX_DEFINITIONS_NAME).hasChildNode(name);
-    }
-
-    private void collectIndexEditors(NodeBuilder definitions,
-            NodeState before) throws CommitFailedException {
+    private void collectIndexEditors(NodeBuilder definitions)
+            throws CommitFailedException {
         for (String name : definitions.getChildNodeNames()) {
             NodeBuilder definition = definitions.getChildNode(name);
             if (Objects.equal(async, definition.getString(ASYNC_PROPERTY_NAME))) {
                 String type = definition.getString(TYPE_PROPERTY_NAME);
-                boolean shouldReindex = shouldReindex(definition,
-                        before, name);
                 Editor editor = provider.getIndexEditor(type, definition, root, updateCallback);
                 if (editor == null) {
                     // trigger reindexing when an indexer becomes available
                     definition.setProperty(REINDEX_PROPERTY_NAME, true);
-                } else if (shouldReindex) {
+                } else if (definition.getBoolean(REINDEX_PROPERTY_NAME)) {
                     if (definition.getBoolean(REINDEX_ASYNC_PROPERTY_NAME)
                             && definition.getString(ASYNC_PROPERTY_NAME) == null) {
                         // switch index to an async update mode

@@ -24,7 +24,7 @@ import org.apache.commons.math3.exception.util.LocalizedFormats;
 import org.apache.commons.math3.util.FastMath;
 
 /**
- * Population of chromosomes which uses elitism (certain percentage of the best
+ * Population of chromosomes which uses elitism (certain percentace of the best
  * chromosomes is directly copied to the next generation).
  *
  * @version $Id$
@@ -42,13 +42,12 @@ public class ElitisticListPopulation extends ListPopulation {
      * @param populationLimit maximal size of the population
      * @param elitismRate how many best chromosomes will be directly transferred to the
      *                    next generation [in %]
-     * @throws OutOfRangeException if the elitism rate is outside the [0, 1] range
      */
     public ElitisticListPopulation(final List<Chromosome> chromosomes,
                                    final int populationLimit,
                                    final double elitismRate) {
         super(chromosomes, populationLimit);
-        setElitismRate(elitismRate);
+        this.elitismRate = elitismRate;
     }
 
     /**
@@ -58,11 +57,10 @@ public class ElitisticListPopulation extends ListPopulation {
      * @param populationLimit maximal size of the population
      * @param elitismRate how many best chromosomes will be directly transferred to the
      *                    next generation [in %]
-     * @throws OutOfRangeException if the elitism rate is outside the [0, 1] range
      */
     public ElitisticListPopulation(final int populationLimit, final double elitismRate) {
         super(populationLimit);
-        setElitismRate(elitismRate);
+        this.elitismRate = elitismRate;
     }
 
     /**

@@ -447,13 +447,11 @@ public final class FixedLengthRecordSorter<T> implements InMemorySorter<T> {
 				num -= recordsPerSegment;
 			} else {
 				// partially filled segment
-				for (; num > 0 && offset <= this.lastEntryOffset; num--, offset += this.recordSize) {
+				for (; num > 0; num--) {
 					record = comparator.readWithKeyDenormalization(record, inView);
 					serializer.serialize(record, output);
 				}
 			}
-
-			offset = 0;
 		}
 	}
 	

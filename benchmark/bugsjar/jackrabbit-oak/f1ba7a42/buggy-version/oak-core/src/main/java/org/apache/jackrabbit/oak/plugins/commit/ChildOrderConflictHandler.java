@@ -45,8 +45,7 @@ public class ChildOrderConflictHandler extends ConflictHandlerWrapper {
         if (isChildOrderProperty(ours)) {
             // two sessions concurrently called orderBefore() on a Tree
             // that was previously unordered.
-            merge(parent, ours, theirs);
-            return Resolution.MERGED;
+            return Resolution.THEIRS;
         } else {
             return handler.addExistingProperty(parent, ours, theirs);
         }
@@ -76,11 +75,11 @@ public class ChildOrderConflictHandler extends ConflictHandlerWrapper {
     }
 
     private static void merge(NodeBuilder parent, PropertyState ours, PropertyState theirs) {
-        Set<String> theirOrder = Sets.newHashSet(theirs.getValue(Type.NAMES));
-        PropertyBuilder<String> merged = PropertyBuilder.array(Type.NAME).assignFrom(theirs);
+        Set<String> theirOrder = Sets.newHashSet(theirs.getValue(Type.STRINGS));
+        PropertyBuilder<String> merged = PropertyBuilder.array(Type.STRING).assignFrom(theirs);
 
         // Append child node names from ours that are not in theirs
-        for (String ourChild : ours.getValue(Type.NAMES)) {
+        for (String ourChild : ours.getValue(Type.STRINGS)) {
             if (!theirOrder.contains(ourChild)) {
                 merged.addValue(ourChild);
             }

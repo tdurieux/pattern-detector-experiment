@@ -103,9 +103,7 @@ public class JdkVersionProfileActivator
             return isLeft ? 1 : -1;
         }
 
-        value = value.replaceAll( "[^0-9\\.\\-\\_]", "" );
-
-        List<String> valueTokens = new ArrayList<String>( Arrays.asList( value.split( "[\\.\\-\\_]" ) ) );
+        List<String> valueTokens = new ArrayList<String>( Arrays.asList( value.split( "\\." ) ) );
         List<String> rangeValueTokens = new ArrayList<String>( Arrays.asList( rangeValue.value.split( "\\." ) ) );
 
         int max = Math.max( valueTokens.size(), rangeValueTokens.size() );
@@ -121,7 +119,7 @@ public class JdkVersionProfileActivator
             return 0;
         }
 
-        for ( int i = 0; i < valueTokens.size() && i < rangeValueTokens.size(); i++ )
+        for ( int i = 0; i < valueTokens.size(); i++ )
         {
             int x = Integer.parseInt( valueTokens.get( i ) );
             int y = Integer.parseInt( rangeValueTokens.get( i ) );

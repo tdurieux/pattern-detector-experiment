@@ -16,7 +16,6 @@
  */
 package org.apache.camel.processor;
 
-import java.net.URISyntaxException;
 import java.util.HashMap;
 
 import org.apache.camel.AsyncCallback;
@@ -34,7 +33,6 @@ import org.apache.camel.impl.ProducerCache;
 import org.apache.camel.support.ServiceSupport;
 import org.apache.camel.util.AsyncProcessorConverterHelper;
 import org.apache.camel.util.AsyncProcessorHelper;
-import org.apache.camel.util.EndpointHelper;
 import org.apache.camel.util.EventHelper;
 import org.apache.camel.util.ObjectHelper;
 import org.apache.camel.util.ServiceHelper;
@@ -55,7 +53,6 @@ public class SendProcessor extends ServiceSupport implements AsyncProcessor, Tra
     protected ProducerCache producerCache;
     protected AsyncProcessor producer;
     protected Endpoint destination;
-    protected ExchangePattern destinationExchangePattern;
     protected final boolean unhandleException;
 
     public SendProcessor(Endpoint destination) {
@@ -72,12 +69,6 @@ public class SendProcessor extends ServiceSupport implements AsyncProcessor, Tra
         this.camelContext = destination.getCamelContext();
         this.pattern = pattern;
         this.unhandleException = unhandleException;
-        try {
-            this.destinationExchangePattern = null;
-            this.destinationExchangePattern = EndpointHelper.resolveExchangePatternFromUrl(destination.getEndpointUri());
-        } catch (URISyntaxException e) {
-            throw ObjectHelper.wrapRuntimeCamelException(e);
-        }
         ObjectHelper.notNull(this.camelContext, "camelContext");
     }
 
@@ -142,9 +133,11 @@ public class SendProcessor extends ServiceSupport implements AsyncProcessor, Tra
                     }
                 });
             } catch (Throwable throwable) {
-                exchange.setException(throwable);
-                checkException(exchange);
-                callback.done(sync);
+                if (exchange != null) {
+                    exchange.setException(throwable);
+                    checkException(exchange);
+                }
+
             }
 
             return sync;
@@ -187,10 +180,7 @@ public class SendProcessor extends ServiceSupport implements AsyncProcessor, Tra
     }
 
     protected Exchange configureExchange(Exchange exchange, ExchangePattern pattern) {
-        // destination exchange pattern overrides pattern
-        if (destinationExchangePattern != null) {
-            exchange.setPattern(destinationExchangePattern);
-        } else if (pattern != null) {
+        if (pattern != null) {
             exchange.setPattern(pattern);
         }
         // set property which endpoint we send to

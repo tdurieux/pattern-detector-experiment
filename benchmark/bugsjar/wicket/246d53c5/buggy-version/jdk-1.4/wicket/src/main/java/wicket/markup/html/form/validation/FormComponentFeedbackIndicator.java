@@ -17,7 +17,6 @@
 package wicket.markup.html.form.validation;
 
 import wicket.Component;
-import wicket.Session;
 import wicket.feedback.ComponentFeedbackMessageFilter;
 import wicket.feedback.IFeedback;
 import wicket.feedback.IFeedbackMessageFilter;
@@ -37,7 +36,7 @@ import wicket.model.IModel;
 public class FormComponentFeedbackIndicator extends Panel implements IFeedback
 {
 	private static final long serialVersionUID = 1L;
-
+	
 	/** The message filter for this indicator component */
 	private IFeedbackMessageFilter filter;
 
@@ -75,7 +74,7 @@ public class FormComponentFeedbackIndicator extends Panel implements IFeedback
 	public void updateFeedback()
 	{
 		// Get the messages for the current page
-		setVisible(Session.get().getFeedbackMessages().hasMessage(getFeedbackMessageFilter()));
+		setVisible(getPage().getFeedbackMessages().hasMessage(getFeedbackMessageFilter()));
 	}
 
 	/**

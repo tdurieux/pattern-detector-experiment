@@ -73,13 +73,10 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.MultiFields;
 import org.apache.lucene.index.Term;
-import org.apache.lucene.index.Terms;
-import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
-import org.apache.lucene.search.MultiPhraseQuery;
 import org.apache.lucene.search.PhraseQuery;
 import org.apache.lucene.search.PrefixQuery;
 import org.apache.lucene.search.Query;
@@ -90,9 +87,6 @@ import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.WildcardQuery;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FSDirectory;
-import org.apache.lucene.util.BytesRef;
-import org.apache.lucene.util.automaton.Automaton;
-import org.apache.lucene.util.automaton.CompiledAutomaton;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -422,7 +416,7 @@ public class LuceneIndex implements FulltextQueryIndex {
             // when using the LowCostLuceneIndexProvider
             // which is used for testing
         } else {
-            qs.add(getFullTextQuery(ft, analyzer, reader));
+            qs.add(getFullTextQuery(ft, analyzer));
         }
         if (nonFullTextConstraints) {
             addNonFullTextConstraints(qs, filter, reader);
@@ -588,7 +582,7 @@ public class LuceneIndex implements FulltextQueryIndex {
         qs.add(bq);
     }
 
-    static Query getFullTextQuery(FullTextExpression ft, final Analyzer analyzer, final IndexReader reader) {
+    static Query getFullTextQuery(FullTextExpression ft, final Analyzer analyzer) {
         // a reference to the query, so it can be set in the visitor
         // (a "non-local return")
         final AtomicReference<Query> result = new AtomicReference<Query>();
@@ -598,7 +592,7 @@ public class LuceneIndex implements FulltextQueryIndex {
             public boolean visit(FullTextOr or) {
                 BooleanQuery q = new BooleanQuery();
                 for (FullTextExpression e : or.list) {
-                    Query x = getFullTextQuery(e, analyzer, reader);
+                    Query x = getFullTextQuery(e, analyzer);
                     q.add(x, SHOULD);
                 }
                 result.set(q);
@@ -609,7 +603,7 @@ public class LuceneIndex implements FulltextQueryIndex {
             public boolean visit(FullTextAnd and) {
                 BooleanQuery q = new BooleanQuery();
                 for (FullTextExpression e : and.list) {
-                    Query x = getFullTextQuery(e, analyzer, reader);
+                    Query x = getFullTextQuery(e, analyzer);
                     // Lucene can't deal with "must(must_not(x))"
                     if (x instanceof BooleanQuery) {
                         BooleanQuery bq = (BooleanQuery) x;
@@ -631,7 +625,7 @@ public class LuceneIndex implements FulltextQueryIndex {
                     // do not add constraints on child nodes properties
                     p = "*";
                 }
-                Query q = tokenToQuery(term.getText(), analyzer, reader);
+                Query q = tokenToQuery(term.getText(), analyzer);
                 if (q == null) {
                     return false;
                 }
@@ -652,7 +646,7 @@ public class LuceneIndex implements FulltextQueryIndex {
         return result.get();
     }
 
-    static Query tokenToQuery(String text, Analyzer analyzer, IndexReader reader) {
+    static Query tokenToQuery(String text, Analyzer analyzer) {
         if (analyzer == null) {
             return null;
         }
@@ -663,76 +657,29 @@ public class LuceneIndex implements FulltextQueryIndex {
             // TODO what should be returned in the case there are no tokens?
             return new BooleanQuery();
         }
+
         if (tokens.size() == 1) {
-            String token = tokens.iterator().next();
-            if (hasFulltextToken(token)) {
-                return new WildcardQuery(newFulltextTerm(token));
+            text = tokens.iterator().next();
+            boolean hasFulltextToken = false;
+            for (char c : fulltextTokens) {
+                if (text.indexOf(c) != -1) {
+                    hasFulltextToken = true;
+                    break;
+                }
+            }
+
+            if (hasFulltextToken) {
+                return new WildcardQuery(newFulltextTerm(text));
             } else {
-                return new TermQuery(newFulltextTerm(token));
+                return new TermQuery(newFulltextTerm(text));
             }
         } else {
-            if (hasFulltextToken(tokens)) {
-                MultiPhraseQuery mpq = new MultiPhraseQuery();
-                for(String token: tokens){
-                    if (hasFulltextToken(token)) {
-                        Term[] terms = extractMatchingTokens(reader, token);
-                        if (terms != null && terms.length > 0) {
-                            mpq.add(terms);
-                        }
-                    } else {
-                        mpq.add(newFulltextTerm(token));
-                    }
-                }
-                return mpq;
-            } else {
-                PhraseQuery pq = new PhraseQuery();
-                for (String t : tokens) {
-                    pq.add(newFulltextTerm(t));
-                }
-                return pq;
+            PhraseQuery pq = new PhraseQuery();
+            for (String t : tokens) {
+                pq.add(newFulltextTerm(t));
             }
+            return pq;
         }
-    }
-
-    private static Term[] extractMatchingTokens(IndexReader reader, String token) {
-        if (reader == null) {
-            // getPlan call
-            return null;
-        }
-
-        try {
-            List<Term> terms = new ArrayList<Term>();
-            Terms t = MultiFields.getTerms(reader, FieldNames.FULLTEXT);
-            Automaton a = WildcardQuery.toAutomaton(newFulltextTerm(token));
-            CompiledAutomaton ca = new CompiledAutomaton(a);
-            TermsEnum te = ca.getTermsEnum(t);
-            BytesRef text;
-            while ((text = te.next()) != null) {
-                terms.add(newFulltextTerm(text.utf8ToString()));
-            }
-            return terms.toArray(new Term[terms.size()]);
-        } catch (IOException e) {
-            LOG.error("Building fulltext query failed", e.getMessage());
-            return null;
-        }
-    }
-
-    private static boolean hasFulltextToken(List<String> tokens) {
-        for (String token : tokens) {
-            if (hasFulltextToken(token)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean hasFulltextToken(String token) {
-        for (char c : fulltextTokens) {
-            if (token.indexOf(c) != -1) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static char[] fulltextTokens = new char[] { '*', '?' };
@@ -780,7 +727,6 @@ public class LuceneIndex implements FulltextQueryIndex {
                 poz = end;
                 if (hasFulltextToken) {
                     token.append(term);
-                    hasFulltextToken = false;
                 } else {
                     if (token.length() > 0) {
                         tokens.add(token.toString());

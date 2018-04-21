@@ -34,7 +34,7 @@ public class KernelNodeBuilder extends MemoryNodeBuilder implements FastCopyMove
 
     private NodeState base = null;
 
-    private NodeState rootBase = null;
+    protected NodeState rootBase = null;
 
     KernelNodeBuilder(MemoryNodeBuilder parent, String name, KernelRootBuilder root) {
         super(parent, name);

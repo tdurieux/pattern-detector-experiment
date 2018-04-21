@@ -289,8 +289,7 @@ public class LastRevRecoveryAgent {
         // if found then lastRev needs to be fixed
         for (Revision rev : revs) {
             if (rev.compareRevisionTime(currentLastRev) > 0) {
-                rev = doc.getCommitRevision(rev);
-                if (rev != null) {
+                if (doc.isCommitted(rev)) {
                     return rev;
                 }
             } else {

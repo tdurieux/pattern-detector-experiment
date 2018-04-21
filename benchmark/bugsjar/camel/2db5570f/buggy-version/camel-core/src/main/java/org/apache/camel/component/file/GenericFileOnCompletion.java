@@ -109,8 +109,8 @@ public class GenericFileOnCompletion<T> implements Synchronization {
             endpoint.getIdempotentRepository().add(absoluteFileName);
         }
 
-        // delete done file if used (and not noop=true)
-        if (endpoint.getDoneFileName() != null && !endpoint.isNoop()) {
+        // delete done file if used
+        if (endpoint.getDoneFileName() != null) {
             // done file must be in same path as the original input file
             String doneFileName = endpoint.createDoneFileName(absoluteFileName);
             ObjectHelper.notEmpty(doneFileName, "doneFileName", endpoint);
@@ -133,6 +133,7 @@ public class GenericFileOnCompletion<T> implements Synchronization {
         } catch (Exception e) {
             handleException(e);
         }
+
     }
 
     /**

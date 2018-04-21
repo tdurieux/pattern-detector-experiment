@@ -137,7 +137,7 @@ public class Splitter extends MulticastProcessor implements AsyncProcessor, Trac
 
                     public Object next() {
                         Object part = iterator.next();
-                        Exchange newExchange = ExchangeHelper.createCopy(exchange, true);
+                        Exchange newExchange = exchange.copy();
                         if (part instanceof Message) {
                             newExchange.setIn((Message)part);
                         } else {

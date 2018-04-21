@@ -264,16 +264,15 @@ public class NodeImpl extends ItemImpl<NodeDelegate> implements Node {
             throws RepositoryException {
         checkStatus();
 
-        String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
+        int targetType = getTargetType(value, type);
+        Value targetValue = ValueHelper.convert(value, targetType, getValueFactory());
         if (value == null) {
-            dlg.removeProperty(oakName);
-            return null;
+            Property p = getProperty(jcrName);
+            p.remove();
+            return p;
         } else {
-            int targetType = getTargetType(value, type);
-            Value targetValue =
-                    ValueHelper.convert(value, targetType, getValueFactory());
-            CoreValue oakValue =
-                    ValueConverter.toCoreValue(targetValue, sessionDelegate);
+            String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
+            CoreValue oakValue = ValueConverter.toCoreValue(targetValue, sessionDelegate);
             return new PropertyImpl(dlg.setProperty(oakName, oakValue));
         }
     }

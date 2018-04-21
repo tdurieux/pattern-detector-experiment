@@ -967,8 +967,8 @@ public abstract class Component implements IClusterable, IConverterLocator, IReq
 	{
 		if (!getFlag(FLAG_INITIALIZED))
 		{
-			setFlag(FLAG_INITIALIZED, true);
 			onInitialize();
+			setFlag(FLAG_INITIALIZED, true);
 		}
 	}
 

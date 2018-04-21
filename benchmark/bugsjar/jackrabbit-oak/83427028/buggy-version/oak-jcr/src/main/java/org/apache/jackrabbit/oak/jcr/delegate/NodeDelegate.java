@@ -586,7 +586,6 @@ public class NodeDelegate extends ItemDelegate {
         }
 
         // First look for a matching named property definition
-        Tree fuzzyMatch = null;
         for (Tree type : types) {
             Tree definitions = type
                     .getChild(OAK_NAMED_PROPERTY_DEFINITIONS)
@@ -599,12 +598,10 @@ public class NodeDelegate extends ItemDelegate {
             if (definition.exists()) {
                 return definition;
             }
-            for (Tree def : definitions.getChildren()) {
-                if (propertyType.isArray() == TreeUtil.getBoolean(def, JCR_MULTIPLE)) {
-                    if (getBoolean(def, JCR_PROTECTED)) {
-                        return null; // no fuzzy matches for protected items
-                    } else if (!exactTypeMatch && fuzzyMatch == null) {
-                        fuzzyMatch = def;
+            if (!exactTypeMatch) {
+                for (Tree def : definitions.getChildren()) {
+                    if (propertyType.isArray() == TreeUtil.getBoolean(def, JCR_MULTIPLE)) {
+                        return def;
                     }
                 }
             }
@@ -621,17 +618,16 @@ public class NodeDelegate extends ItemDelegate {
             if (definition.exists()) {
                 return definition;
             }
-            if (!exactTypeMatch && fuzzyMatch == null) {
+            if (!exactTypeMatch) {
                 for (Tree def : definitions.getChildren()) {
                     if (propertyType.isArray() == TreeUtil.getBoolean(def, JCR_MULTIPLE)) {
-                        fuzzyMatch = def;
-                        break;
+                        return def;
                     }
                 }
             }
         }
 
-        return fuzzyMatch;
+        return null;
     }
 
     private Tree findMatchingChildNodeDefinition(

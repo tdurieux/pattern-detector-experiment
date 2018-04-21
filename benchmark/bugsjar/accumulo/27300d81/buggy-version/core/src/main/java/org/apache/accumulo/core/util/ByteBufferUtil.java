@@ -31,15 +31,7 @@ public class ByteBufferUtil {
   public static byte[] toBytes(ByteBuffer buffer) {
     if (buffer == null)
       return null;
-    if (buffer.hasArray()) {
-      // did not use buffer.get() because it changes the position
-      return Arrays.copyOfRange(buffer.array(), buffer.position() + buffer.arrayOffset(), buffer.limit() + buffer.arrayOffset());
-    } else {
-      byte[] data = new byte[buffer.remaining()];
-      // duplicate inorder to avoid changing position
-      buffer.duplicate().get(data);
-      return data;
-    }
+    return Arrays.copyOfRange(buffer.array(), buffer.position(), buffer.limit());
   }
 
   public static List<ByteBuffer> toByteBuffers(Collection<byte[]> bytesList) {
@@ -55,32 +47,23 @@ public class ByteBufferUtil {
   public static List<byte[]> toBytesList(Collection<ByteBuffer> bytesList) {
     if (bytesList == null)
       return null;
-    ArrayList<byte[]> result = new ArrayList<byte[]>(bytesList.size());
+    ArrayList<byte[]> result = new ArrayList<byte[]>();
     for (ByteBuffer bytes : bytesList) {
       result.add(toBytes(bytes));
     }
     return result;
   }
 
-  public static Text toText(ByteBuffer byteBuffer) {
-    if (byteBuffer == null)
+  public static Text toText(ByteBuffer bytes) {
+    if (bytes == null)
       return null;
-
-    if (byteBuffer.hasArray()) {
-      Text result = new Text();
-      result.set(byteBuffer.array(), byteBuffer.arrayOffset() + byteBuffer.position(), byteBuffer.remaining());
-      return result;
-    } else {
-      return new Text(toBytes(byteBuffer));
-    }
+    Text result = new Text();
+    result.set(bytes.array(), bytes.position(), bytes.remaining());
+    return result;
   }
 
   public static String toString(ByteBuffer bytes) {
-    if (bytes.hasArray()) {
-      return new String(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining(), UTF_8);
-    } else {
-      return new String(toBytes(bytes), UTF_8);
-    }
+    return new String(bytes.array(), bytes.position(), bytes.remaining(), UTF_8);
   }
 
   public static ByteBuffer toByteBuffers(ByteSequence bs) {
@@ -90,6 +73,7 @@ public class ByteBufferUtil {
     if (bs.isBackedByArray()) {
       return ByteBuffer.wrap(bs.getBackingArray(), bs.offset(), bs.length());
     } else {
+      // TODO create more efficient impl
       return ByteBuffer.wrap(bs.toArray());
     }
   }

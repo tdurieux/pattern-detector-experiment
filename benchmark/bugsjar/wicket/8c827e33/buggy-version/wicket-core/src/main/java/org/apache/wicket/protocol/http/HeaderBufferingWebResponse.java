@@ -24,134 +24,135 @@ import org.apache.wicket.util.lang.Args;
 import org.apache.wicket.util.time.Time;
 
 /**
- * Response that keeps headers in buffers until the first content is written.
+ * Response that keeps headers in buffers but writes the content directly to the response.
  * 
  * This is necessary to get {@link #reset()} working without removing the JSESSIONID cookie. When
  * {@link HttpServletResponse#reset()} is called it removes all cookies, including the JSESSIONID
- * cookie - see <a href="https://issues.apache.org/bugzilla/show_bug.cgi?id=26183">Bug 26183</a>.
+ * cookie.
  * 
- * Calling {@link #reset()} on this response clears the buffered meta data, if there is already any
- * content written it throws {@link IllegalStateException}.
+ * Calling {@link #reset()} on this response only clears the buffered headers. If there is any
+ * content written to response it throws {@link IllegalStateException}.
  * 
  * @author Matej Knopp
  */
 class HeaderBufferingWebResponse extends WebResponse implements IMetaDataBufferingWebResponse
 {
 	private final WebResponse originalResponse;
-
-	/**
-	 * Buffer of meta data.
-	 */
 	private final BufferedWebResponse bufferedResponse;
 
 	public HeaderBufferingWebResponse(WebResponse originalResponse)
 	{
 		this.originalResponse = originalResponse;
-
 		bufferedResponse = new BufferedWebResponse(originalResponse);
 	}
 
-	private boolean buffering = true;
+	private boolean bufferedWritten = false;
 
-	private void stopBuffering()
+	private void writeBuffered()
 	{
-		if (buffering)
+		if (!bufferedWritten)
 		{
 			bufferedResponse.writeTo(originalResponse);
-			buffering = false;
+			bufferedWritten = true;
 		}
 	}
 
-	/**
-	 * The response used for meta data.
-	 * 
-	 * @return buffered response if nothing was written yet, the original response otherwise
-	 */
-	private WebResponse getMetaResponse()
+	private void checkHeader()
 	{
-		if (buffering)
+		if (bufferedWritten)
 		{
-			return bufferedResponse;
-		}
-		else
-		{
-			return originalResponse;
+			throw new IllegalStateException("Header was already written to response!");
 		}
 	}
 
 	@Override
 	public void addCookie(Cookie cookie)
 	{
-		getMetaResponse().addCookie(cookie);
+		checkHeader();
+		bufferedResponse.addCookie(cookie);
 	}
 
 	@Override
 	public void clearCookie(Cookie cookie)
 	{
-		getMetaResponse().clearCookie(cookie);
+		checkHeader();
+		bufferedResponse.clearCookie(cookie);
 	}
+
+	private boolean flushed = false;
 
 	@Override
 	public void flush()
 	{
-		stopBuffering();
-
+		if (!bufferedWritten)
+		{
+			bufferedResponse.writeTo(originalResponse);
+			bufferedResponse.reset();
+		}
 		originalResponse.flush();
+		flushed = true;
 	}
 
 	@Override
 	public boolean isRedirect()
 	{
-		return getMetaResponse().isRedirect();
+		return bufferedResponse.isRedirect();
 	}
 
 	@Override
 	public void sendError(int sc, String msg)
 	{
-		getMetaResponse().sendError(sc, msg);
+		checkHeader();
+		bufferedResponse.sendError(sc, msg);
 	}
 
 	@Override
 	public void sendRedirect(String url)
 	{
-		getMetaResponse().sendRedirect(url);
+		checkHeader();
+		bufferedResponse.sendRedirect(url);
 	}
 
 	@Override
 	public void setContentLength(long length)
 	{
-		getMetaResponse().setContentLength(length);
+		checkHeader();
+		bufferedResponse.setContentLength(length);
 	}
 
 	@Override
 	public void setContentType(String mimeType)
 	{
-		getMetaResponse().setContentType(mimeType);
+		checkHeader();
+		bufferedResponse.setContentType(mimeType);
 	}
 
 	@Override
 	public void setDateHeader(String name, Time date)
 	{
 		Args.notNull(date, "date");
-		getMetaResponse().setDateHeader(name, date);
+		checkHeader();
+		bufferedResponse.setDateHeader(name, date);
 	}
 
 	@Override
 	public void setHeader(String name, String value)
 	{
-		getMetaResponse().setHeader(name, value);
+		checkHeader();
+		bufferedResponse.setHeader(name, value);
 	}
 
 	@Override
 	public void addHeader(String name, String value)
 	{
-		getMetaResponse().addHeader(name, value);
+		checkHeader();
+		bufferedResponse.addHeader(name, value);
 	}
 
 	@Override
 	public void setStatus(int sc)
 	{
-		getMetaResponse().setStatus(sc);
+		bufferedResponse.setStatus(sc);
 	}
 
 	@Override
@@ -169,16 +170,14 @@ class HeaderBufferingWebResponse extends WebResponse implements IMetaDataBufferi
 	@Override
 	public void write(CharSequence sequence)
 	{
-		stopBuffering();
-
+		writeBuffered();
 		originalResponse.write(sequence);
 	}
 
 	@Override
 	public void write(byte[] array)
 	{
-		stopBuffering();
-
+		writeBuffered();
 		originalResponse.write(array);
 	}
 
@@ -186,24 +185,19 @@ class HeaderBufferingWebResponse extends WebResponse implements IMetaDataBufferi
 	@Override
 	public void write(byte[] array, int offset, int length)
 	{
-		stopBuffering();
-
+		writeBuffered();
 		originalResponse.write(array, offset, length);
 	}
 
 	@Override
 	public void reset()
 	{
-		if (buffering)
+		if (flushed)
 		{
-			// still buffering so just reset the buffer of meta data
-			bufferedResponse.reset();
+			throw new IllegalStateException("Response has already been flushed!");
 		}
-		else
-		{
-			// the original response is never reset (see class javadoc)
-			throw new IllegalStateException("Response is no longer buffering!");
-		}
+		bufferedResponse.reset();
+		bufferedWritten = false;
 	}
 
 	@Override

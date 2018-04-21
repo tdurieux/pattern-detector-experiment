@@ -837,7 +837,10 @@ public class PactCompiler {
 				
 				// go over the contained data flow and mark the dynamic path nodes
 				StaticDynamicPathIdentifier identifier = new StaticDynamicPathIdentifier(iterNode.getCostWeight());
-				iterNode.acceptForStepFunction(identifier);
+				rootOfStepFunction.accept(identifier);
+				if(terminationCriterion != null){
+					terminationCriterion.accept(identifier);
+				}
 			}
 			else if (n instanceof WorksetIterationNode) {
 				final WorksetIterationNode iterNode = (WorksetIterationNode) n;
@@ -916,7 +919,8 @@ public class PactCompiler {
 				
 				// go over the contained data flow and mark the dynamic path nodes
 				StaticDynamicPathIdentifier pathIdentifier = new StaticDynamicPathIdentifier(iterNode.getCostWeight());
-				iterNode.acceptForStepFunction(pathIdentifier);
+				nextWorksetNode.accept(pathIdentifier);
+				iterNode.getSolutionSetDelta().accept(pathIdentifier);
 			}
 		}
 	};

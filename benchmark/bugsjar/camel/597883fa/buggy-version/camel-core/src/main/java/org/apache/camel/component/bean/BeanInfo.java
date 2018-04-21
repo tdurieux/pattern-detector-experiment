@@ -759,22 +759,20 @@ public class BeanInfo {
             MethodInfo matched = null;
             int matchCounter = 0;
             for (MethodInfo methodInfo : operationList) {
-                if (methodInfo.getBodyParameterType() != null) {
-                    if (methodInfo.getBodyParameterType().isInstance(body)) {
-                        return methodInfo;
-                    }
+                if (methodInfo.getBodyParameterType().isInstance(body)) {
+                    return methodInfo;
+                }
 
-                    // we should only try to convert, as we are looking for best match
-                    Object value = exchange.getContext().getTypeConverter().tryConvertTo(methodInfo.getBodyParameterType(), exchange, body);
-                    if (value != null) {
-                        if (LOG.isTraceEnabled()) {
-                            LOG.trace("Converted body from: {} to: {}",
-                                    body.getClass().getCanonicalName(), methodInfo.getBodyParameterType().getCanonicalName());
-                        }
-                        matchCounter++;
-                        newBody = value;
-                        matched = methodInfo;
+                // we should only try to convert, as we are looking for best match
+                Object value = exchange.getContext().getTypeConverter().tryConvertTo(methodInfo.getBodyParameterType(), exchange, body);
+                if (value != null) {
+                    if (LOG.isTraceEnabled()) {
+                        LOG.trace("Converted body from: {} to: {}",
+                                body.getClass().getCanonicalName(), methodInfo.getBodyParameterType().getCanonicalName());
                     }
+                    matchCounter++;
+                    newBody = value;
+                    matched = methodInfo;
                 }
             }
             if (matchCounter > 1) {

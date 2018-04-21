@@ -41,8 +41,9 @@ public final class AsyncProcessorConverterHelper {
     }
 
     /**
-     * Creates a {@link AsyncProcessor} that delegates to the given processor.
-     * It is important that this implements {@link DelegateProcessor}
+     * Creates a AsnycProcossor that delegates to the given processor.
+     * It is important that this implements DelegateProcessor
+     *
      */
     private static final class ProcessorToAsyncProcessorBridge implements DelegateProcessor, AsyncProcessor, Navigate<Processor>, Service {
         protected Processor processor;

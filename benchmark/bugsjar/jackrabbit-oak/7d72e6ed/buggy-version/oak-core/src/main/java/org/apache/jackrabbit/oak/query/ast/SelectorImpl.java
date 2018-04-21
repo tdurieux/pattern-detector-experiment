@@ -95,9 +95,6 @@ public class SelectorImpl extends SourceImpl {
         return quote(nodeTypeName) + " as " + quote(selectorName);
     }
 
-    public boolean isPrepared() {
-        return index != null;
-    }
 
     @Override
     public void prepare() {
@@ -109,19 +106,19 @@ public class SelectorImpl extends SourceImpl {
                 c.restrictPushDown(this);
             }
         }
-        index = query.getBestIndex(createFilter(true));
+        index = query.getBestIndex(createFilter());
     }
 
     @Override
     public void execute(NodeState rootState) {
-        cursor = index.query(createFilter(false), rootState);
+        cursor = index.query(createFilter(), rootState);
     }
 
     @Override
     public String getPlan(NodeState rootState) {
         StringBuilder buff = new StringBuilder();
         buff.append(toString());
-        buff.append(" /* ").append(index.getPlan(createFilter(true), rootState));
+        buff.append(" /* ").append(index.getPlan(createFilter(), rootState));
         if (selectorCondition != null) {
             buff.append(" where ").append(selectorCondition);
         }
@@ -129,15 +126,8 @@ public class SelectorImpl extends SourceImpl {
         return buff.toString();
     }
 
-    /**
-     * Create the filter condition for planning or execution.
-     * 
-     * @param preparing whether a filter for the prepare phase should be made 
-     * @return the filter
-     */
-    private Filter createFilter(boolean preparing) {
+    private Filter createFilter() {
         FilterImpl f = new FilterImpl(this, query.getStatement());
-        f.setPreparing(preparing);
         validateNodeType(nodeTypeName);
         f.setNodeType(nodeTypeName);
         if (joinCondition != null) {

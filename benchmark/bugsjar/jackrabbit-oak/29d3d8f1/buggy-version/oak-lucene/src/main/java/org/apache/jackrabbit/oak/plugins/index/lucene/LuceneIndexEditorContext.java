@@ -101,8 +101,6 @@ public class LuceneIndexEditorContext {
 
     private final IndexUpdateCallback updateCallback;
 
-    private boolean reindex;
-
     LuceneIndexEditorContext(NodeBuilder definition, Analyzer analyzer, IndexUpdateCallback updateCallback) {
         this.definitionBuilder = definition;
         this.definition = new IndexDefinition(definitionBuilder);
@@ -134,14 +132,6 @@ public class LuceneIndexEditorContext {
      * close writer if it's not null
      */
     void closeWriter() throws IOException {
-        //If reindex or fresh index and write is null on close
-        //it indicates that the index is empty. In such a case trigger
-        //creation of write such that an empty Lucene index state is persisted
-        //in directory
-        if (reindex && writer == null){
-            getWriter();
-        }
-
         if (writer != null) {
             writer.close();
 
@@ -152,10 +142,6 @@ public class LuceneIndexEditorContext {
             status.setProperty("lastUpdated", ISO8601.format(Calendar.getInstance()), Type.DATE);
             status.setProperty("indexedNodes",indexedNodes);
         }
-    }
-
-    public void enableReindexMode(){
-        reindex = true;
     }
 
     public long incIndexedNodes() {

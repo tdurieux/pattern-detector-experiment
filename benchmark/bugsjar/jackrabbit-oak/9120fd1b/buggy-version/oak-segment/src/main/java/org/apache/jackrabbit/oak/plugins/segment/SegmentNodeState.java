@@ -555,11 +555,9 @@ public class SegmentNodeState extends Record implements NodeState {
                 }
             }
         } else if (beforeChildName != Template.MANY_CHILD_NODES) {
-            boolean beforeChildStillExists = false;
             for (ChildNodeEntry entry
                     : afterTemplate.getChildNodeEntries(afterId)) {
                 String childName = entry.getName();
-                beforeChildStillExists |= childName.equals(beforeChildName);
                 NodeState afterChild = entry.getNodeState();
                 if (beforeChildName.equals(childName)) {
                     NodeState beforeChild =
@@ -576,13 +574,6 @@ public class SegmentNodeState extends Record implements NodeState {
                         }
                     }
                 } else if (!diff.childNodeAdded(childName, afterChild)) {
-                    return false;
-                }
-            }
-            if (!beforeChildStillExists) {
-                NodeState beforeChild =
-                        beforeTemplate.getChildNode(beforeChildName, beforeId);
-                if (!diff.childNodeDeleted(beforeChildName, beforeChild)) {
                     return false;
                 }
             }

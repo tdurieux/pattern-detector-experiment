@@ -16,6 +16,8 @@
  */
 package org.apache.commons.math3.geometry.enclosing;
 
+import java.util.List;
+
 import org.apache.commons.math3.geometry.Point;
 import org.apache.commons.math3.geometry.Space;
 
@@ -32,6 +34,6 @@ public interface Encloser<S extends Space, P extends Point<S>> {
      * @param points points to enclose
      * @return enclosing ball
      */
-    EnclosingBall<S, P> enclose(Iterable<P> points);
+    EnclosingBall<S, P> enclose(List<P> points);
 
 }

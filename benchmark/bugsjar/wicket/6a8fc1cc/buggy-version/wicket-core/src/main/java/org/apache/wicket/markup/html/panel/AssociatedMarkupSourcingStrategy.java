@@ -119,12 +119,6 @@ public abstract class AssociatedMarkupSourcingStrategy extends AbstractMarkupSou
 			return associatedMarkup;
 		}
 
-		associatedMarkup = searchMarkupInTransparentResolvers(parent, child);
-		if (associatedMarkup != null)
-		{
-			return associatedMarkup;
-		}
-
 		return findMarkupInAssociatedFileHeader(parent, child);
 	}
 

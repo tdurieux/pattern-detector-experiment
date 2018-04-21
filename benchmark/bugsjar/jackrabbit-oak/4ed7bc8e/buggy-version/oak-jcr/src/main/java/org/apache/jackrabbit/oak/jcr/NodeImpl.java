@@ -302,20 +302,19 @@ public class NodeImpl extends ItemImpl<NodeDelegate> implements Node {
      * @see Node#setProperty(String, javax.jcr.Value, int)
      */
     @Override
-    @Nonnull
+    @CheckForNull
     public Property setProperty(final String jcrName, final Value value, final int type)
             throws RepositoryException {
         checkStatus();
 
-        return sessionDelegate.perform(new SessionOperation<Property>() {
+        return sessionDelegate.perform(new SessionOperation<PropertyImpl>() {
             @Override
-            public Property perform() throws RepositoryException {
+            public PropertyImpl perform() throws RepositoryException {
+                String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
                 if (value == null) {
-                    Property property = getProperty(jcrName);
-                    property.remove();
-                    return property;
+                    dlg.removeProperty(oakName);
+                    return null;
                 } else {
-                    String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
                     int targetType = getTargetType(value, type);
                     Value targetValue =
                             ValueHelper.convert(value, targetType, getValueFactory());

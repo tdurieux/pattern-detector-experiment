@@ -121,7 +121,6 @@ public class VersionGarbageCollector {
             log.debug(sb.toString());
         }
         nodeStore.getDocumentStore().remove(Collection.NODES, docIdsToDelete);
-        nodeStore.invalidateDocChildrenCache();
         stats.deletedDocGCCount += docIdsToDelete.size();
     }
 

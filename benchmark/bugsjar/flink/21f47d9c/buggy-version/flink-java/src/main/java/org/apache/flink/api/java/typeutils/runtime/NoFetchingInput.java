@@ -21,7 +21,6 @@ package org.apache.flink.api.java.typeutils.runtime;
 import com.esotericsoftware.kryo.KryoException;
 import com.esotericsoftware.kryo.io.Input;
 
-import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 
@@ -74,7 +73,7 @@ public class NoFetchingInput extends Input {
 			count = fill(buffer, bytesRead, required - bytesRead);
 
 			if(count == -1){
-				throw new KryoException(new EOFException("No more bytes left."));
+				throw new KryoException("Buffer underflow");
 			}
 
 			bytesRead += count;
@@ -122,7 +121,7 @@ public class NoFetchingInput extends Input {
 				c = inputStream.read(bytes, offset+bytesRead, count-bytesRead);
 
 				if(c == -1){
-					throw new KryoException(new EOFException("No more bytes left."));
+					throw new KryoException("Buffer underflow");
 				}
 
 				bytesRead += c;

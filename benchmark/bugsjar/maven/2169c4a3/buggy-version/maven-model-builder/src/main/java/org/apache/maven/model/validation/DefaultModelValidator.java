@@ -181,11 +181,7 @@ public class DefaultModelValidator
                 validateBoolean( "dependencies.dependency.optional", problems, warnOnBadBoolean, d.getOptional(),
                                  d.getManagementKey() );
 
-                /*
-                 * TODO: Extensions like Flex Mojos use custom scopes like "merged", "internal", "external", etc. In
-                 * order to don't break backward-compat with those, only warn but don't error our.
-                 */
-                validateEnum( "dependencies.dependency.scope", problems, true, d.getScope(),
+                validateEnum( "dependencies.dependency.scope", problems, warnOnBadDependencyScope, d.getScope(),
                               d.getManagementKey(), "provided", "compile", "runtime", "test", "system" );
             }
         }

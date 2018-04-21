@@ -54,7 +54,7 @@ public class FileOperations implements GenericFileOperations<File> {
         this.endpoint = (FileEndpoint) endpoint;
     }
 
-    public boolean deleteFile(String name) throws GenericFileOperationFailedException {
+    public boolean deleteFile(String name) throws GenericFileOperationFailedException {        
         File file = new File(name);
         return FileUtil.deleteFile(file);
     }
@@ -71,7 +71,7 @@ public class FileOperations implements GenericFileOperations<File> {
     }
 
     public boolean buildDirectory(String directory, boolean absolute) throws GenericFileOperationFailedException {
-        ObjectHelper.notNull(endpoint, "endpoint");
+        ObjectHelper.notNull(endpoint, "endpoint");       
 
         // always create endpoint defined directory
         if (endpoint.isAutoCreate() && !endpoint.getFile().exists()) {
@@ -106,17 +106,12 @@ public class FileOperations implements GenericFileOperations<File> {
             }
         }
 
-        // We need to make sure that this is thread-safe and only one thread tries to create the path directory at the same time.
-        synchronized (this) {
-            if (path.isDirectory() && path.exists()) {
-                // the directory already exists
-                return true;
-            } else {
-                if (LOG.isTraceEnabled()) {
-                    LOG.trace("Building directory: " + path);
-                }
-                return path.mkdirs();
-            }
+        if (path.isDirectory() && path.exists()) {
+            // the directory already exists
+            return true;
+        } else {
+            LOG.trace("Building directory: {}", path);
+            return path.mkdirs();
         }
     }
 
@@ -157,9 +152,7 @@ public class FileOperations implements GenericFileOperations<File> {
         if (file.exists()) {
             if (endpoint.getFileExist() == GenericFileExist.Ignore) {
                 // ignore but indicate that the file was written
-                if (LOG.isTraceEnabled()) {
-                    LOG.trace("An existing file already exists: " + file + ". Ignore and do not override it.");
-                }
+                LOG.trace("An existing file already exists: {}. Ignore and do not override it.", file);
                 return true;
             } else if (endpoint.getFileExist() == GenericFileExist.Fail) {
                 throw new GenericFileOperationFailedException("File already exist: " + file + ". Cannot write new file.");
@@ -175,7 +168,7 @@ public class FileOperations implements GenericFileOperations<File> {
             // is the body file based
             File source = null;
             // get the File Object from in message
-            source = exchange.getIn().getBody(File.class);
+            source = exchange.getIn().getBody(File.class);            
 
             if (source != null) {
                 // okay we know the body is a file type
@@ -229,17 +222,13 @@ public class FileOperations implements GenericFileOperations<File> {
             }
             if (last != null) {
                 boolean result = file.setLastModified(last);
-                if (LOG.isTraceEnabled()) {
-                    LOG.trace("Keeping last modified timestamp: " + last + " on file: " + file + " with result: " + result);
-                }
+                LOG.trace("Keeping last modified timestamp: {} on file: {} with result: {}", new Object[]{last, file, result});
             }
         }
     }
 
     private boolean writeFileByLocalWorkPath(File source, File file) {
-        if (LOG.isTraceEnabled()) {
-            LOG.trace("Using local work file being renamed from: " + source + " to: " + file);
-        }
+        LOG.trace("Using local work file being renamed from: {} to: {}", source, file);
 
         return FileUtil.renameFile(source, file);
     }
@@ -250,9 +239,7 @@ public class FileOperations implements GenericFileOperations<File> {
         try {
             out = prepareOutputFileChannel(target, out);
 
-            if (LOG.isTraceEnabled()) {
-                LOG.trace("Using FileChannel to transfer from: " + in + " to: " + out);
-            }
+            LOG.trace("Using FileChannel to transfer from: {} to: {}", in, out);
 
             long size = in.size();
             long position = 0;
@@ -270,9 +257,7 @@ public class FileOperations implements GenericFileOperations<File> {
         try {
             out = prepareOutputFileChannel(target, out);
 
-            if (LOG.isTraceEnabled()) {
-                LOG.trace("Using InputStream to transfer from: " + in + " to: " + out);
-            }
+            LOG.trace("Using InputStream to transfer from: {} to: {}", in, out);
             int size = endpoint.getBufferSize();
             byte[] buffer = new byte[size];
             ByteBuffer byteBuffer = ByteBuffer.wrap(buffer);
@@ -292,7 +277,7 @@ public class FileOperations implements GenericFileOperations<File> {
 
     /**
      * Creates and prepares the output file channel. Will position itself in correct position if the file is writable
-     * eg. it should append or override any existing content.
+     *  eg. it should append or override any existing content.
      */
     private FileChannel prepareOutputFileChannel(File target, FileChannel out) throws IOException {
         if (endpoint.getFileExist() == GenericFileExist.Append) {

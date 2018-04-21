@@ -123,14 +123,14 @@ public final class PageParameters extends ValueMap
 				final String key = pair.substring(0, pos).trim();
 				final String value = pair.substring(pos + 1).trim();
 
-				add(key, value);
+				put(key, value);
 			}
 			else
 			{
 				final String key = pair.trim();
 				final String value = null;
 
-				add(key, value);
+				put(key, value);
 			}
 		}
 	}

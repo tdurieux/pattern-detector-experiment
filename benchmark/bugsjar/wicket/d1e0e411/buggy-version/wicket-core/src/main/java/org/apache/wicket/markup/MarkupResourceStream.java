@@ -45,9 +45,6 @@ public class MarkupResourceStream implements IResourceStream, IFixedLocationReso
 
 	private static final Logger log = LoggerFactory.getLogger(MarkupResourceStream.class);
 
-	/** */
-	public static final String WICKET_XHTML_DTD = "http://wicket.apache.org/dtds.data/wicket-xhtml1.4-strict.dtd";
-
 	private static final Pattern DOCTYPE_REGEX = Pattern.compile("!DOCTYPE\\s+(.*)\\s*");
 
 	/** The associated markup resource stream */
@@ -71,7 +68,10 @@ public class MarkupResourceStream implements IResourceStream, IFixedLocationReso
 	/** The encoding as found in <?xml ... encoding="" ?>. Null, else */
 	private String encoding;
 
-	/** Wicket namespace: see WICKET_XHTML_DTD */
+	/**
+	 * Wicket namespace: <html
+	 * xmlns:wicket="http://wicket.apache.org/dtds.data/wicket-xhtml1.3-strict.dtd>
+	 */
 	private String wicketNamespace;
 
 	/** == wicket namespace name + ":id" */

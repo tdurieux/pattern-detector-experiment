@@ -219,7 +219,7 @@ public class SegmentWriter {
                 data.put(buffer, buffer.length - length, length);
                 data.rewind();
             } else {
-                data = ByteBuffer.wrap(buffer, buffer.length - length, length);
+                data = ByteBuffer.wrap(buffer);
             }
             tracker.setSegment(id, new Segment(tracker, id, data));
 

@@ -935,16 +935,12 @@ public final class ExpressionBuilder {
     public static Expression convertToExpression(final Expression expression, final Class type) {
         return new ExpressionAdapter() {
             public Object evaluate(Exchange exchange) {
-                if (type != null) {
-                    return expression.evaluate(exchange, type);
-                } else {
-                    return expression;
-                }
+                return expression.evaluate(exchange, type);
             }
 
             @Override
             public String toString() {
-                return "" + expression;
+                return "" + expression + ".convertTo(" + type.getCanonicalName() + ".class)";
             }
         };
     }
@@ -956,17 +952,12 @@ public final class ExpressionBuilder {
     public static Expression convertToExpression(final Expression expression, final Expression type) {
         return new ExpressionAdapter() {
             public Object evaluate(Exchange exchange) {
-                Object result = type.evaluate(exchange, Object.class);
-                if (result != null) {
-                    return expression.evaluate(exchange, result.getClass());
-                } else {
-                    return expression;
-                }
+                return expression.evaluate(exchange, type.evaluate(exchange, Object.class).getClass());
             }
 
             @Override
             public String toString() {
-                return "" + expression;
+                return "" + expression + ".convertToEvaluatedType(" + type + ")";
             }
         };
     }

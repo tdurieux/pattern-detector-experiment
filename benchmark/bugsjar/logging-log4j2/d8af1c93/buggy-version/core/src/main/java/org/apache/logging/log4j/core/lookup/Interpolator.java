@@ -107,7 +107,7 @@ public class Interpolator implements StrLookup {
             if (value != null) {
                 return value;
             }
-            var = var.substring(prefixPos + 1);
+            var = var.substring(prefixPos);
         }
         if (defaultLookup != null) {
             return event == null ? defaultLookup.lookup(var) : defaultLookup.lookup(event, var);

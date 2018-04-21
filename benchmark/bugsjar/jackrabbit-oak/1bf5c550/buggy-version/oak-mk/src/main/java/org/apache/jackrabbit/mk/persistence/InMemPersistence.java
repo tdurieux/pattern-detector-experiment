@@ -42,6 +42,7 @@ public class InMemPersistence implements GCPersistence {
     private final Map<Id, byte[]> objects = Collections.synchronizedMap(new HashMap<Id, byte[]>());
     private final Map<Id, byte[]> marked = Collections.synchronizedMap(new HashMap<Id, byte[]>());
 
+    private Id head;
     private long gcStart;
 
     // TODO: make this configurable
@@ -52,13 +53,12 @@ public class InMemPersistence implements GCPersistence {
         // nothing to initialize
     }
     
-    @Override
-    public Id[] readIds() throws Exception {
-        return new Id[2];
+    public Id readHead() {
+        return head;
     }
 
     public void writeHead(Id id) {
-        
+        head = id;
     }
 
     public void readNode(StoredNode node) throws NotFoundException, Exception {

@@ -159,7 +159,7 @@ class UnsavedModifications {
         time = clock.getTime();
         Map<String, Revision> pending;
         try {
-            snapshot.acquiring(getMostRecentRevision());
+            snapshot.acquiring();
             pending = Maps.newTreeMap(PathComparator.INSTANCE);
             pending.putAll(map);
         } finally {
@@ -234,26 +234,14 @@ class UnsavedModifications {
         return map.toString();
     }
 
-    private Revision getMostRecentRevision() {
-        // use revision of root document
-        Revision rev = map.get("/");
-        // otherwise find most recent
-        if (rev == null) {
-            for (Revision r : map.values()) {
-                rev = Utils.max(rev, r);
-            }
-        }
-        return rev;
-    }
-
     public interface Snapshot {
 
         Snapshot IGNORE = new Snapshot() {
             @Override
-            public void acquiring(Revision mostRecent) {
+            public void acquiring() {
             }
         };
 
-        void acquiring(Revision mostRecent);
+        void acquiring();
     }
 }

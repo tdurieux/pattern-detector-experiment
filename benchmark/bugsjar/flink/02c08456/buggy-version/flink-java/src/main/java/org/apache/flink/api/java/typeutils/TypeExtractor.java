@@ -421,9 +421,12 @@ public class TypeExtractor {
 			Type[] tupleElements = ((ParameterizedType) inType).getActualTypeArguments();
 			// go thru all tuple elements and search for type variables
 			for(int i = 0; i < tupleElements.length; i++) {
-				info = createTypeInfoFromInput(returnTypeVar, returnTypeHierarchy, tupleElements[i], ((TupleTypeInfo<?>) inTypeInfo).getTypeAt(i));
-				if(info != null) {
-					break;
+				if(tupleElements[i] instanceof TypeVariable) {
+					inType = materializeTypeVariable(returnTypeHierarchy, (TypeVariable<?>) tupleElements[i]);
+					info = findCorrespondingInfo(returnTypeVar, inType, ((TupleTypeInfo<?>) inTypeInfo).getTypeAt(i));
+					if(info != null) {
+						break;
+					}
 				}
 			}
 		}

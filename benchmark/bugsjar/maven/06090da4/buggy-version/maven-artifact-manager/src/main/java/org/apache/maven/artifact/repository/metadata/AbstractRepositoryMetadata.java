@@ -113,16 +113,16 @@ public abstract class AbstractRepositoryMetadata
         {
             changed = metadata.merge( this.metadata );
         }
-
+        
         // beware meta-versions!
         String version = metadata.getVersion();
         if ( version != null && ( Artifact.LATEST_VERSION.equals( version ) || Artifact.RELEASE_VERSION.equals( version ) ) )
         {
             // meta-versions are not valid <version/> values...don't write them.
-            metadata.setVersion( null );
+            changed = false;
         }
 
-        if ( changed || !metadataFile.exists() )
+        if ( changed )
         {
             Writer writer = null;
             try

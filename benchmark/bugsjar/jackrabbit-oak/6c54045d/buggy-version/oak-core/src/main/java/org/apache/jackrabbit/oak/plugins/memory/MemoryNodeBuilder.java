@@ -190,18 +190,13 @@ public class MemoryNodeBuilder implements NodeBuilder {
 
     /**
      * Determine whether this child exists at its direct parent.
-     * @return {@code true} iff this child exists at its direct parent.
+     * @return  {@code true} iff this child exists at its direct parent.
      */
     private boolean exists() {
-        if (isRoot()) {
-            return true;
-        }
-        else if (parent.writeState == null) {
-            return parent.baseState != null && parent.baseState.hasChildNode(name);
-        }
-        else {
-            return parent.writeState.hasChildNode(name);
-        }
+        // No need to check the base state if write state is null. The fact that we have this
+        // builder instance proofs that this child existed at some point as it must have been
+        // retrieved from the base state.
+        return isRoot() || parent.writeState == null || parent.writeState.hasChildNode(name);
     }
 
     /**
@@ -211,19 +206,18 @@ public class MemoryNodeBuilder implements NodeBuilder {
     private boolean updateReadState() {
         if (revision != root.revision) {
             assert(!isRoot()); // root never gets here since revision == root.revision
-
-            if (parent.updateReadState() && exists()) {
-                // The builder could have been reset, need to re-get base state
-                baseState = parent.getBaseState(name);
-
-                // ... same for the write state
-                writeState = parent.getWriteState(name);
-
-                revision = root.revision;
-                return true;
+            if (!exists()) {
+                return false;
             }
+            parent.updateReadState();
 
-            return false;
+            // The builder could have been reset, need to re-get base state
+            baseState = parent.getBaseState(name);
+
+            // ... same for the write state
+            writeState = parent.getWriteState(name);
+
+            revision = root.revision;
         }
         return writeState != null || baseState != null;
     }
@@ -244,8 +238,8 @@ public class MemoryNodeBuilder implements NodeBuilder {
     private MutableNodeState write(long newRevision, boolean reconnect) {
         // make sure that all revision numbers up to the root gets updated
         if (!isRoot()) {
-            parent.write(newRevision, reconnect);
             checkState(reconnect || exists(), "This node has been removed");
+            parent.write(newRevision, reconnect);
         }
 
         if (writeState == null || revision != root.revision) {

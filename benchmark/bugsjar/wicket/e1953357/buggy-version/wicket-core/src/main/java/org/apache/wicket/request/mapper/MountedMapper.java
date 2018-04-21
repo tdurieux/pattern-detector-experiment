@@ -385,7 +385,7 @@ public class MountedMapper extends AbstractBookmarkableMapper
 					handler.getBehaviorIndex());
 				PageComponentInfo pageComponentInfo = new PageComponentInfo(pageInfo, componentInfo);
 				UrlInfo urlInfo = new UrlInfo(pageComponentInfo, page.getClass(),
-					page.getPageParameters());
+					handler.getPageParameters());
 				url = buildUrl(urlInfo);
 			}
 		}

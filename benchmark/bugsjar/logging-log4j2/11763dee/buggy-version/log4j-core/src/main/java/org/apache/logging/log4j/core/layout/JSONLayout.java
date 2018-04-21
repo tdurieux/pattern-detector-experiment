@@ -189,7 +189,7 @@ public class JSONLayout extends AbstractStringLayout {
             if (jsonSupported) {
                 buf.append(((MultiformatMessage) msg).getFormattedMessage(FORMATS));
             } else {
-                buf.append(Transform.escapeJsonControlCharacters(event.getMessage().getFormattedMessage()));
+                Transform.appendEscapingCDATA(buf, event.getMessage().getFormattedMessage());
             }
             buf.append('\"');
         }
@@ -198,7 +198,7 @@ public class JSONLayout extends AbstractStringLayout {
             buf.append(",");
             buf.append(this.eol);
             buf.append("\"ndc\":");
-            buf.append(Transform.escapeJsonControlCharacters(event.getContextStack().toString()));
+            Transform.appendEscapingCDATA(buf, event.getContextStack().toString());
             buf.append("\"");
         }
 

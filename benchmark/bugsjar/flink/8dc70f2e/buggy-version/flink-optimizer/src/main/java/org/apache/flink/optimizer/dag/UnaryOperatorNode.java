@@ -18,12 +18,10 @@
 
 package org.apache.flink.optimizer.dag;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import org.apache.flink.api.common.operators.SemanticProperties;
-import org.apache.flink.api.common.operators.SingleInputOperator;
 import org.apache.flink.api.common.operators.SingleInputSemanticProperties;
 import org.apache.flink.api.common.operators.util.FieldSet;
 import org.apache.flink.optimizer.DataStatistics;
@@ -32,17 +30,11 @@ import org.apache.flink.optimizer.operators.OperatorDescriptorSingle;
 
 public class UnaryOperatorNode extends SingleInputNode {
 	
-	private final List<OperatorDescriptorSingle> operators;
+	private final List<OperatorDescriptorSingle> operator;
 	
 	private final String name;
 
-	public UnaryOperatorNode(String name, SingleInputOperator<?, ?, ?> operator, boolean onDynamicPath) {
-		super(operator);
 
-		this.name = name;
-		this.operators = new ArrayList<>();
-		this.onDynamicPath = onDynamicPath;
-	}
 	
 	public UnaryOperatorNode(String name, FieldSet keys, OperatorDescriptorSingle ... operators) {
 		this(name, keys, Arrays.asList(operators));
@@ -51,13 +43,13 @@ public class UnaryOperatorNode extends SingleInputNode {
 	public UnaryOperatorNode(String name, FieldSet keys, List<OperatorDescriptorSingle> operators) {
 		super(keys);
 		
-		this.operators = operators;
+		this.operator = operators;
 		this.name = name;
 	}
 
 	@Override
 	protected List<OperatorDescriptorSingle> getPossibleProperties() {
-		return this.operators;
+		return this.operator;
 	}
 
 	@Override

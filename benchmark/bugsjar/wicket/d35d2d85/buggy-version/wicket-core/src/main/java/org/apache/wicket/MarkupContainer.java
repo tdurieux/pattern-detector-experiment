@@ -40,11 +40,10 @@ import org.apache.wicket.model.IComponentInheritedModel;
 import org.apache.wicket.model.IModel;
 import org.apache.wicket.model.IWrapModel;
 import org.apache.wicket.settings.IDebugSettings;
-import org.apache.wicket.util.io.IClusterable;
 import org.apache.wicket.util.iterator.ComponentHierarchyIterator;
 import org.apache.wicket.util.lang.Args;
 import org.apache.wicket.util.lang.Generics;
-import org.apache.wicket.core.util.string.ComponentStrings;
+import org.apache.wicket.util.string.ComponentStrings;
 import org.apache.wicket.util.string.Strings;
 import org.apache.wicket.util.visit.ClassVisitFilter;
 import org.apache.wicket.util.visit.IVisit;
@@ -56,8 +55,8 @@ import org.slf4j.LoggerFactory;
 /**
  * A MarkupContainer holds a map of child components.
  * <ul>
- * <li><b>Children </b>- Children can be added by calling the {@link #add(Component...)} method, and they can be looked
- * up using a colon separated path. For example, if a container called "a" held a nested container "b" which
+ * <li><b>Children </b>- Children can be added by calling the add() method, and they can be looked
+ * up using a dotted path. For example, if a container called "a" held a nested container "b" which
  * held a nested component "c", then a.get("b:c") would return the Component with id "c". The number
  * of children in a MarkupContainer can be determined by calling size(), and the whole hierarchy of
  * children held by a MarkupContainer can be traversed by calling visitChildren(), passing in an
@@ -74,19 +73,19 @@ import org.slf4j.LoggerFactory;
  * graphic designers may be setting attributes on component tags that affect visual presentation.
  * <p>
  * The type of markup held in a given container subclass can be determined by calling
- * {@link #getMarkupType()}. Markup is accessed via a MarkupStream object which allows a component to
+ * getMarkupType(). Markup is accessed via a MarkupStream object which allows a component to
  * traverse ComponentTag and RawMarkup MarkupElements while rendering a response. Markup in the
  * stream may be HTML or some other kind of markup, such as VXML, as determined by the specific
  * container subclass.
  * <p>
  * A markup stream may be directly associated with a container via setMarkupStream. However, a
  * container which does not have a markup stream (its getMarkupStream() returns null) may inherit a
- * markup stream from a container above it in the component hierarchy. The {@link #findMarkupStream()} method
+ * markup stream from a container above it in the component hierarchy. The findMarkupStream() method
  * will locate the first container at or above this container which has a markup stream.
  * <p>
  * All Page containers set a markup stream before rendering by calling the method
- * {@link #getAssociatedMarkupStream(boolean)} to load the markup associated with the page. Since Page is at the top
- * of the container hierarchy, it is guaranteed that {@link #findMarkupStream()} will always return a valid
+ * getAssociatedMarkupStream() to load the markup associated with the page. Since Page is at the top
+ * of the container hierarchy, it is guaranteed that findMarkupStream will always return a valid
  * markup stream.
  * 
  * @see MarkupStream
@@ -123,7 +122,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 * Adds a child component to this container.
 	 * 
 	 * @param childs
-	 *            The child(ren) to add.
+	 *            The child(s)
 	 * @throws IllegalArgumentException
 	 *             Thrown if a child with the same id is replaced by the add operation.
 	 * @return This
@@ -174,6 +173,48 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			{
 				throw new IllegalArgumentException(exceptionMessage("A child with id '" +
 					child.getId() + "' already exists"));
+			}
+
+			// One of the key pre-requisites to successfully load markup, is the availability of the
+			// file extension. Which in turn is part of MarkupType which by default requires the
+			// Page.
+			if (getMarkupType() != null)
+			{
+				// Check if the markup is available after the child has been added to the parent
+				try
+				{
+					// If not yet triggered, then do now (e.g. Pages)
+					if (getMarkup() != null)
+					{
+						internalOnMarkupAttached();
+					}
+
+					if (child.getMarkup() != null)
+					{
+						child.internalOnMarkupAttached();
+
+						// Tell all children of "component" as well
+						if (child instanceof MarkupContainer)
+						{
+							MarkupContainer container = (MarkupContainer)child;
+							container.visitChildren(new IVisitor<Component, Void>()
+							{
+								public void component(final Component component,
+									final IVisit<Void> visit)
+								{
+									if (component.internalOnMarkupAttached())
+									{
+										visit.dontGoDeeper();
+									}
+								}
+							});
+						}
+					}
+				}
+				catch (WicketRuntimeException exception)
+				{
+					// ignore
+				}
 			}
 		}
 		return this;
@@ -494,26 +535,22 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	/**
 	 * @return Iterator that iterates through children in the order they were added
 	 */
-	@Override
 	public Iterator<Component> iterator()
 	{
 		return new Iterator<Component>()
 		{
 			int index = 0;
 
-			@Override
 			public boolean hasNext()
 			{
 				return index < children_size();
 			}
 
-			@Override
 			public Component next()
 			{
 				return children_get(index++);
 			}
 
-			@Override
 			public void remove()
 			{
 				final Component removed = children_remove(--index);
@@ -566,7 +603,10 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	{
 		checkHierarchyChange(component);
 
-		Args.notNull(component, "component");
+		if (component == null)
+		{
+			throw new IllegalArgumentException("argument component may not be null");
+		}
 
 		children_remove(component);
 		removedComponent(component);
@@ -583,7 +623,10 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 */
 	public MarkupContainer remove(final String id)
 	{
-		Args.notNull(id, "id");
+		if (id == null)
+		{
+			throw new IllegalArgumentException("argument id may not be null");
+		}
 
 		final Component component = get(id);
 		if (component != null)
@@ -745,11 +788,11 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			// first remove the component.
 			removedComponent(replaced);
 
-			// The generated markup id remains the same
-			child.setMarkupId(replaced);
-
 			// then add the other one.
 			addedComponent(child);
+
+			// The generated markup id remains the same
+			child.setMarkupId(replaced);
 		}
 
 		return this;
@@ -767,7 +810,6 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		{
 			visitChildren(new IVisitor<Component, Void>()
 			{
-				@Override
 				public void component(final Component component, final IVisit<Void> visit)
 				{
 					IModel<?> compModel = component.getDefaultModel();
@@ -818,26 +860,32 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	public String toString(final boolean detailed)
 	{
 		final StringBuilder buffer = new StringBuilder();
-		buffer.append('[').append(this.getClass().getSimpleName()).append(' ');
+		buffer.append("[").append(this.getClass().getSimpleName()).append(" ");
 		buffer.append(super.toString(detailed));
-		if (detailed && children_size() != 0)
+		if (detailed)
 		{
-
-			buffer.append(", children = ");
-
-			// Loop through child components
-			final int size = children_size();
-			for (int i = 0; i < size; i++)
+			if (getMarkup() != null)
 			{
-				// Get next child
-				final Component child = children_get(i);
-				if (i != 0)
-				{
-					buffer.append(' ');
-				}
-				buffer.append(child.toString());
+				buffer.append(", markup = ").append(new MarkupStream(getMarkup()).toString());
 			}
 
+			if (children_size() != 0)
+			{
+				buffer.append(", children = ");
+
+				// Loop through child components
+				final int size = children_size();
+				for (int i = 0; i < size; i++)
+				{
+					// Get next child
+					final Component child = children_get(i);
+					if (i != 0)
+					{
+						buffer.append(' ');
+					}
+					buffer.append(child.toString());
+				}
+			}
 		}
 		buffer.append(']');
 		return buffer.toString();
@@ -960,7 +1008,6 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		super.fireInitialize();
 		visitChildren(new IVisitor<Component, Void>()
 		{
-			@Override
 			public void component(final Component component, final IVisit<Void> visit)
 			{
 				component.fireInitialize();
@@ -1012,6 +1059,27 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	}
 
 	/**
+	 * If the given object is a {@link ComponentSourceEntry} instance and <code>reconstruct</code>
+	 * is true, it reconstructs the component and returns it. Otherwise it just returns the object
+	 * passed as parameter
+	 * 
+	 * @param object
+	 * @param reconstruct
+	 * @param parent
+	 * @param index
+	 * @return The object directly or the reconstructed component
+	 */
+	private final Object postprocess(Object object, boolean reconstruct, MarkupContainer parent,
+		int index)
+	{
+		if (reconstruct && object instanceof ComponentSourceEntry)
+		{
+			object = ((ComponentSourceEntry)object).reconstruct(parent, index);
+		}
+		return object;
+	}
+
+	/**
 	 * 
 	 * @param index
 	 * @param reconstruct
@@ -1029,7 +1097,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 					throw new ArrayIndexOutOfBoundsException("index " + index +
 						" is greater then 0");
 				}
-				component = children;
+				component = postprocess(children, reconstruct, this, 0);
 				if (children != component)
 				{
 					children = component;
@@ -1048,23 +1116,32 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 					// we have a object array
 					children = (Object[])this.children;
 				}
-				component = children[index];
+				component = postprocess(children[index], reconstruct, this, index);
+				if (children[index] != component)
+				{
+					children[index] = component;
+				}
 			}
 		}
 		return component;
 	}
 
 	/**
-	 * Returns the wicket:id of the given object if it is a {@link Component}
+	 * Returns the wicket:id of the given object, that can be either a {@link Component} or a
+	 * {@link ComponentSourceEntry}
 	 * 
 	 * @param object
-	 * @return The id of the object (object can be component)
+	 * @return The id of the object (object can be component or componentsourcentry)
 	 */
 	private final String getId(Object object)
 	{
 		if (object instanceof Component)
 		{
 			return ((Component)object).getId();
+		}
+		else if (object instanceof ComponentSourceEntry)
+		{
+			return ((ComponentSourceEntry)object).id;
 		}
 		else
 		{
@@ -1088,7 +1165,11 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		{
 			if (getId(children).equals(id))
 			{
-				component = (Component)children;
+				component = (Component)postprocess(children, true, this, 0);
+				if (children != component)
+				{
+					children = component;
+				}
 			}
 		}
 		else
@@ -1109,7 +1190,11 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			{
 				if (getId(children[i]).equals(id))
 				{
-					component = (Component)children[i];
+					component = (Component)postprocess(children[i], true, this, i);
+					if (children[i] != component)
+					{
+						children[i] = component;
+					}
 					break;
 				}
 			}
@@ -1188,11 +1273,11 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			return null;
 		}
 
-		if (children instanceof Component)
+		if (children instanceof Component || children instanceof ComponentSourceEntry)
 		{
 			if (index == 0)
 			{
-				final Component removed = (Component)children;
+				final Component removed = (Component)postprocess(children, true, null, -1);
 				children = null;
 				return removed;
 			}
@@ -1221,7 +1306,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 					{
 						throw new IndexOutOfBoundsException();
 					}
-					return (Component)removed;
+					return (Component)postprocess(removed, true, null, -1);
 				}
 				children = new ChildList(children);
 			}
@@ -1232,7 +1317,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			{
 				children = lst.get(0);
 			}
-			return (Component)removed;
+			return (Component)postprocess(removed, true, null, -1);
 		}
 	}
 
@@ -1248,7 +1333,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		Object replaced;
 		if (index >= 0 && index < children_size())
 		{
-			if (children instanceof Component)
+			if (children instanceof Component || children instanceof ComponentSourceEntry)
 			{
 				replaced = children;
 				children = child;
@@ -1271,7 +1356,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		{
 			throw new IndexOutOfBoundsException();
 		}
-		return replaced;
+		return postprocess(replaced, reconstruct, null, -1);
 	}
 
 	/**
@@ -1297,7 +1382,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		}
 		else
 		{
-			if (children instanceof Component)
+			if (children instanceof Component || children instanceof ComponentSourceEntry)
 			{
 				return 1;
 			}
@@ -1352,7 +1437,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	}
 
 	/**
-	 * THIS METHOD IS NOT PART OF THE WICKET PUBLIC API. DO NOT USE OR OVERWRITE IT.
+	 * THIS METHOD IS NOT PART OF THE WICKET PUBLIC API. DO NOT USE IT.
 	 * 
 	 * Renders the next element of markup in the given markup stream.
 	 * 
@@ -1360,7 +1445,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	 *            The markup stream
 	 * @return true, if element was rendered as RawMarkup
 	 */
-	protected boolean renderNext(final MarkupStream markupStream)
+	protected final boolean renderNext(final MarkupStream markupStream)
 	{
 		// Get the current markup element
 		final MarkupElement element = markupStream.get();
@@ -1414,7 +1499,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 						markupStream.throwMarkupException("Failed to handle: " +
 							tag.toString() +
 							". It might be that no resolver has been registered to handle this special tag. " +
-							" But it also could be that you declared wicket:id=" + id +
+							" But it also be that you declared wicket:id=" + id +
 							" in your markup, but that you either did not add the " +
 							"component to your page at all, or that the hierarchy does not match.");
 					}
@@ -1459,7 +1544,6 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		{
 			page.visitChildren(new IVisitor<Component, Void>()
 			{
-				@Override
 				public void component(Component component, IVisit<Void> visit)
 				{
 					if (Strings.getLevenshteinDistance(id.toLowerCase(), component.getId()
@@ -1562,7 +1646,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 			// Go back to where we were and move the markup stream forward to whatever the next
 			// element is.
 			markupStream.setCurrentIndex(index);
-
+			MarkupElement elem = markupStream.get();
 			if (rawMarkup)
 			{
 				markupStream.next();
@@ -1576,6 +1660,26 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 				throw new WicketRuntimeException("Ups. This should never happen. " +
 					markupStream.toString());
 			}
+		}
+	}
+
+	/**
+	 * 
+	 */
+	private static class ComponentSourceEntry extends org.apache.wicket.ComponentSourceEntry
+	{
+		private ComponentSourceEntry(MarkupContainer container, Component component,
+			IComponentSource componentSource)
+		{
+			super(container, component, componentSource);
+		}
+
+		private static final long serialVersionUID = 1L;
+
+		@Override
+		protected void setChild(MarkupContainer parent, int index, Component child)
+		{
+			parent.children_set(index, child, false);
 		}
 	}
 
@@ -1632,7 +1736,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 
 	/**
 	 * 
-	 * @see org.apache.wicket.Component#internalMarkRendering(boolean)
+	 * @see org.apache.wicket.Component#internalMarkRendering()
 	 */
 	@Override
 	void internalMarkRendering(boolean setRenderingFlag)
@@ -1708,7 +1812,6 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		super.onEnabledStateChanged();
 		visitChildren(new IVisitor<Component, Void>()
 		{
-			@Override
 			public void component(Component component, IVisit<Void> visit)
 			{
 				component.clearEnabledInHierarchyCache();
@@ -1722,7 +1825,6 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 		super.onVisibleStateChanged();
 		visitChildren(new IVisitor<Component, Void>()
 		{
-			@Override
 			public void component(Component component, IVisit<Void> visit)
 			{
 				component.clearVisibleInHierarchyCache();
@@ -1733,12 +1835,42 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	@Override
 	protected void onAfterRenderChildren()
 	{
+		// Loop through child components
 		for (Component child : this)
 		{
-			// set RENDERING_FLAG to false for auto-component's children (like Enclosure)
-			child.markRendering(false);
+			// Call end request on the child
+			child.afterRender();
 		}
+
 		super.onAfterRenderChildren();
+	}
+
+	/**
+	 * @return True if this markup container has associated markup
+	 */
+	public boolean hasAssociatedMarkup()
+	{
+		return getAssociatedMarkup() != null;
+	}
+
+	/**
+	 * @see org.apache.wicket.Component#setRenderAllowed()
+	 */
+	@Override
+	void setRenderAllowed()
+	{
+		super.setRenderAllowed();
+
+		visitChildren(new IVisitor<Component, Void>()
+		{
+			public void component(final Component component, final IVisit<Void> visit)
+			{
+				// Find out if this component can be rendered
+				final boolean renderAllowed = component.isActionAuthorized(RENDER);
+				// Authorize rendering
+				component.setRenderAllowed(renderAllowed);
+			}
+		});
 	}
 
 	/**
@@ -1902,9 +2034,20 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	}
 
 	/**
+	 * @see org.apache.wicket.Component#onMarkupAttached()
+	 */
+	@Override
+	protected void onMarkupAttached()
+	{
+		super.onMarkupAttached();
+
+		// createAndAddComponentsForWicketTags();
+	}
+
+
+	/**
 	 * Automatically create components for <wicket:xxx> tag.
 	 */
-	// to use it call it from #onInitialize()
 	private void createAndAddComponentsForWicketTags()
 	{
 		// Markup must be available

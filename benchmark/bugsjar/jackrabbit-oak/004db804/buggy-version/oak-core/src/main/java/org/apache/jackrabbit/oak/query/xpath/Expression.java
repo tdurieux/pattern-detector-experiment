@@ -17,8 +17,6 @@
 package org.apache.jackrabbit.oak.query.xpath;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
 
 import org.apache.jackrabbit.oak.query.SQL2Parser;
 import org.apache.jackrabbit.util.ISO9075;
@@ -48,15 +46,6 @@ abstract class Expression {
     }
     
     /**
-     * Get the optimized expression.
-     * 
-     * @return the optimized expression
-     */
-    Expression optimize() {
-        return this;
-    }
-
-    /**
      * Whether this is a condition.
      * 
      * @return true if it is 
@@ -65,43 +54,6 @@ abstract class Expression {
         return false;
     }
     
-    /**
-     * Whether this is a or contains a full-text condition.
-     * 
-     * @return true if it is
-     */
-    boolean containsFullTextCondition() {
-        return false;
-    }
-    
-    /**
-     * Get the left-hand-side expression for equality conditions. 
-     * For example, for x=1, it is x. If it is not equality, return null.
-     * 
-     * @return the left-hand-side expression, or null
-     */        
-    String getCommonLeftPart() {
-        return null;
-    }
-    
-    /**
-     * Get the left hand side of an expression.
-     * 
-     * @return the left hand side
-     */
-    Expression getLeft() {
-        return null;
-    }
-    
-    /**
-     * Get the list of the right hand side of an expression.
-     * 
-     * @return the list
-     */
-    List<Expression> getRight() {
-        return null;
-    }
-
     /**
      * Pull an OR condition up to the right hand side of an AND condition.
      * 
@@ -204,23 +156,18 @@ abstract class Expression {
         int getPrecedence() {
             return precedence;
         }
-             
-        @Override
-        String getCommonLeftPart() {
+        
+        /**
+         * Get the left-hand-side expression for equality conditions. 
+         * For example, for x=1, it is x. If it is not equality, return null.
+         * 
+         * @return the left-hand-side expression, or null
+         */        
+        public String getCommonLeftPart() {
             if (!"=".equals(operator)) {
                 return null;
             }
             return left.toString();
-        }
-        
-        @Override
-        Expression getLeft() {
-            return left;
-        }
-        
-        @Override
-        List<Expression> getRight() {
-            return Collections.singletonList(right);
         }
     
         @Override
@@ -275,11 +222,6 @@ abstract class Expression {
         boolean isCondition() {
             return true;
         }
-        
-        @Override
-        Expression optimize() {
-            return this;
-        }
     
     }
     
@@ -301,86 +243,15 @@ abstract class Expression {
          */
         @Override
         public String getCommonLeftPart() {
-            String l = left.getCommonLeftPart();
-            String r = right.getCommonLeftPart();
-            if (l != null && r != null && l.equals(r)) {
-                return l;
+            if (left instanceof Condition && right instanceof Condition) {
+                String l = ((Condition) left).getCommonLeftPart();
+                String r = ((Condition) right).getCommonLeftPart();
+                if (l != null && r != null && l.equals(r)) {
+                    return l;
+                }
             }
             return null;
         }
-        
-        @Override
-        Expression optimize() {
-            Expression l = left.optimize();
-            Expression r = right.optimize();
-            if (l != left || r != right) {
-                return new OrCondition(l, r).optimize();
-            }
-            String commonLeft = getCommonLeftPart();
-            if (commonLeft == null) {
-                return this;
-            }
-            // "@x = 1 or @x = 2" is converted to "@x in (1, 2)"
-            ArrayList<Expression> list = new ArrayList<Expression>();
-            list.addAll(left.getRight());
-            list.addAll(right.getRight());
-            Expression le = left.getLeft();
-            InCondition in = new InCondition(le, list);
-            return in.optimize();
-        }
-        
-        @Override
-        boolean containsFullTextCondition() {
-            return left.containsFullTextCondition() || right.containsFullTextCondition();
-        }
-        
-    }
-    
-    /**
-     * An "or" condition.
-     */
-    static class InCondition extends Expression {
-
-        final Expression left;
-        final List<Expression> list;
-        
-        InCondition(Expression left, List<Expression> list) {
-            this.left = left;
-            this.list = list;
-        }
-        
-        @Override
-        String getCommonLeftPart() {
-            return left.toString();
-        }
-        
-        @Override
-        Expression getLeft() {
-            return left;
-        }
-        
-        @Override
-        List<Expression> getRight() {
-            return list;
-        }
-    
-        @Override
-        public String toString() {
-            StringBuilder buff = new StringBuilder();
-            buff.append(left).append(" in(");
-            for (int i = 0; i < list.size(); i++) {
-                if (i > 0) {
-                    buff.append(", ");
-                }
-                buff.append(list.get(i));
-            }
-            return buff.append(')').toString();
-        }
-    
-        @Override
-        boolean isCondition() {
-            return true;
-        }        
         
     }
     
@@ -391,16 +262,6 @@ abstract class Expression {
 
         AndCondition(Expression left, Expression right) {
             super(left, "and", right, Expression.PRECEDENCE_AND);
-        }
-
-        @Override
-        Expression optimize() {
-            Expression l = left.optimize();
-            Expression r = right.optimize();
-            if (l != left || r != right) {
-                return new AndCondition(l, r);
-            }
-            return this;
         }
         
         @Override
@@ -422,11 +283,6 @@ abstract class Expression {
                 return new AndCondition(right, left).pullOrRight();
             }
             return this;
-        }
-        
-        @Override
-        boolean containsFullTextCondition() {
-            return left.containsFullTextCondition() || right.containsFullTextCondition();
         }
         
     }
@@ -464,11 +320,6 @@ abstract class Expression {
         }
         
         @Override
-        boolean containsFullTextCondition() {
-            return true;
-        }
-        
-        @Override
         boolean isName() {
             return left.isName();
         }
@@ -499,11 +350,6 @@ abstract class Expression {
     
         @Override
         boolean isCondition() {
-            return true;
-        }
-
-        @Override
-        boolean containsFullTextCondition() {
             return true;
         }
         
@@ -674,5 +520,5 @@ abstract class Expression {
         }
     
     }
-
+    
 }

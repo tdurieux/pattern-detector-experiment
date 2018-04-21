@@ -136,12 +136,12 @@ public interface OrderedIndex {
      *  <dt>lane 3:</dt> <dd>0.1%</dd>
      * </dl>
      */
-    double DEFAULT_PROBABILITY = Integer.getInteger("oak.orderedIndex.prob", 3) / 10.0;
+    double DEFAULT_PROBABILITY = 0.1;
     
     /**
      * the number of lanes used in the SkipList 
      */
-    int LANES = Integer.getInteger("oak.orderedIndex.lanes", 15);
+    int LANES = 4;
     
     /**
      * Convenience Predicate that will force the implementor to expose what we're searching for

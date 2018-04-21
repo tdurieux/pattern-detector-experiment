@@ -32,10 +32,6 @@ import org.apache.camel.util.ExchangeHelper;
  * @version 
  */
 public class SedaProducer extends DefaultAsyncProducer {
-    /**
-     * @deprecated Better make use of the {@link SedaEndpoint#getQueue()} API which delivers the accurate reference to the queue currently being used.
-     */
-    @Deprecated
     protected final BlockingQueue<Exchange> queue;
     private final SedaEndpoint endpoint;
     private final WaitForTaskToComplete waitForTaskToComplete;
@@ -43,24 +39,17 @@ public class SedaProducer extends DefaultAsyncProducer {
     private final boolean blockWhenFull;
 
     /**
-     * @deprecated Use {@link #SedaProducer(SedaEndpoint, WaitForTaskToComplete, long, boolean) the other constructor}.
+     * @deprecated use the other constructor
      */
     @Deprecated
     public SedaProducer(SedaEndpoint endpoint, BlockingQueue<Exchange> queue, WaitForTaskToComplete waitForTaskToComplete, long timeout) {
-        this(endpoint, waitForTaskToComplete, timeout, false);
+        this(endpoint, queue, waitForTaskToComplete, timeout, false);
     }
-
-    /**
-     * @deprecated Use {@link #SedaProducer(SedaEndpoint, WaitForTaskToComplete, long, boolean) the other constructor}.
-     */
-    @Deprecated
-    public SedaProducer(SedaEndpoint endpoint, BlockingQueue<Exchange> queue, WaitForTaskToComplete waitForTaskToComplete, long timeout, boolean blockWhenFull) {
-        this(endpoint, waitForTaskToComplete, timeout, blockWhenFull);
-    }
-
-    public SedaProducer(SedaEndpoint endpoint, WaitForTaskToComplete waitForTaskToComplete, long timeout, boolean blockWhenFull) {
+    
+    public SedaProducer(SedaEndpoint endpoint, BlockingQueue<Exchange> queue, WaitForTaskToComplete waitForTaskToComplete,
+                        long timeout, boolean blockWhenFull) {
         super(endpoint);
-        this.queue = endpoint.getQueue();
+        this.queue = queue;
         this.endpoint = endpoint;
         this.waitForTaskToComplete = waitForTaskToComplete;
         this.timeout = timeout;
@@ -136,7 +125,7 @@ public class SedaProducer extends DefaultAsyncProducer {
                 if (!done) {
                     exchange.setException(new ExchangeTimedOutException(exchange, timeout));
                     // remove timed out Exchange from queue
-                    endpoint.getQueue().remove(copy);
+                    queue.remove(copy);
                     // count down to indicate timeout
                     latch.countDown();
                 }
@@ -194,7 +183,6 @@ public class SedaProducer extends DefaultAsyncProducer {
      * @param exchange the exchange to add to the queue
      */
     protected void addToQueue(Exchange exchange) {
-        BlockingQueue<Exchange> queue = endpoint.getQueue();
         if (blockWhenFull) {
             try {
                 queue.put(exchange);

@@ -18,7 +18,6 @@
 package org.apache.commons.math.linear;
 
 import java.util.Iterator;
-import java.util.NoSuchElementException;
 
 import org.apache.commons.math.FunctionEvaluationException;
 import org.apache.commons.math.MathRuntimeException;
@@ -876,23 +875,34 @@ public abstract class AbstractRealVector implements RealVector {
         /** Dimension of the vector. */
         private final int dim;
 
-        /** last entry returned by {@link #next()} */
+        /** Temporary entry (reused on each call to {@link #next()}. */
+        private EntryImpl tmp = new EntryImpl();
+
+        /** Current entry. */
         private EntryImpl current;
 
-        /** Next entry for {@link #next()} to return. */
+        /** Next entry. */
         private EntryImpl next;
 
         /** Simple constructor. */
         protected SparseEntryIterator() {
             dim = getDimension();
             current = new EntryImpl();
-            next = new EntryImpl();
-            if(next.getValue() == 0){
-            	advance(next);
+            if (current.getValue() == 0) {
+                advance(current);
+            }
+            if(current.getIndex() >= 0){
+                // There is at least one non-zero entry
+                next = new EntryImpl();
+                next.setIndex(current.getIndex());
+                advance(next);
+            } else {
+                // The vector consists of only zero entries, so deny having a next
+                current = null;
             }
         }
 
-        /** Advance an entry up to the next nonzero one.
+        /** Advance an entry up to the next non null one.
          * @param e entry to advance
          */
         protected void advance(EntryImpl e) {
@@ -909,18 +919,22 @@ public abstract class AbstractRealVector implements RealVector {
 
         /** {@inheritDoc} */
         public boolean hasNext() {
-            return next.getIndex() >= 0;
+            return current != null;
         }
 
         /** {@inheritDoc} */
         public Entry next() {
-        	int index = next.getIndex();
-        	if(index < 0){
-        		throw new NoSuchElementException();
-        	}
-        	current.setIndex(index);
-        	advance(next);
-        	return current;
+            tmp.setIndex(current.getIndex());
+            if (next != null) {
+                current.setIndex(next.getIndex());
+                advance(next);
+                if (next.getIndex() < 0) {
+                    next = null;
+                }
+            } else {
+                current = null;
+            }
+            return tmp;
         }
 
         /** {@inheritDoc} */

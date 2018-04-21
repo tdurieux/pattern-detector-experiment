@@ -180,36 +180,22 @@ public class Enclosure extends WebMarkupContainer
 		}
 	}
 
-	/**
-	 * 
-	 * @param container
-	 * @param markupStream
-	 * @param enclosureOpenTag
-	 */
 	private void applyEnclosureVisibilityToChildren(final MarkupContainer container,
-		final MarkupStream markupStream, final ComponentTag enclosureOpenTag)
+		final MarkupStream markupStream, ComponentTag enclosureOpenTag)
 	{
 		DirectChildTagIterator it = new DirectChildTagIterator(markupStream, enclosureOpenTag);
 		while (it.hasNext())
 		{
 			final ComponentTag tag = it.next();
-			if (tag.isAutoComponentTag() == false)
-			{
-				final Component child = container.get(tag.getId());
-
-				// record original visiblity allowed value, will restore later
-				changes.put(child, child.isVisibilityAllowed());
-				child.setVisibilityAllowed(isVisible());
-			}
+			final Component child = container.get(tag.getId());
+			// record original visiblity allowed value, will restore later
+			changes.put(child, child.isVisibilityAllowed());
+			child.setVisibilityAllowed(isVisible());
 		}
 		it.rewind();
 	}
 
-	/**
-	 * 
-	 * @param controller
-	 */
-	private void checkChildComponent(final Component controller)
+	private void checkChildComponent(Component controller)
 	{
 		if (controller == null)
 		{
@@ -223,12 +209,6 @@ public class Enclosure extends WebMarkupContainer
 		}
 	}
 
-	/**
-	 * 
-	 * @param container
-	 * @param markupStream
-	 * @param enclosureOpenTag
-	 */
 	private void ensureAllChildrenPresent(final MarkupContainer container,
 		final MarkupStream markupStream, ComponentTag enclosureOpenTag)
 	{
@@ -237,50 +217,43 @@ public class Enclosure extends WebMarkupContainer
 		{
 			final ComponentTag tag = it.next();
 
-			if (tag.isAutoComponentTag() == false)
+			Component child = container.get(tag.getId());
+			if (child == null)
 			{
-				Component child = container.get(tag.getId());
-				if (child == null)
+				// component does not yet exist in the container, attempt to resolve it using
+				// resolvers
+				final int tagIndex = it.getCurrentIndex();
+
+				// because the resolvers can auto-add and therefore immediately render the component
+				// we have to buffer the output since we do not yet know the visibility of the
+				// enclosure
+				CharSequence buffer = new ResponseBufferZone(getRequestCycle(), markupStream)
 				{
-					// component does not yet exist in the container, attempt to resolve it using
-					// resolvers
-					final int tagIndex = it.getCurrentIndex();
-
-					// because the resolvers can auto-add and therefore immediately render the
-					// component
-					// we have to buffer the output since we do not yet know the visibility of the
-					// enclosure
-					CharSequence buffer = new ResponseBufferZone(getRequestCycle(), markupStream)
+					@Override
+					protected void executeInsideBufferedZone()
 					{
-						@Override
-						protected void executeInsideBufferedZone()
-						{
-							markupStream.setCurrentIndex(tagIndex);
-							ComponentResolvers.resolve(container, markupStream, tag);
-						}
-					}.execute();
-
-					child = container.get(tag.getId());
-					checkChildComponent(child);
-
-					if (buffer.length() > 0)
-					{
-						// we have already rendered this child component, insert a stub component
-						// that
-						// will dump the markup during the normal render process if the enclosure is
-						// visible
-						final Component stub = new AutoMarkupLabel(child.getId(), buffer);
-						container.replace(stub); // ok here because we are replacing auto with auto
+						markupStream.setCurrentIndex(tagIndex);
+						ComponentResolvers.resolve(container, markupStream, tag);
 					}
+				}.execute();
+
+				child = container.get(tag.getId());
+				checkChildComponent(child);
+
+				if (buffer.length() > 0)
+				{
+					// we have already rendered this child component, insert a stub component that
+					// will dump the markup during the normal render process if the enclosure is
+					// visible
+					final Component stub = new AutoMarkupLabel(child.getId(), buffer);
+					container.replace(stub); // ok here because we are replacing auto with auto
 				}
 			}
 		}
 		it.rewind();
 	}
 
-	/**
-	 * @see org.apache.wicket.Component#onDetach()
-	 */
+
 	@Override
 	protected void onDetach()
 	{
@@ -288,9 +261,6 @@ public class Enclosure extends WebMarkupContainer
 		super.onDetach();
 	}
 
-	/**
-	 * 
-	 */
 	private void restoreOriginalChildVisibility()
 	{
 		if (changes != null)

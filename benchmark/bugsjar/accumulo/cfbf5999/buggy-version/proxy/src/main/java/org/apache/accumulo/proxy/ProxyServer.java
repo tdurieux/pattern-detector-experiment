@@ -819,17 +819,7 @@ public class ProxyServer implements AccumuloProxy.Iface {
           }
         }
         scanner.setRanges(ranges);
-
-        if (opts.columns != null) {
-          for (ScanColumn col : opts.columns) {
-            if (col.isSetColQualifier())
-              scanner.fetchColumn(ByteBufferUtil.toText(col.colFamily), ByteBufferUtil.toText(col.colQualifier));
-            else
-              scanner.fetchColumnFamily(ByteBufferUtil.toText(col.colFamily));
-          }
-        }
       }
-
       UUID uuid = UUID.randomUUID();
       
       ScannerPlusIterator spi = new ScannerPlusIterator();

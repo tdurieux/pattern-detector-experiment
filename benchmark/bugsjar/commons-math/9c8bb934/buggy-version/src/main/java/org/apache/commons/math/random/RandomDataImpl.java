@@ -36,7 +36,6 @@ import org.apache.commons.math.distribution.PascalDistribution;
 import org.apache.commons.math.distribution.TDistribution;
 import org.apache.commons.math.distribution.WeibullDistribution;
 import org.apache.commons.math.distribution.ZipfDistribution;
-import org.apache.commons.math.exception.MathIllegalArgumentException;
 import org.apache.commons.math.exception.MathInternalError;
 import org.apache.commons.math.exception.NotStrictlyPositiveException;
 import org.apache.commons.math.exception.NumberIsTooLargeException;
@@ -251,8 +250,7 @@ public class RandomDataImpl implements RandomData, Serializable {
                                                 lower, upper, false);
         }
         double r = getRan().nextDouble();
-        double scaled = r * upper + (1.0 - r) * lower + r;
-        return (int)FastMath.floor(scaled);
+        return (int) ((r * upper) + ((1.0 - r) * lower) + r);
     }
 
     /**
@@ -272,8 +270,7 @@ public class RandomDataImpl implements RandomData, Serializable {
                                                 lower, upper, false);
         }
         double r = getRan().nextDouble();
-        double scaled = r * upper + (1.0 - r) * lower + r;
-        return (long)FastMath.floor(scaled);
+        return (long) ((r * upper) + ((1.0 - r) * lower) + r);
     }
 
     /**
@@ -364,9 +361,7 @@ public class RandomDataImpl implements RandomData, Serializable {
                                                 lower, upper, false);
         }
         SecureRandom sec = getSecRan();
-        double r = sec.nextDouble();
-        double scaled = r * upper + (1.0 - r) * lower + r;
-        return (int)FastMath.floor(scaled);
+        return lower + (int) (sec.nextDouble() * (upper - lower + 1));
     }
 
     /**
@@ -387,9 +382,7 @@ public class RandomDataImpl implements RandomData, Serializable {
                                                 lower, upper, false);
         }
         SecureRandom sec = getSecRan();
-        double r = sec.nextDouble();
-        double scaled = r * upper + (1.0 - r) * lower + r;
-        return (long)FastMath.floor(scaled);
+        return lower + (long) (sec.nextDouble() * (upper - lower + 1));
     }
 
     /**
@@ -586,26 +579,19 @@ public class RandomDataImpl implements RandomData, Serializable {
      * provide a symmetric output interval (both endpoints excluded).
      * </p>
      *
-     * @param lower the lower bound.
-     * @param upper the upper bound.
-     * @return a uniformly distributed random value from the interval (lower, upper)
-     * @throws MathIllegalArgumentException if {@code lower >= upper}
-     * or either bound is infinite or NaN
+     * @param lower
+     *            the lower bound.
+     * @param upper
+     *            the upper bound.
+     * @return a uniformly distributed random value from the interval (lower,
+     *         upper)
+     * @throws NumberIsTooLargeException if {@code lower >= upper}.
      */
     public double nextUniform(double lower, double upper) {
         if (lower >= upper) {
-            throw new MathIllegalArgumentException(LocalizedFormats.LOWER_BOUND_NOT_BELOW_UPPER_BOUND,
-                                                lower, upper);
+            throw new NumberIsTooLargeException(LocalizedFormats.LOWER_BOUND_NOT_BELOW_UPPER_BOUND,
+                                                lower, upper, false);
         }
-
-        if (Double.isInfinite(lower) || Double.isInfinite(upper)) {
-            throw new MathIllegalArgumentException(LocalizedFormats.INFINITE_BOUND);
-        }
-
-        if (Double.isNaN(lower) || Double.isNaN(upper)) {
-            throw new MathIllegalArgumentException(LocalizedFormats.NAN_NOT_ALLOWED);
-        }
-
         final RandomGenerator generator = getRan();
 
         // ensure nextDouble() isn't 0.0
@@ -614,7 +600,7 @@ public class RandomDataImpl implements RandomData, Serializable {
             u = generator.nextDouble();
         }
 
-        return u * upper + (1.0 - u) * lower;
+        return lower + u * (upper - lower);
     }
 
     /**

@@ -89,7 +89,6 @@ public class WelzlEncloser<S extends Space, P extends Point<S>> implements Enclo
 
             // select the point farthest to current ball
             final P farthest = selectFarthest(points, ball);
-
             if (ball.contains(farthest, tolerance)) {
                 // we have found a ball containing all points
                 return ball;
@@ -101,7 +100,7 @@ public class WelzlEncloser<S extends Space, P extends Point<S>> implements Enclo
             EnclosingBall<S, P> savedBall = ball;
             ball = moveToFrontBall(extreme, extreme.size(), support);
             if (ball.getRadius() < savedBall.getRadius()) {
-                // this should never happen
+                // TODO: fix this, it should never happen but it does!
                 throw new MathInternalError();
             }
 

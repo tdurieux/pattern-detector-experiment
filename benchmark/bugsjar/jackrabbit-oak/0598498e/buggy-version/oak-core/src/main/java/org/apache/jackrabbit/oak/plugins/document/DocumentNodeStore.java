@@ -1905,14 +1905,14 @@ public final class DocumentNodeStore
                     while (t.read() != '}') {
                         // skip properties
                     }
-                    continueComparison = diff.childNodeAdded(name,
-                            node.getChildNode(name, nodeRev));
+                    NodeState child = getNode(concat(node.getPath(), name), nodeRev);
+                    continueComparison = diff.childNodeAdded(name, child);
                     break;
                 }
                 case '-': {
                     String name = unshareString(t.readString());
-                    continueComparison = diff.childNodeDeleted(name,
-                            base.getChildNode(name, baseRev));
+                    NodeState child = getNode(concat(base.getPath(), name), baseRev);
+                    continueComparison = diff.childNodeDeleted(name, child);
                     break;
                 }
                 case '^': {
@@ -1920,9 +1920,10 @@ public final class DocumentNodeStore
                     t.read(':');
                     if (t.matches('{')) {
                         t.read('}');
-                        continueComparison = diff.childNodeChanged(name,
-                                base.getChildNode(name, baseRev),
-                                node.getChildNode(name, nodeRev));
+                        NodeState nodeChild = getNode(concat(node.getPath(), name), nodeRev);
+                        NodeState baseChild = getNode(concat(base.getPath(), name), baseRev);
+                        continueComparison = diff.childNodeChanged(
+                                name, baseChild, nodeChild);
                     } else if (t.matches('[')) {
                         // ignore multi valued property
                         while (t.read() != ']') {

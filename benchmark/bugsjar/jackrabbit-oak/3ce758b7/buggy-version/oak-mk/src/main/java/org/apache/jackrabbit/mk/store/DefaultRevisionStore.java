@@ -223,12 +223,12 @@ public class DefaultRevisionStore extends AbstractRevisionStore implements
      */
     static class PutTokenImpl extends PutToken {
 
-        private static final AtomicInteger ID_COUNTER = new AtomicInteger();
+        private static int idCounter;
         private int id;
         private StoredNode lastModifiedNode;
 
         public PutTokenImpl() {
-            this.id = ID_COUNTER.incrementAndGet();
+            this.id = ++idCounter;
         }
 
         @Override

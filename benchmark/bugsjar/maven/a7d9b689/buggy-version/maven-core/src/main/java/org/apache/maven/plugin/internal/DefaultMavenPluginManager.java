@@ -311,10 +311,6 @@ public class DefaultMavenPluginManager
         {
             pluginDescriptor.setClassRealm( cacheRecord.realm );
             pluginDescriptor.setArtifacts( new ArrayList<Artifact>( cacheRecord.artifacts ) );
-            for ( ComponentDescriptor<?> componentDescriptor : pluginDescriptor.getComponents() )
-            {
-                componentDescriptor.setRealm( cacheRecord.realm );
-            }
         }
         else
         {

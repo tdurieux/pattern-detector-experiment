@@ -170,7 +170,7 @@ public class MethodCallExpression extends ExpressionDefinition {
             BeanHolder holder = new RegistryBean(camelContext, ref);
             // get the bean which will check that it exists
             instance = holder.getBean();
-            answer = new BeanExpression(instance, getMethod());
+            answer = new BeanExpression(ref, getMethod());
         }
 
         validateHasMethod(camelContext, instance, beanType, getMethod());

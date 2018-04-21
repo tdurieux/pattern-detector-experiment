@@ -18,7 +18,9 @@ package org.apache.wicket.ajax;
 
 import org.apache.wicket.Component;
 import org.apache.wicket.Page;
+import org.apache.wicket.core.util.string.JavaScriptUtils;
 import org.apache.wicket.markup.head.IHeaderResponse;
+import org.apache.wicket.markup.head.JavaScriptHeaderItem;
 import org.apache.wicket.markup.head.OnLoadHeaderItem;
 import org.apache.wicket.util.time.Duration;
 
@@ -34,6 +36,7 @@ public abstract class AbstractAjaxTimerBehavior extends AbstractDefaultAjaxBehav
 {
 	private static final long serialVersionUID = 1L;
 
+	private static final String WICKET_TIMERS_ID = AbstractAjaxTimerBehavior.class.getSimpleName() + "-timers";
 	/** The update interval */
 	private Duration updateInterval;
 
@@ -85,6 +88,10 @@ public abstract class AbstractAjaxTimerBehavior extends AbstractDefaultAjaxBehav
 	{
 		super.renderHead(component, response);
 
+		response.render(JavaScriptHeaderItem.forScript(
+			"if (typeof(Wicket.TimerHandles) === 'undefined') {Wicket.TimerHandles = {}}",
+			WICKET_TIMERS_ID));
+
 		if (component.getRequestCycle().find(AjaxRequestTarget.class) == null)
 		{
 			// complete page is rendered, so timeout has to be rendered again
@@ -105,11 +112,21 @@ public abstract class AbstractAjaxTimerBehavior extends AbstractDefaultAjaxBehav
 	protected final String getJsTimeoutCall(final Duration updateInterval)
 	{
 		CharSequence js = getCallbackScript();
+		js = JavaScriptUtils.escapeQuotes(js);
 
-		return String.format("Wicket.Timer.set('%s', function(){%s}, %d);",
-				getComponent().getMarkupId(), js, updateInterval.getMilliseconds());
+		String timeoutHandle = getTimeoutHandle();
+		// this might look strange, but it is necessary for IE not to leak :(
+		return timeoutHandle+" = setTimeout('" + js + "', " +
+			updateInterval.getMilliseconds() + ')';
 	}
 
+	/**
+	 * @return the name of the handle that is used to stop any scheduled timer
+	 */
+	private String getTimeoutHandle() {
+		return "Wicket.TimerHandles['"+getComponent().getMarkupId() + "']";
+	}
+	
 	/**
 	 * 
 	 * @see org.apache.wicket.ajax.AbstractDefaultAjaxBehavior#respond(AjaxRequestTarget)
@@ -201,7 +218,9 @@ public abstract class AbstractAjaxTimerBehavior extends AbstractDefaultAjaxBehav
 		{
 			hasTimeout = false;
 
-			headerResponse.render(OnLoadHeaderItem.forScript("Wicket.Timer.clear('" + getComponent().getMarkupId() + "');"));
+			String timeoutHandle = getTimeoutHandle();
+			headerResponse.render(OnLoadHeaderItem.forScript("clearTimeout(" + timeoutHandle
+				+ "); delete " + timeoutHandle + ";"));
 		}
 	}
 

@@ -104,19 +104,13 @@ public class DefaultProfileSelector
 
     private boolean isActive( Profile profile, ProfileActivationContext context, ModelProblemCollector problems )
     {
-        boolean isActive = false;
-        for ( ProfileActivator activator : activators ) {
-            if ( activator.presentInConfig( profile, context, problems ) ) {
-                isActive = true;
-            }
-        }
         for ( ProfileActivator activator : activators )
         {
             try
             {
-                if ( activator.presentInConfig( profile, context, problems ) )
+                if ( activator.isActive( profile, context, problems ) )
                 {
-                    isActive &=  activator.isActive( profile, context, problems );
+                    return true;
                 }
             }
             catch ( RuntimeException e )
@@ -128,7 +122,7 @@ public class DefaultProfileSelector
                 return false;
             }
         }
-        return isActive;
+        return false;
     }
 
     private boolean isActiveByDefault( Profile profile )

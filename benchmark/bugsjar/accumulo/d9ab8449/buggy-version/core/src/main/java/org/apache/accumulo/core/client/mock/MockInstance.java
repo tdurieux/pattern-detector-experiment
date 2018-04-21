@@ -31,7 +31,6 @@ import org.apache.accumulo.core.client.impl.thrift.SecurityErrorCode;
 import org.apache.accumulo.core.client.security.tokens.AuthenticationToken;
 import org.apache.accumulo.core.client.security.tokens.PasswordToken;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
-import org.apache.accumulo.core.security.Credentials;
 import org.apache.accumulo.core.util.ByteBufferUtil;
 import org.apache.accumulo.core.util.CachedConfiguration;
 import org.apache.accumulo.core.util.TextUtil;
@@ -151,7 +150,7 @@ public class MockInstance implements Instance {
   
   @Override
   public Connector getConnector(String principal, AuthenticationToken token) throws AccumuloException, AccumuloSecurityException {
-    Connector conn = new MockConnector(new Credentials(principal, token), acu, this);
+    Connector conn = new MockConnector(principal, acu, this);
     if (!acu.users.containsKey(principal))
       conn.securityOperations().createLocalUser(principal, (PasswordToken) token);
     else if (!acu.users.get(principal).token.equals(token))

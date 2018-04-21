@@ -252,17 +252,16 @@ public class FilterImpl implements Filter {
         switch (op) {
         case EQUAL:
             if (x.first != null && x.last == x.first && x.firstIncluding && x.lastIncluding) {
-                // we keep the old equality condition if there is one;
-                // we can not use setAlwaysFalse, as this would not be correct
-                // for multi-valued properties:
-                // unlike in databases, "x = 1 and x = 2" can match a node
-                // if x is a multi-valued property with value {1, 2}
-            } else {
-                // all other conditions (range conditions) are replaced with this one
-                // (we can not use setAlwaysFalse for the same reason as above)
-                x.first = x.last = v;
-                x.firstIncluding = x.lastIncluding = true;
+                // there is already an equality condition on this property
+                // we will keep this, as it could be a multi-valued property
+                // (unlike in databases, "x = 1 and x = 2" can match a node
+                // if x is a multi-valued property with value "{1, 2}")
+                return;
             }
+            x.first = maxValue(oldFirst, v);
+            x.firstIncluding = x.first == oldFirst ? x.firstIncluding : true;
+            x.last = minValue(oldLast, v);
+            x.lastIncluding = x.last == oldLast ? x.lastIncluding : true;
             break;
         case NOT_EQUAL:
             if (v != null) {
@@ -270,40 +269,25 @@ public class FilterImpl implements Filter {
             }
             break;
         case GREATER_THAN:
-            // we don't narrow the range because of multi-valued properties
-            if (x.first == null) {
-                x.first = maxValue(oldFirst, v);
-                x.firstIncluding = false;
-            }
+            x.first = maxValue(oldFirst, v);
+            x.firstIncluding = false;
             break;
         case GREATER_OR_EQUAL:
-            // we don't narrow the range because of multi-valued properties
-            if (x.first == null) {
-                x.first = maxValue(oldFirst, v);
-                x.firstIncluding = x.first == oldFirst ? x.firstIncluding : true;
-            }
+            x.first = maxValue(oldFirst, v);
+            x.firstIncluding = x.first == oldFirst ? x.firstIncluding : true;
             break;
         case LESS_THAN:
-            // we don't narrow the range because of multi-valued properties
-            if (x.last == null) {
-                x.last = minValue(oldLast, v);
-                x.lastIncluding = false;
-            }
+            x.last = minValue(oldLast, v);
+            x.lastIncluding = false;
             break;
         case LESS_OR_EQUAL:
-            // we don't narrow the range because of multi-valued properties
-            if (x.last == null) {
-                x.last = minValue(oldLast, v);
-                x.lastIncluding = x.last == oldLast ? x.lastIncluding : true;
-            }
+            x.last = minValue(oldLast, v);
+            x.lastIncluding = x.last == oldLast ? x.lastIncluding : true;
             break;
         case LIKE:
-            // we don't narrow the range because of multi-valued properties
-            if (x.first == null) {
-                // LIKE is handled in the fulltext index
-                x.isLike = true;
-                x.first = v;
-            }
+            // LIKE is handled in the fulltext index
+            x.isLike = true;
+            x.first = v;
             break;
         case IN:
             

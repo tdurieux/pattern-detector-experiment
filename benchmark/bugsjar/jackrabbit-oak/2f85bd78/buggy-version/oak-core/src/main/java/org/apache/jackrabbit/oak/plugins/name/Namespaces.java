@@ -58,13 +58,6 @@ public class Namespaces implements NamespaceConstants {
      */
     private static final Map<String, String> ENCODED_URIS = newConcurrentMap();
 
-    /**
-     * By default node names with non space whitespace chars are not allowed.
-     * However initial Oak release did allowed that and this flag is provided
-     * to revert back to old behaviour if required for some case temporarily
-     */
-    private static final boolean allowOtherWhitespaceChars = Boolean.getBoolean("oak.allowOtherWhitespaceChars");
-
     private Namespaces() {
     }
 
@@ -251,8 +244,7 @@ public class Namespaces implements NamespaceConstants {
 
         for (int i = 0; i < local.length(); i++) {
             char ch = local.charAt(i);
-            boolean spaceChar = allowOtherWhitespaceChars ? Character.isSpaceChar(ch) : Character.isWhitespace(ch);
-            if (spaceChar) {
+            if (Character.isSpaceChar(ch)) {
                 if (i == 0) {
                     return false; // leading whitespace
                 } else if (i == local.length() - 1) {

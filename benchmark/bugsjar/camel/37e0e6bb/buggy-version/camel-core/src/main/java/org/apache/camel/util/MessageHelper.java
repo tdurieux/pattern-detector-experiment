@@ -223,9 +223,7 @@ public final class MessageHelper {
             } else if (obj instanceof Writer) {
                 return prepend + "[Body is instance of java.io.Writer]";
             } else if (obj instanceof WrappedFile || obj instanceof File) {
-                if (!allowFiles) {
-                    return prepend + "[Body is file based: " + obj + "]";
-                }
+                return prepend + "[Body is file based: " + obj + "]";
             }
         }
 

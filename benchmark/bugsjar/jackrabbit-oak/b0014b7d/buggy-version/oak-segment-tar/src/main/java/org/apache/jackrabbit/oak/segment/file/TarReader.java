@@ -218,7 +218,7 @@ class TarReader implements Closeable {
         for (Map.Entry<UUID, byte[]> entry : entries.entrySet()) {
             UUID uuid = entry.getKey();
             byte[] data = entry.getValue();
-            int generation = getGcGen(wrap(data), uuid);
+            int generation = getGcGen(wrap(data));
             writer.writeEntry(
                     uuid.getMostSignificantBits(),
                     uuid.getLeastSignificantBits(),

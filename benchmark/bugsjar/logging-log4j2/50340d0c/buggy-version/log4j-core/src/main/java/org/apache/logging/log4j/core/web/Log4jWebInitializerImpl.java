@@ -17,15 +17,12 @@
 package org.apache.logging.log4j.core.web;
 
 import java.net.URI;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import javax.servlet.ServletContext;
 import javax.servlet.UnavailableException;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LoggerContext;
 import org.apache.logging.log4j.core.config.Configurator;
-import org.apache.logging.log4j.core.helpers.NetUtils;
 import org.apache.logging.log4j.core.impl.ContextAnchor;
 import org.apache.logging.log4j.core.impl.Log4jContextFactory;
 import org.apache.logging.log4j.core.lookup.Interpolator;
@@ -51,8 +48,7 @@ final class Log4jWebInitializerImpl implements Log4jWebInitializer {
         }
     }
 
-    private final Map<String, String> map = new ConcurrentHashMap<String, String>();
-    private final StrSubstitutor substitutor = new StrSubstitutor(new Interpolator(map));
+    private final StrSubstitutor substitutor = new StrSubstitutor(new Interpolator());
     private final ServletContext servletContext;
 
     private String name;
@@ -64,7 +60,6 @@ final class Log4jWebInitializerImpl implements Log4jWebInitializer {
 
     private Log4jWebInitializerImpl(final ServletContext servletContext) {
         this.servletContext = servletContext;
-        map.put("hostName", NetUtils.getLocalHostname());
     }
 
     @Override

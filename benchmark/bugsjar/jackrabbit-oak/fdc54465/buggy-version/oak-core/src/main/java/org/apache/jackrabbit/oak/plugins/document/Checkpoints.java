@@ -26,7 +26,6 @@ import java.util.SortedMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
 
 import org.apache.jackrabbit.oak.commons.json.JsopBuilder;
 import org.apache.jackrabbit.oak.commons.json.JsopReader;
@@ -74,14 +73,7 @@ class Checkpoints {
     }
 
     public Revision create(long lifetimeInMillis, Map<String, String> info) {
-        // create a unique dummy commit we can use as checkpoint revision
-        Revision r = nodeStore.commitQueue.createRevision();
-        nodeStore.commitQueue.done(r, new CommitQueue.Callback() {
-            @Override
-            public void headOfQueue(@Nonnull Revision revision) {
-                // do nothing
-            }
-        });
+        Revision r = nodeStore.getHeadRevision();
         createCounter.getAndIncrement();
         performCleanupIfRequired();
         UpdateOp op = new UpdateOp(ID, false);

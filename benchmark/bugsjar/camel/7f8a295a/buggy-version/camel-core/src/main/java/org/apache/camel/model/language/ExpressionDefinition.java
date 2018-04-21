@@ -243,17 +243,20 @@ public class ExpressionDefinition implements Expression, Predicate {
      * Returns some descriptive text to describe this node
      */
     public String getLabel() {
-        Predicate predicate = getPredicate();
-        if (predicate != null) {
-            return predicate.toString();
+        String language = getExpression();
+        if (ObjectHelper.isEmpty(language)) {
+            Predicate predicate = getPredicate();
+            if (predicate != null) {
+                return predicate.toString();
+            }
+            Expression expressionValue = getExpressionValue();
+            if (expressionValue != null) {
+                return expressionValue.toString();
+            }
+        } else {
+            return language;
         }
-        Expression expressionValue = getExpressionValue();
-        if (expressionValue != null) {
-            return expressionValue.toString();
-        }
-
-        String exp = getExpression();
-        return exp != null ? exp : "";
+        return "";
     }
 
     /**

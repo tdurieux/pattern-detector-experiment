@@ -21,7 +21,6 @@ import java.util.Locale;
 import org.apache.wicket.Component;
 import org.apache.wicket.markup.html.form.FormComponent;
 import org.apache.wicket.validation.IValidator;
-import org.apache.wicket.validation.ValidatorAdapter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,8 +81,7 @@ public class ValidatorStringResourceLoader extends ComponentStringResourceLoader
 		FormComponent<?> fc = (FormComponent<?>)component;
 		for (IValidator<?> validator : fc.getValidators())
 		{
-			Class<?> scope = getScope(validator);
-			String resource = loadStringResource(scope, key, locale, style,
+			String resource = loadStringResource(validator.getClass(), key, locale, style,
 				variation);
 			if (resource != null)
 			{
@@ -93,19 +91,5 @@ public class ValidatorStringResourceLoader extends ComponentStringResourceLoader
 
 		// not found
 		return null;
-	}
-
-	private Class<? extends IValidator> getScope(IValidator<?> validator)
-	{
-		Class<? extends IValidator> scope;
-		if (validator instanceof ValidatorAdapter)
-		{
-			scope = ((ValidatorAdapter) validator).getValidator().getClass();
-		}
-		else
-		{
-			scope = validator.getClass();
-		}
-		return scope;
 	}
 }

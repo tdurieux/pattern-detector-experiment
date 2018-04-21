@@ -241,6 +241,7 @@ public class ServletWebResponse extends WebResponse
 		try
 		{
 			redirect = true;
+			url = getAbsoluteURL(url);
 			url = encodeRedirectURL(url);
 
 			// wicket redirects should never be cached

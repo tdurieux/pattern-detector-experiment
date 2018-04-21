@@ -186,8 +186,7 @@ public final class EmptyNodeState implements NodeState {
         } else if (object instanceof NodeState) {
             NodeState that = (NodeState) object;
             return that.getPropertyCount() == 0
-                    && that.getChildNodeCount(1) == 0
-                    && (exists == that.exists());
+                    && that.getChildNodeCount(1) == 0;
         } else {
             return false;
         }

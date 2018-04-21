@@ -39,13 +39,13 @@ public class ExternalIdentityRef {
      */
     public ExternalIdentityRef(@Nonnull String id, @CheckForNull String providerName) {
         this.id = id;
-        this.providerName = (providerName == null || providerName.isEmpty()) ? null : providerName;
+        this.providerName = providerName;
 
         StringBuilder b = new StringBuilder();
         escape(b, id);
-        if (this.providerName != null) {
+        if (providerName != null && providerName.length() > 0) {
             b.append(';');
-            escape(b, this.providerName);
+            escape(b, providerName);
         }
         string =  b.toString();
     }
@@ -82,7 +82,6 @@ public class ExternalIdentityRef {
      * @param str the string
      * @return the reference
      */
-    @Nonnull
     public static ExternalIdentityRef fromString(@Nonnull String str) {
         int idx = str.indexOf(';');
         if (idx < 0) {
@@ -100,7 +99,7 @@ public class ExternalIdentityRef {
      * @param builder the builder
      * @param str the string
      */
-    private static void escape(@Nonnull StringBuilder builder, @Nonnull CharSequence str) {
+    private void escape(StringBuilder builder, CharSequence str) {
         final int len = str.length();
         for (int i=0; i<len; i++) {
             char c = str.charAt(i);
@@ -120,20 +119,16 @@ public class ExternalIdentityRef {
     }
 
     /**
-     * Tests if the given object is an external identity reference and if it's
-     * getString() is equal to this. Note, that there is no need to
-     * include {@code id} and {@code provider} fields in the comparison as
-     * the string representation already incorporates both.
+     * Tests if the given object is an external identity reference and if it's getString() is equal to this.
      */
     @Override
     public boolean equals(Object o) {
-        if (this == o) {
-            return true;
+        try {
+            // assuming that we never compare other types of classes
+            return this == o || string.equals(((ExternalIdentityRef) o).string);
+        } catch (Exception e) {
+            return false;
         }
-        if (o instanceof ExternalIdentityRef) {
-            return string.equals(((ExternalIdentityRef) o).string);
-        }
-        return false;
     }
 
     /**

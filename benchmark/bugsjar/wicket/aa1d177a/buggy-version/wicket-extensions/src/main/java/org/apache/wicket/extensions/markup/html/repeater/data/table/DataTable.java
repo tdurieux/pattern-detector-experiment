@@ -33,8 +33,6 @@ import org.apache.wicket.markup.repeater.RepeatingView;
 import org.apache.wicket.markup.repeater.data.IDataProvider;
 import org.apache.wicket.model.IModel;
 import org.apache.wicket.util.string.Strings;
-import org.apache.wicket.util.visit.IVisit;
-import org.apache.wicket.util.visit.IVisitor;
 
 
 /**
@@ -111,9 +109,9 @@ public class DataTable<T> extends Panel implements IPageableItems
 
 	private final List<IColumn<T>> columns;
 
-	private final ToolbarsContainer topToolbars;
+	private final RepeatingView topToolbars;
 
-	private final ToolbarsContainer bottomToolbars;
+	private final RepeatingView bottomToolbars;
 
 	/**
 	 * Constructor
@@ -322,14 +320,14 @@ public class DataTable<T> extends Panel implements IPageableItems
 		return datagrid.getItemCount();
 	}
 
-	private void addToolbar(final AbstractToolbar toolbar, final ToolbarsContainer container)
+	private void addToolbar(final AbstractToolbar toolbar, final RepeatingView container)
 	{
 		if (toolbar == null)
 		{
 			throw new IllegalArgumentException("argument [toolbar] cannot be null");
 		}
 
-		container.getRepeatingView().add(toolbar);
+		container.add(toolbar);
 	}
 
 	/**
@@ -394,17 +392,13 @@ public class DataTable<T> extends Panel implements IPageableItems
 	}
 
 	/**
-	 * This class acts as a repeater that will contain the toolbar. It makes sure that the table row
-	 * group (e.g. thead) tags are only visible when they contain rows in accordance with the HTML
-	 * specification.
+	 * This class acts as a repeater that will contain the toolbar.
 	 * 
 	 * @author igor.vaynberg
 	 */
-	private static class ToolbarsContainer extends WebMarkupContainer
+	private static class ToolbarsContainer extends RepeatingView
 	{
 		private static final long serialVersionUID = 1L;
-
-		private final RepeatingView toolbars;
 
 		/**
 		 * Constructor
@@ -414,41 +408,6 @@ public class DataTable<T> extends Panel implements IPageableItems
 		private ToolbarsContainer(final String id)
 		{
 			super(id);
-			toolbars = new RepeatingView("toolbars");
-			add(toolbars);
-		}
-
-		public RepeatingView getRepeatingView()
-		{
-			return toolbars;
-		}
-
-		@Override
-		public boolean isVisible()
-		{
-			if (!super.isVisible())
-			{
-				return false;
-			}
-
-			toolbars.configure();
-
-			Boolean visible = toolbars.visitChildren(new IVisitor<Component, Boolean>()
-			{
-				public void component(Component object, IVisit<Boolean> visit)
-				{
-					object.configure();
-					if (object.isVisible())
-					{
-						visit.stop(Boolean.TRUE);
-					}
-					else
-					{
-						visit.dontGoDeeper();
-					}
-				}
-			});
-			return visible == Boolean.TRUE;
 		}
 	}
 }

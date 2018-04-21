@@ -82,11 +82,15 @@ public class EvictingWindowOperator<K, IN, OUT, W extends Window> extends Window
 		Collection<W> elementWindows = windowAssigner.assignWindows(element.getValue(),
 				element.getTimestamp());
 
-		final K key = (K) getStateBackend().getCurrentKey();
+		K key = (K) getStateBackend().getCurrentKey();
 
 		if (windowAssigner instanceof MergingWindowAssigner) {
+			MergingWindowSet<W> mergingWindows = mergingWindowsByKey.get(getStateBackend().getCurrentKey());
+			if (mergingWindows == null) {
+				mergingWindows = new MergingWindowSet<>((MergingWindowAssigner<? super IN, W>) windowAssigner);
+				mergingWindowsByKey.put(key, mergingWindows);
+			}
 
-			MergingWindowSet<W> mergingWindows = getMergingWindowSet();
 
 			for (W window : elementWindows) {
 				// If there is a merge, it can only result in a window that contains our new
@@ -103,7 +107,6 @@ public class EvictingWindowOperator<K, IN, OUT, W extends Window> extends Window
 							public void merge(W mergeResult,
 									Collection<W> mergedWindows, W stateWindowResult,
 									Collection<W> mergedStateWindows) throws Exception {
-								context.key = key;
 								context.window = mergeResult;
 
 								// store for later use
@@ -138,7 +141,7 @@ public class EvictingWindowOperator<K, IN, OUT, W extends Window> extends Window
 				TriggerResult combinedTriggerResult = TriggerResult.merge(triggerResult,
 						mergeTriggerResult.f0);
 
-				processTriggerResult(combinedTriggerResult, actualWindow);
+				processTriggerResult(combinedTriggerResult, key, actualWindow);
 			}
 
 		} else {
@@ -154,14 +157,14 @@ public class EvictingWindowOperator<K, IN, OUT, W extends Window> extends Window
 				context.window = window;
 				TriggerResult triggerResult = context.onElement(element);
 
-				processTriggerResult(triggerResult, window);
+				processTriggerResult(triggerResult, key, window);
 			}
 		}
 	}
 
 	@Override
 	@SuppressWarnings("unchecked,rawtypes")
-	protected void processTriggerResult(TriggerResult triggerResult, W window) throws Exception {
+	protected void processTriggerResult(TriggerResult triggerResult, K key, W window) throws Exception {
 		if (!triggerResult.isFire() && !triggerResult.isPurge()) {
 			// do nothing
 			return;
@@ -172,7 +175,7 @@ public class EvictingWindowOperator<K, IN, OUT, W extends Window> extends Window
 		MergingWindowSet<W> mergingWindows = null;
 
 		if (windowAssigner instanceof MergingWindowAssigner) {
-			mergingWindows = getMergingWindowSet();
+			mergingWindows = mergingWindowsByKey.get(key);
 			W stateWindow = mergingWindows.getStateWindow(window);
 			windowState = getPartitionedState(stateWindow, windowSerializer, windowStateDescriptor);
 

@@ -73,7 +73,6 @@ public class TryProcessor extends ServiceSupport implements AsyncProcessor, Navi
         exchange.setProperty(Exchange.EXCEPTION_HANDLED, null);
 
         while (continueRouting(processors, exchange)) {
-            exchange.setProperty(Exchange.TRY_ROUTE_BLOCK, true);
             ExchangeHelper.prepareOutToIn(exchange);
 
             // process the next processor
@@ -93,7 +92,6 @@ public class TryProcessor extends ServiceSupport implements AsyncProcessor, Navi
         }
 
         ExchangeHelper.prepareOutToIn(exchange);
-        exchange.removeProperty(Exchange.TRY_ROUTE_BLOCK);
         exchange.setProperty(Exchange.EXCEPTION_HANDLED, lastHandled);
         LOG.trace("Processing complete for exchangeId: {} >>> {}", exchange.getExchangeId(), exchange);
         callback.done(true);
@@ -117,7 +115,6 @@ public class TryProcessor extends ServiceSupport implements AsyncProcessor, Navi
 
                 // continue processing the try .. catch .. finally asynchronously
                 while (continueRouting(processors, exchange)) {
-                    exchange.setProperty(Exchange.TRY_ROUTE_BLOCK, true);
                     ExchangeHelper.prepareOutToIn(exchange);
 
                     // process the next processor
@@ -133,7 +130,6 @@ public class TryProcessor extends ServiceSupport implements AsyncProcessor, Navi
                 }
 
                 ExchangeHelper.prepareOutToIn(exchange);
-                exchange.removeProperty(Exchange.TRY_ROUTE_BLOCK);
                 exchange.setProperty(Exchange.EXCEPTION_HANDLED, lastHandled);
                 LOG.trace("Processing complete for exchangeId: {} >>> {}", exchange.getExchangeId(), exchange);
                 callback.done(false);

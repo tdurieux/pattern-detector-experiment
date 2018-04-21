@@ -1094,9 +1094,6 @@ public final class PropertyResolver
 			Class type = null;
 			if (setMethod != null)
 			{
-				// getMethod is always there and if the value will be set through a setMethod then
-				// the getMethod return type will be its type. Else we have to look at the
-				// parameters if the setter but getting the return type is quicker
 				type = getMethod.getReturnType();
 			}
 			else if (field != null)
@@ -1107,7 +1104,7 @@ public final class PropertyResolver
 			Object converted = null;
 			if (type != null)
 			{
-				converted = converter.convert(value, type);
+				converted = converter.convert(value, getMethod.getReturnType());
 				if (converted == null)
 				{
 					if (value != null)

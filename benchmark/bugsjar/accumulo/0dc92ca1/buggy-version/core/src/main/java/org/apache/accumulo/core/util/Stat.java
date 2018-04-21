@@ -16,66 +16,54 @@
  */
 package org.apache.accumulo.core.util;
 
-import org.apache.commons.math.stat.descriptive.StorelessUnivariateStatistic;
-import org.apache.commons.math.stat.descriptive.moment.Mean;
-import org.apache.commons.math.stat.descriptive.moment.StandardDeviation;
-import org.apache.commons.math.stat.descriptive.rank.Max;
-import org.apache.commons.math.stat.descriptive.rank.Min;
-import org.apache.commons.math.stat.descriptive.summary.Sum;
-
 public class Stat {
-  Min min;
-  Max max;
-  Sum sum;
-  Mean mean;
-  StandardDeviation sd;
-
-  StorelessUnivariateStatistic[] stats;
-
-  public Stat() {
-    min = new Min();
-    max = new Max();
-    sum = new Sum();
-    mean = new Mean();
-    sd = new StandardDeviation();
-
-    stats = new StorelessUnivariateStatistic[] {min, max, sum, mean, sd};
-  }
-
+  
+  long max = Long.MIN_VALUE;
+  long min = Long.MAX_VALUE;
+  long sum = 0;
+  int count = 0;
+  double partialStdDev = 0;
+  
   public void addStat(long stat) {
-    for (StorelessUnivariateStatistic statistic : stats) {
-      statistic.increment(stat);
-    }
+    if (stat > max)
+      max = stat;
+    if (stat < min)
+      min = stat;
+    
+    sum += stat;
+    
+    partialStdDev += stat * stat;
+    
+    count++;
   }
-
+  
   public long getMin() {
-    return (long) min.getResult();
+    return min;
   }
-
+  
   public long getMax() {
-    return (long) max.getResult();
+    return max;
   }
-
-  public long getSum() {
-    return (long) sum.getResult();
-  }
-
+  
   public double getAverage() {
-    return mean.getResult();
+    return ((double) sum) / count;
   }
-
+  
   public double getStdDev() {
-    return sd.getResult();
+    return Math.sqrt(partialStdDev / count - getAverage() * getAverage());
   }
-
+  
   public String toString() {
-    return String.format("%,d %,d %,.2f %,d", getMin(), getMax(), getAverage(), mean.getN());
+    return String.format("%,d %,d %,.2f %,d", getMin(), getMax(), getAverage(), count);
   }
-
+  
   public void clear() {
-    for (StorelessUnivariateStatistic statistic : stats) {
-      statistic.clear();
-    }
+    sum = 0;
+    count = 0;
+    partialStdDev = 0;
   }
-
+  
+  public long getSum() {
+    return sum;
+  }
 }

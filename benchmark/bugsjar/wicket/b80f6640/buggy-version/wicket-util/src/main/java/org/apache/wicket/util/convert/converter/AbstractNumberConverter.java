@@ -16,11 +16,8 @@
  */
 package org.apache.wicket.util.convert.converter;
 
-import java.math.BigDecimal;
-import java.text.DecimalFormat;
 import java.text.NumberFormat;
 import java.util.Locale;
-import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.wicket.util.convert.ConversionException;
 
@@ -35,45 +32,11 @@ public abstract class AbstractNumberConverter<N extends Number> extends Abstract
 {
 	private static final long serialVersionUID = 1L;
 
-	/** The date format to use */
-	private final ConcurrentHashMap<Locale, NumberFormat> numberFormats = new ConcurrentHashMap<>();
-
 	/**
 	 * @param locale
-	 *            The locale
 	 * @return Returns the numberFormat.
 	 */
-	public NumberFormat getNumberFormat(final Locale locale)
-	{
-		NumberFormat numberFormat = numberFormats.get(locale);
-		if (numberFormat == null)
-		{
-			numberFormat = newNumberFormat(locale);
-
-			if (numberFormat instanceof DecimalFormat)
-			{
-				// always try to parse BigDecimals
-				((DecimalFormat)numberFormat).setParseBigDecimal(true);
-			}
-
-			NumberFormat tmpNumberFormat = numberFormats.putIfAbsent(locale, numberFormat);
-			if (tmpNumberFormat != null)
-			{
-				numberFormat = tmpNumberFormat;
-			}
-		}
-		// return a clone because NumberFormat.get..Instance use a pool
-		return (NumberFormat)numberFormat.clone();
-	}
-
-	/**
-	 * Creates a new {@link NumberFormat} for the given locale. The instance is later cached and is
-	 * accessible through {@link #getNumberFormat(Locale)}
-	 *
-	 * @param locale
-	 * @return number format
-	 */
-	protected abstract NumberFormat newNumberFormat(final Locale locale);
+	public abstract NumberFormat getNumberFormat(Locale locale);
 
 	/**
 	 * Parses a value as a String and returns a Number.
@@ -81,15 +44,15 @@ public abstract class AbstractNumberConverter<N extends Number> extends Abstract
 	 * @param value
 	 *            The object to parse (after converting with toString())
 	 * @param min
-	 *            The minimum allowed value or {@code null} if none
+	 *            The minimum allowed value
 	 * @param max
-	 *            The maximum allowed value or {@code null} if none
+	 *            The maximum allowed value
 	 * @param locale
 	 * @return The number
 	 * @throws ConversionException
 	 *             if value is unparsable or out of range
 	 */
-	protected BigDecimal parse(Object value, final BigDecimal min, final BigDecimal max, Locale locale)
+	protected N parse(Object value, final double min, final double max, Locale locale)
 	{
 		if (locale == null)
 		{
@@ -115,30 +78,19 @@ public abstract class AbstractNumberConverter<N extends Number> extends Abstract
 			return null;
 		}
 
-		BigDecimal bigDecimal;
-		if (number instanceof BigDecimal)
+		if (number.doubleValue() < min)
 		{
-			bigDecimal = (BigDecimal)number;
-		}
-		else
-		{
-			// should occur rarely, see #getNumberFormat(Locale)
-			bigDecimal = new BigDecimal(number.toString());
+			throw newConversionException("Value cannot be less than " + min, value, locale).setFormat(
+				numberFormat);
 		}
 
-		if (min != null && bigDecimal.compareTo(min) < 0)
+		if (number.doubleValue() > max)
 		{
-			throw newConversionException("Value cannot be less than " + min, value, locale)
-					.setFormat(numberFormat);
+			throw newConversionException("Value cannot be greater than " + max, value, locale).setFormat(
+				numberFormat);
 		}
 
-		if (max != null && bigDecimal.compareTo(max) > 0)
-		{
-			throw newConversionException("Value cannot be greater than " + max, value, locale)
-					.setFormat(numberFormat);
-		}
-
-		return bigDecimal;
+		return number;
 	}
 
 	@Override

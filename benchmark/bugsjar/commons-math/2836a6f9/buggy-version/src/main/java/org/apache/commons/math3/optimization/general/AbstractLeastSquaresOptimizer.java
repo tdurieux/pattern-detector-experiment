@@ -26,7 +26,6 @@ import org.apache.commons.math3.exception.NumberIsTooSmallException;
 import org.apache.commons.math3.exception.util.LocalizedFormats;
 import org.apache.commons.math3.linear.ArrayRealVector;
 import org.apache.commons.math3.linear.RealMatrix;
-import org.apache.commons.math3.linear.DiagonalMatrix;
 import org.apache.commons.math3.linear.DecompositionSolver;
 import org.apache.commons.math3.linear.MatrixUtils;
 import org.apache.commons.math3.linear.QRDecomposition;
@@ -559,16 +558,7 @@ public abstract class AbstractLeastSquaresOptimizer
      * @return the square-root of the weight matrix.
      */
     private RealMatrix squareRoot(RealMatrix m) {
-        if (m instanceof DiagonalMatrix) {
-            final int dim = m.getRowDimension();
-            final RealMatrix sqrtM = new DiagonalMatrix(dim);
-            for (int i = 0; i < dim; i++) {
-               sqrtM.setEntry(i, i, FastMath.sqrt(m.getEntry(i, i)));
-            }
-            return sqrtM;
-        } else {
-            final EigenDecomposition dec = new EigenDecomposition(m);
-            return dec.getSquareRoot();
-        }
+        final EigenDecomposition dec = new EigenDecomposition(m);
+        return dec.getSquareRoot();
     }
 }

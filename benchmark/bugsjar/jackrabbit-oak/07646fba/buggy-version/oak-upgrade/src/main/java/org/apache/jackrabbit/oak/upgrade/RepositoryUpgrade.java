@@ -238,8 +238,7 @@ public class RepositoryUpgrade {
         logger.info(
                 "Copying repository content from {} to Oak", config.getHomeDir());
         try {
-            NodeState base = target.getRoot();
-            NodeBuilder builder = base.builder();
+            NodeBuilder builder = target.getRoot().builder();
 
             String workspace =
                     source.getRepositoryConfig().getDefaultWorkspaceName();
@@ -260,11 +259,6 @@ public class RepositoryUpgrade {
             copyNamespaces(builder, uriToPrefix, idxToPrefix);
             copyNodeTypes(builder, uriToPrefix.inverse());
             copyPrivileges(builder);
-
-            // Triggers compilation of type information, which we need for
-            // the type predicates used by the bulk  copy operations below.
-            new TypeEditorProvider(false).getRootEditor(
-                    base, builder.getNodeState(), builder, null);
 
             NodeState root = builder.getNodeState();
             copyVersionStore(builder, root, uriToPrefix, idxToPrefix);

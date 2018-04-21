@@ -417,8 +417,8 @@ public class ManagedRoute extends ManagedPerformanceCounter implements TimerList
 
     @Override
     public void init(ManagementStrategy strategy) {
-        exchangesInFlightStartTimestamps.clear();
         super.init(strategy);
+        exchangesInFlightStartTimestamps.clear();
     }
 
     @Override
@@ -438,23 +438,14 @@ public class ManagedRoute extends ManagedPerformanceCounter implements TimerList
         super.completedExchange(exchange, time);
     }
 
-    @Override
-    public synchronized void failedExchange(Exchange exchange) {
-        InFlightKey key = exchangesInFlightKeys.remove(exchange.getExchangeId());
-        if (key != null) {
-            exchangesInFlightStartTimestamps.remove(key);
-        }
-        super.failedExchange(exchange);
-    }
-
     private static class InFlightKey implements Comparable<InFlightKey> {
 
         private final Long timeStamp;
         private final String exchangeId;
 
         InFlightKey(Long timeStamp, String exchangeId) {
-            this.timeStamp = timeStamp;
             this.exchangeId = exchangeId;
+            this.timeStamp = timeStamp;
         }
 
         @Override

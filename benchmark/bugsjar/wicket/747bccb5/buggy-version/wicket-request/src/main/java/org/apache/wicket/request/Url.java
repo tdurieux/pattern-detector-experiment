@@ -22,7 +22,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 
 import org.apache.wicket.util.lang.Args;
 import org.apache.wicket.util.lang.Generics;
@@ -106,7 +105,6 @@ public final class Url implements Serializable
 	 * Parses the given URL string.
 	 * 
 	 * @param url
-	 *           absolute or relative url with query string
 	 * @return Url object
 	 */
 	public static Url parse(final String url)
@@ -118,7 +116,7 @@ public final class Url implements Serializable
 	 * Parses the given URL string.
 	 * 
 	 * @param url
-	 *           absolute or relative url with query string
+	 *           full absolute or relative url with query string
 	 * @param charset
 	 * @return Url object
 	 */
@@ -156,13 +154,12 @@ public final class Url implements Serializable
 
 		if (protocolAt != -1)
 		{
-			result.protocol = absoluteUrl.substring(0, protocolAt).toLowerCase(Locale.US);
+			result.protocol = absoluteUrl.substring(0, protocolAt);
 			final String afterProto = absoluteUrl.substring(protocolAt + 3);
 			final String hostAndPort;
 
 			int relativeAt = afterProto.indexOf('/');
-			
-			
+
 			if (relativeAt == -1)
 			{
 				relativeUrl = "";
@@ -179,7 +176,7 @@ public final class Url implements Serializable
 			if (portAt == -1)
 			{
 				result.host = hostAndPort;
-				result.port = getDefaultPortForProtocol(result.protocol);
+				result.port = null;
 			}
 			else
 			{
@@ -230,33 +227,6 @@ public final class Url implements Serializable
 		}
 
 		return result;
-	}
-
-	/**
-	 * get default port number for protocol
-	 * 
-	 * @param protocol
-	 *           name of protocol
-	 * @return default port for protocol or <code>null</code> if unknown
-	 */
-	private static Integer getDefaultPortForProtocol(String protocol)
-	{
-		if ("http".equals(protocol))
-		{
-			return 80;
-		}
-		else if ("https".equals(protocol))
-		{
-			return 443;
-		}
-		else if ("ftp".equals(protocol))
-		{
-			return 21;
-		}
-		else
-		{
-			return null;
-		}
 	}
 
 	/**
@@ -311,7 +281,7 @@ public final class Url implements Serializable
 	 */
 	public Url(final List<String> segments, final Charset charset)
 	{
-		this(segments, Collections.<QueryParameter>emptyList(), charset);
+		this(segments, Collections.<QueryParameter> emptyList(), charset);
 	}
 
 	/**

@@ -610,11 +610,7 @@ public class EmpiricalDistribution extends AbstractRealDistribution {
         final double pB = pB(binIndex);
         final RealDistribution kernel = k(x);
         if (kernel instanceof ConstantRealDistribution) {
-            if (x < kernel.getNumericalMean()) {
-                return pBminus;
-            } else {
-                return pBminus + pB;
-            }
+            return pBminus + pB;
         }
         final double[] binBounds = getUpperBounds();
         final double kB = kB(binIndex);

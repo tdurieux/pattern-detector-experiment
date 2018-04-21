@@ -1,10 +1,6 @@
 package org.apache.wicket.bean.validation;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Set;
 
 import javax.validation.ConstraintViolation;
@@ -66,8 +62,8 @@ public class PropertyValidator<T> extends Behavior implements IValidator<T>
 	private final IModel<Class<?>[]> groups_;
 
 	/**
-	 * A flag that indicates whether {@linkplain #setComponentRequiredFlag()} has been called for
-	 * this behavior.
+	 * A flag that indicates whether {@linkplain #setComponentRequiredFlag()}
+	 * has been called for this behavior.
 	 */
 	private boolean requiredFlagSet;
 
@@ -136,10 +132,8 @@ public class PropertyValidator<T> extends Behavior implements IValidator<T>
 				" can only be added to FormComponents");
 		}
 
-		// TODO add a validation key that appends the type so we can have
-		// different messages for
-		// @Size on String vs Collection - done but need to add a key for each
-		// superclass/interface
+		// TODO add a validation key that appends the type so we can have different messages for
+		// @Size on String vs Collection - done but need to add a key for each superclass/interface
 
 		this.component = (FormComponent<T>)component;
 	}
@@ -150,15 +144,10 @@ public class PropertyValidator<T> extends Behavior implements IValidator<T>
 		super.onConfigure(component);
 		if (requiredFlagSet == false)
 		{
-			// "Required" flag is calculated upon component's model property, so
-			// we must ensure,
-			// that model object is accessible (i.e. component is already added
-			// in a page).
+			// "Required" flag is calculated upon component's model property, so we must ensure,
+			// that model object is accessible (i.e. component is already added in a page).
 			requiredFlagSet = true;
-			if (isRequired())
-			{
-				this.component.setRequired(true);
-			}
+			setComponentRequiredFlag();
 		}
 	}
 
@@ -172,57 +161,27 @@ public class PropertyValidator<T> extends Behavior implements IValidator<T>
 		}
 	}
 
-	private List<NotNull> findNotNullConstraints()
+	/**
+	 * Marks the form component required if necessary
+	 */
+	private void setComponentRequiredFlag()
 	{
 		BeanValidationContext config = BeanValidationConfiguration.get();
 		Validator validator = config.getValidator();
 		Property property = getProperty();
 
-		List<NotNull> constraints = new ArrayList<NotNull>();
+		// if the property has a NotNull constraint mark the form component required
 
 		Iterator<ConstraintDescriptor<?>> it = new ConstraintIterator(validator, property);
-
 		while (it.hasNext())
 		{
 			ConstraintDescriptor<?> desc = it.next();
 			if (desc.getAnnotation().annotationType().equals(NotNull.class))
 			{
-				constraints.add((NotNull)desc.getAnnotation());
+				component.setRequired(true);
+				break;
 			}
 		}
-
-		return constraints;
-	}
-
-	boolean isRequired()
-	{
-		List<NotNull> constraints = findNotNullConstraints();
-
-		if (constraints.isEmpty())
-		{
-			return false;
-		}
-
-		HashSet<Class<?>> validatorGroups = new HashSet<Class<?>>();
-		validatorGroups.addAll(Arrays.asList(getGroups()));
-
-		for (NotNull constraint : constraints)
-		{
-			if (constraint.groups().length == 0 && validatorGroups.isEmpty())
-			{
-				return true;
-			}
-
-			for (Class<?> constraintGroup : constraint.groups())
-			{
-				if (validatorGroups.contains(constraintGroup))
-				{
-					return true;
-				}
-			}
-		}
-
-		return false;
 	}
 
 	@Override
@@ -235,8 +194,7 @@ public class PropertyValidator<T> extends Behavior implements IValidator<T>
 		Validator validator = config.getValidator();
 		Property property = getProperty();
 
-		// find any tag modifiers that apply to the constraints of the property
-		// being validated
+		// find any tag modifiers that apply to the constraints of the property being validated
 		// and allow them to modify the component tag
 
 		Iterator<ConstraintDescriptor<?>> it = new ConstraintIterator(validator, property,

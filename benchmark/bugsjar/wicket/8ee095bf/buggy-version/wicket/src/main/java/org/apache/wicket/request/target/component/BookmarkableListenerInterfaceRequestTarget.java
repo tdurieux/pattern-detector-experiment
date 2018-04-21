@@ -117,11 +117,11 @@ public class BookmarkableListenerInterfaceRequestTarget extends BookmarkablePage
 		if (page == null)
 		{
 			page = Session.get().getPage(getPageMapName(), componentPath, -1);
-			if (page != null && page.getClass() == getPageClass())
+			if (page != null)
 			{
 				setPage(page);
 			}
-			else
+			else if (page == null)
 			{
 				page = getPage(requestCycle);
 			}

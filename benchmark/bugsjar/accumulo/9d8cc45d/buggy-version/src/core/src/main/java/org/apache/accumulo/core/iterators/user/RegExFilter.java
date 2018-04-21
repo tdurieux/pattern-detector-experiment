@@ -37,7 +37,8 @@ public class RegExFilter extends Filter {
   
   @Override
   public SortedKeyValueIterator<Key,Value> deepCopy(IteratorEnvironment env) {
-    RegExFilter result = (RegExFilter) super.deepCopy(env);
+    RegExFilter result = new RegExFilter();
+    result.setSource(getSource().deepCopy(env));
     result.rowMatcher = copyMatcher(rowMatcher);
     result.colfMatcher = copyMatcher(colfMatcher);
     result.colqMatcher = copyMatcher(colqMatcher);

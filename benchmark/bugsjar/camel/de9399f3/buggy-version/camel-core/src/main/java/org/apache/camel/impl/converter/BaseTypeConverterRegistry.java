@@ -223,7 +223,9 @@ public abstract class BaseTypeConverterRegistry extends ServiceSupport implement
         }
 
         // Could not find suitable conversion, so remember it
-        misses.put(key, key);
+        synchronized (misses) {
+            misses.put(key, key);
+        }
 
         // Could not find suitable conversion, so return Void to indicate not found
         return Void.TYPE;
@@ -241,8 +243,6 @@ public abstract class BaseTypeConverterRegistry extends ServiceSupport implement
                     log.warn("Overriding type converter from: " + converter + " to: " + typeConverter);
                 }
                 typeMappings.put(key, typeConverter);
-                // remove any previous misses, as we added the new type converter
-                misses.remove(key);
             }
         }
     }

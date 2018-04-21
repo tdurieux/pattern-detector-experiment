@@ -21,11 +21,9 @@ import java.lang.reflect.Method;
 
 import org.apache.camel.CamelContext;
 import org.apache.camel.Expression;
-import org.apache.camel.Predicate;
 import org.apache.camel.language.LanguageAnnotation;
 import org.apache.camel.spi.Language;
 import org.apache.camel.util.ObjectHelper;
-import org.apache.camel.util.PredicateToExpressionAdapter;
 
 /**
  * Default implementation of the {@link AnnotationExpressionFactory}.
@@ -44,13 +42,7 @@ public class DefaultAnnotationExpressionFactory implements AnnotationExpressionF
             throw new IllegalArgumentException("Cannot find the language: " + languageName + " on the classpath");
         }
         String expression = getExpressionFromAnnotation(annotation);
-
-        if (expressionReturnType == Boolean.class || expressionReturnType == boolean.class) {
-            Predicate predicate = language.createPredicate(expression);
-            return PredicateToExpressionAdapter.toExpression(predicate);
-        } else {
-            return language.createExpression(expression);
-        }
+        return language.createExpression(expression);
     }
 
     protected String getExpressionFromAnnotation(Annotation annotation) {

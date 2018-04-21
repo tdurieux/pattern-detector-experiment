@@ -797,7 +797,6 @@ public class Form<T> extends WebMarkupContainer implements IFormSubmitListener
 			if (hasError())
 			{
 				callOnError(submittingComponent);
-				return;
 			}
 
 			// Form has no error

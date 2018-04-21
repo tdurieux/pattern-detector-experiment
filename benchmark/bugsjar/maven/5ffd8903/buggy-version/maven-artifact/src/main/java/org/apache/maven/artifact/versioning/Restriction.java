@@ -1,5 +1,6 @@
 package org.apache.maven.artifact.versioning;
 
+
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -18,8 +19,6 @@ package org.apache.maven.artifact.versioning;
  * specific language governing permissions and limitations
  * under the License.
  */
-
-import org.apache.maven.artifact.Artifact;
 
 /**
  * Describes a restriction in versioning.
@@ -72,17 +71,9 @@ public class Restriction
 
     public boolean containsVersion( ArtifactVersion version )
     {
-        boolean snapshot = isSnapshot( version );
-
         if ( lowerBound != null )
         {
             int comparison = lowerBound.compareTo( version );
-
-            if ( snapshot && comparison == 0 )
-            {
-                return true;
-            }
-
             if ( ( comparison == 0 ) && !lowerBoundInclusive )
             {
                 return false;
@@ -95,12 +86,6 @@ public class Restriction
         if ( upperBound != null )
         {
             int comparison = upperBound.compareTo( version );
-
-            if ( snapshot && comparison == 0 )
-            {
-                return true;
-            }
-
             if ( ( comparison == 0 ) && !upperBoundInclusive )
             {
                 return false;
@@ -110,18 +95,7 @@ public class Restriction
                 return false;
             }
         }
-
-        if ( lowerBound != null || upperBound != null )
-        {
-            return !snapshot;
-        }
-
         return true;
-    }
-
-    private boolean isSnapshot( ArtifactVersion version )
-    {
-        return Artifact.SNAPSHOT_VERSION.equals( version.getQualifier() );
     }
 
     @Override

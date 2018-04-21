@@ -411,7 +411,7 @@ public class MicroKernelImpl implements MicroKernel {
             throw new IllegalArgumentException("absolute path expected: " + path);
         }
         if (jsonDiff == null || jsonDiff.length() == 0) {
-            return revisionId != null ? revisionId : getHeadRevision();
+            return getHeadRevision();
         }
 
         Id revId = revisionId == null ? getHeadRevisionId() : Id.fromString(revisionId);

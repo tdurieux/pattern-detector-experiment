@@ -82,7 +82,15 @@ public abstract class AjaxEventBehavior extends AbstractDefaultAjaxBehavior
 		{
 			CharSequence js = getCallbackScript(component);
 
-			response.render(OnDomReadyHeaderItem.forScript(js.toString()));
+			AjaxRequestTarget target = component.getRequestCycle().find(AjaxRequestTarget.class);
+			if (target == null)
+			{
+				response.render(OnDomReadyHeaderItem.forScript(js.toString()));
+			}
+			else
+			{
+				target.appendJavaScript(js);
+			}
 		}
 	}
 

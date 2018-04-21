@@ -133,10 +133,7 @@ class PartitionRequestClientHandler extends ChannelInboundHandlerAdapter {
 			}
 
 			inputChannels.clear();
-
-			if (ctx != null) {
-				ctx.close();
-			}
+			ctx.close();
 		}
 	}
 
@@ -190,13 +187,6 @@ class PartitionRequestClientHandler extends ChannelInboundHandlerAdapter {
 		try {
 			if (bufferOrEvent.isBuffer()) {
 				// ---- Buffer ------------------------------------------------
-
-				// Early return for empty buffers. Otherwise Netty's readBytes() throws an
-				// IndexOutOfBoundsException.
-				if (bufferOrEvent.getSize() == 0) {
-					return true;
-				}
-
 				BufferProvider bufferProvider = inputChannel.getBufferProvider();
 
 				if (bufferProvider == null) {
@@ -226,6 +216,7 @@ class PartitionRequestClientHandler extends ChannelInboundHandlerAdapter {
 			}
 			else {
 				// ---- Event -------------------------------------------------
+
 				// TODO We can just keep the serialized data in the Netty buffer and release it later at the reader
 				byte[] byteArray = new byte[bufferOrEvent.getSize()];
 				bufferOrEvent.getNettyBuffer().readBytes(byteArray);

@@ -53,7 +53,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.TreeMap;
-import java.util.HashMap;
 
 public final class ModelUtils
 {
@@ -65,7 +64,7 @@ public final class ModelUtils
             // nothing to do.
             return;
         }
-
+        
         List mergedPlugins = new ArrayList();
 
         List parentPlugins = parentContainer.getPlugins();
@@ -208,8 +207,6 @@ public final class ModelUtils
         childConfiguration = Xpp3Dom.mergeXpp3Dom( childConfiguration, parentConfiguration );
 
         child.setConfiguration( childConfiguration );
-
-        child.setDependencies( mergeDependencyList( child.getDependencies(), parent.getDependencies() ) );
 
         // from here to the end of the method is dealing with merging of the <executions/> section.
         String parentInherited = parent.getInherited();
@@ -1003,30 +1000,4 @@ public final class ModelUtils
             }
         }
     }
-
-    public static List mergeDependencyList( List child, List parent )
-    {
-        Map depsMap = new HashMap();
-
-        if ( parent != null )
-        {
-            for ( Iterator it = parent.iterator(); it.hasNext(); )
-            {
-                Dependency dependency = (Dependency) it.next();
-                depsMap.put( dependency.getManagementKey(), dependency );
-            }
-        }
-
-        if ( child != null )
-        {
-            for ( Iterator it = child.iterator(); it.hasNext(); )
-            {
-                Dependency dependency = (Dependency) it.next();
-                depsMap.put( dependency.getManagementKey(), dependency );
-            }
-        }
-
-        return new ArrayList( depsMap.values() );
-    }
-
 }

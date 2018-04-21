@@ -290,11 +290,7 @@ public class Url implements Serializable
 			}
 
 			final int credentialsAt = hostAndPort.lastIndexOf('@') + 1;
-			//square brackets are used for ip6 URLs
-			final int closeSqrBracketAt = hostAndPort.lastIndexOf(']') + 1;
-			final int portAt = hostAndPort.substring(credentialsAt)
-										  .substring(closeSqrBracketAt)
-									      .lastIndexOf(':');
+			final int portAt = hostAndPort.substring(credentialsAt).lastIndexOf(':');
 
 			if (portAt == -1)
 			{
@@ -303,10 +299,8 @@ public class Url implements Serializable
 			}
 			else
 			{
-				final int portOffset = portAt + credentialsAt + closeSqrBracketAt;
-				
-				result.host = hostAndPort.substring(0, portOffset);
-				result.port = Integer.parseInt(hostAndPort.substring(portOffset + 1));
+				result.host = hostAndPort.substring(0, portAt + credentialsAt);
+				result.port = Integer.parseInt(hostAndPort.substring(portAt + credentialsAt + 1));
 			}
 
 			if (relativeAt < 0)

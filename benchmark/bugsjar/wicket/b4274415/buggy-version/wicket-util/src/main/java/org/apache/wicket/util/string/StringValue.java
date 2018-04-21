@@ -592,69 +592,69 @@ public class StringValue implements IClusterable
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Boolean toOptionalBoolean() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toBooleanObject();
+		return (text == null) ? null : toBooleanObject();
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Character toOptionalCharacter() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toCharacter();
+		return (text == null) ? null : toCharacter();
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Double toOptionalDouble() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toDoubleObject();
+		return (text == null) ? null : toDoubleObject();
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Duration toOptionalDuration() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toDuration();
+		return (text == null) ? null : toDuration();
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Integer toOptionalInteger() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toInteger();
+		return (text == null) ? null : toInteger();
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Long toOptionalLong() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toLongObject();
+		return (text == null) ? null : toLongObject();
 	}
 
 	/**
@@ -668,14 +668,14 @@ public class StringValue implements IClusterable
 	}
 
 	/**
-	 * Convert to object types, returning null if text is null or empty.
+	 * Convert to object types, returning null if text is null.
 	 * 
 	 * @return converted
 	 * @throws StringValueConversionException
 	 */
 	public final Time toOptionalTime() throws StringValueConversionException
 	{
-		return Strings.isEmpty(text) ? null : toTime();
+		return (text == null) ? null : toTime();
 	}
 
 	/**

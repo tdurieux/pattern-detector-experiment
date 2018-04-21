@@ -29,7 +29,6 @@ public class ObjectMessage implements Message {
     private static final long serialVersionUID = -5903272448334166185L;
 
     private transient Object obj;
-    private final String objectString;
 
     /**
      * Create the ObjectMessage.
@@ -40,9 +39,6 @@ public class ObjectMessage implements Message {
             obj = "null";
         }
         this.obj = obj;
-        
-        // LOG4J2-763: take snapshot of parameters at message construction time
-        objectString = String.valueOf(obj);
     }
 
     /**
@@ -51,7 +47,7 @@ public class ObjectMessage implements Message {
      */
     @Override
     public String getFormattedMessage() {
-        return objectString;
+        return obj.toString();
     }
 
     /**
@@ -60,7 +56,7 @@ public class ObjectMessage implements Message {
      */
     @Override
     public String getFormat() {
-        return objectString;
+        return obj.toString();
     }
 
     /**
@@ -93,7 +89,7 @@ public class ObjectMessage implements Message {
 
     @Override
     public String toString() {
-        return "ObjectMessage[obj=" + objectString + ']';
+        return "ObjectMessage[obj=" + obj.toString() + ']';
     }
 
     private void writeObject(final ObjectOutputStream out) throws IOException {

@@ -23,16 +23,16 @@ abstract class CollisionHandler {
 
     static final CollisionHandler DEFAULT = new CollisionHandler() {
         @Override
-        void concurrentModification(Revision other) {
+        void uncommittedModification(Revision uncommitted) {
             // do nothing
         }
     };
 
     /**
-     * Callback for an concurrent modification in {@link Revision}
-     * <code>other</code>.
+     * Callback for an uncommitted modification in {@link Revision}
+     * <code>uncommitted</code>.
      *
-     * @param other the revision of the concurrent change.
+     * @param uncommitted the uncommitted revision of the change.
      */
-    abstract void concurrentModification(Revision other);
+    abstract void uncommittedModification(Revision uncommitted);
 }

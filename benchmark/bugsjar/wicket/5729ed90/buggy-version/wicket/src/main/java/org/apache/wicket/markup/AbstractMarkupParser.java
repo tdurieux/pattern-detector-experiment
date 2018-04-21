@@ -30,6 +30,7 @@ import org.apache.wicket.markup.parser.filter.RootMarkupFilter;
 import org.apache.wicket.settings.IMarkupSettings;
 import org.apache.wicket.util.resource.ResourceStreamNotFoundException;
 import org.apache.wicket.util.resource.StringResourceStream;
+import org.apache.wicket.util.string.AppendingStringBuffer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -403,9 +404,9 @@ public abstract class AbstractMarkupParser
 		int pos1 = rawMarkup.indexOf("<!--");
 		while (pos1 != -1)
 		{
-			int pos2 = rawMarkup.indexOf("-->", pos1 + 4);
+			final int pos2 = rawMarkup.indexOf("-->", pos1 + 4);
 
-			final StringBuilder buf = new StringBuilder(rawMarkup.length());
+			final AppendingStringBuffer buf = new AppendingStringBuffer(rawMarkup.length());
 			if (pos2 != -1)
 			{
 				final String comment = rawMarkup.substring(pos1 + 4, pos2);
@@ -423,12 +424,8 @@ public abstract class AbstractMarkupParser
 					}
 					rawMarkup = buf.toString();
 				}
-				else
-				{
-					pos1 = pos2;
-				}
 			}
-			pos1 = rawMarkup.indexOf("<!--", pos1);
+			pos1 = rawMarkup.length() <= pos1 + 2 ? -1 : rawMarkup.indexOf("<!--", pos1 + 4);
 		}
 		return rawMarkup;
 	}

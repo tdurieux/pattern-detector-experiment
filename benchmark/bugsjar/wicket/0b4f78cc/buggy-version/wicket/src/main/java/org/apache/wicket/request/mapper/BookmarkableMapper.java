@@ -16,6 +16,7 @@
  */
 package org.apache.wicket.request.mapper;
 
+import org.apache.wicket.Page;
 import org.apache.wicket.request.Request;
 import org.apache.wicket.request.Url;
 import org.apache.wicket.request.component.IRequestablePage;
@@ -102,7 +103,7 @@ public class BookmarkableMapper extends AbstractBookmarkableMapper
 			String className = url.getSegments().get(2);
 			Class<? extends IRequestablePage> pageClass = getPageClass(className);
 
-			if (pageClass != null && IRequestablePage.class.isAssignableFrom(pageClass))
+			if (Page.class.isAssignableFrom(pageClass))
 			{
 
 				// extract the PageParameters from URL if there are any

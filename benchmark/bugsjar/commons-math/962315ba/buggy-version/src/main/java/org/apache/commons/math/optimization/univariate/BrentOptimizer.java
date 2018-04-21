@@ -41,37 +41,39 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
      * Construct a solver.
      */
     public BrentOptimizer() {
-        setMaxEvaluations(1000);
-        setMaximalIterationCount(100);
-        setAbsoluteAccuracy(1e-11);
-        setRelativeAccuracy(1e-9);
+        super(100, 1E-10);
     }
 
-    /**
-     * Perform the optimization.
-     *
-     * @return the optimum.
-     */
-    protected double doOptimize()
+    /** {@inheritDoc} */
+    public double optimize(final UnivariateRealFunction f, final GoalType goalType,
+                           final double min, final double max, final double startValue)
         throws MaxIterationsExceededException, FunctionEvaluationException {
-        return localMin(getGoalType() == GoalType.MINIMIZE,
-                        getMin(), getStartValue(), getMax(),
+        clearResult();
+        return localMin(f, goalType, min, startValue, max,
                         getRelativeAccuracy(), getAbsoluteAccuracy());
     }
 
+    /** {@inheritDoc} */
+    public double optimize(final UnivariateRealFunction f, final GoalType goalType,
+                           final double min, final double max)
+        throws MaxIterationsExceededException, FunctionEvaluationException {
+        return optimize(f, goalType, min, max, min + GOLDEN_SECTION * (max - min));
+    }
+
     /**
-     * Find the minimum of the function within the interval {@code (lo, hi)}.
+     * Find the minimum of the function {@code f} within the interval {@code (a, b)}.
      *
-     * If the function is defined on the interval {@code (lo, hi)}, then
-     * this method finds an approximation {@code x} to the point at which
-     * the function attains its minimum.<br/>
-     * {@code t} and {@code eps} define a tolerance {@code tol = eps |x| + t}
-     * and the function is never evaluated at two points closer together than
-     * {@code tol}. {@code eps} should be no smaller than <em>2 macheps</em> and
-     * preferable not much less than <em>sqrt(macheps)</em>, where
-     * <em>macheps</em> is the relative machine precision. {@code t} should be
-     * positive.
-     * @param isMinim {@code true} when minimizing the function.
+     * If the function {@code f} is defined on the interval {@code (a, b)}, then
+     * this method finds an approximation {@code x} to the point at which {@code f}
+     * attains its minimum.<br/>
+     * {@code t} and {@code eps} define a tolerance {@code tol = eps |x| + t} and
+     * {@code f} is never evaluated at two points closer together than {@code tol}.
+     * {@code eps} should be no smaller than <em>2 macheps</em> and preferable not
+     * much less than <em>sqrt(macheps)</em>, where <em>macheps</em> is the relative
+     * machine precision. {@code t} should be positive.
+     * @param f the function to solve.
+     * @param goalType type of optimization goal: either {@link GoalType#MAXIMIZE}
+     * or {@link GoalType#MINIMIZE}.
      * @param lo Lower bound of the interval.
      * @param mid Point inside the interval {@code [lo, hi]}.
      * @param hi Higher bound of the interval.
@@ -83,7 +85,8 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
      * @throws FunctionEvaluationException if an error occurs evaluating
      * the function.
      */
-    private double localMin(boolean isMinim,
+    private double localMin(UnivariateRealFunction f,
+                            GoalType goalType,
                             double lo, double mid, double hi,
                             double eps, double t)
         throws MaxIterationsExceededException, FunctionEvaluationException {
@@ -105,16 +108,16 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
         double x = mid;
         double v = x;
         double w = x;
-        double d = 0;
         double e = 0;
-        double fx = computeObjectiveValue(x);
-        if (!isMinim) {
+        double fx = computeObjectiveValue(f, x);
+        if (goalType == GoalType.MAXIMIZE) {
             fx = -fx;
         }
         double fv = fx;
         double fw = fx;
 
-        while (true) {
+        int count = 0;
+        while (count < maximalIterationCount) {
             double m = 0.5 * (a + b);
             final double tol1 = eps * Math.abs(x) + t;
             final double tol2 = 2 * tol1;
@@ -124,6 +127,7 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
                 double p = 0;
                 double q = 0;
                 double r = 0;
+                double d = 0;
                 double u = 0;
 
                 if (Math.abs(e) > tol1) { // Fit parabola.
@@ -187,8 +191,8 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
                     u = x + d;
                 }
 
-                double fu = computeObjectiveValue(u);
-                if (!isMinim) {
+                double fu = computeObjectiveValue(f, u);
+                if (goalType == GoalType.MAXIMIZE) {
                     fu = -fu;
                 }
 
@@ -225,10 +229,16 @@ public class BrentOptimizer extends AbstractUnivariateRealOptimizer {
                     }
                 }
             } else { // termination
-                setFunctionValue(isMinim ? fx : -fx);
+                setResult(x, (goalType == GoalType.MAXIMIZE) ? -fx : fx, count);
                 return x;
             }
-            incrementIterationsCounter();
+            ++count;
         }
+        throw new MaxIterationsExceededException(maximalIterationCount);
+    }
+
+    /** Temporary workaround. */
+    protected double doOptimize() {
+        throw new UnsupportedOperationException();
     }
 }

@@ -430,12 +430,8 @@ abstract class ItemImpl<T extends ItemDelegate> implements Item {
         Value[] nonNullValues = compact(values);
         int targetType = getType(definition, type);
         if (nonNullValues.length == 0) {
-            if (targetType == PropertyType.UNDEFINED) {
-                // default to string when no other type hints are available
-                targetType = PropertyType.STRING;
-            }
             return MemoryPropertyBuilder
-                    .array(Type.fromTag(targetType, false), name)
+                    .array(Type.fromTag(type, false), name)
                     .getPropertyState();
         } else if (targetType == type) {
             return PropertyStates.createProperty(name, Arrays.asList(nonNullValues));

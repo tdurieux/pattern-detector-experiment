@@ -28,7 +28,6 @@ import java.util.Map;
 import java.util.Set;
 
 import org.apache.maven.model.Build;
-import org.apache.maven.model.BuildBase;
 import org.apache.maven.model.Dependency;
 import org.apache.maven.model.DependencyManagement;
 import org.apache.maven.model.DistributionManagement;
@@ -104,12 +103,12 @@ public class DefaultModelValidator
             Build build = model.getBuild();
             if ( build != null )
             {
-                validateRawPlugins( problems, build.getPlugins(), "build.plugins.plugin", request );
+                validateRawPlugins( problems, build.getPlugins(), false, request );
 
                 PluginManagement mngt = build.getPluginManagement();
                 if ( mngt != null )
                 {
-                    validateRawPlugins( problems, mngt.getPlugins(), "build.pluginManagement.plugins.plugin", request );
+                    validateRawPlugins( problems, mngt.getPlugins(), true, request );
                 }
             }
 
@@ -117,48 +116,37 @@ public class DefaultModelValidator
 
             for ( Profile profile : model.getProfiles() )
             {
-                String prefix = "profiles.profile[" + profile.getId() + "]";
-
                 if ( !profileIds.add( profile.getId() ) )
                 {
                     addViolation( problems, errOn30, "profiles.profile.id", null,
                                   "must be unique but found duplicate profile with id " + profile.getId(), profile );
                 }
 
-                validateRawDependencies( problems, profile.getDependencies(), prefix + ".dependencies.dependency",
-                                         request );
+                validateRawDependencies( problems, profile.getDependencies(), "profiles.profile[" + profile.getId()
+                    + "].dependencies.dependency", request );
 
                 if ( profile.getDependencyManagement() != null )
                 {
-                    validateRawDependencies( problems, profile.getDependencyManagement().getDependencies(), prefix
-                        + ".dependencyManagement.dependencies.dependency", request );
+                    validateRawDependencies( problems, profile.getDependencyManagement().getDependencies(),
+                                          "profiles.profile[" + profile.getId()
+                                              + "].dependencyManagement.dependencies.dependency", request );
                 }
 
-                validateRepositories( problems, profile.getRepositories(), prefix + ".repositories.repository", request );
+                validateRepositories( problems, profile.getRepositories(), "profiles.profile[" + profile.getId()
+                    + "].repositories.repository", request );
 
-                validateRepositories( problems, profile.getPluginRepositories(), prefix
-                    + ".pluginRepositories.pluginRepository", request );
-
-                BuildBase buildBase = profile.getBuild();
-                if ( buildBase != null )
-                {
-                    validateRawPlugins( problems, buildBase.getPlugins(), prefix + ".plugins.plugin", request );
-
-                    PluginManagement mngt = buildBase.getPluginManagement();
-                    if ( mngt != null )
-                    {
-                        validateRawPlugins( problems, mngt.getPlugins(), prefix + ".pluginManagement.plugins.plugin",
-                                            request );
-                    }
-                }
+                validateRepositories( problems, profile.getPluginRepositories(), "profiles.profile[" + profile.getId()
+                    + "].pluginRepositories.pluginRepository", request );
             }
         }
     }
 
-    private void validateRawPlugins( ModelProblemCollector problems, List<Plugin> plugins, String prefix,
+    private void validateRawPlugins( ModelProblemCollector problems, List<Plugin> plugins, boolean managed,
                                      ModelBuildingRequest request )
     {
         Severity errOn31 = getSeverity( request, ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_3_1 );
+
+        String prefix = ( managed ? "build.pluginManagement." : "build." ) + "plugins.plugin.";
 
         Map<String, Plugin> index = new HashMap<String, Plugin>();
 
@@ -170,7 +158,7 @@ public class DefaultModelValidator
 
             if ( existing != null )
             {
-                addViolation( problems, errOn31, prefix + ".(groupId:artifactId)", null,
+                addViolation( problems, errOn31, prefix + "(groupId:artifactId)", null,
                               "must be unique but found duplicate declaration of plugin " + key, plugin );
             }
             else
@@ -184,7 +172,7 @@ public class DefaultModelValidator
             {
                 if ( !executionIds.add( exec.getId() ) )
                 {
-                    addViolation( problems, Severity.ERROR, prefix + "[" + plugin.getKey()
+                    addViolation( problems, Severity.ERROR, "build.plugins.plugin[" + plugin.getKey()
                         + "].executions.execution.id", null, "must be unique but found duplicate execution with id "
                         + exec.getId(), exec );
                 }

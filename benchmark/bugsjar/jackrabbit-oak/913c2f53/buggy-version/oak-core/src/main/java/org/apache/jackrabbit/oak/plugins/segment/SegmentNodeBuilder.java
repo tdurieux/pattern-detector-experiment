@@ -33,12 +33,8 @@ public class SegmentNodeBuilder extends MemoryNodeBuilder {
     private long updateCount = 0;
 
     SegmentNodeBuilder(SegmentNodeState base) {
-        this(base, base.getTracker().getWriter());
-    }
-
-    SegmentNodeBuilder(SegmentNodeState base, SegmentWriter writer) {
         super(base);
-        this.writer = writer;
+        this.writer = base.getRecordId().getSegmentId().getTracker().getWriter();
     }
 
     //-------------------------------------------------< MemoryNodeBuilder >--

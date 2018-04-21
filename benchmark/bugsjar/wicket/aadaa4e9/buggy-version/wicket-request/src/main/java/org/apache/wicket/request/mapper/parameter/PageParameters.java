@@ -483,8 +483,7 @@ public class PageParameters implements IClusterable, IIndexedParameters, INamedP
 	 */
 	public PageParameters set(final String name, final Object value)
 	{
-		int position = getPosition(name);
-		set(name, value, position);
+		set(name, value, -1);
 		return this;
 	}
 

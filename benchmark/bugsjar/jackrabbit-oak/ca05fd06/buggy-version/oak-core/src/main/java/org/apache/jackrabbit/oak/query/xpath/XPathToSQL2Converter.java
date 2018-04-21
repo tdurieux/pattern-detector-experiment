@@ -192,56 +192,45 @@ public class XPathToSQL2Converter {
                         currentSelector.path = "/";
                     }
                 }
-            } else if (currentTokenType == IDENTIFIER) {
-                // probably a path restriction
-                // String name = readPathSegment();
-                String identifier = readIdentifier();
-                if (readIf("(")) {
-                    if ("text".equals(identifier)) {
-                        // "...text()"
-                        currentSelector.isChild = false;
-                        pathPattern += "jcr:xmltext";
-                        read(")");
-                        if (currentSelector.isDescendant) {
-                            currentSelector.nodeName = "jcr:xmltext";
-                        } else {
-                            currentSelector.path = PathUtils.concat(currentSelector.path, "jcr:xmltext");
-                        }                        
-                    } else if ("element".equals(identifier)) {
-                        // "...element(..."
-                        if (readIf(")")) {
-                            // any
-                            pathPattern += "%";
-                        } else {
-                            if (readIf("*")) {
-                                // any
-                                pathPattern += "%";
-                            } else {
-                                String name = readPathSegment();
-                                pathPattern += name;
-                                appendNodeName(name);
-                            }
-                            if (readIf(",")) {
-                                currentSelector.nodeType = readIdentifier();
-                            }
-                            read(")");
-                        }
-                    } else if ("rep:excerpt".equals(identifier)) {
-                        readOpenDotClose(false);
-                        rewindSelector();
-                        Expression.Property p = new Expression.Property(currentSelector, "rep:excerpt", false);
-                        statement.addSelectColumn(p);
-                    } else {
-                        throw getSyntaxError();
-                    }
+            } else if (readIf("text")) {
+                // "...text()"
+                currentSelector.isChild = false;
+                pathPattern += "jcr:xmltext";
+                read("(");
+                read(")");
+                if (currentSelector.isDescendant) {
+                    currentSelector.nodeName = "jcr:xmltext";
                 } else {
-                    String name = ISO9075.decode(identifier);
-                    pathPattern += name;
-                    appendNodeName(name);
+                    currentSelector.path = PathUtils.concat(currentSelector.path, "jcr:xmltext");
+                }
+            } else if (readIf("element")) {
+                // "...element(..."
+                read("(");
+                if (readIf(")")) {
+                    // any
+                    pathPattern += "%";
+                } else {
+                    if (readIf("*")) {
+                        // any
+                        pathPattern += "%";
+                    } else {
+                        String name = readPathSegment();
+                        pathPattern += name;
+                        appendNodeName(name);
+                    }
+                    if (readIf(",")) {
+                        currentSelector.nodeType = readIdentifier();
+                    }
+                    read(")");
                 }
             } else if (readIf("@")) {
                 rewindSelector();
                 Expression.Property p = readProperty();
+                statement.addSelectColumn(p);
+            } else if (readIf("rep:excerpt")) {
+                rewindSelector();
+                readExcerpt();
+                Expression.Property p = new Expression.Property(currentSelector, "rep:excerpt", false);
                 statement.addSelectColumn(p);
             } else if (readIf("(")) {
                 rewindSelector();
@@ -250,7 +239,7 @@ public class XPathToSQL2Converter {
                         Expression.Property p = readProperty();
                         statement.addSelectColumn(p);
                     } else if (readIf("rep:excerpt")) {
-                        readOpenDotClose(true);
+                        readExcerpt();
                         Expression.Property p = new Expression.Property(currentSelector, "rep:excerpt", false);
                         statement.addSelectColumn(p);
                     } else if (readIf("rep:spellcheck")) {
@@ -260,7 +249,7 @@ public class XPathToSQL2Converter {
                         Expression.Property p = new Expression.Property(currentSelector, "rep:spellcheck()", false);
                         statement.addSelectColumn(p);
                     } else if (readIf("rep:suggest")) {
-                        readOpenDotClose(true);
+                        readExcerpt();
                         Expression.Property p = new Expression.Property(currentSelector, "rep:suggest()", false);
                         statement.addSelectColumn(p);
                     }
@@ -268,6 +257,11 @@ public class XPathToSQL2Converter {
                 if (!readIf(")")) {
                     return convertToUnion(query, statement, startParseIndex - 1);
                 }
+            } else if (currentTokenType == IDENTIFIER) {
+                // path restriction
+                String name = readPathSegment();
+                pathPattern += name;
+                appendNodeName(name);
             } else if (readIf(".")) {
                 // just "." this is simply ignored, so that
                 // "a/./b" is the same as "a/b"
@@ -723,19 +717,13 @@ public class XPathToSQL2Converter {
         return new Expression.Property(currentSelector, readPathSegment(), false);
     }
     
-    /**
-     * Read open bracket (optional), and optional dot, and close bracket.
-     * 
-     * @param readOpenBracket whether to read the open bracket (false if this
-     *            was already read)
-     * @throws ParseException if close bracket or the dot were not read
-     */
-    private void readOpenDotClose(boolean readOpenBracket) throws ParseException {
-        if (readOpenBracket) {
-            read("(");
+    private void readExcerpt() throws ParseException {
+        read("(");
+        if (!readIf(")")) {
+            // only rep:excerpt(.) and rep:excerpt() are currently supported
+            read(".");
+            read(")");
         }
-        readIf(".");
-        read(")");
     }
 
     private String readPathSegment() throws ParseException {

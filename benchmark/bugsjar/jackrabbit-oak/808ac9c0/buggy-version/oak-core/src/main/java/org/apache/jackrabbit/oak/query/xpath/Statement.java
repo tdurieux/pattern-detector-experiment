@@ -58,34 +58,8 @@ public class Statement {
         if (where == null) {
             return this;
         }
-        ArrayList<Expression> unionList = new ArrayList<Expression>();
-        addToUnionList(where, unionList);
-        if (unionList.size() == 1) {
-            return this;
-        }
-        Statement union = null;
-        for (int i = 0; i < unionList.size(); i++) {
-            Expression e = unionList.get(i);
-            Statement s = new Statement();
-            s.columnSelector = columnSelector;
-            s.selectors = selectors;
-            s.columnList = columnList;
-            s.where = e;
-            if (i == unionList.size() - 1) {
-                s.xpathQuery = xpathQuery;
-            }
-            if (union == null) {
-                union = s;
-            } else {
-                union = new UnionStatement(union.optimize(), s.optimize());
-            }
-        }
-        return union;
-    }
-    
-    private static void addToUnionList(Expression condition,  ArrayList<Expression> unionList) {
-        if (condition instanceof OrCondition) {
-            OrCondition or = (OrCondition) condition;
+        if (where instanceof OrCondition) {
+            OrCondition or = (OrCondition) where;
             if (or.getCommonLeftPart() != null) {
                 // @x = 1 or @x = 2 
                 // is automatically converted to 
@@ -98,17 +72,29 @@ public class Statement {
                 // @x = 1 or @y = 2
                 // or similar are converted to
                 // (@x = 1) union (@y = 2)
-                addToUnionList(or.left, unionList);
-                addToUnionList(or.right, unionList);
-                return;
+                Statement s1 = new Statement();
+                s1.columnSelector = columnSelector;
+                s1.selectors = selectors;
+                s1.columnList = columnList;
+                s1.where = or.left;
+                Statement s2 = new Statement();
+                s2.columnSelector = columnSelector;
+                s2.selectors = selectors;
+                s2.columnList = columnList;
+                s2.where = or.right;
+                s2.xpathQuery = xpathQuery;
+                return new UnionStatement(s1.optimize(), s2.optimize());
             }
-        } else if (condition instanceof AndCondition) {
+        } else if (where instanceof AndCondition) {
             // conditions of type
             // @a = 1 and (@x = 1 or @y = 2)
             // are automatically converted to
             // (@a = 1 and @x = 1) union (@a = 1 and @y = 2)
-            AndCondition and = (AndCondition) condition;
-            and = and.pullOrRight();
+            AndCondition and = (AndCondition) where;
+            if (and.left instanceof OrCondition && !(and.right instanceof OrCondition)) {
+                // swap left and right
+                and = new AndCondition(and.right, and.left);
+            }
             if (and.right instanceof OrCondition) {
                 OrCondition or = (OrCondition) and.right;
                 if (or.getCommonLeftPart() != null) {
@@ -120,13 +106,23 @@ public class Statement {
                     // do not optimize "contains"
                 } else {
                     // same as above, but with the added "and"
-                    addToUnionList(new AndCondition(and.left, or.left), unionList);
-                    addToUnionList(new AndCondition(and.left, or.right), unionList);
-                    return;
+                    // TODO avoid code duplication if possible
+                    Statement s1 = new Statement();
+                    s1.columnSelector = columnSelector;
+                    s1.selectors = selectors;
+                    s1.columnList = columnList;
+                    s1.where = new AndCondition(and.left, or.left);
+                    Statement s2 = new Statement();
+                    s2.columnSelector = columnSelector;
+                    s2.selectors = selectors;
+                    s2.columnList = columnList;
+                    s2.where = new AndCondition(and.left, or.right);
+                    s2.xpathQuery = xpathQuery;
+                    return new UnionStatement(s1.optimize(), s2.optimize());
                 }
             }
         }
-        unionList.add(condition);
+        return this;
     }
     
     @Override

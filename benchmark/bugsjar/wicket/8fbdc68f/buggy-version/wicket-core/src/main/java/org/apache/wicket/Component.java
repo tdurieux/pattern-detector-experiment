@@ -36,7 +36,6 @@ import org.apache.wicket.feedback.FeedbackMessage;
 import org.apache.wicket.feedback.IFeedback;
 import org.apache.wicket.markup.ComponentTag;
 import org.apache.wicket.markup.IMarkupFragment;
-import org.apache.wicket.markup.MarkupCache;
 import org.apache.wicket.markup.MarkupElement;
 import org.apache.wicket.markup.MarkupException;
 import org.apache.wicket.markup.MarkupNotFoundException;
@@ -1171,8 +1170,6 @@ public abstract class Component
 
 		requestFlags = 0;
 
-		internalDetach();
-
 		// notify any detach listener
 		IDetachListener detachListener = getApplication().getFrameworkSettings()
 			.getDetachListener();
@@ -1180,15 +1177,6 @@ public abstract class Component
 		{
 			detachListener.onDetach(this);
 		}
-	}
-
-	/**
-	 * Removes the cached markup at the end of the request. For the next request it will be get
-	 * either from the parent's markup or from {@link MarkupCache}.
-	 */
-	private void internalDetach()
-	{
-		markup = null;
 	}
 
 	/**
@@ -3077,7 +3065,7 @@ public abstract class Component
 			{
 				setFlag(FLAG_PLACEHOLDER, false);
 				// I think it's better to not setOutputMarkupId to false...
-				// user can do it if she want
+				// user can do it if we want
 			}
 		}
 		return this;

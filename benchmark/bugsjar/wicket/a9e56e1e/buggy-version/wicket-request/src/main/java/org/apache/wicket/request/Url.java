@@ -263,8 +263,7 @@ public class Url implements Serializable
 				hostAndPort = afterProto.substring(0, relativeAt);
 			}
 
-			final int credentialsAt = hostAndPort.lastIndexOf('@') + 1;
-			final int portAt = hostAndPort.substring(credentialsAt).lastIndexOf(':');
+			final int portAt = hostAndPort.lastIndexOf(':');
 
 			if (portAt == -1)
 			{
@@ -273,8 +272,8 @@ public class Url implements Serializable
 			}
 			else
 			{
-				result.host = hostAndPort.substring(0, portAt + credentialsAt);
-				result.port = Integer.parseInt(hostAndPort.substring(portAt + credentialsAt + 1));
+				result.host = hostAndPort.substring(0, portAt);
+				result.port = Integer.parseInt(hostAndPort.substring(portAt + 1));
 			}
 
 			if (relativeAt < 0)

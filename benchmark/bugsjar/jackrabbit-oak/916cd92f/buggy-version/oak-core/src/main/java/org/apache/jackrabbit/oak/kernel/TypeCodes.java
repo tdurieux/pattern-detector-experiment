@@ -34,9 +34,7 @@ public class TypeCodes {
 
     static {
         for (int type = PropertyType.UNDEFINED; type <= PropertyType.DECIMAL; type++) {
-            String code = type == PropertyType.BINARY
-                    ? ":blobId"  // See class comment for MicroKernel and OAK-428
-                    : PropertyType.nameFromValue(type).substring(0, 3).toLowerCase(Locale.ENGLISH);
+            String code = PropertyType.nameFromValue(type).substring(0, 3).toLowerCase(Locale.ENGLISH);
             TYPE2CODE.put(type, code);
             CODE2TYPE.put(code, type);
         }
@@ -63,10 +61,7 @@ public class TypeCodes {
      * @return  the location where the prefix ends or -1 if no prefix is present
      */
     public static int split(String jsonString) {
-        if (jsonString.startsWith(":blobId:")) {  // See OAK-428
-            return 7;
-        }
-        else if (jsonString.length() >= 4 && jsonString.charAt(3) == ':') {
+        if (jsonString.length() >= 4 && jsonString.charAt(3) == ':') {
             return 3;
         }
         else {
@@ -87,8 +82,8 @@ public class TypeCodes {
         else {
             Integer type = CODE2TYPE.get(jsonString.substring(0, split));
             return type == null
-                    ? PropertyType.UNDEFINED
-                    : type;
+                ? PropertyType.UNDEFINED
+                : type;
         }
     }
 

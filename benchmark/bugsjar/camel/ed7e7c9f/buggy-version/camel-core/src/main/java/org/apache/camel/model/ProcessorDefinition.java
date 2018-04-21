@@ -1015,7 +1015,6 @@ public abstract class ProcessorDefinition<Type extends ProcessorDefinition<Type>
             // set id on this
             setId(id);
         } else {
-            
             // set it on last output as this is what the user means to do
             // for Block(s) with non empty getOutputs() the id probably refers
             //  to the last definition in the current Block
@@ -1028,12 +1027,7 @@ public abstract class ProcessorDefinition<Type extends ProcessorDefinition<Type>
                     }
                 }
             }
-            if (!getOutputs().isEmpty()) {
-                outputs.get(outputs.size() - 1).setId(id);
-            } else {
-                // the output could be empty
-                setId(id);
-            }
+            outputs.get(outputs.size() - 1).setId(id);
         }
 
         return (Type) this;

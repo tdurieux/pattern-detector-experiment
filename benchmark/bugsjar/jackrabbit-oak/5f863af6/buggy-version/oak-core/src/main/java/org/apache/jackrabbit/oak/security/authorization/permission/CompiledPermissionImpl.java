@@ -145,8 +145,7 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
         return new RepositoryPermission() {
             @Override
             public boolean isGranted(long repositoryPermissions) {
-                EntryPredicate predicate = new EntryPredicate();
-                return hasPermissions(getEntryIterator(predicate), predicate, repositoryPermissions, null);
+                return hasPermissions(getEntryIterator(new EntryPredicate()), repositoryPermissions, null);
             }
         };
     }
@@ -243,8 +242,8 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
 
     @Override
     public boolean isGranted(@Nonnull String path, long permissions) {
-        EntryPredicate predicate = new EntryPredicate(path, Permissions.respectParentPermissions(permissions));
-        return hasPermissions(getEntryIterator(predicate), predicate, permissions, path);
+        Iterator<PermissionEntry> it = getEntryIterator(new EntryPredicate(path, Permissions.respectParentPermissions(permissions)));
+        return hasPermissions(it, permissions, path);
     }
 
     @Nonnull
@@ -261,12 +260,11 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
     //------------------------------------------------------------< private >---
 
     private boolean internalIsGranted(@Nonnull Tree tree, @Nullable PropertyState property, long permissions) {
-        EntryPredicate predicate = new EntryPredicate(tree, property, Permissions.respectParentPermissions(permissions));
-        return hasPermissions(getEntryIterator(predicate), predicate, permissions, tree.getPath());
+        Iterator<PermissionEntry> it = getEntryIterator(tree, property, permissions);
+        return hasPermissions(it, permissions, tree.getPath());
     }
 
     private boolean hasPermissions(@Nonnull Iterator<PermissionEntry> entries,
-                                   @Nonnull EntryPredicate predicate,
                                    long permissions, @Nullable String path) {
         // calculate readable paths if the given permissions includes any read permission.
         boolean isReadable = Permissions.diff(Permissions.READ, permissions) != Permissions.READ && readPolicy.isReadablePath(path, false);
@@ -312,18 +310,14 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
             }
 
             if (entry.isAllow) {
-                if (!respectParent || predicate.apply(entry, false)) {
-                    allowBits.addDifference(entry.privilegeBits, denyBits);
-                }
+                allowBits.addDifference(entry.privilegeBits, denyBits);
                 long ap = PrivilegeBits.calculatePermissions(allowBits, parentAllowBits, true);
                 allows |= Permissions.diff(ap, denies);
                 if ((allows | ~permissions) == -1) {
                     return true;
                 }
             } else {
-                if (!respectParent || predicate.apply(entry, false)) {
-                    denyBits.addDifference(entry.privilegeBits, allowBits);
-                }
+                denyBits.addDifference(entry.privilegeBits, allowBits);
                 long dp = PrivilegeBits.calculatePermissions(denyBits, parentDenyBits, false);
                 denies |= Permissions.diff(dp, allows);
                 if (Permissions.includes(denies, permissions)) {
@@ -380,6 +374,11 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
             allowBits.add(bitsProvider.getBits(PrivilegeConstants.JCR_READ));
         }
         return allowBits;
+    }
+
+    @Nonnull
+    private Iterator<PermissionEntry> getEntryIterator(@Nonnull Tree tree, @Nullable PropertyState property, long permissions) {
+        return getEntryIterator(new EntryPredicate(tree, property, Permissions.respectParentPermissions(permissions)));
     }
 
     @Nonnull
@@ -527,16 +526,12 @@ final class CompiledPermissionImpl implements CompiledPermissions, PermissionCon
 
         @Override
         public boolean isGranted(long permissions) {
-            EntryPredicate predicate = new EntryPredicate(tree, null, Permissions.respectParentPermissions(permissions));
-            Iterator<PermissionEntry> it = concat(new LazyIterator(this, true, predicate), new LazyIterator(this, false, predicate));
-            return hasPermissions(it, predicate, permissions, tree.getPath());
+            return hasPermissions(getIterator(null, permissions), permissions, tree.getPath());
         }
 
         @Override
         public boolean isGranted(long permissions, @Nonnull PropertyState property) {
-            EntryPredicate predicate = new EntryPredicate(tree, property, Permissions.respectParentPermissions(permissions));
-            Iterator<PermissionEntry> it = concat(new LazyIterator(this, true, predicate), new LazyIterator(this, false, predicate));
-            return hasPermissions(it, predicate, permissions, tree.getPath());
+            return hasPermissions(getIterator(property, permissions), permissions, tree.getPath());
         }
 
         //--------------------------------------------------------< private >---

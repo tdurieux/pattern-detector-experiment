@@ -23,10 +23,7 @@ import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
 import org.apache.jackrabbit.oak.spi.commit.EmptyHook;
 import org.apache.jackrabbit.oak.spi.state.NodeBuilder;
-import org.apache.jackrabbit.oak.spi.state.NodeState;
 import org.apache.jackrabbit.oak.spi.state.NodeStore;
-
-import javax.annotation.CheckForNull;
 
 /**
  * Utility class to manage a unique cluster/repository id for the cluster.
@@ -60,13 +57,8 @@ public class ClusterRepositoryInfo {
      * @param store the NodeStore instance
      * @return the repository id
      */
-    @CheckForNull
     public static String getId(NodeStore store) {
-        NodeState state = store.getRoot().getChildNode(CLUSTER_CONFIG_NODE);
-        if (state.hasProperty(CLUSTER_ID_PROP)) {
-            return state.getProperty(CLUSTER_ID_PROP).getValue(Type.STRING);
-        }
-        return null;
+        return store.getRoot().getChildNode(CLUSTER_CONFIG_NODE).getProperty(CLUSTER_ID_PROP).getValue(Type.STRING);
     }
 }
 

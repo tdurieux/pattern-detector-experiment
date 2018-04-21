@@ -116,11 +116,10 @@ public final class Url implements Serializable
 	 * Parses the given URL string.
 	 * 
 	 * @param url
-	 *           full absolute or relative url with query string
 	 * @param charset
 	 * @return Url object
 	 */
-	public static Url parse(String url, Charset charset)
+	public static Url parse(final String url, Charset charset)
 	{
 		Args.notNull(url, "url");
 
@@ -129,79 +128,36 @@ public final class Url implements Serializable
 		// the url object resolved the charset, use that
 		charset = result.getCharset();
 
-		// extract query string part
-		final String queryString;
-		final String absoluteUrl;
+		String segments;
+		String query;
 
-		int queryAt = url.indexOf('?');
+		int qIndex = url.indexOf('?');
 
-		if (queryAt == -1)
+		if (qIndex == -1)
 		{
-			queryString = "";
-			absoluteUrl = url;
+			segments = url;
+			query = "";
 		}
 		else
 		{
-			absoluteUrl = url.substring(0, queryAt);
-			queryString = url.substring(queryAt + 1);
-		}
-		
-		// get absolute / relative part of url
-		String relativeUrl;
-
-		// absolute urls contain a scheme://
-		final int protocolAt = absoluteUrl.indexOf("://");
-
-		if (protocolAt != -1)
-		{
-			result.protocol = absoluteUrl.substring(0, protocolAt);
-			final String afterProto = absoluteUrl.substring(protocolAt + 3);
-			final String hostAndPort;
-
-			int relativeAt = afterProto.indexOf('/');
-
-			if (relativeAt == -1)
-			{
-				relativeUrl = "";
-				hostAndPort = afterProto;
-			}
-			else
-			{
-				relativeUrl = afterProto.substring(relativeAt);
-				hostAndPort = afterProto.substring(0, relativeAt);
-			}
-
-			int portAt = hostAndPort.indexOf(':');
-
-			if (portAt == -1)
-			{
-				result.host = hostAndPort;
-				result.port = null;
-			}
-			else
-			{
-				result.host = hostAndPort.substring(0, portAt);
-				result.port = Integer.parseInt(hostAndPort.substring(portAt + 1));
-			}
-		}
-		else
-		{
-			relativeUrl = absoluteUrl;
+			segments = url.substring(0, qIndex);
+			query = url.substring(qIndex + 1);
 		}
 
-		if (relativeUrl.length() > 0)
+		if (segments.length() > 0)
 		{
+
 			boolean removeLast = false;
-			if (relativeUrl.endsWith("/"))
+			if (segments.endsWith("/"))
 			{
 				// we need to append something and remove it after splitting
 				// because otherwise the
 				// trailing slashes will be lost
-				relativeUrl += "/x";
+				segments += "/x";
 				removeLast = true;
 			}
 
-			String segmentArray[] = Strings.split(relativeUrl, '/');
+			String segmentArray[] = Strings.split(segments, '/');
 
 			if (removeLast)
 			{
@@ -217,9 +173,9 @@ public final class Url implements Serializable
 			}
 		}
 
-		if (queryString.length() > 0)
+		if (query.length() > 0)
 		{
-			String queryArray[] = Strings.split(queryString, '&');
+			String queryArray[] = Strings.split(query, '&');
 			for (String s : queryArray)
 			{
 				result.parameters.add(parseQueryParameter(s, charset));

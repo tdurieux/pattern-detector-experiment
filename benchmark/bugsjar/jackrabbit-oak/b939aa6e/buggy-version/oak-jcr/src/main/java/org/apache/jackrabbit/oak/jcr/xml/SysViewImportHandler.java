@@ -277,8 +277,7 @@ class SysViewImportHandler extends TargetImportHandler {
                 PropInfo prop = new PropInfo(
                         currentPropName == null ? null : currentPropName.getRepoQualifiedName(),
                         currentPropType,
-                        currentPropValues,
-                        currentPropMultipleStatus);
+                        currentPropValues);
                 state.props.add(prop);
             }
             // reset temp fields

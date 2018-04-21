@@ -166,8 +166,4 @@ public class UniqueEntryStoreStrategy implements IndexStoreStrategy {
         return count;
     }
 
-    @Override
-    public long count(final Filter filter, NodeState indexMeta, Set<String> values, int max) {
-        return count(indexMeta, values, max);
-    }
 }

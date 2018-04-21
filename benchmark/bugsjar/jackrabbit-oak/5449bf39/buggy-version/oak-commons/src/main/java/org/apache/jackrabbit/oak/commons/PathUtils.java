@@ -16,10 +16,9 @@
  */
 package org.apache.jackrabbit.oak.commons;
 
+import javax.annotation.Nonnull;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
-
-import javax.annotation.Nonnull;
 
 /**
  * Utility methods to parse a path.
@@ -289,12 +288,7 @@ public class PathUtils {
         if (ancestor.isEmpty() || path.isEmpty()) {
             return false;
         }
-        if (denotesRoot(ancestor)) {
-            if (denotesRoot(path)) {
-                return false;
-            }
-        }
-        else {
+        if (!denotesRoot(ancestor)) {
             ancestor += "/";
         }
         return path.startsWith(ancestor);

@@ -38,11 +38,6 @@ public class DefaultPathTranslator
 
     public void alignToBaseDirectory( Model model, File basedir )
     {
-        if ( basedir == null )
-        {
-            return;
-        }
-
         Build build = model.getBuild();
 
         if ( build != null )
@@ -88,11 +83,6 @@ public class DefaultPathTranslator
 
     public String alignToBaseDirectory( String path, File basedir )
     {
-        if ( basedir == null )
-        {
-            return path;
-        }
-
         if ( path == null )
         {
             return null;
@@ -176,11 +166,6 @@ public class DefaultPathTranslator
 
     public void unalignFromBaseDirectory( Model model, File basedir )
     {
-        if ( basedir == null )
-        {
-            return;
-        }
-
         Build build = model.getBuild();
 
         if ( build != null )
@@ -224,37 +209,14 @@ public class DefaultPathTranslator
         }
     }
 
-    public String unalignFromBaseDirectory( String path, File basedir )
+    public String unalignFromBaseDirectory( String directory, File basedir )
     {
-        if ( basedir == null )
+        String path = basedir.getPath();
+        if ( directory.startsWith( path ) )
         {
-            return path;
+            directory = directory.substring( path.length() + 1 ).replace( '\\', '/' );
         }
-
-        if ( path == null )
-        {
-            return null;
-        }
-
-        path = path.trim();
-
-        String base = basedir.getAbsolutePath();
-        if ( path.startsWith( base ) )
-        {
-            path = chopLeadingFileSeparator( path.substring( base.length() ) );
-        }
-
-        if ( path.length() <= 0 )
-        {
-            path = ".";
-        }
-
-        if ( !new File( path ).isAbsolute() )
-        {
-            path = path.replace( '\\', '/' );
-        }
-
-        return path;
+        return directory;
     }
 
 }

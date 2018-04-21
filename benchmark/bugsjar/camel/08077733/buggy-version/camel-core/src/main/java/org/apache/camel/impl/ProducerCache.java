@@ -60,31 +60,23 @@ public class ProducerCache extends ServiceSupport {
     private boolean eventNotifierEnabled = true;
     private boolean extendedStatistics;
     private int maxCacheSize;
-    private boolean stopServicePool;
 
     public ProducerCache(Object source, CamelContext camelContext) {
         this(source, camelContext, CamelContextHelper.getMaximumCachePoolSize(camelContext));
     }
 
     public ProducerCache(Object source, CamelContext camelContext, int cacheSize) {
-        this(source, camelContext, null, createLRUCache(cacheSize));
+        this(source, camelContext, camelContext.getProducerServicePool(), createLRUCache(cacheSize));
     }
 
     public ProducerCache(Object source, CamelContext camelContext, Map<String, Producer> cache) {
-        this(source, camelContext, null, cache);
+        this(source, camelContext, camelContext.getProducerServicePool(), cache);
     }
 
     public ProducerCache(Object source, CamelContext camelContext, ServicePool<Endpoint, Producer> producerServicePool, Map<String, Producer> cache) {
         this.source = source;
         this.camelContext = camelContext;
-        if (producerServicePool == null) {
-            // use shared producer pool which lifecycle is managed by CamelContext
-            this.pool = camelContext.getProducerServicePool();
-            this.stopServicePool = false;
-        } else {
-            this.pool = producerServicePool;
-            this.stopServicePool = true;
-        }
+        this.pool = producerServicePool;
         this.producers = cache;
         if (producers instanceof LRUCache) {
             maxCacheSize = ((LRUCache) producers).getMaxCacheSize();
@@ -476,10 +468,7 @@ public class ProducerCache extends ServiceSupport {
 
     protected void doStop() throws Exception {
         // when stopping we intend to shutdown
-        ServiceHelper.stopAndShutdownService(statistics);
-        if (stopServicePool) {
-            ServiceHelper.stopAndShutdownService(pool);
-        }
+        ServiceHelper.stopAndShutdownServices(statistics, pool);
         try {
             ServiceHelper.stopAndShutdownServices(producers.values());
         } finally {

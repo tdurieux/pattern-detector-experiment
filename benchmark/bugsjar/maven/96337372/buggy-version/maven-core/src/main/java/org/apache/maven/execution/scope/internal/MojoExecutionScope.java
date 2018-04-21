@@ -19,8 +19,6 @@ package org.apache.maven.execution.scope.internal;
  * under the License.
  */
 
-import java.util.Collection;
-import java.util.IdentityHashMap;
 import java.util.LinkedList;
 import java.util.Map;
 
@@ -179,42 +177,36 @@ public class MojoExecutionScope
     public void beforeMojoExecution( MojoExecutionEvent event )
         throws MojoExecutionException
     {
-        for ( WeakMojoExecutionListener provided : getProvidedListeners() )
+        for ( Object provided : getScopeState().provided.values() )
         {
-            provided.beforeMojoExecution( event );
+            if ( provided instanceof WeakMojoExecutionListener )
+            {
+                ( (WeakMojoExecutionListener) provided ).beforeMojoExecution( event );
+            }
         }
     }
 
     public void afterMojoExecutionSuccess( MojoExecutionEvent event )
         throws MojoExecutionException
     {
-        for ( WeakMojoExecutionListener provided : getProvidedListeners() )
+        for ( Object provided : getScopeState().provided.values() )
         {
-            provided.afterMojoExecutionSuccess( event );
+            if ( provided instanceof WeakMojoExecutionListener )
+            {
+                ( (WeakMojoExecutionListener) provided ).afterMojoExecutionSuccess( event );
+            }
         }
     }
 
     public void afterExecutionFailure( MojoExecutionEvent event )
     {
-        for ( WeakMojoExecutionListener provided : getProvidedListeners() )
-        {
-            provided.afterExecutionFailure( event );
-        }
-    }
-
-    private Collection<WeakMojoExecutionListener> getProvidedListeners()
-    {
-        // the same instance can be provided multiple times under different Key's
-        // deduplicate instances to avoid redundant beforeXXX/afterXXX callbacks
-        IdentityHashMap<WeakMojoExecutionListener, Object> listeners =
-            new IdentityHashMap<WeakMojoExecutionListener, Object>();
         for ( Object provided : getScopeState().provided.values() )
         {
             if ( provided instanceof WeakMojoExecutionListener )
             {
-                listeners.put( (WeakMojoExecutionListener) provided, null );
+                ( (WeakMojoExecutionListener) provided ).afterExecutionFailure( event );
             }
         }
-        return listeners.keySet();
     }
+
 }

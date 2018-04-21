@@ -161,11 +161,7 @@ public class SessionImpl implements JackrabbitSession {
         return perform(new ReadOperation<Node>() {
             @Override
             public Node perform() throws RepositoryException {
-                try {
-                    return NodeImpl.createNodeOrNull(sd.getNode(getOakPathOrThrow(absPath)), sessionContext);
-                } catch (PathNotFoundException e) {
-                    return null;
-                }
+                return NodeImpl.createNodeOrNull(sd.getNode(getOakPathOrThrow(absPath)), sessionContext);
             }
         });
     }
@@ -183,12 +179,7 @@ public class SessionImpl implements JackrabbitSession {
         if (absPath.equals("/")) {
             return null;
         } else {
-            final String oakPath;
-            try {
-                oakPath = getOakPathOrThrow(absPath);
-            } catch (PathNotFoundException e) {
-                return null;
-            }
+            final String oakPath = getOakPathOrThrow(absPath);
             return perform(new ReadOperation<Property>() {
                 @Override
                 public Property perform() throws RepositoryException {

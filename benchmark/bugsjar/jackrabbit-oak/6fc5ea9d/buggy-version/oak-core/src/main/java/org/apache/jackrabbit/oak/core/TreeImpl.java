@@ -91,7 +91,7 @@ public class TreeImpl implements Tree {
         this.root = checkNotNull(root);
         this.parent = checkNotNull(parent);
         this.name = checkNotNull(name);
-        this.nodeBuilder = parent.nodeBuilder.getChildNode(name);
+        this.nodeBuilder = parent.nodeBuilder.child(name);
         this.pendingMoves = checkNotNull(pendingMoves);
     }
 
@@ -187,7 +187,11 @@ public class TreeImpl implements Tree {
         checkNotNull(name);
         enter();
         TreeImpl child = internalGetChild(name);
-        return canRead(child) ? child : null;
+        if (child != null && canRead(child)) {
+            return child;
+        } else {
+            return null;
+        }
     }
 
     @Override
@@ -434,8 +438,11 @@ public class TreeImpl implements Tree {
         TreeImpl child = this;
         for (String name : elements(path)) {
             child = child.internalGetChild(name);
+            if (child == null) {
+                return null;
+            }
         }
-        return canRead(child) ? child : null;
+        return (canRead(child)) ? child : null;
     }
 
     /**
@@ -519,7 +526,9 @@ public class TreeImpl implements Tree {
     }
 
     private TreeImpl internalGetChild(String childName) {
-        return new TreeImpl(root, this, childName, pendingMoves);
+        return nodeBuilder.hasChildNode(childName)
+            ? new TreeImpl(root, this, childName, pendingMoves)
+            : null;
     }
 
     private PropertyState internalGetProperty(String propertyName) {

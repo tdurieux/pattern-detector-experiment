@@ -98,8 +98,7 @@ class MongoRootBuilder extends MongoNodeBuilder {
         purge();
         branch.rebase();
         NodeState head = branch.getHead();
-        reset(branch.getBase());
-        super.reset(head);
+        reset(head);
         return head;
     }
 

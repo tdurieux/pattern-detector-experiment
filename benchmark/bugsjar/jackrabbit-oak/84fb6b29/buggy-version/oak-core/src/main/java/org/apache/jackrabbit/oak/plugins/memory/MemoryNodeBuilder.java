@@ -260,7 +260,7 @@ public class MemoryNodeBuilder implements NodeBuilder {
 
     @Override
     public boolean isNew() {
-        return exists() && !base.exists();
+        return !isRoot() && !parent.base().hasChildNode(name) && parent.hasChildNode(name);
     }
 
     @Override

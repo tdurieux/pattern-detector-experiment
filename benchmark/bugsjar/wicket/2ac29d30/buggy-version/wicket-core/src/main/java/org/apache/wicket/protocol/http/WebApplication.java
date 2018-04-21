@@ -876,12 +876,10 @@ public abstract class WebApplication extends Application
 	}
 
 	/**
-	 * Retrieves a stored buffered response for a given sessionId and url.
-	 *
+	 * 
+	 * @param sessionId
 	 * @param url
-	 *          The url used as a key
-	 * @return the stored buffered response. {@code null} if there is no stored response for the given url
-	 * @see org.apache.wicket.settings.IRequestCycleSettings.RenderStrategy#REDIRECT_TO_BUFFER
+	 * @return buffered response
 	 */
 	public BufferedWebResponse getAndRemoveBufferedResponse(String sessionId, Url url)
 	{

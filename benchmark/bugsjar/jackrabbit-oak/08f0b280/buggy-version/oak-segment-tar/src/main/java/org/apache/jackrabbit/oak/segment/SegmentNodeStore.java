@@ -404,11 +404,7 @@ public class SegmentNodeStore implements NodeStore, Observable {
             }
 
             NodeBuilder cp = checkpoints.child(name);
-            if (Long.MAX_VALUE - now > lifetime) {
-                cp.setProperty("timestamp", now + lifetime);
-            } else {
-                cp.setProperty("timestamp", Long.MAX_VALUE);
-            }
+            cp.setProperty("timestamp", now + lifetime);
             cp.setProperty("created", now);
 
             NodeBuilder props = cp.setChildNode("properties");

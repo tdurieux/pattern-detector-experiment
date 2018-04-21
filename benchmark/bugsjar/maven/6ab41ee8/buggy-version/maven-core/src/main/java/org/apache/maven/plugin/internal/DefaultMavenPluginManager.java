@@ -390,6 +390,8 @@ public class DefaultMavenPluginManager
         RepositorySystemSession repositorySession = session.getRepositorySession();
         if ( plugin.isExtensions() )
         {
+            // TODO discover components in #setupExtensionsRealm
+
             ExtensionRealmCache.CacheRecord extensionRecord;
             try
             {
@@ -404,11 +406,6 @@ public class DefaultMavenPluginManager
 
             pluginRealm = extensionRecord.realm;
             pluginArtifacts = extensionRecord.artifacts;
-
-            for ( ComponentDescriptor<?> componentDescriptor : pluginDescriptor.getComponents() )
-            {
-                componentDescriptor.setRealm( pluginRealm );
-            }
         }
         else
         {
@@ -879,8 +876,6 @@ public class DefaultMavenPluginManager
         if ( extensionRecord == null )
         {
             ClassRealm extensionRealm = classRealmManager.createExtensionRealm( plugin, toAetherArtifacts( artifacts ) );
-
-            // TODO figure out how to use the same PluginDescriptor when running mojos
 
             PluginDescriptor pluginDescriptor = null;
             if ( plugin.isExtensions() && !artifacts.isEmpty() )

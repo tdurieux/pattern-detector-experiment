@@ -2084,9 +2084,9 @@ public final class DocumentNodeStore
     BackgroundWriteStats backgroundWrite() {
         return unsavedLastRevisions.persist(this, new UnsavedModifications.Snapshot() {
             @Override
-            public void acquiring(Revision mostRecent) {
+            public void acquiring() {
                 if (store.create(JOURNAL,
-                        singletonList(changes.asUpdateOp(mostRecent)))) {
+                        singletonList(changes.asUpdateOp(getHeadRevision())))) {
                     changes = JOURNAL.newDocument(getDocumentStore());
                 }
             }

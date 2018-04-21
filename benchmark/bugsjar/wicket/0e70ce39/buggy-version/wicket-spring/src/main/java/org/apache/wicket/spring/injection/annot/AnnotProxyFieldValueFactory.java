@@ -29,10 +29,8 @@ import org.apache.wicket.spring.ISpringContextLocator;
 import org.apache.wicket.spring.SpringBeanLocator;
 import org.apache.wicket.util.lang.Generics;
 import org.apache.wicket.util.string.Strings;
-import org.springframework.beans.factory.BeanFactory;
 import org.springframework.beans.factory.BeanFactoryUtils;
 import org.springframework.beans.factory.config.BeanDefinition;
-import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.beans.factory.support.AbstractBeanDefinition;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.support.AbstractApplicationContext;
@@ -189,15 +187,12 @@ public class AnnotProxyFieldValueFactory implements IFieldValueFactory
 		while (it.hasNext())
 		{
 			final String possibility = it.next();
-			if (ctx instanceof AbstractApplicationContext)
+			BeanDefinition beanDef = ((AbstractApplicationContext)ctx).getBeanFactory()
+					.getBeanDefinition(possibility);
+			if (BeanFactoryUtils.isFactoryDereference(possibility) ||
+					possibility.startsWith("scopedTarget.") || !beanDef.isAutowireCandidate())
 			{
-				BeanDefinition beanDef = getBeanDefinition(((AbstractApplicationContext)ctx)
-						.getBeanFactory(), possibility);
-				if (BeanFactoryUtils.isFactoryDereference(possibility) ||
-						possibility.startsWith("scopedTarget.") || !beanDef.isAutowireCandidate())
-				{
-					it.remove();
-				}
+				it.remove();
 			}
 		}
 
@@ -209,22 +204,17 @@ public class AnnotProxyFieldValueFactory implements IFieldValueFactory
 		{
 			if (ctx instanceof AbstractApplicationContext)
 			{
-				List<String> primaries = new ArrayList<String>();
 				for (String name : names)
 				{
-					BeanDefinition beanDef = getBeanDefinition(((AbstractApplicationContext)ctx)
-							.getBeanFactory(), name);
+					BeanDefinition beanDef = ((AbstractApplicationContext)ctx).getBeanFactory()
+							.getBeanDefinition(name);
 					if (beanDef instanceof AbstractBeanDefinition)
 					{
 						if (((AbstractBeanDefinition)beanDef).isPrimary())
 						{
-							primaries.add(name);
+							return name;
 						}
 					}
-				}
-				if (primaries.size() == 1)
-				{
-					return primaries.get(0);
 				}
 			}
 			StringBuilder msg = new StringBuilder();
@@ -241,28 +231,6 @@ public class AnnotProxyFieldValueFactory implements IFieldValueFactory
 			return names.get(0);
 		}
 	}
-
-	private BeanDefinition getBeanDefinition(ConfigurableListableBeanFactory beanFactory,
-			String name)
-	{
-		if (beanFactory.containsBeanDefinition(name))
-		{
-			return beanFactory.getBeanDefinition(name);
-		}
-		else
-		{
-			BeanFactory parent = beanFactory.getParentBeanFactory();
-			if (parent != null && parent instanceof ConfigurableListableBeanFactory)
-			{
-				return getBeanDefinition(beanFactory, name);
-			}
-			else
-			{
-				return null;
-			}
-		}
-	}
-
 
 	/**
 	 * @see org.apache.wicket.injection.IFieldValueFactory#supportsField(java.lang.reflect.Field)

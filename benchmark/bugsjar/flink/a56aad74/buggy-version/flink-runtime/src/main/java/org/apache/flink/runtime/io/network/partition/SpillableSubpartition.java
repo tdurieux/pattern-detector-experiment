@@ -59,7 +59,7 @@ class SpillableSubpartition extends ResultSubpartition {
 	private boolean isFinished;
 
 	/** Flag indicating whether the subpartition has been released. */
-	boolean isReleased;
+	private boolean isReleased;
 
 	/** The read view to consume this subpartition. */
 	private ResultSubpartitionView readView;

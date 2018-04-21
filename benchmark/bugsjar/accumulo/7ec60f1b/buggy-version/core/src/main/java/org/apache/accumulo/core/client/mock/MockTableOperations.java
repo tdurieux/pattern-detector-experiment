@@ -55,9 +55,9 @@ import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Text;
 
 public class MockTableOperations extends TableOperationsHelper {
-  private static final byte[] ZERO = {0};
-  private final MockAccumulo acu;
-  private final String username;
+
+  final private MockAccumulo acu;
+  final private String username;
 
   MockTableOperations(MockAccumulo acu, String username) {
     this.acu = acu;
@@ -314,11 +314,7 @@ public class MockTableOperations extends TableOperationsHelper {
     if (!exists(tableName))
       throw new TableNotFoundException(tableName, tableName, "");
     MockTable t = acu.tables.get(tableName);
-    Text startText = new Text(start);
-    Text endText = new Text(end);
-    startText.append(ZERO, 0, 1);
-    endText.append(ZERO, 0, 1);
-    Set<Key> keep = new TreeSet<Key>(t.table.subMap(new Key(startText), new Key(endText)).keySet());
+    Set<Key> keep = new TreeSet<Key>(t.table.tailMap(new Key(start)).headMap(new Key(end)).keySet());
     t.table.keySet().removeAll(keep);
   }
 

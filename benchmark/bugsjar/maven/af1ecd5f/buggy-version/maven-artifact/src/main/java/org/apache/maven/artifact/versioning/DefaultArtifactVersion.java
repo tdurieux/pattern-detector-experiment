@@ -21,7 +21,6 @@ package org.apache.maven.artifact.versioning;
 
 import java.util.StringTokenizer;
 import java.util.regex.Pattern;
-import java.util.NoSuchElementException;
 
 /**
  * Default implementation of artifact versioning.
@@ -205,18 +204,12 @@ public class DefaultArtifactVersion
 
     private static Integer getNextIntegerToken( StringTokenizer tok )
     {
-        try {
-            String s = tok.nextToken();
-            if ( ( s.length() > 1 ) && s.startsWith( "0" ) )
-            {
-                throw new NumberFormatException( "Number part has a leading 0: '" + s + "'" );
-            }
-            return Integer.valueOf( s );
-        } 
-        catch( NoSuchElementException e )
+        String s = tok.nextToken();
+        if ( ( s.length() > 1 ) && s.startsWith( "0" ) )
         {
-            throw new NumberFormatException( "Number is invalid" );
+            throw new NumberFormatException( "Number part has a leading 0: '" + s + "'" );
         }
+        return Integer.valueOf( s );
     }
 
     @Override

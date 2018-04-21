@@ -137,21 +137,24 @@ public class FileConsumer extends GenericFileConsumer<File> {
         answer.setAbsolute(FileUtil.isAbsolute(file));
         answer.setAbsoluteFilePath(file.getAbsolutePath());
         answer.setLastModified(file.lastModified());
-
-        // compute the file path as relative to the starting directory
-        File path;
-        String endpointNormalized = FileUtil.normalizePath(endpointPath);
-        if (file.getPath().startsWith(endpointNormalized)) {
-            // skip duplicate endpoint path
-            path = new File(ObjectHelper.after(file.getPath(), endpointNormalized + File.separator));
+        if (answer.isAbsolute()) {
+            // use absolute path as relative
+            answer.setRelativeFilePath(file.getAbsolutePath());
         } else {
-            path = new File(file.getPath());
-        }
+            File path;
+            String endpointNormalized = FileUtil.normalizePath(endpointPath);
+            if (file.getPath().startsWith(endpointNormalized)) {
+                // skip duplicate endpoint path
+                path = new File(ObjectHelper.after(file.getPath(), endpointNormalized + File.separator));
+            } else {
+                path = new File(file.getPath());
+            }
 
-        if (path.getParent() != null) {
-            answer.setRelativeFilePath(path.getParent() + File.separator + file.getName());
-        } else {
-            answer.setRelativeFilePath(path.getName());
+            if (path.getParent() != null) {
+                answer.setRelativeFilePath(path.getParent() + File.separator + file.getName());
+            } else {
+                answer.setRelativeFilePath(path.getName());
+            }
         }
 
         // the file name should be the relative path

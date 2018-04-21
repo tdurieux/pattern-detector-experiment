@@ -60,11 +60,7 @@ public class LoopProcessor extends DelegateAsyncProcessor implements Traceable {
             callback.done(true);
             return true;
         }
-        
-        // we hold on to the original Exchange in case it's needed for copies
-        final Exchange original = exchange;
-        
-        // per-iteration exchange
+
         Exchange target = exchange;
 
         // set the size before we start
@@ -74,9 +70,8 @@ public class LoopProcessor extends DelegateAsyncProcessor implements Traceable {
         while (index.get() < count.get()) {
 
             // and prepare for next iteration
-            // if (!copy) target = exchange; else copy of original
-            target = prepareExchange(exchange, index.get(), original);
-            boolean sync = process(target, callback, index, count, original);
+            target = prepareExchange(exchange, index.get());
+            boolean sync = process(target, callback, index, count);
 
             if (!sync) {
                 LOG.trace("Processing exchangeId: {} is continued being processed asynchronously", target.getExchangeId());
@@ -99,13 +94,12 @@ public class LoopProcessor extends DelegateAsyncProcessor implements Traceable {
     }
 
     protected boolean process(final Exchange exchange, final AsyncCallback callback,
-                              final AtomicInteger index, final AtomicInteger count,
-                              final Exchange original) {
+                              final AtomicInteger index, final AtomicInteger count) {
 
         // set current index as property
         LOG.debug("LoopProcessor: iteration #{}", index.get());
         exchange.setProperty(Exchange.LOOP_INDEX, index.get());
-        
+
         boolean sync = processor.process(exchange, new AsyncCallback() {
             public void done(boolean doneSync) {
                 // we only have to handle async completion of the routing slip
@@ -122,10 +116,10 @@ public class LoopProcessor extends DelegateAsyncProcessor implements Traceable {
                 while (index.get() < count.get()) {
 
                     // and prepare for next iteration
-                    target = prepareExchange(exchange, index.get(), original);
+                    target = prepareExchange(exchange, index.get());
 
                     // process again
-                    boolean sync = process(target, callback, index, count, original);
+                    boolean sync = process(target, callback, index, count);
                     if (!sync) {
                         LOG.trace("Processing exchangeId: {} is continued being processed asynchronously", target.getExchangeId());
                         // the remainder of the routing slip will be completed async
@@ -154,11 +148,10 @@ public class LoopProcessor extends DelegateAsyncProcessor implements Traceable {
      * @param index the index of the next iteration
      * @return the exchange to use
      */
-    protected Exchange prepareExchange(Exchange exchange, int index, Exchange original) {
+    protected Exchange prepareExchange(Exchange exchange, int index) {
         if (copy) {
             // use a copy but let it reuse the same exchange id so it appear as one exchange
-            // use the original exchange rather than the looping exchange (esp. with the async routing engine)
-            return ExchangeHelper.createCopy(original, true);
+            return ExchangeHelper.createCopy(exchange, true);
         } else {
             ExchangeHelper.prepareOutToIn(exchange);
             return exchange;

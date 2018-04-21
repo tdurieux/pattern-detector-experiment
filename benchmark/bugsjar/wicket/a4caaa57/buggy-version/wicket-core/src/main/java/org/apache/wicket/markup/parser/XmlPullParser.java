@@ -31,7 +31,6 @@ import org.apache.wicket.util.lang.Args;
 import org.apache.wicket.util.parse.metapattern.parsers.TagNameParser;
 import org.apache.wicket.util.parse.metapattern.parsers.VariableAssignmentParser;
 import org.apache.wicket.util.resource.ResourceStreamNotFoundException;
-import org.apache.wicket.util.string.Strings;
 
 /**
  * A fairly shallow markup pull parser which parses a markup string of a given type of markup (for
@@ -665,9 +664,6 @@ public final class XmlPullParser implements IXmlPullParser
 
 				// Trim trailing whitespace
 				value = value.trim();
-
-				// Unescape
-				value = Strings.unescapeMarkup(value).toString();
 
 				// Get key
 				final String key = attributeParser.getKey();

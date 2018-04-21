@@ -228,13 +228,8 @@ public class LocalFileSystem extends FileSystem {
 	 */
 	public boolean mkdirs(final Path f) throws IOException {
 
-		final File p2f = pathToFile(f);
-
-		if(p2f.isDirectory()) {
-			return true;
-		}
-
 		final Path parent = f.getParent();
+		final File p2f = pathToFile(f);
 		return (parent == null || mkdirs(parent)) && (p2f.mkdir() || p2f.isDirectory());
 	}
 

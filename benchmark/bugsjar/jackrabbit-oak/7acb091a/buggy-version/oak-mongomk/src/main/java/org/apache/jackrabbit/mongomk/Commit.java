@@ -268,11 +268,11 @@ public class Commit {
             Revision newestRev = mk.getNewestRevision(map, revision,
                     new CollisionHandler() {
                 @Override
-                void concurrentModification(Revision other) {
+                void uncommittedModification(Revision uncommitted) {
                     if (collisions.get() == null) {
                         collisions.set(new ArrayList<Revision>());
                     }
-                    collisions.get().add(other);
+                    collisions.get().add(uncommitted);
                 }
             });
             String conflictMessage = null;
@@ -296,7 +296,7 @@ public class Commit {
             }
             if (conflictMessage != null) {
                 conflictMessage += ", before\n" + revision + 
-                        "; document:\n" + Utils.formatDocument(map) + 
+                        "; document:\n" + map.toString().replaceAll(", _", ",\n_").replaceAll("}, ", "},\n") + 
                         ",\nrevision order:\n" + mk.getRevisionComparator();
                 throw new MicroKernelException(conflictMessage);
             }
@@ -306,7 +306,11 @@ public class Commit {
             if (collisions.get() != null && isConflicting(map, op)) {
                 for (Revision r : collisions.get()) {
                     // mark collisions on commit root
-                    new Collision(map, r, op, revision).mark(store);
+                    Collision c = new Collision(map, r, op, revision);
+                    boolean success = c.mark(store);
+                    if (!success) {
+                        // TODO: fail this commit
+                    }
                 }
             }
         }

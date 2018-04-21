@@ -303,9 +303,10 @@ public abstract class RealVector {
     public double dotProduct(RealVector v) {
         checkVectorDimensions(v);
         double d = 0;
-        final int n = getDimension();
-        for (int i = 0; i < n; i++) {
-            d += getEntry(i) * v.getEntry(i);
+        Iterator<Entry> it = sparseIterator();
+        while (it.hasNext()) {
+            final Entry e = it.next();
+            d += e.getValue() * v.getEntry(e.getIndex());
         }
         return d;
     }

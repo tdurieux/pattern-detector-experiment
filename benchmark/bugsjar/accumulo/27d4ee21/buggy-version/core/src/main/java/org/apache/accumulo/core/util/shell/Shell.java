@@ -286,7 +286,8 @@ public class Shell extends ShellOptions {
 
     // process default parameters if unspecified
     try {
-      final boolean hasToken = (token != null);
+      boolean hasToken = (token != null);
+      boolean hasTokenOptions = !loginOptions.isEmpty();
 
       if (hasToken && password != null) {
         throw new ParameterException("Can not supply '--pass' option with '--tokenClass' option");
@@ -299,15 +300,16 @@ public class Shell extends ShellOptions {
         }
       });
 
-      if (hasToken) { // implied hasTokenOptions
+      // Need either both a token and options, or neither, but not just one.
+      if (hasToken != hasTokenOptions) {
+        throw new ParameterException("Must supply either both or neither of '--tokenClass' and '--tokenProperty'");
+      } else if (hasToken) { // implied hasTokenOptions
         // Fully qualified name so we don't shadow java.util.Properties
         org.apache.accumulo.core.client.security.tokens.AuthenticationToken.Properties props;
         // and line wrap it because the package name is so long
         props = new org.apache.accumulo.core.client.security.tokens.AuthenticationToken.Properties();
 
-        if (!loginOptions.isEmpty()) {
-          props.putAllStrings(loginOptions);
-        }
+        props.putAllStrings(loginOptions);
         token.init(props);
       } else {
         // Read password if the user explicitly asked for it, or didn't specify anything at all

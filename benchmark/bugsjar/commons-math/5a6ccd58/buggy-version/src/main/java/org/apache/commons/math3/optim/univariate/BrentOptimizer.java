@@ -150,6 +150,7 @@ public class BrentOptimizer extends UnivariateOptimizer {
         // Best point encountered so far (which is the initial guess).
         UnivariatePointValuePair best = current;
 
+        int iter = 0;
         while (true) {
             final double m = 0.5 * (a + b);
             final double tol1 = relativeThreshold * FastMath.abs(x) + absoluteThreshold;
@@ -237,7 +238,7 @@ public class BrentOptimizer extends UnivariateOptimizer {
                                  isMinim),
                             isMinim);
 
-                if (checker != null && checker.converged(getIterations(), previous, current)) {
+                if (checker != null && checker.converged(iter, previous, current)) {
                     return best;
                 }
 
@@ -280,8 +281,7 @@ public class BrentOptimizer extends UnivariateOptimizer {
                                  isMinim),
                             isMinim);
             }
-
-            incrementIterationCount();
+            ++iter;
         }
     }
 

@@ -1407,7 +1407,7 @@ public class MavenProject
 
     public void setActiveProfiles( List<Profile> activeProfiles )
     {
-        this.activeProfiles = activeProfiles;
+        this.activeProfiles.addAll( activeProfiles );
     }
 
     public List<Profile> getActiveProfiles()

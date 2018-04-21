@@ -292,16 +292,8 @@ public abstract class EmbeddedRungeKuttaIntegrator
           if (manager.evaluateStep(interpolator)) {
               final double dt = manager.getEventTime() - stepStart;
               if (Math.abs(dt) <= Math.ulp(stepStart)) {
-                  // we cannot simply truncate the step, reject the current computation
-                  // and let the loop compute another state with the truncated step.
-                  // it is so small (much probably exactly 0 due to limited accuracy)
-                  // that the code above would fail handling it.
-                  // So we set up an artificial 0 size step by copying states
-                  interpolator.storeTime(stepStart);
-                  System.arraycopy(y, 0, yTmp, 0, y0.length);
-                  hNew     = 0;
-                  stepSize = 0;
-                  loop     = false;
+                  // rejecting the step would lead to a too small next step, we accept it
+                  loop = false;
               } else {
                   // reject the step to match exactly the next switch time
                   hNew = dt;

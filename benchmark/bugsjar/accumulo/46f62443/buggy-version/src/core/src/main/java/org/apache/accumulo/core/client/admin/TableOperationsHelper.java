@@ -48,8 +48,6 @@ public abstract class TableOperationsHelper implements TableOperations {
   @Override
   public void removeIterator(String tableName, String name, EnumSet<IteratorScope> scopes) throws AccumuloSecurityException, AccumuloException,
       TableNotFoundException {
-    if (!exists(tableName))
-      throw new TableNotFoundException(null, tableName, null);
     Map<String,String> copy = new TreeMap<String,String>();
     for (Entry<String,String> property : this.getProperties(tableName)) {
       copy.put(property.getKey(), property.getValue());
@@ -66,8 +64,6 @@ public abstract class TableOperationsHelper implements TableOperations {
   @Override
   public IteratorSetting getIteratorSetting(String tableName, String name, IteratorScope scope) throws AccumuloSecurityException, AccumuloException,
       TableNotFoundException {
-    if (!exists(tableName))
-      throw new TableNotFoundException(null, tableName, null);
     int priority = -1;
     String classname = null;
     Map<String,String> settings = new HashMap<String,String>();
@@ -94,8 +90,6 @@ public abstract class TableOperationsHelper implements TableOperations {
   
   @Override
   public Set<String> listIterators(String tableName) throws AccumuloSecurityException, AccumuloException, TableNotFoundException {
-    if (!exists(tableName))
-      throw new TableNotFoundException(null, tableName, null);
     Set<String> result = new HashSet<String>();
     Set<String> lifecycles = new HashSet<String>();
     for (IteratorScope scope : IteratorScope.values())
@@ -113,8 +107,6 @@ public abstract class TableOperationsHelper implements TableOperations {
   
   @Override
   public void checkIteratorConflicts(String tableName, IteratorSetting setting) throws AccumuloException, TableNotFoundException {
-    if (!exists(tableName))
-      throw new TableNotFoundException(null, tableName, null);
     for (IteratorScope scope : setting.getScopes()) {
       String scopeStr = String.format("%s%s", Property.TABLE_ITERATOR_PREFIX, scope.name().toLowerCase());
       String nameStr = String.format("%s.%s", scopeStr, setting.getName());

@@ -642,20 +642,27 @@ public abstract class RealVector {
      * @return the matrix outer product between this instance and {@code v}.
      */
     public RealMatrix outerProduct(RealVector v) {
-        final int m = this.getDimension();
-        final int n = v.getDimension();
-        final RealMatrix product;
+        RealMatrix product;
         if (v instanceof SparseRealVector || this instanceof SparseRealVector) {
-            product = new OpenMapRealMatrix(m, n);
+            product = new OpenMapRealMatrix(this.getDimension(),
+                                            v.getDimension());
         } else {
-            product = new Array2DRowRealMatrix(m, n);
+            product = new Array2DRowRealMatrix(this.getDimension(),
+                                               v.getDimension());
         }
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                product.setEntry(i, j, this.getEntry(i) * v.getEntry(j));
+        Iterator<Entry> thisIt = sparseIterator();
+        while (thisIt.hasNext()) {
+            final Entry thisE = thisIt.next();
+            Iterator<Entry> otherIt = v.sparseIterator();
+            while (otherIt.hasNext()) {
+                final Entry otherE = otherIt.next();
+                product.setEntry(thisE.getIndex(), otherE.getIndex(),
+                                 thisE.getValue() * otherE.getValue());
             }
         }
+
         return product;
+
     }
 
     /**

@@ -18,13 +18,11 @@ package org.apache.jackrabbit.oak.plugins.mongomk;
 
 import org.apache.jackrabbit.oak.plugins.memory.MemoryNodeBuilder;
 import org.apache.jackrabbit.oak.spi.state.NodeBuilder;
-import org.apache.jackrabbit.oak.spi.state.NodeState;
 
 /**
  * A node builder implementation for MongoMK.
  */
 class MongoNodeBuilder extends MemoryNodeBuilder {
-    private NodeState base;
 
     protected MongoNodeBuilder(MongoNodeState base) {
         super(base);
@@ -32,14 +30,6 @@ class MongoNodeBuilder extends MemoryNodeBuilder {
 
     private MongoNodeBuilder(MongoNodeBuilder parent, String name) {
         super(parent, name);
-    }
-
-    @Override
-    public NodeState getBaseState() {
-        if (base == null) {
-            base = getParent().getBaseState().getChildNode(getName());
-        }
-        return base;
     }
 
     @Override

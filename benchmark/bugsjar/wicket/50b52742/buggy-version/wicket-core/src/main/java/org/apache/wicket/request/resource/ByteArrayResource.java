@@ -21,8 +21,6 @@ import java.net.URLConnection;
 import org.apache.wicket.WicketRuntimeException;
 import org.apache.wicket.util.time.Time;
 
-import javax.servlet.http.HttpServletResponse;
-
 /**
  * An {@link IResource} for byte arrays. The byte array can be static - passed to the constructor,
  * or dynamic - by overriding
@@ -121,35 +119,32 @@ public class ByteArrayResource extends AbstractResource
 		final byte[] data = getData(attributes);
 		if (data == null)
 		{
-			response.setError(HttpServletResponse.SC_NOT_FOUND);
+			throw new WicketRuntimeException("ByteArrayResource's data cannot be 'null'.");
 		}
-		else
+		response.setContentLength(data.length);
+
+		if (response.dataNeedsToBeWritten(attributes))
 		{
-			response.setContentLength(data.length);
-
-			if (response.dataNeedsToBeWritten(attributes))
+			if (filename != null)
 			{
-				if (filename != null)
-				{
-					response.setFileName(filename);
-					response.setContentDisposition(ContentDisposition.ATTACHMENT);
-				}
-				else
-				{
-					response.setContentDisposition(ContentDisposition.INLINE);
-				}
-
-				response.setWriteCallback(new WriteCallback()
-				{
-					@Override
-					public void writeData(final Attributes attributes)
-					{
-						attributes.getResponse().write(data);
-					}
-				});
-
-				configureResponse(response, attributes);
+				response.setFileName(filename);
+				response.setContentDisposition(ContentDisposition.ATTACHMENT);
 			}
+			else
+			{
+				response.setContentDisposition(ContentDisposition.INLINE);
+			}
+
+			response.setWriteCallback(new WriteCallback()
+			{
+				@Override
+				public void writeData(final Attributes attributes)
+				{
+					attributes.getResponse().write(data);
+				}
+			});
+
+			configureResponse(response, attributes);
 		}
 
 		return response;

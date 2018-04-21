@@ -237,20 +237,23 @@ public abstract class AbstractLeastSquaresOptimizer implements DifferentiableMul
      * @return RMS value
      */
     public double getRMS() {
-        return Math.sqrt(getChiSquare() / rows);
+        double criterion = 0;
+        for (int i = 0; i < rows; ++i) {
+            final double residual = residuals[i];
+            criterion += residualsWeights[i] * residual * residual;
+        }
+        return Math.sqrt(criterion / rows);
     }
 
     /**
-     * Get a Chi-Square-like value assuming the N residuals follow N
-     * distinct normal distributions centered on 0 and whose variances are
-     * the reciprocal of the weights.
+     * Get the Chi-Square value.
      * @return chi-square value
      */
     public double getChiSquare() {
         double chiSquare = 0;
         for (int i = 0; i < rows; ++i) {
             final double residual = residuals[i];
-            chiSquare += residual * residual * residualsWeights[i];
+            chiSquare += residual * residual / residualsWeights[i];
         }
         return chiSquare;
     }

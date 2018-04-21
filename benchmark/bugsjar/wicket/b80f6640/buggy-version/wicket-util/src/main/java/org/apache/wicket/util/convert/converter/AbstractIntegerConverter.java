@@ -18,9 +18,10 @@ package org.apache.wicket.util.convert.converter;
 
 import java.text.NumberFormat;
 import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Base class for all converters of integer numbers.
+ * Base class for all number converters.
  * 
  * @author Jonathan Locke
  * @param <I>
@@ -29,12 +30,29 @@ public abstract class AbstractIntegerConverter<I extends Number> extends Abstrac
 {
 	private static final long serialVersionUID = 1L;
 
+	/** The date format to use */
+	private final ConcurrentHashMap<Locale, NumberFormat> numberFormats = new ConcurrentHashMap<>();
+
+	/**
+	 * @param locale
+	 *            The locale
+	 * @return Returns the numberFormat.
+	 */
 	@Override
-	protected NumberFormat newNumberFormat(Locale locale)
+	public NumberFormat getNumberFormat(final Locale locale)
 	{
-		NumberFormat numberFormat  = NumberFormat.getIntegerInstance(locale);
-		numberFormat.setParseIntegerOnly(true);
-		numberFormat.setGroupingUsed(false);
-		return numberFormat;
+		NumberFormat numberFormat = numberFormats.get(locale);
+		if (numberFormat == null)
+		{
+			numberFormat = NumberFormat.getIntegerInstance(locale);
+			numberFormat.setParseIntegerOnly(true);
+			numberFormat.setGroupingUsed(false);
+			NumberFormat tmpNumberFormat = numberFormats.putIfAbsent(locale, numberFormat);
+			if (tmpNumberFormat != null)
+			{
+				numberFormat = tmpNumberFormat;
+			}
+		}
+		return (NumberFormat)numberFormat.clone();
 	}
 }

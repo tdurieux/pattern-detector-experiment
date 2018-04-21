@@ -176,7 +176,11 @@ public final class InlineEnclosureHandler extends AbstractMarkupFilter
 		String inlineEnclosureChildId = getInlineEnclosureAttribute(tag);
 		if (Strings.isEmpty(inlineEnclosureChildId) == false)
 		{
-			String id = tag.getId() + container.getPage().getAutoIndex();
+			String id = tag.getId();
+			if (id.equals(INLINE_ENCLOSURE_ID_PREFIX))
+			{
+				id = id + container.getPage().getAutoIndex();
+			}
 			// Yes, we handled the tag
 			return new InlineEnclosure(id, inlineEnclosureChildId);
 		}

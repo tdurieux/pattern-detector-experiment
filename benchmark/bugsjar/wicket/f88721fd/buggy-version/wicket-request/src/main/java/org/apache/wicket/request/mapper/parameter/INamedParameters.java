@@ -49,8 +49,9 @@ public interface INamedParameters
 		 */
 		public NamedPair(final String key, final String value)
 		{
-			this.key = Args.notNull(key, "key");;
-			this.value = Args.notNull(value, "value");
+			Args.notEmpty(key, "key");
+			this.key = key;
+			this.value = value;
 		}
 
 		/**

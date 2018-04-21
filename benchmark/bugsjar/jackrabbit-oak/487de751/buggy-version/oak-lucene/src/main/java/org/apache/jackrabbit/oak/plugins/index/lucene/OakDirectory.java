@@ -187,7 +187,7 @@ class OakDirectory extends Directory {
                 this.data = newArrayList();
             }
 
-            this.length = (long)data.size() * blobSize;
+            this.length = data.size() * blobSize;
             if (!data.isEmpty()) {
                 Blob last = data.get(data.size() - 1);
                 this.length -= blobSize - last.length();
@@ -253,9 +253,7 @@ class OakDirectory extends Directory {
             checkPositionIndexes(offset, offset + len, checkNotNull(b).length);
 
             if (len < 0 || position + len > length) {
-                String msg = String.format("Invalid byte range request [%s] : position : %d, length : " +
-                                "%d, len : %d", name, position, length, len);
-                throw new IOException(msg);
+                throw new IOException("Invalid byte range request");
             }
 
             int i = (int) (position / blobSize);

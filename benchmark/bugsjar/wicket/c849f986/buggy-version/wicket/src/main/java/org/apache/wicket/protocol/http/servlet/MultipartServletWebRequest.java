@@ -110,8 +110,7 @@ public class MultipartServletWebRequest extends ServletWebRequest implements IMu
 		final boolean isMultipart = ServletFileUpload.isMultipartContent(request);
 		if (!isMultipart)
 		{
-			throw new IllegalStateException(
-				"ServletRequest does not contain multipart content. One possible solution is to explicitly call Form.setMultipart(true), Wicket tries its best to auto-detect multipart forms but there are certain situation where it cannot.");
+			throw new IllegalStateException("ServletRequest does not contain multipart content");
 		}
 
 

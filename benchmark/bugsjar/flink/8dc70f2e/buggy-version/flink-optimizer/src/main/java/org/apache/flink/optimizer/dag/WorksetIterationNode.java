@@ -52,7 +52,6 @@ import org.apache.flink.optimizer.plan.WorksetIterationPlanNode;
 import org.apache.flink.optimizer.plan.WorksetPlanNode;
 import org.apache.flink.optimizer.plan.PlanNode.FeedbackPropertiesMeetRequirementsReport;
 import org.apache.flink.optimizer.util.NoOpBinaryUdfOp;
-import org.apache.flink.optimizer.util.NoOpUnaryUdfOp;
 import org.apache.flink.runtime.operators.DriverStrategy;
 import org.apache.flink.runtime.operators.shipping.ShipStrategyType;
 import org.apache.flink.runtime.operators.util.LocalStrategy;
@@ -308,8 +307,7 @@ public class WorksetIterationNode extends TwoInputNode implements IterationNode 
 		this.nextWorkset.accept(InterestingPropertiesClearer.INSTANCE);
 		this.solutionSetDelta.accept(InterestingPropertiesClearer.INSTANCE);
 	}
-
-	@SuppressWarnings("unchecked")
+	
 	@Override
 	protected void instantiate(OperatorDescriptorDual operator, Channel solutionSetIn, Channel worksetIn,
 			List<Set<? extends NamedChannel>> broadcastPlanChannels, List<PlanNode> target, CostEstimator estimator,
@@ -369,14 +367,9 @@ public class WorksetIterationNode extends TwoInputNode implements IterationNode 
 					globPropsReqWorkset.parameterizeChannel(toNoOp, false,
 															nextWorksetRootConnection.getDataExchangeMode(), false);
 					locPropsReqWorkset.parameterizeChannel(toNoOp);
-
-					NoOpUnaryUdfOp noOpUnaryUdfOp = new NoOpUnaryUdfOp<>();
-					noOpUnaryUdfOp.setInput(candidate.getProgramOperator());
-
-					UnaryOperatorNode rebuildWorksetPropertiesNode = new UnaryOperatorNode(
-						"Rebuild Workset Properties",
-						noOpUnaryUdfOp,
-						true);
+					
+					UnaryOperatorNode rebuildWorksetPropertiesNode = new UnaryOperatorNode("Rebuild Workset Properties",
+																							FieldList.EMPTY_LIST);
 					
 					rebuildWorksetPropertiesNode.setParallelism(candidate.getParallelism());
 					

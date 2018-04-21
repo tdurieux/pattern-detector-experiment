@@ -92,6 +92,8 @@ public class AccumuloVFSClassLoader {
 
   public static final String VFS_CACHE_DIR = "general.vfs.cache.dir";
   
+  public static final AtomicInteger uniqueDirectoryGenerator = new AtomicInteger(0);
+
   private static ClassLoader parent = null;
   private static volatile ReloadingClassLoader loader = null;
   private static final Object lock = new Object();
@@ -277,7 +279,10 @@ public class AccumuloVFSClassLoader {
     vfs.addMimeTypeMap("application/zip", "zip");
     vfs.setFileContentInfoFactory(new FileContentInfoFilenameFactory());
     vfs.setFilesCache(new SoftRefFilesCache());
+    String cacheDirPath = AccumuloClassLoader.getAccumuloString(VFS_CACHE_DIR, "");
     File cacheDir = computeTopCacheDir(); 
+    if (!cacheDirPath.isEmpty())
+      cacheDir = new File(cacheDirPath, "" + uniqueDirectoryGenerator.getAndIncrement());
     vfs.setReplicator(new UniqueFileReplicator(cacheDir));
     vfs.setCacheStrategy(CacheStrategy.ON_RESOLVE);
     vfs.init();
@@ -286,9 +291,8 @@ public class AccumuloVFSClassLoader {
   }
 
   private static File computeTopCacheDir() {
-    String cacheDirPath = AccumuloClassLoader.getAccumuloString(VFS_CACHE_DIR, System.getProperty("java.io.tmpdir"));
     String procName = ManagementFactory.getRuntimeMXBean().getName();
-    return new File(cacheDirPath, "accumulo-vfs-cache-" + procName + "-" + System.getProperty("user.name", "nouser"));
+    return new File(System.getProperty("java.io.tmpdir"), "accumulo-vfs-cache-" + procName + "-" + System.getProperty("user.name", "nouser"));
   }
 
   public interface Printer {

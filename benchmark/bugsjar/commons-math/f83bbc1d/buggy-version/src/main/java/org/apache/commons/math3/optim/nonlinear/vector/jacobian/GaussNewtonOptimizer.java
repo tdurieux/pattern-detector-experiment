@@ -103,8 +103,9 @@ public class GaussNewtonOptimizer extends AbstractLeastSquaresOptimizer {
 
         // iterate until convergence is reached
         PointVectorValuePair current = null;
+        int iter = 0;
         for (boolean converged = false; !converged;) {
-            incrementIterationCount();
+            ++iter;
 
             // evaluate the objective function and its jacobian
             PointVectorValuePair previous = current;
@@ -156,7 +157,7 @@ public class GaussNewtonOptimizer extends AbstractLeastSquaresOptimizer {
 
             // Check convergence.
             if (previous != null) {
-                converged = checker.converged(getIterations(), previous, current);
+                converged = checker.converged(iter, previous, current);
                 if (converged) {
                     setCost(computeCost(currentResiduals));
                     return current;

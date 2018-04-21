@@ -76,7 +76,7 @@ public class BarrierBuffer implements CheckpointBarrierHandler {
 
 	/**
 	 * 
-	 * @param inputGate The input gate to draw the buffers and events from.
+	 * @param inputGate Teh input gate to draw the buffers and events from.
 	 * @param ioManager The I/O manager that gives access to the temp directories.
 	 * 
 	 * @throws IOException Thrown, when the spilling to temp files cannot be initialized.
@@ -102,7 +102,6 @@ public class BarrierBuffer implements CheckpointBarrierHandler {
 			if (currentBuffered != null) {
 				next = currentBuffered.getNext();
 				if (next == null) {
-					currentBuffered.cleanup();
 					currentBuffered = queuedBuffered.pollFirst();
 					if (currentBuffered != null) {
 						currentBuffered.open();

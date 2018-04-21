@@ -247,15 +247,6 @@ public abstract class EmbeddedRungeKuttaIntegrator
         }
 
         stepSize = hNew;
-        if (forward) {
-            if (stepStart + stepSize >= t) {
-                stepSize = t - stepStart;
-            }
-        } else {
-            if (stepStart + stepSize <= t) {
-                stepSize = t - stepStart;
-            }
-        }
 
         // next stages
         for (int k = 1; k < stages; ++k) {

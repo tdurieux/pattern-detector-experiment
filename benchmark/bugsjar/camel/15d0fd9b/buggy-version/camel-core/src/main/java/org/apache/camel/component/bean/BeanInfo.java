@@ -52,6 +52,8 @@ import org.apache.camel.util.ObjectHelper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static org.apache.camel.util.ExchangeHelper.convertToType;
+
 /**
  * Represents the metadata about a bean type created via a combination of
  * introspection and annotations together with some useful sensible defaults
@@ -569,9 +571,8 @@ public class BeanInfo {
                 if (methodInfo.getBodyParameterType().isInstance(body)) {
                     return methodInfo;
                 }
-
-                // we should only try to convert, as we are looking for best match
-                Object value = exchange.getContext().getTypeConverter().tryConvertTo(methodInfo.getBodyParameterType(), exchange, body);
+                
+                Object value = convertToType(exchange, methodInfo.getBodyParameterType(), body);
                 if (value != null) {
                     if (LOG.isTraceEnabled()) {
                         LOG.trace("Converted body from: {} to: {}",

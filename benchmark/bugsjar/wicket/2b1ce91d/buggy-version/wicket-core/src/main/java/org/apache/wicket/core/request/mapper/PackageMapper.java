@@ -216,7 +216,7 @@ public class PackageMapper extends AbstractBookmarkableMapper
 	@Override
 	protected boolean pageMustHaveBeenCreatedBookmarkable()
 	{
-		return false;
+		return true;
 	}
 
 	/**

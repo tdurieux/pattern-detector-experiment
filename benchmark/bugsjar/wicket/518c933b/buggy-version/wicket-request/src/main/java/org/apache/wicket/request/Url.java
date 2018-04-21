@@ -674,7 +674,7 @@ public class Url implements Serializable
 				result.append(port);
 			}
 
-			if (segments.contains(".."))
+			if (path.contains(".."))
 			{
 				throw new IllegalStateException("Cannot render this url in " +
 					StringMode.FULL.name() + " mode because it has a `..` segment: " + toString());

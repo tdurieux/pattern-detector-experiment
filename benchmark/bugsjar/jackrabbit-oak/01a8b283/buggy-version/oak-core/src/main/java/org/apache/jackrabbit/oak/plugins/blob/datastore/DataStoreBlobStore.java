@@ -32,7 +32,6 @@ import javax.annotation.Nullable;
 import javax.jcr.RepositoryException;
 
 import com.google.common.base.Function;
-import com.google.common.base.Predicate;
 import com.google.common.collect.Iterators;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.Closeables;
@@ -48,8 +47,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.collect.Iterators.filter;
-import static com.google.common.collect.Iterators.transform;
 
 /**
  * BlobStore wrapper for DataStore. Wraps Jackrabbit 2 DataStore and expose them as BlobStores
@@ -261,23 +258,12 @@ public class DataStoreBlobStore implements DataStore, BlobStore, GarbageCollecta
     }
 
     @Override
-    public Iterator<String> getAllChunkIds(final long maxLastModifiedTime) throws Exception {
-        return transform(filter(delegate.getAllIdentifiers(), new Predicate<DataIdentifier>() {
+    public Iterator<String> getAllChunkIds(long maxLastModifiedTime) throws Exception {
+        //TODO Ignores the maxLastModifiedTime currently.
+        return Iterators.transform(delegate.getAllIdentifiers(), new Function<DataIdentifier, String>() {
+            @Nullable
             @Override
-            public boolean apply(DataIdentifier input) {
-                try {
-                    DataRecord dr = delegate.getRecord(input);
-                    if(dr != null && dr.getLastModified() < maxLastModifiedTime){
-                        return true;
-                    }
-                } catch (DataStoreException e) {
-                    log.warn("Error occurred while fetching DataRecord for identifier {}",input, e);
-                }
-                return false;
-            }
-        }),new Function<DataIdentifier, String>() {
-            @Override
-            public String apply(DataIdentifier input) {
+            public String apply(@Nullable DataIdentifier input) {
                 return input.toString();
             }
         });

@@ -20,8 +20,6 @@ import java.util.BitSet;
 
 /**
  * Encoder for unsafe URI characters.
- * <p/>
- * A good source for details is <a href="http://en.wikipedia.org/wiki/Url_encode">wikipedia url encode</a> article.
  */
 public final class UnsafeUriCharactersEncoder {
     private static BitSet unsafeCharacters;   
@@ -35,7 +33,7 @@ public final class UnsafeUriCharactersEncoder {
         unsafeCharacters.set('<');
         unsafeCharacters.set('>');
         unsafeCharacters.set('#');
-        unsafeCharacters.set('%');
+        // unsafeCharacters.set('%');
         unsafeCharacters.set('{');
         unsafeCharacters.set('}');
         unsafeCharacters.set('|');
@@ -72,47 +70,22 @@ public final class UnsafeUriCharactersEncoder {
         }
 
         // okay there are some unsafe characters so we do need to encode
-        // see details at: http://en.wikipedia.org/wiki/Url_encode
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < chars.length; i++) {
-            char ch = chars[i];
+        for (char ch : chars) {
             if (ch > 0 && ch < 128 && unsafeCharacters.get(ch)) {
-                // special for % sign as it may be a decimal encoded value
-                if (ch == '%') {
-                    char next = i + 1 < chars.length ? chars[i + 1] : ' ';
-                    char next2 = i + 2 < chars.length ? chars[i + 2] : ' ';
-
-                    if (isHexDigit(next) && isHexDigit(next2)) {
-                        // its already encoded (decimal encoded) so just append as is
-                        sb.append(ch);
-                    } else {
-                        // must escape then, as its an unsafe character
-                        appendEscape(sb, (byte)ch);
-                    }
-                } else {
-                    // must escape then, as its an unsafe character
-                    appendEscape(sb, (byte)ch);
-                }
+                appendEscape(sb, (byte)ch);
             } else {
                 sb.append(ch);
             }
         }
         return sb.toString();
+
     }
 
     private static void appendEscape(StringBuilder sb, byte b) {
         sb.append('%');
         sb.append(HEX_DIGITS[(b >> 4) & 0x0f]);
         sb.append(HEX_DIGITS[(b >> 0) & 0x0f]);
-    }
-
-    private static boolean isHexDigit(char ch) {
-        for (char hex : HEX_DIGITS) {
-            if (hex == ch) {
-                return true;
-            }
-        }
-        return false;
     }
 
 }

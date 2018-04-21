@@ -340,7 +340,6 @@ public class SegmentWriter {
 
 
     private synchronized RecordId writeListBucket(List<RecordId> bucket) {
-        checkArgument(bucket.size() > 1);
         RecordId bucketId = prepare(RecordType.BUCKET, 0, bucket);
         for (RecordId id : bucket) {
             writeRecordId(id);
@@ -517,11 +516,7 @@ public class SegmentWriter {
             List<RecordId> nextLevel = Lists.newArrayList();
             for (List<RecordId> bucket :
                     Lists.partition(thisLevel, ListRecord.LEVEL_SIZE)) {
-                if (bucket.size() > 1) {
-                    nextLevel.add(writeListBucket(bucket));
-                } else {
-                    nextLevel.add(bucket.get(0));
-                }
+                nextLevel.add(writeListBucket(bucket));
             }
             thisLevel = nextLevel;
         }

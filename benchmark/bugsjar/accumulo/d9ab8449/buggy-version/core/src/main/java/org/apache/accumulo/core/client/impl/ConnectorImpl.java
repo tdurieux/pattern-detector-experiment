@@ -55,9 +55,6 @@ public class ConnectorImpl extends Connector {
   
   public ConnectorImpl(final Instance instance, Credentials cred) throws AccumuloException, AccumuloSecurityException {
     ArgumentChecker.notNull(instance, cred);
-    if (cred.getToken().isDestroyed())
-      throw new AccumuloSecurityException(cred.getPrincipal(), SecurityErrorCode.TOKEN_EXPIRED);
-    
     this.instance = instance;
     
     this.credentials = cred;

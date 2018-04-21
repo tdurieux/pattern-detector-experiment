@@ -164,7 +164,7 @@ public class WebPageRenderer extends PageRenderer
 			bufferedResponse.writeTo((WebResponse)requestCycle.getResponse());
 		}
 		else if (getRedirectPolicy() == RedirectPolicy.NEVER_REDIRECT ||
-			(isOnePassRender() && isAjax == false && getRedirectPolicy() != RedirectPolicy.ALWAYS_REDIRECT) //
+			(isOnePassRender() && isAjax == false) //
 			||
 			(!isAjax //
 				&&

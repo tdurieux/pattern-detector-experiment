@@ -32,9 +32,6 @@ public abstract class AbstractCommit implements Commit {
     // commit message
     protected String msg;
 
-    // changes
-    protected String changes;
-
     // id of parent commit
     protected Id parentId;
 
@@ -45,7 +42,6 @@ public abstract class AbstractCommit implements Commit {
         this.parentId = other.getParentId();
         this.rootNodeId = other.getRootNodeId();
         this.msg = other.getMsg();
-        this.changes = other.getChanges();
         this.commitTS = other.getCommitTS();
     }
 
@@ -65,15 +61,10 @@ public abstract class AbstractCommit implements Commit {
         return msg;
     }
 
-    public String getChanges() {
-        return changes;
-    }
-
     public void serialize(Binding binding) throws Exception {
         binding.write("rootNodeId", rootNodeId.getBytes());
         binding.write("commitTS", commitTS);
         binding.write("msg", msg == null ? "" : msg);
-        binding.write("changes", changes == null ? "" : changes);
         binding.write("parentId", parentId == null ? "" : parentId.toString());
     }
 }

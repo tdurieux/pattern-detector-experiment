@@ -315,11 +315,6 @@ public class ShellOptionsJC {
       clientConfig.withZkHosts(siteConf.get(Property.INSTANCE_ZK_HOST));
     }
 
-    // If the user provided the hosts, set the ZK for tracing too
-    if (null != zooKeeperHosts) {
-      clientConfig.setProperty(ClientProperty.INSTANCE_ZK_HOST, zooKeeperHosts);
-    }
-
     return clientConfig;
   }
 

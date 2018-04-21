@@ -1135,15 +1135,8 @@ public final class MongoNodeStore
             Revision r = e.getValue();
             Revision last = lastKnownRevision.get(machineId);
             if (last == null || r.compareRevisionTime(last) > 0) {
-                if (!hasNewRevisions) {
-                    // publish our revision once before any foreign revision
-
-                    // the latest revisions of the current cluster node
-                    // happened before the latest revisions of other cluster nodes
-                    revisionComparator.add(Revision.newRevision(clusterId), headSeen);
-                }
-                hasNewRevisions = true;
                 lastKnownRevision.put(machineId, r);
+                hasNewRevisions = true;
                 revisionComparator.add(r, otherSeen);
             }
         }
@@ -1151,6 +1144,11 @@ public final class MongoNodeStore
             store.invalidateCache();
             // TODO only invalidate affected items
             docChildrenCache.invalidateAll();
+            // add a new revision, so that changes are visible
+            Revision r = Revision.newRevision(clusterId);
+            // the latest revisions of the current cluster node
+            // happened before the latest revisions of other cluster nodes
+            revisionComparator.add(r, headSeen);
             // the head revision is after other revisions
             setHeadRevision(Revision.newRevision(clusterId));
         }

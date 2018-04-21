@@ -324,11 +324,6 @@ public class StringSearchModelInterpolator
 
         private boolean isQualifiedForInterpolation( Field field, Class<?> fieldType )
         {
-            if ( Map.class.equals( fieldType ) && "locations".equals( field.getName() ) )
-            {
-                return false;
-            }
-
             Boolean primitive = fieldIsPrimitiveByClass.get( fieldType );
             if ( primitive == null )
             {

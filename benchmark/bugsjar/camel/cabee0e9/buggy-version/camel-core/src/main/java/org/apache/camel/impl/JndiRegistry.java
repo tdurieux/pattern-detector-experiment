@@ -78,8 +78,8 @@ public class JndiRegistry implements Registry {
             NamingEnumeration<NameClassPair> list = getContext().list("");
             while (list.hasMore()) {
                 NameClassPair pair = list.next();
-                Object instance = context.lookup(pair.getName());
-                if (type.isInstance(instance)) {
+                if (type.isInstance(pair.getClass()) || type.getName().equals(pair.getClassName())) {
+                    Object instance = context.lookup(pair.getName());
                     answer.put(pair.getName(), type.cast(instance));
                 }
             }
@@ -96,8 +96,8 @@ public class JndiRegistry implements Registry {
             NamingEnumeration<NameClassPair> list = getContext().list("");
             while (list.hasMore()) {
                 NameClassPair pair = list.next();
-                Object instance = context.lookup(pair.getName());
-                if (type.isInstance(instance)) {
+                if (type.isInstance(pair.getClass()) || type.getName().equals(pair.getClassName())) {
+                    Object instance = context.lookup(pair.getName());
                     answer.add(type.cast(instance));
                 }
             }

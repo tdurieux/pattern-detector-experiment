@@ -435,15 +435,19 @@ public class DateTimeField extends FormComponentPanel<Date>
 		}
 		else
 		{
-			MutableDateTime mDate = new MutableDateTime(modelObject);
+			MutableDateTime mDate;
 			// convert date to the client's time zone if we have that info
 			TimeZone zone = getClientTimeZone();
 			if (zone != null)
 			{
-				mDate.setZone(DateTimeZone.forTimeZone(zone));
+				mDate = new MutableDateTime(modelObject, DateTimeZone.forTimeZone(zone));
+			}
+			else
+			{
+				mDate = new MutableDateTime(modelObject);
 			}
 
-			date = mDate.toDateTime().toLocalDate().toDate();
+			date = mDate.toDate();
 
 			if (use12HourFormat)
 			{

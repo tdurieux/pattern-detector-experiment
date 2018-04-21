@@ -22,8 +22,6 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.Iterables.filter;
 import static com.google.common.collect.Iterables.toArray;
 import static com.google.common.collect.Iterables.transform;
-import static com.google.common.collect.Lists.newArrayList;
-import static com.google.common.collect.Lists.reverse;
 import static java.util.Collections.singletonList;
 import static org.apache.jackrabbit.oak.commons.PathUtils.concat;
 import static org.apache.jackrabbit.oak.plugins.document.Collection.JOURNAL;
@@ -83,7 +81,6 @@ import org.apache.jackrabbit.oak.commons.jmx.AnnotatedStandardMBean;
 import org.apache.jackrabbit.oak.plugins.blob.BlobStoreBlob;
 import org.apache.jackrabbit.oak.plugins.blob.MarkSweepGarbageCollector;
 import org.apache.jackrabbit.oak.plugins.blob.ReferencedBlob;
-import org.apache.jackrabbit.oak.plugins.document.Branch.BranchCommit;
 import org.apache.jackrabbit.oak.plugins.document.cache.CacheInvalidationStats;
 import org.apache.jackrabbit.oak.plugins.document.persistentCache.PersistentCache;
 import org.apache.jackrabbit.oak.plugins.document.persistentCache.broadcast.DynamicBroadcastConfig;
@@ -1252,7 +1249,8 @@ public final class DocumentNodeStore
 
     @Nonnull
     RevisionVector reset(@Nonnull RevisionVector branchHead,
-                         @Nonnull RevisionVector ancestor) {
+                         @Nonnull RevisionVector ancestor,
+                         @Nullable DocumentNodeStoreBranch branch) {
         checkNotNull(branchHead);
         checkNotNull(ancestor);
         Branch b = getBranches().getBranch(branchHead);
@@ -1263,44 +1261,61 @@ public final class DocumentNodeStore
             throw new DocumentStoreException(branchHead + " is not the head " +
                     "of a branch");
         }
-        if (!b.containsCommit(ancestor.getBranchRevision())
-                && !b.getBase().asBranchRevision(getClusterId()).equals(ancestor)) {
+        if (!b.containsCommit(ancestor.getBranchRevision())) {
             throw new DocumentStoreException(ancestor + " is not " +
                     "an ancestor revision of " + branchHead);
         }
-        // tailSet is inclusive -> use an ancestorRev with a
-        // counter incremented by one to make the call exclusive
-        Revision ancestorRev = ancestor.getBranchRevision();
-        ancestorRev = new Revision(ancestorRev.getTimestamp(),
-                ancestorRev.getCounter() + 1, ancestorRev.getClusterId(), true);
-        List<Revision> revs = newArrayList(b.getCommits().tailSet(ancestorRev));
-        if (revs.isEmpty()) {
+        if (branchHead.equals(ancestor)) {
             // trivial
             return branchHead;
         }
-        UpdateOp rootOp = new UpdateOp(Utils.getIdFromPath("/"), false);
-        // reset each branch commit in reverse order
-        Map<String, UpdateOp> operations = Maps.newHashMap();
-        for (Revision r : reverse(revs)) {
-            NodeDocument.removeCollision(rootOp, r.asTrunkRevision());
-            NodeDocument.removeRevision(rootOp, r.asTrunkRevision());
-            operations.clear();
-            BranchCommit bc = b.getCommit(r);
-            if (bc.isRebase()) {
-                continue;
+        boolean success = false;
+        Commit commit = newCommit(branchHead, branch);
+        try {
+            Iterator<Revision> it = b.getCommits().tailSet(ancestor.getBranchRevision()).iterator();
+            // first revision is the ancestor (tailSet is inclusive)
+            // do not undo changes for this revision
+            it.next();
+            Map<String, UpdateOp> operations = Maps.newHashMap();
+            if (it.hasNext()) {
+                Revision reset = it.next();
+                // TODO: correct?
+                getRoot(b.getCommit(reset).getBase().update(reset))
+                        .compareAgainstBaseState(getRoot(ancestor),
+                                new ResetDiff(reset.asTrunkRevision(), operations));
+                UpdateOp rootOp = operations.get("/");
+                if (rootOp == null) {
+                    rootOp = new UpdateOp(Utils.getIdFromPath("/"), false);
+                    NodeDocument.setModified(rootOp, commit.getRevision());
+                    operations.put("/", rootOp);
+                }
+                NodeDocument.removeCollision(rootOp, reset.asTrunkRevision());
+                NodeDocument.removeRevision(rootOp, reset.asTrunkRevision());
             }
-            getRoot(bc.getBase().update(r))
-                    .compareAgainstBaseState(getRoot(bc.getBase()),
-                            new ResetDiff(r.asTrunkRevision(), operations));
-            // apply reset operations
+            // update root document first
+            if (store.findAndUpdate(Collection.NODES, operations.get("/")) != null) {
+                // clean up in-memory branch data
+                // first revision is the ancestor (tailSet is inclusive)
+                List<Revision> revs = Lists.newArrayList(b.getCommits().tailSet(ancestor.getBranchRevision()));
+                for (Revision r : revs.subList(1, revs.size())) {
+                    b.removeCommit(r);
+                }
+                // successfully updating the root document can be considered
+                // as success because the changes are not marked as committed
+                // anymore
+                success = true;
+            }
+            operations.remove("/");
+            // update remaining documents
             for (UpdateOp op : operations.values()) {
                 store.findAndUpdate(Collection.NODES, op);
             }
-        }
-        store.findAndUpdate(Collection.NODES, rootOp);
-        // clean up in-memory branch data
-        for (Revision r : revs) {
-            b.removeCommit(r);
+        } finally {
+            if (!success) {
+                canceled(commit);
+            } else {
+                done(commit, true, null);
+            }
         }
         return ancestor;
     }

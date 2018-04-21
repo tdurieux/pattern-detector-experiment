@@ -225,7 +225,9 @@ public class RootImpl implements Root {
      * All registered {@link PurgeListener}s are notified.
      */
     private void purgePendingChanges() {
-        branch.setRoot(rootTree.getNodeState());
+        if (hasPendingChanges()) {
+            branch.setRoot(rootTree.getNodeState());
+        }
         notifyListeners();
     }
 

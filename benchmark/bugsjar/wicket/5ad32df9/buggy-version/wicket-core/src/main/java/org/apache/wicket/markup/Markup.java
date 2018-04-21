@@ -25,6 +25,7 @@ import java.util.List;
 import org.apache.wicket.util.lang.Args;
 import org.apache.wicket.util.resource.ResourceStreamNotFoundException;
 import org.apache.wicket.util.string.AppendingStringBuffer;
+import org.apache.wicket.util.string.Strings;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -186,7 +187,10 @@ public class Markup implements IMarkupFragment
 
 	public final IMarkupFragment find(final String id)
 	{
-		Args.notEmpty(id, "id");
+		if (Strings.isEmpty(id))
+		{
+			throw new IllegalArgumentException("Parameter 'id' must not be null or empty");
+		}
 
 		MarkupStream stream = new MarkupStream(this);
 		stream.setCurrentIndex(0);

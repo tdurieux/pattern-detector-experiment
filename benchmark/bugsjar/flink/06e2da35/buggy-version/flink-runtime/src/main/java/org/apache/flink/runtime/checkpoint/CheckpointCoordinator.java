@@ -23,7 +23,6 @@ import akka.actor.PoisonPill;
 import akka.actor.Props;
 
 import org.apache.flink.api.common.JobID;
-import org.apache.flink.runtime.execution.ExecutionState;
 import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionAttemptID;
 import org.apache.flink.runtime.executiongraph.ExecutionJobVertex;
@@ -225,7 +224,7 @@ public class CheckpointCoordinator {
 			ExecutionAttemptID[] triggerIDs = new ExecutionAttemptID[tasksToTrigger.length];
 			for (int i = 0; i < tasksToTrigger.length; i++) {
 				Execution ee = tasksToTrigger[i].getCurrentExecutionAttempt();
-				if (ee != null && ee.getState() == ExecutionState.RUNNING) {
+				if (ee != null) {
 					triggerIDs[i] = ee.getAttemptId();
 				} else {
 					LOG.info("Checkpoint triggering task {} is not being executed at the moment. Aborting checkpoint.",

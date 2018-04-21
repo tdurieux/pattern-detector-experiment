@@ -84,12 +84,9 @@ public class Log4jMarker implements Marker {
     }
 
     @Override
-	public boolean contains(final org.slf4j.Marker marker) {
-		if (marker == null) {
-			throw new IllegalArgumentException();
-		}
-		return this.marker.isInstanceOf(marker.getName());
-	}
+    public boolean contains(final org.slf4j.Marker marker) {
+        return this.marker.isInstanceOf(marker.getName());
+    }
 
     @Override
 	public boolean contains(final String s) {

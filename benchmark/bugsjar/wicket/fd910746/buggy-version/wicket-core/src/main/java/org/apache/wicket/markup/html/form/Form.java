@@ -170,7 +170,8 @@ public class Form<T> extends WebMarkupContainer implements IFormSubmitListener
 				return;
 			}
 
-			if (formComponent.isVisibleInHierarchy() && formComponent.isEnabledInHierarchy())
+			if (formComponent.isVisibleInHierarchy() && formComponent.isValid() &&
+				formComponent.isEnabledInHierarchy())
 			{
 				validate(formComponent);
 			}

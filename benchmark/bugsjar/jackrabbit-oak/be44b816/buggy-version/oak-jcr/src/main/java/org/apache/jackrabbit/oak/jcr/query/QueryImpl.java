@@ -34,10 +34,9 @@ import javax.jcr.version.VersionException;
 
 import org.apache.jackrabbit.JcrConstants;
 import org.apache.jackrabbit.oak.commons.PathUtils;
-import org.apache.jackrabbit.oak.jcr.delegate.NodeDelegate;
 import org.apache.jackrabbit.oak.jcr.session.NodeImpl;
 import org.apache.jackrabbit.oak.jcr.session.SessionContext;
-import org.apache.jackrabbit.oak.jcr.session.operation.SessionOperation;
+import org.apache.jackrabbit.oak.jcr.delegate.NodeDelegate;
 
 /**
  * The implementation of the corresponding JCR interface.
@@ -87,14 +86,7 @@ public class QueryImpl implements Query {
 
     @Override
     public QueryResult execute() throws RepositoryException {
-        return sessionContext.getSessionDelegate().perform(
-                new SessionOperation<QueryResult>() {
-                    @Override
-                    public QueryResult perform() throws RepositoryException {
-                        return manager.executeQuery(statement, language, limit,
-                                offset, bindVariableMap);
-                    }
-                });
+        return manager.executeQuery(statement, language, limit, offset, bindVariableMap);
     }
 
     @Override

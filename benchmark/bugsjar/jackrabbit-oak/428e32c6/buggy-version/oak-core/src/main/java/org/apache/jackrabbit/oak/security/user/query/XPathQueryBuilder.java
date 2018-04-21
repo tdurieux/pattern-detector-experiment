@@ -35,7 +35,7 @@ public class XPathQueryBuilder implements QueryBuilder<Condition> {
     private boolean sortIgnoreCase;
     private Value bound;
     private long offset;
-    private long maxCount = Long.MAX_VALUE;
+    private long maxCount = -1;
 
     //-------------------------------------------------------< QueryBuilder >---
     @Override

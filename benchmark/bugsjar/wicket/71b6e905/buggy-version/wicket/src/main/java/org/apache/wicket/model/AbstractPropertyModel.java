@@ -247,11 +247,8 @@ public abstract class AbstractPropertyModel<T>
 		{
 			try
 			{
-				Class<?> targetClass = ((IObjectClassAwareModel<?>)this.target).getObjectClass();
-				if (targetClass != null)
-				{
-					return PropertyResolver.getPropertyClass(expression, targetClass);
-				}
+				return PropertyResolver.getPropertyClass(expression,
+					((IObjectClassAwareModel<?>)this.target).getObjectClass());
 			}
 			catch (WicketRuntimeException e)
 			{

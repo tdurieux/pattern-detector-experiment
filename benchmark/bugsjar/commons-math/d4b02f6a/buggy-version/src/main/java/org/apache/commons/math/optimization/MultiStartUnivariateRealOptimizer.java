@@ -89,12 +89,12 @@ public class MultiStartUnivariateRealOptimizer implements UnivariateRealOptimize
 
     /** {@inheritDoc} */
     public double getFunctionValue() {
-        return optimaValues[0];
+        return optimizer.getFunctionValue();
     }
 
     /** {@inheritDoc} */
     public double getResult() {
-        return optima[0];
+        return optimizer.getResult();
     }
 
     /** {@inheritDoc} */
@@ -315,4 +315,5 @@ public class MultiStartUnivariateRealOptimizer implements UnivariateRealOptimize
             throws ConvergenceException, FunctionEvaluationException {
         return optimize(f, goalType, min, max);
     }
+
 }

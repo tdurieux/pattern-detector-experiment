@@ -299,7 +299,6 @@ public class Indexer {
     /**
      * Update the index with the given changes.
      *
-     * @param rootPath the root path
      * @param t the changes
      * @param lastRevision
      */
@@ -310,7 +309,6 @@ public class Indexer {
                 break;
             }
             String path = PathUtils.concat(rootPath, t.readString());
-            String target;
             switch (r) {
             case '+': {
                 t.read(':');
@@ -329,16 +327,8 @@ public class Indexer {
                 }
                 break;
             }
-            case '*':
-                // TODO support and test copy operation ("*"),
-                // specially in combination with other operations
-                // possibly split up the commit in this case
-                t.read(':');
-                target = t.readString();
-                moveOrCopyNode(path, false, target, lastRevision);
-                break;
             case '-':
-                moveOrCopyNode(path, true, null, lastRevision);
+                moveNode(path, null, lastRevision);
                 break;
             case '^': {
                 removeProperty(path, lastRevision);
@@ -352,12 +342,9 @@ public class Indexer {
                 break;
             }
             case '>':
-                // TODO does move work correctly
-                // in combination with other operations?
-                // possibly split up the commit in this case
                 t.read(':');
                 String name = PathUtils.getName(path);
-                String position;
+                String target, position;
                 if (t.matches('{')) {
                     position = t.readString();
                     t.read(':');
@@ -377,7 +364,7 @@ public class Indexer {
                 } else {
                     throw ExceptionFactory.get("position: " + position);
                 }
-                moveOrCopyNode(path, true, target, lastRevision);
+                moveNode(path, target, lastRevision);
                 break;
             default:
                 throw new AssertionError("token: " + (char) t.getTokenType());
@@ -443,7 +430,7 @@ public class Indexer {
         }
     }
 
-    private void moveOrCopyNode(String sourcePath, boolean remove, String targetPath, String lastRevision) {
+    private void moveNode(String sourcePath, String targetPath, String lastRevision) {
         if (isInIndex(sourcePath)) {
             // don't index the index
             return;
@@ -457,9 +444,7 @@ public class Indexer {
         NodeMap map = new NodeMap();
         t.read('{');
         NodeImpl n = NodeImpl.parse(map, t, 0, sourcePath);
-        if (remove) {
-            addOrRemoveRecursive(n, true, false);
-        }
+        addOrRemoveRecursive(n, true, false);
         if (targetPath != null) {
             t = new JsopTokenizer(node);
             map = new NodeMap();

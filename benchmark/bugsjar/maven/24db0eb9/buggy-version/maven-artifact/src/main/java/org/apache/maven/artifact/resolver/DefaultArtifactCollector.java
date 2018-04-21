@@ -201,15 +201,14 @@ public class DefaultArtifactCollector
                     if ( checkScopeUpdate( farthest, nearest, listeners ) )
                     {
                         fireEvent( ResolutionListener.UPDATE_SCOPE, listeners, nearest, farthest.getArtifact() );
-                        /* we need nearest version but farthest scope */
-                        nearest.disable();
-                        farthest.getArtifact().setVersion( nearest.getArtifact().getVersion() );
-                    }
-                    else
-                    {
-                        farthest.disable();
+
+                        // previously we cloned the artifact, but it is more effecient to just update the scope
+                        // if problems are later discovered that the original object needs its original scope value, cloning may
+                        // again be appropriate
+                        nearest.getArtifact().setScope( farthest.getArtifact().getScope() );
                     }
                     fireEvent( ResolutionListener.OMIT_FOR_NEARER, listeners, farthest, nearest.getArtifact() );
+                    farthest.disable();
                 }
             }
         }

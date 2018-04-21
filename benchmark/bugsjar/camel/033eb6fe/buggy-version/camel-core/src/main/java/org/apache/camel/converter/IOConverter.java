@@ -101,16 +101,12 @@ public final class IOConverter {
      */
     @Deprecated
     public static BufferedWriter toWriter(File file) throws IOException {
-        return toWriter(file, false, IOHelper.getCharsetName(null, true));
+        return toWriter(file, null);
     }
     
     @Converter
     public static BufferedWriter toWriter(File file, Exchange exchange) throws IOException {
-        return toWriter(file, false, IOHelper.getCharsetName(exchange));
-    }
-
-    public static BufferedWriter toWriter(File file, boolean append, String charset) throws IOException {
-        return IOHelper.buffered(new EncodingFileWriter(file, append, charset));
+        return IOHelper.buffered(new EncodingFileWriter(file, IOHelper.getCharsetName(exchange)));
     }
 
     /**
@@ -436,16 +432,6 @@ public final class IOConverter {
         public EncodingFileWriter(File file, String charset)
             throws FileNotFoundException, UnsupportedEncodingException {
             super(new FileOutputStream(file), charset);
-        }
-
-        /**
-         * @param file file to write
-         * @param append whether to append to the file
-         * @param charset character set to use
-         */
-        public EncodingFileWriter(File file, boolean append, String charset)
-            throws FileNotFoundException, UnsupportedEncodingException {
-            super(new FileOutputStream(file, append), charset);
         }
 
     }

@@ -81,6 +81,4 @@ public abstract class ResultSubpartition {
 
 	abstract int releaseMemory() throws IOException;
 
-	abstract public boolean isReleased();
-
 }

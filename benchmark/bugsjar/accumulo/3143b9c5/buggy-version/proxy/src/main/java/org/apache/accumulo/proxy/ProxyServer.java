@@ -1126,14 +1126,14 @@ public class ProxyServer implements AccumuloProxy.Iface {
           if (update.isSetDeleteCell()) {
             m.putDelete(update.getColFamily(), update.getColQualifier(), viz, update.getTimestamp());
           } else {
-            m.put(new Text(update.getColFamily()), new Text(update.getColQualifier()), viz, update.getTimestamp(), new Value(value));
+            if (update.isSetDeleteCell()) {
+              m.putDelete(update.getColFamily(), update.getColQualifier(), viz, update.getTimestamp());
+            } else {
+              m.put(update.getColFamily(), update.getColQualifier(), viz, update.getTimestamp(), value);
             }
-        } else {
-          if (update.isSetDeleteCell()) {
-            m.putDelete(new Text(update.getColFamily()), new Text(update.getColQualifier()), viz);
-          } else {
-            m.put(new Text(update.getColFamily()), new Text(update.getColQualifier()), viz, new Value(value));
           }
+        } else {
+          m.put(update.getColFamily(), update.getColQualifier(), viz, value);
         }
       }
       try {

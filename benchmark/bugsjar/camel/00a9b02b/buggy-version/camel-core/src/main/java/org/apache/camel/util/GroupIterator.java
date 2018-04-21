@@ -65,24 +65,16 @@ public final class GroupIterator implements Iterator<Object>, Closeable {
 
     @Override
     public void close() throws IOException {
-        try {
-            if (it instanceof Scanner) {
-                // special for Scanner which implement the Closeable since JDK7 
-                Scanner scanner = (Scanner) it;
-                scanner.close();
-                IOException ioException = scanner.ioException();
-                if (ioException != null) {
-                    throw ioException;
-                }
-            } else if (it instanceof Closeable) {
-                IOHelper.closeWithException((Closeable) it);
-            }
-        } finally {
-            // close the buffer as well
-            bos.close();
-            // we are now closed
-            closed = true;
+        if (it instanceof Closeable) {
+            IOHelper.close((Closeable) it);
+        } else if (it instanceof Scanner) {
+            // special for Scanner as it does not implement Closeable
+            ((Scanner) it).close();
         }
+        // close the buffer as well
+        bos.close();
+        // we are now closed
+        closed = true;
     }
 
     @Override

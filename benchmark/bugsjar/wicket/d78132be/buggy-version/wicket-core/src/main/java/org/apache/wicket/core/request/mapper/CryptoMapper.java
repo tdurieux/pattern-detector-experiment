@@ -234,8 +234,6 @@ public class CryptoMapper implements IRequestMapper
 			}
 
 			url.getQueryParameters().addAll(originalUrl.getQueryParameters());
-			// WICKET-4923 additional parameters
-			url.getQueryParameters().addAll(encryptedUrl.getQueryParameters());
 		}
 		catch (Exception e)
 		{

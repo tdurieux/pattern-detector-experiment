@@ -24,19 +24,13 @@ import org.apache.commons.math3.optimization.ConvergenceChecker;
 import org.apache.commons.math3.optimization.GoalType;
 
 /**
- * For a function defined on some interval {@code (lo, hi)}, this class
- * finds an approximation {@code x} to the point at which the function
- * attains its minimum.
- * It implements Richard Brent's algorithm (from his book "Algorithms for
+ * Implements Richard Brent's algorithm (from his book "Algorithms for
  * Minimization without Derivatives", p. 79) for finding minima of real
- * univariate functions.
- * <br/>
- * This code is an adaptation, partly based on the Python code from SciPy
- * (module "optimize.py" v0.5); the original algorithm is also modified
- * <ul>
- *  <li>to use an initial guess provided by the user,</li>
- *  <li>to ensure that the best point encountered is the one returned.</li>
- * </ul>
+ * univariate functions. This implementation is an adaptation partly
+ * based on the Python code from SciPy (module "optimize.py" v0.5).
+ * If the function is defined on some interval {@code (lo, hi)}, then
+ * this method finds an approximation {@code x} to the point at which
+ * the function attains its minimum.
  *
  * @version $Id$
  * @since 2.0
@@ -147,8 +141,6 @@ public class BrentOptimizer extends BaseAbstractUnivariateOptimizer {
         UnivariatePointValuePair previous = null;
         UnivariatePointValuePair current
             = new UnivariatePointValuePair(x, isMinim ? fx : -fx);
-        // Best point encountered so far (which is the initial guess).
-        UnivariatePointValuePair best = current;
 
         int iter = 0;
         while (true) {
@@ -232,15 +224,10 @@ public class BrentOptimizer extends BaseAbstractUnivariateOptimizer {
                 // User-defined convergence checker.
                 previous = current;
                 current = new UnivariatePointValuePair(u, isMinim ? fu : -fu);
-                best = best(best,
-                            best(current,
-                                 previous,
-                                 isMinim),
-                            isMinim);
 
                 if (checker != null) {
                     if (checker.converged(iter, previous, current)) {
-                        return best;
+                        return best(current, previous, isMinim);
                     }
                 }
 
@@ -277,11 +264,7 @@ public class BrentOptimizer extends BaseAbstractUnivariateOptimizer {
                     }
                 }
             } else { // Default termination (Brent's criterion).
-                return best(best,
-                            best(current,
-                                 previous,
-                                 isMinim),
-                            isMinim);
+                return best(current, previous, isMinim);
             }
             ++iter;
         }
@@ -295,8 +278,7 @@ public class BrentOptimizer extends BaseAbstractUnivariateOptimizer {
      * @param isMinim {@code true} if the selected point must be the one with
      * the lowest value.
      * @return the best point, or {@code null} if {@code a} and {@code b} are
-     * both {@code null}. When {@code a} and {@code b} have the same function
-     * value, {@code a} is returned.
+     * both {@code null}.
      */
     private UnivariatePointValuePair best(UnivariatePointValuePair a,
                                           UnivariatePointValuePair b,
@@ -309,9 +291,9 @@ public class BrentOptimizer extends BaseAbstractUnivariateOptimizer {
         }
 
         if (isMinim) {
-            return a.getValue() <= b.getValue() ? a : b;
+            return a.getValue() < b.getValue() ? a : b;
         } else {
-            return a.getValue() >= b.getValue() ? a : b;
+            return a.getValue() > b.getValue() ? a : b;
         }
     }
 }

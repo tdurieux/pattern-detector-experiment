@@ -199,8 +199,6 @@ public class RequestCycle extends RequestHandlerStack implements IRequestCycle, 
 		try
 		{
 			set(this);
-			listeners.onBeginRequest(this);
-			onBeginRequest();
 			IRequestHandler handler = resolveRequestHandler();
 			if (handler != null)
 			{
@@ -244,6 +242,8 @@ public class RequestCycle extends RequestHandlerStack implements IRequestCycle, 
 		boolean result;
 		try
 		{
+			listeners.onBeginRequest(this);
+			onBeginRequest();
 			result = processRequest();
 		}
 		finally

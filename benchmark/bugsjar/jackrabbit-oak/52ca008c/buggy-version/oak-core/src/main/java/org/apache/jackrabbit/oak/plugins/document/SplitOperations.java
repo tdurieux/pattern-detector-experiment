@@ -240,10 +240,10 @@ class SplitOperations {
             } else if (r.getClusterId() == context.getClusterId() 
                     && !changes.contains(r)) {
                 // OAK-2528: _commitRoot entry without associated change
-                // consider all but most recent as garbage (OAK-3333, OAK-4050)
-                if (mostRecent && doc.isCommitted(r)) {
+                // consider all but most recent as garbage (OAK-3333)
+                if (mostRecent) {
                     mostRecent = false;
-                } else if (isGarbage(r)) {
+                } else {
                     addGarbage(r, COMMIT_ROOT);
                 }
             }

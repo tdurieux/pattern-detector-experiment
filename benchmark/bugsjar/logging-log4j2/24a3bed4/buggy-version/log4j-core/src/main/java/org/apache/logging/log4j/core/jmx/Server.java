@@ -87,14 +87,6 @@ public final class Server {
                 // no need to escape these, but value must be quoted
                 needsQuotes = true;
                 break;
-            case '\r':
-                // replace by \\r, no need to quote
-                sb.append("\\r");
-                continue;
-            case '\n':
-                // replace by \\n, no need to quote
-                sb.append("\\n");
-                continue;
             }
             sb.append(c);
         }

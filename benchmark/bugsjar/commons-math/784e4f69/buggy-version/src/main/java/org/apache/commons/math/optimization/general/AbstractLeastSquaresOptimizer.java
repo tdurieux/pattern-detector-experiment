@@ -247,7 +247,12 @@ public abstract class AbstractLeastSquaresOptimizer implements DifferentiableMul
      * @return chi-square value
      */
     public double getChiSquare() {
-        return cost*cost;
+        double chiSquare = 0;
+        for (int i = 0; i < rows; ++i) {
+            final double residual = residuals[i];
+            chiSquare += residual * residual * residualsWeights[i];
+        }
+        return chiSquare;
     }
 
     /**

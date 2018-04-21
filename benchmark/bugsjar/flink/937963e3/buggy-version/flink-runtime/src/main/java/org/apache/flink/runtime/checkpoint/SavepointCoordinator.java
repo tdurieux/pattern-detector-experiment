@@ -230,7 +230,6 @@ public class SavepointCoordinator extends CheckpointCoordinator {
 
 			// Reset the checkpoint ID counter
 			long nextCheckpointId = checkpoint.getCheckpointID();
-			checkpointIdCounter.start();
 			checkpointIdCounter.setCount(nextCheckpointId + 1);
 			LOG.info("Reset the checkpoint ID to {}", nextCheckpointId);
 

@@ -54,7 +54,7 @@ public final class NIOConverter {
 
     @Converter
     public static String toString(ByteBuffer buffer, Exchange exchange) throws IOException {
-        return IOConverter.toString(toByteArray(buffer), exchange);
+        return IOConverter.toString(buffer.array(), exchange);
     }
 
     @Converter

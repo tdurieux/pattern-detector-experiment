@@ -19,11 +19,11 @@ package org.apache.wicket.core.request.mapper;
 import java.util.List;
 
 import org.apache.wicket.Application;
-import org.apache.wicket.request.IRequestMapper;
+import org.apache.wicket.core.request.handler.PageProvider;
+import org.apache.wicket.core.request.handler.RenderPageRequestHandler;
 import org.apache.wicket.request.Request;
 import org.apache.wicket.request.Url;
 import org.apache.wicket.request.component.IRequestablePage;
-import org.apache.wicket.request.mapper.ICompoundRequestMapper;
 import org.apache.wicket.request.mapper.info.PageComponentInfo;
 import org.apache.wicket.request.mapper.parameter.IPageParametersEncoder;
 import org.apache.wicket.request.mapper.parameter.PageParameters;
@@ -118,7 +118,9 @@ public class BookmarkableMapper extends AbstractBookmarkableMapper
 						if (!pageClass.equals(application.getHomePage()))
 						{
 							// WICKET-5094 only enforce mount if page is mounted
-							if (isPageMounted(pageClass, application))
+							Url reverseUrl = application.getRootRequestMapper().mapHandler(
+								new RenderPageRequestHandler(new PageProvider(pageClass)));
+							if (!matches(request.cloneWithUrl(reverseUrl)))
 							{
 								return null;
 							}
@@ -134,27 +136,6 @@ public class BookmarkableMapper extends AbstractBookmarkableMapper
 			}
 		}
 		return null;
-	}
-
-	private boolean isPageMounted(Class<? extends IRequestablePage> pageClass,
-		Application application)
-	{
-	    ICompoundRequestMapper applicationMappers = application.getRootRequestMapperAsCompound();
-	    
-	    for (IRequestMapper requestMapper : applicationMappers)
-	    {
-		if(requestMapper instanceof AbstractBookmarkableMapper  && requestMapper != this)
-		{
-		    AbstractBookmarkableMapper mapper = (AbstractBookmarkableMapper) requestMapper;  
-		    
-		    if(mapper.checkPageClass(pageClass))
-		    {
-			return true;
-		    }
-		}
-	    }
-	    
-	    return false;
 	}
 
 	@Override

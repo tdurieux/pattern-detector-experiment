@@ -98,7 +98,6 @@ public final class DefaultExchange implements Exchange {
 
         if (safeCopy) {
             exchange.getIn().setBody(getIn().getBody());
-            exchange.getIn().setFault(getIn().isFault());
             if (getIn().hasHeaders()) {
                 exchange.getIn().setHeaders(safeCopyHeaders(getIn().getHeaders()));
                 // just copy the attachments here
@@ -106,7 +105,6 @@ public final class DefaultExchange implements Exchange {
             }
             if (hasOut()) {
                 exchange.getOut().setBody(getOut().getBody());
-                exchange.getOut().setFault(getOut().isFault());
                 if (getOut().hasHeaders()) {
                     exchange.getOut().setHeaders(safeCopyHeaders(getOut().getHeaders()));
                 }

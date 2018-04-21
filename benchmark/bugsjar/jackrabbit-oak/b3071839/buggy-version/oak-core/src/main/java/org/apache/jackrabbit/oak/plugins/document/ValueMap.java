@@ -120,34 +120,27 @@ class ValueMap {
 
             @Override
             public String get(Object key) {
-                Revision r = (Revision) key;
                 // first check values map of this document
-                if (map.containsKey(r)) {
-                    return map.get(r);
+                String value = map.get(key);
+                if (value != null) {
+                    return value;
                 }
+                Revision r = (Revision) key;
                 for (NodeDocument prev : doc.getPreviousDocs(property, r)) {
-                    String value = prev.getValueMap(property).get(r);
+                    value = prev.getValueMap(property).get(key);
                     if (value != null) {
                         return value;
                     }
                 }
-                // not found or null
+                // not found
                 return null;
             }
 
             @Override
             public boolean containsKey(Object key) {
-                // check local map first
-                if (map.containsKey(key)) {
-                    return true;
-                }
-                Revision r = (Revision) key;
-                for (NodeDocument prev : doc.getPreviousDocs(property, r)) {
-                    if (prev.getValueMap(property).containsKey(key)) {
-                        return true;
-                    }
-                }
-                return false;
+                // can use get()
+                // the values map does not have null values
+                return get(key) != null;
             }
         };
     }

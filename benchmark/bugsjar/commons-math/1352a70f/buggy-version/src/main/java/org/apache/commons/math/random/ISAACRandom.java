@@ -235,7 +235,6 @@ public class ISAACRandom extends BitsStreamGenerator implements Serializable {
         }
         isaac();
         count = SIZE - 1;
-        clear();
     }
 
     /** Shuffle array. */

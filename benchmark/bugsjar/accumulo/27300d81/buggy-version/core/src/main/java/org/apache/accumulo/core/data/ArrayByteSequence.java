@@ -21,8 +21,6 @@ import static com.google.common.base.Charsets.UTF_8;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 
-import org.apache.accumulo.core.util.ByteBufferUtil;
-
 public class ArrayByteSequence extends ByteSequence implements Serializable {
 
   private static final long serialVersionUID = 1L;
@@ -54,14 +52,15 @@ public class ArrayByteSequence extends ByteSequence implements Serializable {
   }
 
   public ArrayByteSequence(ByteBuffer buffer) {
+    this.length = buffer.remaining();
+
     if (buffer.hasArray()) {
       this.data = buffer.array();
-      this.offset = buffer.position() + buffer.arrayOffset();
-      this.length = buffer.remaining();
+      this.offset = buffer.position();
     } else {
+      this.data = new byte[length];
       this.offset = 0;
-      this.data = ByteBufferUtil.toBytes(buffer);
-      this.length = data.length;
+      buffer.get(data);
     }
   }
 
@@ -119,7 +118,6 @@ public class ArrayByteSequence extends ByteSequence implements Serializable {
     return copy;
   }
 
-  @Override
   public String toString() {
     return new String(data, offset, length, UTF_8);
   }

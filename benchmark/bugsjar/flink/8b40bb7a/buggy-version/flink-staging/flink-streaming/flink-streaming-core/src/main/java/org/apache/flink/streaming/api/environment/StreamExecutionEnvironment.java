@@ -1228,7 +1228,8 @@ public abstract class StreamExecutionEnvironment {
 	 */
 	public static StreamExecutionEnvironment createRemoteEnvironment(String host, int port,
 			String... jarFiles) {
-		return new RemoteStreamEnvironment(host, port, jarFiles);
+		RemoteStreamEnvironment env = new RemoteStreamEnvironment(host, port, jarFiles);
+		return env;
 	}
 
 	/**
@@ -1297,7 +1298,8 @@ public abstract class StreamExecutionEnvironment {
 		if (transformations.size() <= 0) {
 			throw new IllegalStateException("No operators defined in streaming topology. Cannot execute.");
 		}
-		return StreamGraphGenerator.generate(this, transformations);
+		StreamGraph result = StreamGraphGenerator.generate(this, transformations);
+		return result;
 	}
 
 	/**

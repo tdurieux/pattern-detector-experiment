@@ -20,7 +20,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -54,7 +53,7 @@ public class Commit {
     private final Revision revision;
     private HashMap<String, UpdateOp> operations = new LinkedHashMap<String, UpdateOp>();
     private JsopWriter diff = new JsopStream();
-    private Set<Revision> collisions = new LinkedHashSet<Revision>();
+    private List<Revision> collisions = new ArrayList<Revision>();
 
     /**
      * List of all node paths which have been modified in this commit. In addition to the nodes

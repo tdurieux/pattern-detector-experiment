@@ -174,6 +174,7 @@ public class UrlEncoder
 		dontNeedEncoding.set('!');
 		dontNeedEncoding.set('$');
 		// "&" needs to be encoded for query stings
+		dontNeedEncoding.set('\'');
 		// "(" and ")" probably don't need encoding, but we'll be conservative
 		dontNeedEncoding.set('*');
 		// "+" needs to be encoded for query strings (since it means =

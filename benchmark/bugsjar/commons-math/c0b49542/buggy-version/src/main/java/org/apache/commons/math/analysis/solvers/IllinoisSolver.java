@@ -26,9 +26,7 @@ package org.apache.commons.math.analysis.solvers;
  * <p>Like the <em>Regula Falsi</em> method, convergence is guaranteed by
  * maintaining a bracketed solution. The <em>Illinois</em> method however,
  * should converge much faster than the original <em>Regula Falsi</em>
- * method. Furthermore, this implementation of the <em>Illinois</em> method
- * should not suffer from the same implementation issues as the <em>Regula
- * Falsi</em> method, which may fail to convergence in certain cases.</p>
+ * method.</p>
  *
  * <p>The <em>Illinois</em> method assumes that the function is continuous,
  * but not necessarily smooth.</p>
@@ -51,7 +49,7 @@ public class IllinoisSolver extends BaseSecantSolver {
     /**
      * Construct a solver.
      *
-     * @param absoluteAccuracy Absolute accuracy.
+     * @param absoluteAccuracy absolute accuracy
      */
     public IllinoisSolver(final double absoluteAccuracy) {
         super(absoluteAccuracy, Method.ILLINOIS);
@@ -60,8 +58,8 @@ public class IllinoisSolver extends BaseSecantSolver {
     /**
      * Construct a solver.
      *
-     * @param relativeAccuracy Relative accuracy.
-     * @param absoluteAccuracy Absolute accuracy.
+     * @param relativeAccuracy relative accuracy
+     * @param absoluteAccuracy absolute accuracy
      */
     public IllinoisSolver(final double relativeAccuracy,
                           final double absoluteAccuracy) {
@@ -71,8 +69,8 @@ public class IllinoisSolver extends BaseSecantSolver {
     /**
      * Construct a solver.
      *
-     * @param relativeAccuracy Relative accuracy.
-     * @param absoluteAccuracy Absolute accuracy.
+     * @param relativeAccuracy relative accuracy
+     * @param absoluteAccuracy absolute accuracy
      * @param functionValueAccuracy Maximum function value error.
      */
     public IllinoisSolver(final double relativeAccuracy,
@@ -80,4 +78,5 @@ public class IllinoisSolver extends BaseSecantSolver {
                           final double functionValueAccuracy) {
         super(relativeAccuracy, absoluteAccuracy, functionValueAccuracy, Method.PEGASUS);
     }
+
 }

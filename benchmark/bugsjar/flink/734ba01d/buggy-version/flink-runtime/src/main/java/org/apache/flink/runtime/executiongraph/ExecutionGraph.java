@@ -809,7 +809,7 @@ public class ExecutionGraph implements Serializable {
 	public void fail(Throwable t) {
 		while (true) {
 			JobStatus current = state;
-			if (current == JobStatus.FAILING || current.isTerminalState()) {
+			if (current == JobStatus.FAILED || current == JobStatus.FAILING) {
 				return;
 			}
 			else if (transitionState(current, JobStatus.FAILING, t)) {

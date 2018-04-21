@@ -694,7 +694,6 @@ public class ArrayRealVector extends AbstractRealVector implements Serializable 
     }
 
     /** {@inheritDoc} */
-    @Override
     public double getNorm() {
         double sum = 0;
         for (double a : data) {
@@ -704,7 +703,6 @@ public class ArrayRealVector extends AbstractRealVector implements Serializable 
     }
 
     /** {@inheritDoc} */
-    @Override
     public double getL1Norm() {
         double sum = 0;
         for (double a : data) {
@@ -714,11 +712,10 @@ public class ArrayRealVector extends AbstractRealVector implements Serializable 
     }
 
     /** {@inheritDoc} */
-    @Override
     public double getLInfNorm() {
         double max = 0;
         for (double a : data) {
-            max = Math.max(max, Math.abs(a));
+            max += Math.max(max, Math.abs(a));
         }
         return max;
     }

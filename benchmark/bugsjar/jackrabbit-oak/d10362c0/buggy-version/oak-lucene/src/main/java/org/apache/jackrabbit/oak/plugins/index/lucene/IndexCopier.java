@@ -75,7 +75,6 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.Iterables.toArray;
 import static com.google.common.collect.Iterables.transform;
 import static com.google.common.collect.Maps.newConcurrentMap;
-import static com.google.common.collect.Maps.newHashMap;
 import static org.apache.jackrabbit.oak.commons.IOUtils.humanReadableByteCount;
 
 public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
@@ -112,7 +111,6 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
 
 
     private final Map<String, String> indexPathMapping = newConcurrentMap();
-    private final Map<String, Set<String>> sharedWorkingSetMap = newHashMap();
     private final Map<String, String> indexPathVersionMapping = newConcurrentMap();
     private final ConcurrentMap<String, LocalIndexFile> failedToDeleteFiles = newConcurrentMap();
     private final Set<LocalIndexFile> copyInProgressFiles = Collections.newSetFromMap(new ConcurrentHashMap<LocalIndexFile, Boolean>());
@@ -133,13 +131,12 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
     public Directory wrapForRead(String indexPath, IndexDefinition definition,
             Directory remote) throws IOException {
         Directory local = createLocalDirForIndexReader(indexPath, definition);
-        return new CopyOnReadDirectory(remote, local, prefetchEnabled, indexPath, getSharedWorkingSet(definition));
+        return new CopyOnReadDirectory(remote, local, prefetchEnabled, indexPath);
     }
 
     public Directory wrapForWrite(IndexDefinition definition, Directory remote, boolean reindexMode) throws IOException {
         Directory local = createLocalDirForIndexWriter(definition);
-        return new CopyOnWriteDirectory(remote, local, reindexMode,
-                getIndexPathForLogging(definition), getSharedWorkingSet(definition));
+        return new CopyOnWriteDirectory(remote, local, reindexMode, getIndexPathForLogging(definition));
     }
 
     @Override
@@ -241,34 +238,6 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
     }
 
     /**
-     * Provide the corresponding shared state to enable COW inform COR
-     * about new files it is creating while indexing. This would allow COR to ignore
-     * such files while determining the deletion candidates.
-     *
-     * @param defn index definition for which the directory is being created
-     * @return a set to maintain the state of new files being created by the COW Directory
-     */
-    private Set<String> getSharedWorkingSet(IndexDefinition defn){
-        String indexPath = defn.getIndexPathFromConfig();
-
-        if (indexPath == null){
-            //With indexPath null the working directory would not
-            //be shared between COR and COW. So just return a new set
-            return new HashSet<String>();
-        }
-
-        Set<String> sharedSet;
-        synchronized (sharedWorkingSetMap){
-            sharedSet = sharedWorkingSetMap.get(indexPath);
-            if (sharedSet == null){
-                sharedSet = Sets.newConcurrentHashSet();
-                sharedWorkingSetMap.put(indexPath, sharedSet);
-            }
-        }
-        return sharedSet;
-    }
-
-    /**
      * Creates the workDir. If it exists then it is cleaned
      *
      * @param indexRootDir root directory under which all indexing related files are managed
@@ -305,17 +274,12 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
          */
         private final Set<String> localFileNames = Sets.newConcurrentHashSet();
 
-        public CopyOnReadDirectory(Directory remote, Directory local, boolean prefetch,
-                                   String indexPath, Set<String> sharedWorkingSet) throws IOException {
+        public CopyOnReadDirectory(Directory remote, Directory local, boolean prefetch, String indexPath) throws IOException {
             super(remote);
             this.remote = remote;
             this.local = local;
             this.indexPath = indexPath;
-
             this.localFileNames.addAll(Arrays.asList(local.listAll()));
-            //Remove files which are being worked upon by COW
-            this.localFileNames.removeAll(sharedWorkingSet);
-
             if (prefetch) {
                 prefetchIndexFiles();
             }
@@ -585,7 +549,6 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
         private final CountDownLatch copyDone = new CountDownLatch(1);
         private final boolean reindexMode;
         private final String indexPathForLogging;
-        private final Set<String> sharedWorkingSet;
 
         /**
          * Current background task
@@ -639,13 +602,12 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
         };
 
         public CopyOnWriteDirectory(Directory remote, Directory local, boolean reindexMode,
-                                    String indexPathForLogging, Set<String> sharedWorkingSet) throws IOException {
+                                    String indexPathForLogging) throws IOException {
             super(local);
             this.remote = remote;
             this.local = local;
             this.indexPathForLogging = indexPathForLogging;
             this.reindexMode = reindexMode;
-            this.sharedWorkingSet = sharedWorkingSet;
             initialize();
         }
 
@@ -685,7 +647,6 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
             }
             ref = new COWLocalFileReference(name);
             fileMap.put(name, ref);
-            sharedWorkingSet.add(name);
             return ref.createOutput(context);
         }
 
@@ -762,7 +723,6 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
 
             local.close();
             remote.close();
-            sharedWorkingSet.clear();
         }
 
         @Override
@@ -1034,7 +994,7 @@ public class IndexCopier implements CopyOnReadStatsMBean, Closeable {
         } catch (IOException e) {
             failedToDelete(file);
             log.debug("Error occurred while removing deleted file {} from Local {}. " +
-                    "Attempt would be made to delete it on next run ", fileName, dir, e);
+                    "Attempt would be maid to delete it on next run ", fileName, dir, e);
         }
         return successFullyDeleted;
     }

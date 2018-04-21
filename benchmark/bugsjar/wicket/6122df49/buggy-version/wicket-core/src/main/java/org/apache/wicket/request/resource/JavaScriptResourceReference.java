@@ -78,9 +78,7 @@ public class JavaScriptResourceReference extends PackageResourceReference
 	@Override
 	public JavaScriptPackageResource getResource()
 	{
-        final JavaScriptPackageResource resource = new JavaScriptPackageResource(getScope(), getName(), getLocale(), getStyle(),
-                getVariation());
-        removeCompressFlagIfUnnecessary(resource);
-        return resource;
+		return new JavaScriptPackageResource(getScope(), getName(), getLocale(), getStyle(),
+			getVariation());
 	}
 }

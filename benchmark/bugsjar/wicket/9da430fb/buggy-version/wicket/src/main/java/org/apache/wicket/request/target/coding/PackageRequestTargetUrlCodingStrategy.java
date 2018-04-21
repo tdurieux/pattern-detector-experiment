@@ -39,7 +39,8 @@ import org.slf4j.LoggerFactory;
  */
 public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTargetUrlCodingStrategy
 {
-	private static final Logger log = LoggerFactory.getLogger(PackageRequestTargetUrlCodingStrategy.class);
+	private static final Logger log = LoggerFactory
+			.getLogger(PackageRequestTargetUrlCodingStrategy.class);
 
 	/** package for this mount. */
 	private final PackageName packageName;
@@ -92,7 +93,7 @@ public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTarget
 		try
 		{
 			bookmarkablePageClass = Session.get().getClassResolver().resolveClass(
-				bookmarkablePageClassName);
+					bookmarkablePageClassName);
 		}
 		catch (Exception e)
 		{
@@ -100,7 +101,7 @@ public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTarget
 			return null;
 		}
 		PageParameters parameters = new PageParameters(decodeParameters(parametersFragment,
-			requestParameters.getParameters()));
+				requestParameters.getParameters()));
 
 		String pageMapName = (String)parameters.remove(WebRequestCodingStrategy.PAGEMAP);
 		pageMapName = WebRequestCodingStrategy.decodePageMapName(pageMapName);
@@ -109,14 +110,15 @@ public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTarget
 		// do some extra work for checking whether this is a normal request to a
 		// bookmarkable page, or a request to a stateless page (in which case a
 		// wicket:interface parameter should be available
-		final String interfaceParameter = (String)parameters.remove(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME);
+		final String interfaceParameter = (String)parameters
+				.remove(WebRequestCodingStrategy.INTERFACE_PARAMETER_NAME);
 
 		if (interfaceParameter != null)
 		{
 			WebRequestCodingStrategy.addInterfaceParameters(interfaceParameter, requestParameters);
 			return new BookmarkableListenerInterfaceRequestTarget(pageMapName,
-				bookmarkablePageClass, parameters, requestParameters.getComponentPath(),
-				requestParameters.getInterfaceName(), requestParameters.getVersionNumber());
+					bookmarkablePageClass, parameters, requestParameters.getComponentPath(),
+					requestParameters.getInterfaceName(), requestParameters.getVersionNumber());
 		}
 		else
 		{
@@ -132,18 +134,18 @@ public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTarget
 		if (!(requestTarget instanceof IBookmarkablePageRequestTarget))
 		{
 			throw new IllegalArgumentException("this encoder can only be used with instances of " +
-				IBookmarkablePageRequestTarget.class.getName());
+					IBookmarkablePageRequestTarget.class.getName());
 		}
 		AppendingStringBuffer url = new AppendingStringBuffer(40);
 		url.append(getMountPath());
 		IBookmarkablePageRequestTarget target = (IBookmarkablePageRequestTarget)requestTarget;
-		url.append("/").append(Classes.simpleName(target.getPageClass()));
+		url.append("/").append(Classes.simpleName(target.getPageClass())).append("/");
 
 		PageParameters pageParameters = target.getPageParameters();
 		if (target.getPageMapName() != null)
 		{
-			pageParameters.put(WebRequestCodingStrategy.PAGEMAP,
-				WebRequestCodingStrategy.encodePageMapName(target.getPageMapName()));
+			pageParameters.put(WebRequestCodingStrategy.PAGEMAP, WebRequestCodingStrategy
+					.encodePageMapName(target.getPageMapName()));
 		}
 
 		appendParameters(url, pageParameters);
@@ -169,7 +171,6 @@ public class PackageRequestTargetUrlCodingStrategy extends AbstractRequestTarget
 	/**
 	 * @see java.lang.Object#toString()
 	 */
-	@Override
 	public String toString()
 	{
 		return "PackageEncoder[package=" + packageName + "]";

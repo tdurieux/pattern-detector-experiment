@@ -79,16 +79,14 @@ public class SplitDocumentCleanUp {
                     mainId, splitId);
             return;
         }
-        
-        String splitDocPath = splitDoc.getPath();
-        int slashIdx = splitDocPath.lastIndexOf('/');
-        int height = Integer.parseInt(splitDocPath.substring(slashIdx + 1));
+        int slashIdx = splitId.lastIndexOf('/');
+        int height = Integer.parseInt(splitId.substring(slashIdx + 1));
         Revision rev = Revision.fromString(
-                splitDocPath.substring(splitDocPath.lastIndexOf('/', slashIdx - 1) + 1, slashIdx));
+                splitId.substring(splitId.lastIndexOf('/', slashIdx - 1) + 1, slashIdx));
         doc = doc.findPrevReferencingDoc(rev, height);
         if (doc == null) {
-            LOG.warn("Split document {} for path {} not referenced anymore. Main document is {}",
-                    splitId, splitDocPath, mainId);
+            LOG.warn("Split document {} not referenced anymore. Main document is {}",
+                    splitId, mainId);
             return;
         }
         // remove reference

@@ -30,12 +30,10 @@ public class MethodNotFoundException extends CamelExchangeException {
     private final Object bean;
     private final String methodName;
     @SuppressWarnings("rawtypes")
-    private List<Class> parameterTypes;
+    private final List<Class> parameterTypes;
 
     public MethodNotFoundException(Exchange exchange, Object pojo, String methodName) {
-        super("Method with name: " + methodName + " not found on bean: " + pojo, exchange);
-        this.methodName = methodName;
-        this.bean = pojo;
+        this(exchange, pojo, methodName, null);
     }
     
     @SuppressWarnings("rawtypes")
@@ -44,12 +42,6 @@ public class MethodNotFoundException extends CamelExchangeException {
         this.methodName = methodName;
         this.bean = pojo;
         this.parameterTypes = parameterTypes;
-    }
-
-    public MethodNotFoundException(Object pojo, String methodName, Throwable cause) {
-        super("Method with name: " + methodName + " not found on bean: " + pojo, null, cause);
-        this.methodName = methodName;
-        this.bean = pojo;
     }
 
     public String getMethodName() {

@@ -118,11 +118,6 @@ public class NodeDocument extends Document {
 
     final DocumentStore store;
 
-    /**
-     * Parsed and sorted set of previous revisions.
-     */
-    private SortedMap<Revision, Range> previous;
-
     private final long time = System.currentTimeMillis();
 
     NodeDocument(@Nonnull DocumentStore store) {
@@ -156,23 +151,19 @@ public class NodeDocument extends Document {
 
     /**
      * Returns <code>true</code> if the given <code>revision</code> is marked
-     * committed.
+     * committed in <strong>this</strong> document including previous documents.
      *
      * @param revision the revision.
      * @return <code>true</code> if committed; <code>false</code> otherwise.
      */
     public boolean isCommitted(@Nonnull Revision revision) {
-        NodeDocument commitRootDoc = getCommitRoot(checkNotNull(revision));
-        if (commitRootDoc == null) {
-            return false;
-        }
         String rev = checkNotNull(revision).toString();
-        String value = commitRootDoc.getLocalRevisions().get(rev);
+        String value = getLocalRevisions().get(rev);
         if (value != null) {
             return Utils.isCommitted(value);
         }
         // check previous docs
-        for (NodeDocument prev : commitRootDoc.getPreviousDocs(revision, REVISIONS)) {
+        for (NodeDocument prev : getPreviousDocs(revision, REVISIONS)) {
             if (prev.containsRevision(revision)) {
                 return prev.isCommitted(revision);
             }
@@ -668,26 +659,20 @@ public class NodeDocument extends Document {
                     main.removeMapEntry(property, r);
                     old.setMapEntry(property, r, entry.getValue());
                 }
+                splitOps.add(old);
+                splitOps.add(main);
             }
-            splitOps.add(old);
-            splitOps.add(main);
         }
         return splitOps;
     }
 
-    /**
-     * Returns previous revision ranges for this document. The revision keys are
-     * sorted descending, newest first!
-     *
-     * @return the previous ranges for this document.
-     */
+    @Override
     @Nonnull
-    SortedMap<Revision, Range> getPreviousRanges() {
-        if (previous == null) {
-            Map<String, String> map = getLocalMap(PREVIOUS);
-            if (map.isEmpty()) {
-                previous = EMPTY_RANGE_MAP;
-            } else {
+    protected Map<?, ?> transformAndSeal(@Nonnull Map<Object, Object> map,
+                                         @Nullable String key,
+                                         int level) {
+        if (level == 1) {
+            if (PREVIOUS.equals(key)) {
                 SortedMap<Revision, Range> transformed = new TreeMap<Revision, Range>(
                         new Comparator<Revision>() {
                             @Override
@@ -702,13 +687,29 @@ public class NodeDocument extends Document {
                                 return c;
                             }
                         });
-                for (Map.Entry<String, String> entry : map.entrySet()) {
-                    Revision high = Revision.fromString(entry.getKey());
-                    Revision low = Revision.fromString(entry.getValue());
+                for (Map.Entry<Object, Object> entry : map.entrySet()) {
+                    Revision high = Revision.fromString(entry.getKey().toString());
+                    Revision low = Revision.fromString(entry.getValue().toString());
                     transformed.put(high, new Range(high, low));
                 }
-                previous = Collections.unmodifiableSortedMap(transformed);
+                return Collections.unmodifiableSortedMap(transformed);
             }
+        }
+        return super.transformAndSeal(map, key, level);
+    }
+
+    /**
+     * Returns previous revision ranges for this document. The revision keys are
+     * sorted descending, newest first!
+     *
+     * @return the previous ranges for this document.
+     */
+    @Nonnull
+    SortedMap<Revision, Range> getPreviousRanges() {
+        @SuppressWarnings("unchecked")
+        SortedMap<Revision, Range> previous = (SortedMap<Revision, Range>) get(PREVIOUS);
+        if (previous == null) {
+            previous = EMPTY_RANGE_MAP;
         }
         return previous;
     }

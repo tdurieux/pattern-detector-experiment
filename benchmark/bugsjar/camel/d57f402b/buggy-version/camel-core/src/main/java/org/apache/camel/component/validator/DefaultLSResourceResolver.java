@@ -117,7 +117,8 @@ public class DefaultLSResourceResolver implements LSResourceResolver {
         
         @Override
         public Reader getCharacterStream() {
-            return null;
+            InputStream is = getByteStream();
+            return camelContext.getTypeConverter().convertTo(Reader.class, is);
         }
 
         @Override

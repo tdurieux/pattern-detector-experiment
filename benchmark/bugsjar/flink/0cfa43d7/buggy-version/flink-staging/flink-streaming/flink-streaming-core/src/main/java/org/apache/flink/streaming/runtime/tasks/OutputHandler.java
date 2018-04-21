@@ -150,11 +150,7 @@ public class OutputHandler<OUT> {
 			// operator which will be returned and set it up using the wrapper
 			OneInputStreamOperator chainableOperator =
 					chainedTaskConfig.getStreamOperator(vertex.getUserCodeClassLoader());
-			
-			StreamingRuntimeContext chainedContext = vertex.createRuntimeContext(chainedTaskConfig);
-			vertex.contexts.add(chainedContext);
-			
-			chainableOperator.setup(wrapper, chainedContext);
+			chainableOperator.setup(wrapper, vertex.context);
 
 			chainedOperators.add(chainableOperator);
 			return new OperatorCollector<X>(chainableOperator);

@@ -450,7 +450,7 @@ public class RadioChoice<T> extends AbstractSingleSelectChoice<T> implements IOn
 				buffer.append(getPrefix());
 
 				String id = getChoiceRenderer().getIdValue(choice, index);
-				final String idAttr = getMarkupId() + "-" + id;
+				final String idAttr = getMarkupId() + "_" + id;
 
 				boolean enabled = isEnabledInHierarchy() && !isDisabled(choice, index, selected);
 

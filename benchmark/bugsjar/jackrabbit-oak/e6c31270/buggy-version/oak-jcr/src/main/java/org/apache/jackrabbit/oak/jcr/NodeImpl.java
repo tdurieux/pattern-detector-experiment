@@ -1450,17 +1450,13 @@ public class NodeImpl extends ItemImpl<NodeDelegate> implements Node {
         return sessionDelegate.perform(new SessionOperation<Property>() {
             @Override
             public Property perform() throws RepositoryException {
-                String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
                 if (value == null) {
-                    if (hasProperty(jcrName)) {
-                        Property property = getProperty(jcrName);
-                        property.remove();
-                        return property;
-                    } else {
-                        return new PropertyImpl(new PropertyDelegate(
-                                sessionDelegate, dlg.getLocation().getChild(oakName)));
-                    }
+                    Property property = getProperty(jcrName);
+                    property.remove();
+                    return property;
                 } else {
+                    String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
+
                     PropertyDefinition definition;
                     if (hasProperty(jcrName)) {
                         definition = getProperty(jcrName).getDefinition();
@@ -1489,17 +1485,13 @@ public class NodeImpl extends ItemImpl<NodeDelegate> implements Node {
         return sessionDelegate.perform(new SessionOperation<Property>() {
             @Override
             public Property perform() throws RepositoryException {
-                String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
                 if (values == null) {
-                    if (hasProperty(jcrName)) {
-                        Property property = getProperty(jcrName);
-                        property.remove();
-                        return property;
-                    } else {
-                        return new PropertyImpl(new PropertyDelegate(
-                                sessionDelegate, dlg.getLocation().getChild(oakName)));
-                    }
+                    Property p = getProperty(jcrName);
+                    p.remove();
+                    return p;
                 } else {
+                    String oakName = sessionDelegate.getOakPathOrThrow(jcrName);
+
                     PropertyDefinition definition;
                     if (hasProperty(jcrName)) {
                         definition = getProperty(jcrName).getDefinition();

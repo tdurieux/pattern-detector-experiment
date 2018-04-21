@@ -537,7 +537,7 @@ public class Task implements Runnable {
 			//  actual task core work
 			// ----------------------------------------------------------------
 
-			// we must make strictly sure that the invokable is accessible to the cancel() call
+			// we must make strictly sure that the invokable is accessible to teh cancel() call
 			// by the time we switched to running.
 			this.invokable = invokable;
 
@@ -597,25 +597,22 @@ public class Task implements Runnable {
 				// to failExternally()
 				while (true) {
 					ExecutionState current = this.executionState;
-
 					if (current == ExecutionState.RUNNING || current == ExecutionState.DEPLOYING) {
-						if (t instanceof CancelTaskException) {
-							if (STATE_UPDATER.compareAndSet(this, current, ExecutionState.CANCELED)) {
-								cancelInvokable();
+						if (STATE_UPDATER.compareAndSet(this, current, ExecutionState.FAILED)) {
+							// proper failure of the task. record the exception as the root cause
+							failureCause = t;
+							notifyObservers(ExecutionState.FAILED, t);
 
-								notifyObservers(ExecutionState.CANCELED, null);
-								break;
+							// in case of an exception during execution, we still call "cancel()" on the task
+							if (invokable != null && this.invokable != null && invokableHasBeenCanceled.compareAndSet(false, true)) {
+								try {
+									invokable.cancel();
+								}
+								catch (Throwable t2) {
+									LOG.error("Error while canceling task " + taskNameWithSubtask, t2);
+								}
 							}
-						}
-						else {
-							if (STATE_UPDATER.compareAndSet(this, current, ExecutionState.FAILED)) {
-								// proper failure of the task. record the exception as the root cause
-								failureCause = t;
-								cancelInvokable();
-
-								notifyObservers(ExecutionState.FAILED, t);
-								break;
-							}
+							break;
 						}
 					}
 					else if (current == ExecutionState.CANCELING) {
@@ -749,7 +746,7 @@ public class Task implements Runnable {
 	}
 
 	/**
-	 * Marks task execution failed for an external reason (a reason other than the task code itself
+	 * Marks task execution failed for an external reason (a reason other than th task code itself
 	 * throwing an exception). If the task is already in a terminal state
 	 * (such as FINISHED, CANCELED, FAILED), or if the task is already canceling this does nothing.
 	 * Otherwise it sets the state to FAILED, and, if the invokable code is running,
@@ -964,18 +961,6 @@ public class Task implements Runnable {
 	// ------------------------------------------------------------------------
 	//  Utilities
 	// ------------------------------------------------------------------------
-
-	private void cancelInvokable() {
-		// in case of an exception during execution, we still call "cancel()" on the task
-		if (invokable != null && this.invokable != null && invokableHasBeenCanceled.compareAndSet(false, true)) {
-			try {
-				invokable.cancel();
-			}
-			catch (Throwable t) {
-				LOG.error("Error while canceling task " + taskNameWithSubtask, t);
-			}
-		}
-	}
 
 	@Override
 	public String toString() {

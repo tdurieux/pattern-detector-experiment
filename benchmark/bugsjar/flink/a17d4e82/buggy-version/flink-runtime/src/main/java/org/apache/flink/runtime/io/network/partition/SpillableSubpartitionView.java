@@ -73,7 +73,7 @@ class SpillableSubpartitionView implements ResultSubpartitionView {
 
 		// 1) In-memory
 		synchronized (parent.buffers) {
-			if (parent.isReleased()) {
+			if (parent.isReleased) {
 				return null;
 			}
 
@@ -162,7 +162,7 @@ class SpillableSubpartitionView implements ResultSubpartitionView {
 
 	@Override
 	public boolean isReleased() {
-		return parent.isReleased() || isReleased.get();
+		return isReleased.get();
 	}
 
 	@Override

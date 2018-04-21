@@ -26,8 +26,6 @@ import org.apache.wicket.markup.html.internal.HtmlHeaderContainer;
 import org.apache.wicket.markup.parser.XmlTag.TagType;
 import org.apache.wicket.markup.resolver.IComponentResolver;
 import org.apache.wicket.util.lang.Classes;
-import org.apache.wicket.util.visit.IVisit;
-import org.apache.wicket.util.visit.IVisitor;
 
 /**
  * Implements boilerplate as needed by many markup sourcing strategies.
@@ -62,37 +60,22 @@ public abstract class AbstractMarkupSourcingStrategy implements IMarkupSourcingS
 	protected IMarkupFragment searchMarkupInTransparentResolvers(final MarkupContainer container,
 		final Component child)
 	{
-		return container.visitChildren(MarkupContainer.class, new IVisitor<MarkupContainer, IMarkupFragment>()
+		IMarkupFragment markup = null;
+
+		for (Component ch : container)
 		{
-			@Override
-			public void component(MarkupContainer resolvingContainer, IVisit<IMarkupFragment> visit)
+			if ((ch != child) && (ch instanceof MarkupContainer) &&
+				(ch instanceof IComponentResolver))
 			{
-				if (resolvingContainer instanceof IComponentResolver)
+				markup = ((MarkupContainer)ch).getMarkup(child);
+				if (markup != null)
 				{
-					IMarkupFragment childMarkup = resolvingContainer.getMarkup(child);
-
-					if (childMarkup != null && childMarkup.size() > 0)
-					{
-						IComponentResolver componentResolver = (IComponentResolver)resolvingContainer;
-
-						MarkupStream stream = new MarkupStream(childMarkup);
-
-						ComponentTag tag = stream.getTag();
-
-						Component resolvedComponent = resolvingContainer.get(tag.getId());
-						if (resolvedComponent == null)
-						{
-							resolvedComponent = componentResolver.resolve(resolvingContainer, stream, tag);
-						}
-
-						if (child == resolvedComponent)
-						{
-							visit.stop(childMarkup);
-						}
-					}
+					break;
 				}
 			}
-		});
+		}
+
+		return markup;
 	}
 
 	/**

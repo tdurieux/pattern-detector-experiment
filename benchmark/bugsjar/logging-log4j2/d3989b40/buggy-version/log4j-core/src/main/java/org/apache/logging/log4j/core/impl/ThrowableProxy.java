@@ -451,21 +451,13 @@ public class ThrowableProxy implements Serializable {
         try {
             clazz = Loader.loadClass(className);
         } catch (final ClassNotFoundException ignored) {
-            return initializeClass(className);
-        } catch (final NoClassDefFoundError ignored) {
-            return initializeClass(className);
+            try {
+                clazz = Loader.initializeClass(className, this.getClass().getClassLoader());
+            } catch (final ClassNotFoundException ignore) {
+                return null;
+            }
         }
         return clazz;
-    }
-
-    private Class<?> initializeClass(final String className) {
-        try {
-            return Loader.initializeClass(className, this.getClass().getClassLoader());
-        } catch (final ClassNotFoundException ignore) {
-            return null;
-        } catch (final NoClassDefFoundError ignore) {
-            return null;
-        }
     }
 
     /**

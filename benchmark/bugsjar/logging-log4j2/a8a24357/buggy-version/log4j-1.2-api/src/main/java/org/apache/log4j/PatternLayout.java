@@ -23,10 +23,6 @@ import org.apache.log4j.spi.LoggingEvent;
  */
 public class PatternLayout extends Layout {
 
-    public PatternLayout(String pattern) {
-
-    }
-
     @Override
     public String format(final LoggingEvent event) {
         return "";

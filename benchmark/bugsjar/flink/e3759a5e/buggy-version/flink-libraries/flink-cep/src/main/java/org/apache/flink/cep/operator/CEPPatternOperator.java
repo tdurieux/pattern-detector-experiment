@@ -87,8 +87,6 @@ public class CEPPatternOperator<IN> extends AbstractCEPPatternOperator<IN> {
 
 			processEvent(nfa, streamRecord.getValue(), streamRecord.getTimestamp());
 		}
-
-		output.emitWatermark(mark);
 	}
 
 	@Override

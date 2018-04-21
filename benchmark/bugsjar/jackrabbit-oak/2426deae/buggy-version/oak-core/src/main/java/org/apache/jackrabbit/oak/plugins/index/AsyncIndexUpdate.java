@@ -41,15 +41,10 @@ import org.apache.jackrabbit.oak.api.CommitFailedException;
 import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.api.jmx.IndexStatsMBean;
-import org.apache.jackrabbit.oak.plugins.commit.AnnotatingConflictHandler;
-import org.apache.jackrabbit.oak.plugins.commit.ConflictHook;
-import org.apache.jackrabbit.oak.plugins.commit.ConflictValidatorProvider;
 import org.apache.jackrabbit.oak.plugins.value.Conversions;
 import org.apache.jackrabbit.oak.spi.commit.CommitHook;
 import org.apache.jackrabbit.oak.spi.commit.CommitInfo;
-import org.apache.jackrabbit.oak.spi.commit.CompositeHook;
 import org.apache.jackrabbit.oak.spi.commit.EditorDiff;
-import org.apache.jackrabbit.oak.spi.commit.EditorHook;
 import org.apache.jackrabbit.oak.spi.commit.EmptyHook;
 import org.apache.jackrabbit.oak.spi.state.NodeBuilder;
 import org.apache.jackrabbit.oak.spi.state.NodeState;
@@ -231,10 +226,7 @@ public class AsyncIndexUpdate implements Runnable {
 
     private static CommitHook newCommitHook(final String name,
             final PropertyState state) throws CommitFailedException {
-        return new CompositeHook(
-                new ConflictHook(new AnnotatingConflictHandler()),
-                new EditorHook(new ConflictValidatorProvider()),
-                new CommitHook() {
+        return new CommitHook() {
             @Override
             @Nonnull
             public NodeState processCommit(NodeState before, NodeState after,
@@ -249,7 +241,7 @@ public class AsyncIndexUpdate implements Runnable {
                     throw CONCURRENT_UPDATE;
                 }
             }
-        });
+        };
     }
 
     private static void preAsyncRun(NodeStore store, String name) throws CommitFailedException {

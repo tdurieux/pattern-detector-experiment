@@ -322,9 +322,6 @@ public abstract class InputFormatBase<K,V> extends AbstractInputFormat<K,V> {
         iterators = getIterators(job);
       } else {
         iterators = split.getIterators();
-        if (null == iterators) {
-          iterators = getIterators(job);
-        }
       }
 
       setupIterators(iterators, scanner);

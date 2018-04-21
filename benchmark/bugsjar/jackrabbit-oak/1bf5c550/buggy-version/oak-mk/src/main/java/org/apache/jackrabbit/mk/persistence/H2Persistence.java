@@ -70,7 +70,6 @@ public class H2Persistence implements GCPersistence {
         try {
             Statement stmt = con.createStatement();
             stmt.execute("create table if not exists REVS(ID binary primary key, DATA binary, TIME timestamp)");
-            stmt.execute("create table if not exists NODES(ID binary primary key, DATA binary, TIME timestamp)");
             stmt.execute("create table if not exists HEAD(ID binary) as select null");
             stmt.execute("create sequence if not exists DATASTORE_ID");
 /*
@@ -87,35 +86,10 @@ public class H2Persistence implements GCPersistence {
         cp.dispose();
     }
 
-    public Id[] readIds() throws Exception {
-        Id lastCommitId = null;
-        Id headId = readHead();
-        if (headId != null) {
-            lastCommitId = readLastCommitId();
-        }
-        return new Id[] { headId, lastCommitId };
-    }
-    
-    private Id readHead() throws Exception {
+    public Id readHead() throws Exception {
         Connection con = cp.getConnection();
         try {
             PreparedStatement stmt = con.prepareStatement("select * from HEAD");
-            ResultSet rs = stmt.executeQuery();
-            byte[] rawId = null;
-            if (rs.next()) {
-                rawId = rs.getBytes(1);
-            }
-            stmt.close();
-            return rawId == null ? null : new Id(rawId); 
-        } finally {
-            con.close();
-        }
-    }
-
-    private Id readLastCommitId() throws Exception {
-        Connection con = cp.getConnection();
-        try {
-            PreparedStatement stmt = con.prepareStatement("select MAX(ID) from REVS");
             ResultSet rs = stmt.executeQuery();
             byte[] rawId = null;
             if (rs.next()) {
@@ -144,7 +118,7 @@ public class H2Persistence implements GCPersistence {
         Id id = node.getId();
         Connection con = cp.getConnection();
         try {
-            PreparedStatement stmt = con.prepareStatement("select DATA from NODES where ID = ?");
+            PreparedStatement stmt = con.prepareStatement("select DATA from REVS where ID = ?");
             try {
                 stmt.setBytes(1, id.getBytes());
                 ResultSet rs = stmt.executeQuery();
@@ -174,7 +148,7 @@ public class H2Persistence implements GCPersistence {
         try {
             PreparedStatement stmt = con
                     .prepareStatement(
-                            "insert into NODES (ID, DATA, TIME) select ?, ?, ? where not exists (select 1 from NODES where ID = ?)");
+                            "insert into REVS (ID, DATA, TIME) select ?, ?, ? where not exists (select 1 from REVS where ID = ?)");
             try {
                 stmt.setBytes(1, rawId);
                 stmt.setBytes(2, bytes);
@@ -238,7 +212,7 @@ public class H2Persistence implements GCPersistence {
     public ChildNodeEntriesMap readCNEMap(Id id) throws NotFoundException, Exception {
         Connection con = cp.getConnection();
         try {
-            PreparedStatement stmt = con.prepareStatement("select DATA from NODES where ID = ?");
+            PreparedStatement stmt = con.prepareStatement("select DATA from REVS where ID = ?");
             try {
                 stmt.setBytes(1, id.getBytes());
                 ResultSet rs = stmt.executeQuery();
@@ -267,7 +241,7 @@ public class H2Persistence implements GCPersistence {
         try {
             PreparedStatement stmt = con
                     .prepareStatement(
-                            "insert into NODES (ID, DATA, TIME) select ?, ?, ? where not exists (select 1 from NODES where ID = ?)");
+                            "insert into REVS (ID, DATA, TIME) select ?, ?, ? where not exists (select 1 from REVS where ID = ?)");
             try {
                 stmt.setBytes(1, rawId);
                 stmt.setBytes(2, bytes);
@@ -290,7 +264,7 @@ public class H2Persistence implements GCPersistence {
     
     @Override
     public boolean markCommit(Id id) throws Exception {
-        return touch("REVS", id, gcStart);
+        return touch(id, gcStart);
     }
 
     @Override
@@ -318,23 +292,22 @@ public class H2Persistence implements GCPersistence {
     
     @Override
     public boolean markNode(Id id) throws Exception {
-        return touch("NODES", id, gcStart);
+        return touch(id, gcStart);
     }
 
     @Override
     public boolean markCNEMap(Id id) throws Exception {
-        return touch("NODES", id, gcStart);
+        return touch(id, gcStart);
     }
     
-    private boolean touch(String table, Id id, long timeMillis) throws Exception {
+    private boolean touch(Id id, long timeMillis) throws Exception {
         Timestamp ts = new Timestamp(timeMillis);
 
         Connection con = cp.getConnection();
         try {
-            PreparedStatement stmt = con.prepareStatement(
-                    String.format("update %s set TIME = ? where ID = ? and TIME < ?",
-                            table));
-                                    
+            PreparedStatement stmt = con
+                    .prepareStatement(
+                            "update REVS set TIME = ? where ID = ? and TIME < ?");
             try {
                 stmt.setTimestamp(1, ts);
                 stmt.setBytes(2, id.getBytes());
@@ -351,29 +324,20 @@ public class H2Persistence implements GCPersistence {
     @Override
     public int sweep() throws Exception {
         Timestamp ts = new Timestamp(gcStart);
-        int swept = 0;
 
         Connection con = cp.getConnection();
         try {
-            PreparedStatement stmt = con.prepareStatement("delete REVS where TIME < ?");
+            PreparedStatement stmt = con
+                    .prepareStatement(
+                            "delete REVS where TIME < ?");
             try {
                 stmt.setTimestamp(1, ts);
-                swept += stmt.executeUpdate();
-            } finally {
-                stmt.close();
-            }
-
-            stmt = con.prepareStatement("delete NODES where TIME < ?");
-            
-            try {
-                stmt.setTimestamp(1, ts);
-                swept += stmt.executeUpdate();
+                return stmt.executeUpdate();
             } finally {
                 stmt.close();
             }
         } finally {
             con.close();
         }
-        return swept;
      }
 }

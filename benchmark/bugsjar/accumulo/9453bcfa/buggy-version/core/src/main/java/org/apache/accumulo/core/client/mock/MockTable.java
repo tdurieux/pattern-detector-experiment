@@ -88,9 +88,9 @@ public class MockTable {
   private TimeType timeType;
   SortedSet<Text> splits = new TreeSet<Text>();
   
-  MockTable(boolean limitVersion, TimeType timeType) {
+  MockTable(boolean useVersions, TimeType timeType) {
     this.timeType = timeType;
-    settings = IteratorUtil.generateInitialTableProperties(limitVersion);
+    settings = IteratorUtil.generateInitialTableProperties();
     for (Entry<String,String> entry : AccumuloConfiguration.getDefaultConfiguration()) {
       String key = entry.getKey();
       if (key.startsWith(Property.TABLE_PREFIX.getKey()))

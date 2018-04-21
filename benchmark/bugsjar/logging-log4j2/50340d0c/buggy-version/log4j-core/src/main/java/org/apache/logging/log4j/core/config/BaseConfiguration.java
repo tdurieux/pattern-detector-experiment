@@ -104,9 +104,7 @@ public class BaseConfiguration extends AbstractFilterable implements Configurati
 
     private ConcurrentMap<String, LoggerConfig> loggers = new ConcurrentHashMap<String, LoggerConfig>();
 
-    private ConcurrentMap<String, String> properties = new ConcurrentHashMap<String, String>();
-
-    private final StrLookup tempLookup = new Interpolator(properties);
+    private final StrLookup tempLookup = new Interpolator();
 
     private final StrSubstitutor subst = new StrSubstitutor(tempLookup);
 
@@ -122,7 +120,6 @@ public class BaseConfiguration extends AbstractFilterable implements Configurati
      * Constructor.
      */
     protected BaseConfiguration() {
-        componentMap.put(Configuration.CONTEXT_PROPERTIES, properties);
         pluginManager = new PluginManager("Core");
         rootNode = new Node();
     }
@@ -130,7 +127,7 @@ public class BaseConfiguration extends AbstractFilterable implements Configurati
     @Override
     @SuppressWarnings("unchecked")
     public Map<String, String> getProperties() {
-        return properties;
+        return (Map<String, String>) componentMap.get(CONTEXT_PROPERTIES);
     }
 
     /**

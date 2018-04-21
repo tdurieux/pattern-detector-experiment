@@ -452,6 +452,9 @@ public class XsltBuilder implements Processor {
             return (Source) body;
         }
         Source source = null;
+        if (body instanceof InputStream) {
+            return new StreamSource((InputStream)body);
+        }
         if (body != null) {
             if (isAllowStAX()) {
                 source = exchange.getContext().getTypeConverter().tryConvertTo(StAXSource.class, exchange, body);

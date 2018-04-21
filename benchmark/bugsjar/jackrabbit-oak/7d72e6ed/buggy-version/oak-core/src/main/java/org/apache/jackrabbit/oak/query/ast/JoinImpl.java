@@ -60,15 +60,8 @@ public class JoinImpl extends SourceImpl {
 
     @Override
     public String getPlan(NodeState rootState) {
-        StringBuilder buff = new StringBuilder();
-        buff.append(left.getPlan(rootState)).
-            append(' ').
-            append(joinType).
-            append(' ').
-            append(right.getPlan(rootState)).
-            append(" on ").
-            append(joinCondition);
-        return buff.toString();
+        return left.getPlan(rootState) + ' ' + joinType +
+                " " + right.getPlan(rootState) + " on " + joinCondition;
     }
 
     @Override

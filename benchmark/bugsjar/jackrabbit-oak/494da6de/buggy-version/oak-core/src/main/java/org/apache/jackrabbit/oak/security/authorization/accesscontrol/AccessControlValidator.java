@@ -42,7 +42,6 @@ import org.apache.jackrabbit.oak.plugins.tree.impl.AbstractTree;
 import org.apache.jackrabbit.oak.plugins.tree.impl.TreeConstants;
 import org.apache.jackrabbit.oak.spi.commit.DefaultValidator;
 import org.apache.jackrabbit.oak.spi.commit.Validator;
-import org.apache.jackrabbit.oak.spi.commit.VisibleValidator;
 import org.apache.jackrabbit.oak.spi.security.authorization.accesscontrol.AccessControlConstants;
 import org.apache.jackrabbit.oak.spi.security.authorization.restriction.Restriction;
 import org.apache.jackrabbit.oak.spi.security.authorization.restriction.RestrictionProvider;
@@ -123,7 +122,7 @@ class AccessControlValidator extends DefaultValidator implements AccessControlCo
         Tree treeAfter = checkNotNull(parentAfter.getChild(name));
 
         checkValidTree(parentAfter, treeAfter, after);
-        return newValidator(this, treeAfter);
+        return new AccessControlValidator(this, treeAfter);
     }
 
     @Override
@@ -131,7 +130,7 @@ class AccessControlValidator extends DefaultValidator implements AccessControlCo
         Tree treeAfter = checkNotNull(parentAfter.getChild(name));
 
         checkValidTree(parentAfter, treeAfter, after);
-        return newValidator(this, treeAfter);
+        return new AccessControlValidator(this, treeAfter);
     }
 
     @Override
@@ -141,14 +140,6 @@ class AccessControlValidator extends DefaultValidator implements AccessControlCo
     }
 
     //------------------------------------------------------------< private >---
-
-    private static Validator newValidator(AccessControlValidator parent,
-                                          Tree parentAfter) {
-        return new VisibleValidator(
-                new AccessControlValidator(parent, parentAfter),
-                true,
-                true);
-    }
 
     private void checkValidTree(Tree parentAfter, Tree treeAfter, NodeState nodeAfter) throws CommitFailedException {
         if (isPolicy(treeAfter)) {

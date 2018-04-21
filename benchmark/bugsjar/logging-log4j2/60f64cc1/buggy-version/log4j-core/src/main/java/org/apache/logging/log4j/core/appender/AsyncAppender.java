@@ -27,7 +27,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.apache.logging.log4j.core.Appender;
 import org.apache.logging.log4j.core.Filter;
 import org.apache.logging.log4j.core.LogEvent;
-import org.apache.logging.log4j.core.async.RingBufferLogEvent;
 import org.apache.logging.log4j.core.config.AppenderControl;
 import org.apache.logging.log4j.core.config.AppenderRef;
 import org.apache.logging.log4j.core.config.Configuration;
@@ -128,15 +127,12 @@ public final class AsyncAppender extends AbstractAppender {
      * @param logEvent The LogEvent.
      */
     @Override
-    public void append(LogEvent logEvent) {
+    public void append(final LogEvent logEvent) {
         if (!isStarted()) {
             throw new IllegalStateException("AsyncAppender " + getName() + " is not active");
         }
         if (!(logEvent instanceof Log4jLogEvent)) {
-            if (!(logEvent instanceof RingBufferLogEvent)) {
-                return; // only know how to Serialize Log4jLogEvents and RingBufferLogEvents
-            }
-            logEvent = ((RingBufferLogEvent) logEvent).createMemento();
+            return; // only know how to Serialize Log4jLogEvents
         }
         Log4jLogEvent coreEvent = (Log4jLogEvent) logEvent;
         boolean appendSuccessful = false;

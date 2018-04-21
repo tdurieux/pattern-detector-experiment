@@ -122,8 +122,8 @@ public class UnsynchronizedBuffer {
         offset = buffer.arrayOffset() + buffer.position();
         data = buffer.array();
       } else {
-        offset = 0;
-        data = ByteBufferUtil.toBytes(buffer);
+        data = new byte[buffer.remaining()];
+        buffer.get(data);
       }
     }
 

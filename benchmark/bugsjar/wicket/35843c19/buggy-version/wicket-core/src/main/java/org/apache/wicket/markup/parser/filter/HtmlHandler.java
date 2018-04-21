@@ -78,7 +78,6 @@ public final class HtmlHandler extends AbstractMarkupFilter
 			if (!requiresCloseTag(top.getName()))
 			{
 				stack.pop();
-				top.setHasNoCloseTag(true);
 			}
 			else
 			{

@@ -798,7 +798,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
                     min, readRevision, validRevisions, lastRevs);
 
             // check if there may be more recent values in a previous document
-            if (!getPreviousRanges().isEmpty()) {
+            if (value != null && !getPreviousRanges().isEmpty()) {
                 Revision newest = getLocalMap(key).firstKey();
                 if (isRevisionNewer(nodeStore, newest, value.revision)) {
                     // not reading the most recent value, we may need to
@@ -894,13 +894,13 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
         // check local deleted map first
         Value value = getLatestValue(context, getLocalDeleted(),
                 null, maxRev, validRevisions, lastRevs);
-        if (value.value == null && !getPreviousRanges().isEmpty()) {
+        if (value == null && !getPreviousRanges().isEmpty()) {
             // need to check complete map
             value = getLatestValue(context, getDeleted(),
                     null, maxRev, validRevisions, lastRevs);
         }
 
-        return "false".equals(value.value) ? value.revision : null;
+        return value != null && "false".equals(value.value) ? value.revision : null;
     }
 
     /**
@@ -1435,12 +1435,10 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
 
     /**
      * Get the latest property value that is larger or equal the min revision,
-     * and smaller or equal the readRevision revision. The returned value will
-     * provide the revision when the value was set between the {@code min} and
-     * {@code readRevision}. The returned value will have a {@code null} value
-     * contained if there is no valid change within the given range. In this
-     * case the associated revision is {@code min} or {@code readRevision} if
-     * no {@code min} is provided.
+     * and smaller or equal the readRevision revision. A {@code null} return
+     * value indicates that the property was not set or removed within the given
+     * range. A non-null value means the the property was either set or removed
+     * depending on {@link Value#value}.
      *
      * @param valueMap the sorted revision-value map
      * @param min the minimum revision (null meaning unlimited)
@@ -1448,9 +1446,9 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
      * @param validRevisions map of revision to commit value considered valid
      *                       against the given readRevision.
      * @param lastRevs to keep track of the most recent modification.
-     * @return the latest value from the {@code readRevision} point of view.
+     * @return the value, or null if not found
      */
-    @Nonnull
+    @CheckForNull
     private Value getLatestValue(@Nonnull RevisionContext context,
                                  @Nonnull Map<Revision, String> valueMap,
                                  @Nullable Revision min,
@@ -1488,9 +1486,7 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
                 return new Value(commitRev, entry.getValue());
             }
         }
-
-        Revision r = min != null ? min : readRevision;
-        return new Value(r, null);
+        return null;
     }
 
     @Override

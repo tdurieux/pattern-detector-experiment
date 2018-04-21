@@ -581,45 +581,29 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
      * @return the revision, or null if deleted
      */
     @CheckForNull
-    public Revision getNewestRevision(final RevisionContext context,
-                                      final Revision changeRev,
-                                      final CollisionHandler handler) {
-        final Map<Revision, String> validRevisions = Maps.newHashMap();
-        Predicate<Revision> predicate = new Predicate<Revision>() {
-            @Override
-            public boolean apply(Revision input) {
-                if (input.equals(changeRev)) {
-                    return false;
-                }
-                if (isValidRevision(context, input, null, changeRev, validRevisions)) {
-                    return true;
-                }
-                handler.concurrentModification(input);
-                return false;
-            }
-        };
-
-        Revision newestRev = null;
-        // check local commits first
+    public Revision getNewestRevision(RevisionContext context,
+                                      Revision changeRev,
+                                      CollisionHandler handler) {
+        // no need to look at all commits. the primary document
+        // always contains at least one commit, including all
+        // branch commits which are not yet merged
         SortedMap<Revision, String> revisions = getLocalRevisions();
         SortedMap<Revision, String> commitRoots = getLocalCommitRoot();
-        Iterator<Revision> it = filter(Iterables.mergeSorted(
+        Revision newestRev = null;
+        for (Revision r : Iterables.mergeSorted(
                 Arrays.asList(revisions.keySet(), commitRoots.keySet()),
-                revisions.comparator()), predicate).iterator();
-        if (it.hasNext()) {
-            newestRev = it.next();
-        } else {
-            // check full history (only needed in rare cases)
-            it = filter(Iterables.mergeSorted(
-                    Arrays.asList(
-                            getValueMap(REVISIONS).keySet(),
-                            getValueMap(COMMIT_ROOT).keySet()),
-                    revisions.comparator()), predicate).iterator();
-            if (it.hasNext()) {
-                newestRev = it.next();
+                revisions.comparator())) {
+            if (!r.equals(changeRev)) {
+                if (isValidRevision(context, r, null, changeRev, new HashMap<Revision, String>())) {
+                    newestRev = r;
+                    // found newest revision, no need to check more revisions
+                    // revisions are sorted newest first
+                    break;
+                } else {
+                    handler.concurrentModification(r);
+                }
             }
         }
-
         if (newestRev == null) {
             return null;
         }

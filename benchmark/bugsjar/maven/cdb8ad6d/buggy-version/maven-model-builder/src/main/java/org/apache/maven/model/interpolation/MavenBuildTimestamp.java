@@ -26,8 +26,7 @@ import java.util.TimeZone;
 
 public class MavenBuildTimestamp
 {
-    // ISO 8601-compliant timestamp for machine readability
-    public static final String DEFAULT_BUILD_TIMESTAMP_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'";
+    public static final String DEFAULT_BUILD_TIMESTAMP_FORMAT = "yyyyMMdd-HHmm";
 
     public static final String BUILD_TIMESTAMP_FORMAT_PROPERTY = "maven.build.timestamp.format";
 
@@ -36,8 +35,8 @@ public class MavenBuildTimestamp
     public MavenBuildTimestamp()
     {
         this( new Date() );
-    }
-
+    }    
+    
     public MavenBuildTimestamp( Date time )
     {
         this( time, DEFAULT_BUILD_TIMESTAMP_FORMAT );

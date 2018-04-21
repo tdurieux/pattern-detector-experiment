@@ -22,7 +22,6 @@ import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
-import org.apache.wicket.WicketRuntimeException;
 import org.apache.wicket.request.resource.ResourceReference.Key;
 import org.apache.wicket.util.file.File;
 import org.apache.wicket.util.lang.Args;
@@ -50,7 +49,7 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 	 */
 	private static interface IResourceStreamReference
 	{
-		IResourceStream getReference();
+		String getReference();
 	}
 
 	/**
@@ -62,7 +61,7 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 	{
 		private final static NullResourceStreamReference INSTANCE = new NullResourceStreamReference();
 
-		public IResourceStream getReference()
+		public String getReference()
 		{
 			return null;
 		}
@@ -80,9 +79,9 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 			this.fileName = fileName;
 		}
 
-		public FileResourceStream getReference()
+		public String getReference()
 		{
-			return new FileResourceStream(new File(fileName));
+			return fileName;
 		}
 	}
 
@@ -98,18 +97,9 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 			this.url = url;
 		}
 
-		public UrlResourceStream getReference()
+		public String getReference()
 		{
-			try
-			{
-				return new UrlResourceStream(new URL(url));
-			}
-			catch (MalformedURLException e)
-			{
-				// should not ever happen. The cached url is created by previously existing URL
-				// instance
-				throw new WicketRuntimeException(e);
-			}
+			return url;
 		}
 	}
 
@@ -143,21 +133,16 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 	public IResourceStream locate(Class<?> clazz, String path)
 	{
 		Key key = new Key(clazz.getName(), path, null, null, null);
-		IResourceStreamReference resourceStreamReference = cache.get(key);
+		IResourceStream resourceStream = getCopyFromCache(key);
 
-		final IResourceStream result;
-		if (resourceStreamReference == null)
+		if (resourceStream == null)
 		{
-			result = delegate.locate(clazz, path);
+			resourceStream = delegate.locate(clazz, path);
 
-			updateCache(key, result);
-		}
-		else
-		{
-			result = resourceStreamReference.getReference();
+			updateCache(key, resourceStream);
 		}
 
-		return result;
+		return resourceStream;
 	}
 
 	private void updateCache(Key key, IResourceStream stream)
@@ -180,25 +165,60 @@ public class CachingResourceStreamLocator implements IResourceStreamLocator
 		}
 	}
 
+	/**
+	 * Make a copy before returning an item from the cache as resource streams are not thread-safe.
+	 * 
+	 * @param key
+	 *            the cache key
+	 * @return the cached File or Url resource stream
+	 */
+	private IResourceStream getCopyFromCache(Key key)
+	{
+		final IResourceStreamReference orig = cache.get(key);
+		if (NullResourceStreamReference.INSTANCE == orig)
+		{
+			return null;
+		}
+
+		if (orig instanceof UrlResourceStreamReference)
+		{
+			UrlResourceStreamReference resourceStreamReference = (UrlResourceStreamReference)orig;
+			String url = resourceStreamReference.getReference();
+			try
+			{
+				return new UrlResourceStream(new URL(url));
+			}
+			catch (MalformedURLException e)
+			{
+				return null;
+			}
+		}
+
+		if (orig instanceof FileResourceStreamReference)
+		{
+			FileResourceStreamReference resourceStreamReference = (FileResourceStreamReference)orig;
+			String absolutePath = resourceStreamReference.getReference();
+			return new FileResourceStream(new File(absolutePath));
+		}
+
+		return null;
+	}
+
 	public IResourceStream locate(Class<?> scope, String path, String style, String variation,
 		Locale locale, String extension, boolean strict)
 	{
 		Key key = new Key(scope.getName(), path, locale, style, variation);
-		IResourceStreamReference resourceStreamReference = cache.get(key);
+		IResourceStream resourceStream = getCopyFromCache(key);
 
-		final IResourceStream result;
-		if (resourceStreamReference == null)
+		if (resourceStream == null)
 		{
-			result = delegate.locate(scope, path, style, variation, locale, extension, strict);
+			resourceStream = delegate.locate(scope, path, style, variation, locale, extension,
+				strict);
 
-			updateCache(key, result);
-		}
-		else
-		{
-			result = resourceStreamReference.getReference();
+			updateCache(key, resourceStream);
 		}
 
-		return result;
+		return resourceStream;
 	}
 
 	public ResourceNameIterator newResourceNameIterator(String path, Locale locale, String style,

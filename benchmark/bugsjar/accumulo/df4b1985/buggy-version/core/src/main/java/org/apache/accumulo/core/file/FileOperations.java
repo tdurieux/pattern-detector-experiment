@@ -44,13 +44,14 @@ class DispatchingFileFactory extends FileOperations {
     if (name.startsWith(Constants.MAPFILE_EXTENSION + "_")) {
       return new MapFileOperations();
     }
+    
     String[] sp = name.split("\\.");
     
-    if (sp.length < 2) {
+    if (sp.length != 2) {
       throw new IllegalArgumentException("File name " + name + " has no extension");
     }
     
-    String extension = sp[sp.length - 1];
+    String extension = sp[1];
     
     if (extension.equals(Constants.MAPFILE_EXTENSION) || extension.equals(Constants.MAPFILE_EXTENSION + "_tmp")) {
       return new MapFileOperations();

@@ -208,7 +208,7 @@ public final class HTMLLayout extends AbstractStringLayout {
      * @return The content type.
      */
     public String getContentType() {
-        return "text/html; charset=" + this.getCharset();
+        return "text/html";
     }
 
     private void appendThrowableAsHTML(final Throwable throwable, final StringBuilder sbuf) {

@@ -644,7 +644,7 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 					// Do not call remove() because the state change would than be
 					// recorded twice.
 					child.internalOnRemove();
-					child.detach();
+					child.detachModel();
 					child.setParent(null);
 				}
 			}

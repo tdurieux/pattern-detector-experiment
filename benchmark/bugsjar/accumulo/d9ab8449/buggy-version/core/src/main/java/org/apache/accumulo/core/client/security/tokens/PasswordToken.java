@@ -46,9 +46,7 @@ public class PasswordToken implements AuthenticationToken {
   /**
    * Constructor for use with {@link Writable}. Call {@link #readFields(DataInput)}.
    */
-  public PasswordToken() {
-    password = new byte[0];
-  }
+  public PasswordToken() {}
   
   /**
    * Constructs a token from a copy of the password. Destroying the argument after construction will not destroy the copy in this token, and destroying this

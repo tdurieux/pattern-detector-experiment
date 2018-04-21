@@ -19,8 +19,6 @@
 
 package org.apache.jackrabbit.oak.plugins.index.lucene.util;
 
-import java.util.Collections;
-
 import com.google.common.primitives.Ints;
 import org.apache.jackrabbit.JcrConstants;
 import org.apache.jackrabbit.oak.api.Blob;
@@ -60,11 +58,6 @@ public class ConfigUtil {
     public static String getPrimaryTypeName(NodeState nodeState) {
         PropertyState ps = nodeState.getProperty(JcrConstants.JCR_PRIMARYTYPE);
         return (ps == null) ? JcrConstants.NT_BASE : ps.getValue(Type.NAME);
-    }
-
-    public static Iterable<String> getMixinNames(NodeState nodeState) {
-        PropertyState ps = nodeState.getProperty(JcrConstants.JCR_MIXINTYPES);
-        return (ps == null) ? Collections.<String>emptyList() : ps.getValue(Type.NAMES);
     }
 
     /**

@@ -539,7 +539,7 @@ public class CreditCardValidator extends AbstractValidator<String>
 		{
 			if (creditCardNumber.startsWith("4"))
 			{
-				return CreditCard.VISA;
+				return CreditCard.SWITCH;
 			}
 		}
 

@@ -24,6 +24,7 @@ import javax.annotation.Nonnull;
 
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
+
 import org.apache.jackrabbit.oak.api.PropertyState;
 import org.apache.jackrabbit.oak.api.Type;
 import org.apache.jackrabbit.oak.spi.state.AbstractNodeState;
@@ -267,12 +268,11 @@ public class MemoryNodeBuilder implements NodeBuilder {
 
     @Override
     public boolean isModified() {
-        NodeState baseState = getBaseState();
         if (writeState == null) {
             return false;
         }
         else {
-            Map<String, MutableNodeState> nodes = writeState.nodes;
+            NodeState baseState = getBaseState();
             for (Entry<String, MutableNodeState> n : writeState.nodes.entrySet()) {
                 if (n.getValue() == null) {
                     return true;
@@ -308,7 +308,6 @@ public class MemoryNodeBuilder implements NodeBuilder {
 
     @Override
     public NodeState getBaseState() {
-        read();
         return baseState;
     }
 

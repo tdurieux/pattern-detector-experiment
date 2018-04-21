@@ -552,7 +552,9 @@ public class XPathToSQL2Converter {
             // path without all attributes, as in:
             // jcr:contains(jcr:content, 'x')
             if (buff.toString().equals(".")) {
-                return new Expression.Property(currentSelector, "*", false);
+                buff = new StringBuilder("*");
+            } else {
+                buff.append("/*");
             }
             return new Expression.Property(currentSelector, buff.toString(), true);
         }

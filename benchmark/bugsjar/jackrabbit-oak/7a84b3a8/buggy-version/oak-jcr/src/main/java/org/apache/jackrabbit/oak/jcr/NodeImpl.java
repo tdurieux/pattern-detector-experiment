@@ -250,10 +250,11 @@ public class NodeImpl<T extends NodeDelegate> extends ItemImpl<T> implements Nod
                 String ntName = primaryNodeTypeName;
                 if (ntName == null) {
                     DefinitionProvider dp = sessionDelegate.getDefinitionProvider();
-                    String childName = sessionDelegate.getOakName(PathUtils.getName(relPath));
-                    NodeDefinition def = dp.getDefinition(new NodeImpl<NodeDelegate>(parent), childName);
-                    ntName = def.getDefaultPrimaryTypeName();
-                    if (ntName == null) {
+                    try {
+                        String childName = sessionDelegate.getOakName(PathUtils.getName(relPath));
+                        NodeDefinition def = dp.getDefinition(new NodeImpl<NodeDelegate>(parent), childName);
+                        ntName = def.getDefaultPrimaryTypeName();
+                    } catch (RepositoryException e) {
                         throw new ConstraintViolationException(
                                 "no matching child node definition found for " + relPath);
                     }

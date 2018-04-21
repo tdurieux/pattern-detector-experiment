@@ -38,9 +38,6 @@ import org.apache.commons.math.ode.sampling.AbstractStepInterpolator;
 abstract class RungeKuttaStepInterpolator
   extends AbstractStepInterpolator {
 
-    /** Previous state. */
-    protected double[] previousState;
-
     /** Slopes at the intermediate points */
     protected double[][] yDotK;
 
@@ -58,9 +55,9 @@ abstract class RungeKuttaStepInterpolator
    * uninitialized model and latter initializing the copy.
    */
   protected RungeKuttaStepInterpolator() {
-    previousState = null;
-    yDotK         = null;
-    integrator    = null;
+    super();
+    yDotK      = null;
+    integrator = null;
   }
 
   /** Copy constructor.
@@ -85,16 +82,16 @@ abstract class RungeKuttaStepInterpolator
     super(interpolator);
 
     if (interpolator.currentState != null) {
-
-      previousState = interpolator.previousState.clone();
+      final int dimension = currentState.length;
 
       yDotK = new double[interpolator.yDotK.length][];
       for (int k = 0; k < interpolator.yDotK.length; ++k) {
-        yDotK[k] = interpolator.yDotK[k].clone();
+        yDotK[k] = new double[dimension];
+        System.arraycopy(interpolator.yDotK[k], 0,
+                         yDotK[k], 0, dimension);
       }
 
     } else {
-      previousState = null;
       yDotK = null;
     }
 
@@ -132,16 +129,8 @@ abstract class RungeKuttaStepInterpolator
                            final EquationsMapper primaryMapper,
                            final EquationsMapper[] secondaryMappers) {
     reinitialize(y, forward, primaryMapper, secondaryMappers);
-    this.previousState = null;
     this.yDotK = yDotArray;
     this.integrator = rkIntegrator;
-  }
-
-  /** {@inheritDoc} */
-  @Override
-  public void shift() {
-    previousState = currentState.clone();
-    super.shift();
   }
 
   /** {@inheritDoc} */
@@ -154,10 +143,6 @@ abstract class RungeKuttaStepInterpolator
 
     // save the local attributes
     final int n = (currentState == null) ? -1 : currentState.length;
-    for (int i = 0; i < n; ++i) {
-      out.writeDouble(previousState[i]);
-    }
-
     final int kMax = (yDotK == null) ? -1 : yDotK.length;
     out.writeInt(kMax);
     for (int k = 0; k < kMax; ++k) {
@@ -180,15 +165,6 @@ abstract class RungeKuttaStepInterpolator
 
     // read the local attributes
     final int n = (currentState == null) ? -1 : currentState.length;
-    if (n < 0) {
-      previousState = null;
-    } else {
-      previousState = new double[n];
-      for (int i = 0; i < n; ++i) {
-        previousState[i] = in.readDouble();
-      }
-    }
-
     final int kMax = in.readInt();
     yDotK = (kMax < 0) ? null : new double[kMax][];
     for (int k = 0; k < kMax; ++k) {

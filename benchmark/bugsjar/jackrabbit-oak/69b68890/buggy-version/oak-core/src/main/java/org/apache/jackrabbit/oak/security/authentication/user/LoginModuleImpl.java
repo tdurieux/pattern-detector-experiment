@@ -33,9 +33,9 @@ import javax.security.auth.login.LoginException;
 
 import org.apache.jackrabbit.oak.api.AuthInfo;
 import org.apache.jackrabbit.oak.spi.security.ConfigurationParameters;
+import org.apache.jackrabbit.oak.spi.security.authentication.AuthInfoImpl;
 import org.apache.jackrabbit.oak.spi.security.SecurityProvider;
 import org.apache.jackrabbit.oak.spi.security.authentication.AbstractLoginModule;
-import org.apache.jackrabbit.oak.spi.security.authentication.AuthInfoImpl;
 import org.apache.jackrabbit.oak.spi.security.authentication.Authentication;
 import org.apache.jackrabbit.oak.spi.security.authentication.ImpersonationCredentials;
 import org.apache.jackrabbit.oak.spi.security.user.UserConfiguration;
@@ -143,7 +143,10 @@ public final class LoginModuleImpl extends AbstractLoginModule {
             if (!subject.isReadOnly()) {
                 subject.getPrincipals().addAll(principals);
                 subject.getPublicCredentials().add(credentials);
-                setAuthInfo(createAuthInfo(), subject);
+                Set<AuthInfo> ais = subject.getPublicCredentials(AuthInfo.class);
+                if (ais.isEmpty()) {
+                    subject.getPublicCredentials().add(createAuthInfo());
+                }
             } else {
                 log.debug("Could not add information to read only subject {}", subject);
             }
@@ -210,19 +213,14 @@ public final class LoginModuleImpl extends AbstractLoginModule {
     }
 
     private AuthInfo createAuthInfo() {
+        Map<String, Object> attributes = new HashMap<String, Object>();
         Credentials creds;
         if (credentials instanceof ImpersonationCredentials) {
             creds = ((ImpersonationCredentials) credentials).getBaseCredentials();
         } else {
             creds = credentials;
         }
-        Map<String, Object> attributes = new HashMap<String, Object>();
-        Object shared = sharedState.get(SHARED_KEY_ATTRIBUTES);
-        if (shared instanceof Map) {
-            for (Object key : ((Map) shared).keySet()) {
-                attributes.put(key.toString(), ((Map) shared).get(key));
-            }
-        } else if (creds instanceof SimpleCredentials) {
+        if (creds instanceof SimpleCredentials) {
             SimpleCredentials sc = (SimpleCredentials) creds;
             for (String attrName : sc.getAttributeNames()) {
                 attributes.put(attrName, sc.getAttribute(attrName));

@@ -255,7 +255,6 @@ public class RequestListenerInterface
 		{
 			log.warn("behavior not enabled; ignore call. Behavior {} at component {}", behavior,
 				component);
-			return;
 		}
 
 		try

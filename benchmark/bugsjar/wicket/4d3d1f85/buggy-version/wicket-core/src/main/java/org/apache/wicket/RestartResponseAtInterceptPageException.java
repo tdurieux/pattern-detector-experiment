@@ -165,7 +165,7 @@ public class RestartResponseAtInterceptPageException extends ResetResponseExcept
 	{
 		public int getCompatibilityScore(Request request)
 		{
-			return matchedData(request) != null ? Integer.MAX_VALUE : 0;
+			return 0;
 		}
 
 		public Url mapHandler(IRequestHandler requestHandler)
@@ -175,30 +175,23 @@ public class RestartResponseAtInterceptPageException extends ResetResponseExcept
 
 		public IRequestHandler mapRequest(Request request)
 		{
-			InterceptData data = matchedData(request);
+			InterceptData data = InterceptData.get();
 			if (data != null)
 			{
-				if (data.postParameters.isEmpty() == false &&
-					request.getPostParameters() instanceof IWritableRequestParameters)
+				if (data.originalUrl.equals(request.getOriginalUrl()))
 				{
-					IWritableRequestParameters parameters = (IWritableRequestParameters)request.getPostParameters();
-					parameters.reset();
-					for (String s : data.postParameters.keySet())
+					if (data.postParameters.isEmpty() == false &&
+						request.getPostParameters() instanceof IWritableRequestParameters)
 					{
-						parameters.setParameterValues(s, data.postParameters.get(s));
+						IWritableRequestParameters parameters = (IWritableRequestParameters)request.getPostParameters();
+						parameters.reset();
+						for (String s : data.postParameters.keySet())
+						{
+							parameters.setParameterValues(s, data.postParameters.get(s));
+						}
 					}
+					InterceptData.clear();
 				}
-				InterceptData.clear();
-			}
-			return null;
-		}
-		
-		private InterceptData matchedData(Request request)
-		{
-			InterceptData data = InterceptData.get();
-			if(data != null && data.originalUrl.equals(request.getOriginalUrl()))
-			{
-				return data;
 			}
 			return null;
 		}

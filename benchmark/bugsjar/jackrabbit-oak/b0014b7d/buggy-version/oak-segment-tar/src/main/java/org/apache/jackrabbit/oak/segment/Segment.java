@@ -26,7 +26,6 @@ import static com.google.common.collect.Lists.newArrayListWithCapacity;
 import static com.google.common.collect.Maps.newConcurrentMap;
 import static java.lang.Boolean.getBoolean;
 import static org.apache.jackrabbit.oak.commons.IOUtils.closeQuietly;
-import static org.apache.jackrabbit.oak.segment.SegmentId.isDataSegmentId;
 import static org.apache.jackrabbit.oak.segment.SegmentVersion.isValid;
 import static org.apache.jackrabbit.oak.segment.SegmentWriter.BLOCK_SIZE;
 
@@ -39,7 +38,6 @@ import java.nio.channels.Channels;
 import java.nio.channels.WritableByteChannel;
 import java.util.Arrays;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 
 import javax.annotation.CheckForNull;
@@ -316,27 +314,12 @@ public class Segment {
         return data.getShort(ROOT_COUNT_OFFSET) & 0xffff;
     }
 
-    /**
-     * Determine the gc generation a segment from its data. Note that bulk segments don't have
-     * generations (i.e. stay at 0).
-     *
-     * @param data         the date of the segment
-     * @param segmentId    the id of the segment
-     * @return  the gc generation of this segment or 0 if this is bulk segment.
-     */
-    public static int getGcGen(ByteBuffer data, UUID segmentId) {
-        return isDataSegmentId(segmentId.getLeastSignificantBits())
-            ? data.getInt(GC_GEN_OFFSET)
-            : 0;
+    public static int getGcGen(ByteBuffer data) {
+        return data.getInt(GC_GEN_OFFSET);
     }
 
-    /**
-     * Determine the gc generation of this segment. Note that bulk segments don't have
-     * generations (i.e. stay at 0).
-     * @return  the gc generation of this segment or 0 if this is bulk segment.
-     */
     public int getGcGen() {
-        return getGcGen(data, id.asUUID());
+        return getGcGen(data);
     }
 
     public RecordType getRootType(int index) {

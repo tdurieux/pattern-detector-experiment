@@ -37,8 +37,6 @@ import org.apache.logging.log4j.core.config.plugins.PluginManager;
 import org.apache.logging.log4j.core.config.plugins.PluginType;
 import org.apache.logging.log4j.core.helpers.FileUtils;
 import org.apache.logging.log4j.core.helpers.Loader;
-import org.apache.logging.log4j.core.lookup.Interpolator;
-import org.apache.logging.log4j.core.lookup.StrSubstitutor;
 import org.apache.logging.log4j.status.StatusLogger;
 import org.apache.logging.log4j.util.PropertiesUtil;
 
@@ -105,8 +103,6 @@ public abstract class ConfigurationFactory {
     private static volatile List<ConfigurationFactory> factories = null;
 
     private static ConfigurationFactory configFactory = new Factory();
-
-    protected final StrSubstitutor substitutor = new StrSubstitutor(new Interpolator());
 
     /**
      * Returns the ConfigurationFactory.
@@ -366,19 +362,10 @@ public abstract class ConfigurationFactory {
         public Configuration getConfiguration(final String name, final URI configLocation) {
 
             if (configLocation == null) {
-                final String config = this.substitutor.replace(
-                    PropertiesUtil.getProperties().getStringProperty(CONFIGURATION_FILE_PROPERTY));
+                final String config = PropertiesUtil.getProperties().getStringProperty(CONFIGURATION_FILE_PROPERTY);
                 if (config != null) {
-                    ConfigurationSource source = null;
-                    try {
-                        source = getInputFromURI(new URI(config));
-                    } catch (Exception ex) {
-                        // Ignore the error and try as a String.
-                    }
-                    if (source == null) {
-                        final ClassLoader loader = this.getClass().getClassLoader();
-                        source = getInputFromString(config, loader);
-                    }
+                    final ClassLoader loader = this.getClass().getClassLoader();
+                    final ConfigurationSource source = getInputFromString(config, loader);
                     if (source != null) {
                         for (final ConfigurationFactory factory : factories) {
                             final String[] types = factory.getSupportedTypes();

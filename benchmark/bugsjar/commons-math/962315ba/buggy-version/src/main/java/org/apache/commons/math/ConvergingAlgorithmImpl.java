@@ -139,14 +139,14 @@ public abstract class ConvergingAlgorithmImpl implements ConvergingAlgorithm {
     /**
      * Increment the iterations counter by 1.
      *
-     * @throws MaxIterationsExceededException if the maximal number
+     * @throws OptimizationException if the maximal number
      * of iterations is exceeded.
      * @since 2.2
      */
     protected void incrementIterationsCounter()
-        throws MaxIterationsExceededException {
+        throws ConvergenceException {
         if (++iterationCount > maximalIterationCount) {
-            throw new MaxIterationsExceededException(maximalIterationCount);
+            throw new ConvergenceException(new MaxIterationsExceededException(maximalIterationCount));
         }
     }
 }

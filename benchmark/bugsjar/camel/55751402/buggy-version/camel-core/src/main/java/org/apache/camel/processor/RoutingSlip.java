@@ -36,7 +36,6 @@ import org.apache.camel.impl.ProducerCache;
 import org.apache.camel.support.ServiceSupport;
 import org.apache.camel.util.AsyncProcessorHelper;
 import org.apache.camel.util.ExchangeHelper;
-import org.apache.camel.util.MessageHelper;
 import org.apache.camel.util.ObjectHelper;
 import org.apache.camel.util.ServiceHelper;
 import org.slf4j.Logger;
@@ -269,10 +268,6 @@ public class RoutingSlip extends ServiceSupport implements AsyncProcessor, Trace
         // exchange being routed.
         copy.setExchangeId(current.getExchangeId());
         copyOutToIn(copy, current);
-
-        // ensure stream caching is reset
-        MessageHelper.resetStreamCache(copy.getIn());
-
         return copy;
     }
 

@@ -164,9 +164,7 @@ public class ContentMirrorStoreStrategy implements IndexStoreStrategy {
             int i = 0;
             for (String p : values) {
                 if (count > max && i > 3) {
-                    // the total count is extrapolated from the the number 
-                    // of values counted so far to the total number of values
-                    count = count * size / i;
+                    count = count / size / i;
                     break;
                 }
                 NodeState s = index.getChildNode(p);

@@ -134,8 +134,7 @@ public class DefaultRevisionStore extends AbstractRevisionStore implements
         cache = Collections.synchronizedMap(SimpleLRUCache.<Id, Object> newInstance(initialCacheSize));
 
         // make sure we've got a HEAD commit
-        Id[] ids = pm.readIds();
-        head = ids[0];
+        head = pm.readHead();
         if (head == null || head.getBytes().length == 0) {
             // assume virgin repository
             byte[] rawHead = Id.fromLong(commitCounter.incrementAndGet())
@@ -149,11 +148,7 @@ public class DefaultRevisionStore extends AbstractRevisionStore implements
             pm.writeCommit(head, initialCommit);
             pm.writeHead(head);
         } else {
-            Id lastCommitId = head;
-            if (ids[1] != null && ids[1].compareTo(lastCommitId) > 0) {
-                lastCommitId = ids[1];
-            }
-            commitCounter.set(Long.parseLong(lastCommitId.toString(), 16));
+            commitCounter.set(Long.parseLong(head.toString(), 16));
         }
 
         if (gcpm != null) {

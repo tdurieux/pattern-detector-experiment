@@ -47,8 +47,7 @@ public abstract class OnChangeAjaxBehavior extends AjaxFormComponentUpdatingBeha
 	 * for text input form component depending on the browser.
 	 * 'change' is used as a fallback for all other form component types.
 	 */
-	public static final String EVENT_NAME = "inputchange change";
-
+	public static final String EVENT_INPUTCHANGE = "inputchange";
 	public static final String EVENT_CHANGE = "change";
 
 	/**
@@ -56,19 +55,23 @@ public abstract class OnChangeAjaxBehavior extends AjaxFormComponentUpdatingBeha
 	 */
 	public OnChangeAjaxBehavior()
 	{
-		super(EVENT_NAME);
+		super(EVENT_INPUTCHANGE + " " + EVENT_CHANGE);
 	}
 
 	@Override
 	protected void updateAjaxAttributes(AjaxRequestAttributes attributes) 
 	{
 		super.updateAjaxAttributes(attributes);
-
+		
 		Component component = getComponent();
-
-		// textfiels and textareas will trigger this behavior with either 'inputchange' or 'change' events
-		// all the other components will use just 'change'
-		if (!(component instanceof TextField || component instanceof TextArea))
+		
+		//textfiels and textareas will trigger this behavior with event 'inputchange'
+		//while all the other components will use 'change'
+		if (component instanceof TextField || component instanceof TextArea) 
+		{
+			attributes.setEventNames(EVENT_INPUTCHANGE);
+		} 
+		else 
 		{
 			attributes.setEventNames(EVENT_CHANGE);
 		}

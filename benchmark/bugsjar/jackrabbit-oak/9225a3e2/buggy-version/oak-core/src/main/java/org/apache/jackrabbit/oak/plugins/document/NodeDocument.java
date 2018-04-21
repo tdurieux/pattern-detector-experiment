@@ -556,40 +556,30 @@ public final class NodeDocument extends Document implements CachedNodeDocument{
     }
 
     /**
-     * Purge the  uncommitted revisions of this document with the
+     * Gets a sorted map of uncommitted revisions of this document with the
      * local cluster node id as returned by the {@link RevisionContext}. These
      * are the {@link #REVISIONS} entries where {@link Utils#isCommitted(String)}
      * returns false.
      *
-     * <p>
-     *     <bold>Note</bold> - This method should only be invoked upon startup
-     *     as then only we can safely assume that these revisions would not be
-     *     committed
-     * </p>
-     *
      * @param context the revision context.
-     * @return count of the revision entries purged
+     * @return the uncommitted revisions of this document.
      */
-    public int purgeUncommittedRevisions(RevisionContext context) {
+    public SortedMap<Revision, Revision> getUncommittedRevisions(RevisionContext context) {
         // only look at revisions in this document.
         // uncommitted revisions are not split off
         Map<Revision, String> valueMap = getLocalRevisions();
-        UpdateOp op = new UpdateOp(getId(), false);
-        int purgeCount = 0;
+        SortedMap<Revision, Revision> revisions =
+                new TreeMap<Revision, Revision>(context.getRevisionComparator());
         for (Map.Entry<Revision, String> commit : valueMap.entrySet()) {
             if (!Utils.isCommitted(commit.getValue())) {
                 Revision r = commit.getKey();
                 if (r.getClusterId() == context.getClusterId()) {
-                    purgeCount++;
-                    op.removeMapEntry(REVISIONS, r);
+                    Revision b = Revision.fromString(commit.getValue());
+                    revisions.put(r, b);
                 }
             }
         }
-
-        if (op.hasChanges()) {
-            store.findAndUpdate(Collection.NODES, op);
-        }
-        return purgeCount;
+        return revisions;
     }
 
     /**

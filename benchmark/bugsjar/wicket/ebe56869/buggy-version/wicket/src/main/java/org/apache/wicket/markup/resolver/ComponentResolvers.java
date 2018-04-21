@@ -50,53 +50,7 @@ public class ComponentResolvers
 		final MarkupStream markupStream, final ComponentTag tag)
 	{
 		// try to resolve using component hierarchy
-		Component component = resolveByComponentHierarchy(container, markupStream, tag);
 
-		if (component == null)
-		{
-			// fallback to application-level resolvers
-			component = resolveByApplication(container, markupStream, tag);
-		}
-
-		return component;
-	}
-
-	/**
-	 * Attempts to resolve a component via application registered resolvers.
-	 * 
-	 * @param container
-	 * @param markupStream
-	 * @param tag
-	 * @return Null, if no component was found
-	 */
-	public static Component resolveByApplication(final MarkupContainer container,
-		final MarkupStream markupStream, final ComponentTag tag)
-	{
-		for (final IComponentResolver resolver : Application.get()
-			.getPageSettings()
-			.getComponentResolvers())
-		{
-			Component component = resolver.resolve(container, markupStream, tag);
-			if (component != null)
-			{
-				return component;
-			}
-		}
-
-		return null;
-	}
-
-	/**
-	 * Attempts to resolve a component via the component hierarchy using resolvers.
-	 * 
-	 * @param container
-	 * @param markupStream
-	 * @param tag
-	 * @return Null, if no component was found
-	 */
-	public static Component resolveByComponentHierarchy(final MarkupContainer container,
-		final MarkupStream markupStream, final ComponentTag tag)
-	{
 		Component cursor = container;
 		while (cursor != null)
 		{
@@ -110,6 +64,19 @@ public class ComponentResolvers
 				}
 			}
 			cursor = cursor.getParent();
+		}
+
+		// fallback to application-level resolvers
+
+		for (final IComponentResolver resolver : Application.get()
+			.getPageSettings()
+			.getComponentResolvers())
+		{
+			Component component = resolver.resolve(container, markupStream, tag);
+			if (component != null)
+			{
+				return component;
+			}
 		}
 
 		return null;

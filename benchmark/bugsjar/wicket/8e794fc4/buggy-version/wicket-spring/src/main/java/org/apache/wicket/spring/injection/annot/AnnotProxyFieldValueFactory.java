@@ -68,7 +68,6 @@ import org.springframework.context.support.AbstractApplicationContext;
  * @see LazyInitProxyFactory
  * @see SpringBean
  * @see SpringBeanLocator
- * @see javax.inject.Inject
  * 
  * @author Igor Vaynberg (ivaynberg)
  * @author Istvan Devai
@@ -124,7 +123,7 @@ public class AnnotProxyFieldValueFactory implements IFieldValueFactory
 			{
 				Named named = field.getAnnotation(Named.class);
 				name = named != null ? named.value() : "";
-				required = true;
+				required = false;
 			}
 
 			String beanName = getBeanName(field, name, required);

@@ -84,7 +84,7 @@ public class TabbedPanel<T extends ITab> extends Panel
 	/** the current tab */
 	private int currentTab = -1;
 
-	private transient VisibilityCache visibilityCache;
+	private transient Boolean[] tabsVisibilityCache;
 
 	/**
 	 * Constructor
@@ -204,18 +204,9 @@ public class TabbedPanel<T extends ITab> extends Panel
 			private static final long serialVersionUID = 1L;
 
 			@Override
-			protected void onConfigure()
-			{
-				super.onConfigure();
-
-				setVisible(getVisiblityCache().isVisible(tabIndex));
-			}
-
-			@Override
 			protected void onComponentTag(final ComponentTag tag)
 			{
 				super.onComponentTag(tag);
-
 				String cssClass = tag.getAttribute("class");
 				if (cssClass == null)
 				{
@@ -227,11 +218,17 @@ public class TabbedPanel<T extends ITab> extends Panel
 				{
 					cssClass += ' ' + getSelectedTabCssClass();
 				}
-				if (getVisiblityCache().getLastVisible() == getIndex())
+				if (getIndex() == getTabs().size() - 1)
 				{
 					cssClass += ' ' + getLastTabCssClass();
 				}
 				tag.put("class", cssClass.trim());
+			}
+
+			@Override
+			public boolean isVisible()
+			{
+				return getTabs().get(tabIndex).isVisible();
 			}
 		};
 	}
@@ -241,13 +238,13 @@ public class TabbedPanel<T extends ITab> extends Panel
 	{
 		int index = getSelectedTab();
 
-		if ((index == -1) || (getVisiblityCache().isVisible(index) == false))
+		if ((index == -1) || (isTabVisible(index) == false))
 		{
 			// find first visible tab
 			index = -1;
 			for (int i = 0; i < tabs.size(); i++)
 			{
-				if (getVisiblityCache().isVisible(i))
+				if (isTabVisible(i))
 				{
 					index = i;
 					break;
@@ -256,7 +253,9 @@ public class TabbedPanel<T extends ITab> extends Panel
 
 			if (index != -1)
 			{
-				// found a visible tab, so select it
+				/*
+				 * found a visible tab, so select it
+				 */
 				setSelectedTab(index);
 			}
 		}
@@ -402,7 +401,7 @@ public class TabbedPanel<T extends ITab> extends Panel
 
 		final Component component;
 
-		if (currentTab == -1 || (tabs.size() == 0) || !getVisiblityCache().isVisible(currentTab))
+		if (currentTab == -1 || (tabs.size() == 0) || !isTabVisible(currentTab))
 		{
 			// no tabs or the current tab is not visible
 			component = newPanel();
@@ -444,84 +443,45 @@ public class TabbedPanel<T extends ITab> extends Panel
 		return (Integer)getDefaultModelObject();
 	}
 
+	/**
+	 * 
+	 * @param tabIndex
+	 * @return visible
+	 */
+	private boolean isTabVisible(final int tabIndex)
+	{
+		if (tabsVisibilityCache == null)
+		{
+			tabsVisibilityCache = new Boolean[tabs.size()];
+		}
+
+		if (tabsVisibilityCache.length < tabIndex + 1)
+		{
+			Boolean[] resized = new Boolean[tabIndex + 1];
+			System.arraycopy(tabsVisibilityCache, 0, resized, 0, tabsVisibilityCache.length);
+			tabsVisibilityCache = resized;
+		}
+
+		if (tabsVisibilityCache.length > 0)
+		{
+			Boolean visible = tabsVisibilityCache[tabIndex];
+			if (visible == null)
+			{
+				visible = tabs.get(tabIndex).isVisible();
+				tabsVisibilityCache[tabIndex] = visible;
+			}
+			return visible;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
 	@Override
 	protected void onDetach()
 	{
-		visibilityCache = null;
-
+		tabsVisibilityCache = null;
 		super.onDetach();
-	}
-
-	private VisibilityCache getVisiblityCache()
-	{
-		if (visibilityCache == null)
-		{
-			visibilityCache = new VisibilityCache();
-		}
-
-		return visibilityCache;
-	}
-
-	/**
-	 * A cache for visibilities of {@link ITab}s.
-	 */
-	private class VisibilityCache
-	{
-
-		/**
-		 * Visibility for each tab.
-		 */
-		private Boolean[] visibilities;
-
-		/**
-		 * Last visible tab.
-		 */
-		private int lastVisible = -1;
-
-		public VisibilityCache()
-		{
-			visibilities = new Boolean[tabs.size()];
-		}
-
-		public int getLastVisible()
-		{
-			if (lastVisible == -1)
-			{
-				for (int t = 0; t < tabs.size(); t++)
-				{
-					if (isVisible(t))
-					{
-						lastVisible = t;
-					}
-				}
-			}
-
-			return lastVisible;
-		}
-
-		public boolean isVisible(int index)
-		{
-			if (visibilities.length < index + 1)
-			{
-				Boolean[] resized = new Boolean[index + 1];
-				System.arraycopy(visibilities, 0, resized, 0, visibilities.length);
-				visibilities = resized;
-			}
-
-			if (visibilities.length > 0)
-			{
-				Boolean visible = visibilities[index];
-				if (visible == null)
-				{
-					visible = tabs.get(index).isVisible();
-					visibilities[index] = visible;
-				}
-				return visible;
-			}
-			else
-			{
-				return false;
-			}
-		}
 	}
 }

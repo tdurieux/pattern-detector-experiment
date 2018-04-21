@@ -1610,8 +1610,8 @@ public abstract class FormComponent<T> extends LabeledWebMarkupContainer impleme
 	 * @param formComponent
 	 *            the form component to update
 	 * @see FormComponent#updateModel()
-	 * @throws WicketRuntimeException
-	 *             if the existing model object collection is unmodifiable and no setter exists
+	 * @throws UnsupportedOperationException
+	 *             if the existing model object Collection cannot be modified
 	 */
 	public static <S> void updateCollectionModel(FormComponent<Collection<S>> formComponent)
 	{
@@ -1625,42 +1625,23 @@ public abstract class FormComponent<T> extends LabeledWebMarkupContainer impleme
 		}
 		else
 		{
-			Exception failure;
-
 			formComponent.modelChanging();
-			
-			try {
-				collection.clear();
-				if (convertedInput != null)
-				{
-					collection.addAll(convertedInput);
-				}
-				failure = null;
-			} catch (UnsupportedOperationException unmodifiable) {
-				logger.debug("An error occurred while trying to change the collection attached to " + formComponent, unmodifiable);
-
-				failure = unmodifiable;
-				collection = new ArrayList<>(convertedInput); 
+			collection.clear();
+			if (convertedInput != null)
+			{
+				collection.addAll(convertedInput);
 			}
-			
+			formComponent.modelChanged();
+
 			try
 			{
 				formComponent.getModel().setObject(collection);
-				failure = null;
 			}
-			catch (Exception noSetter)
+			catch (Exception e)
 			{
-				logger.debug("An error occurred while trying to set the collection attached to " + formComponent, noSetter);
-				
-				if (failure != null) {
-					failure = noSetter;
-				}
-			}
-			
-			if (failure == null) {
-				formComponent.modelChanged();
-			} else {
-				throw new WicketRuntimeException("Unable to update the collection attached to " + formComponent); 
+				// ignore this exception because it could be that there
+				// is not setter for this collection.
+				logger.info("An error occurred while trying to set the new value for the property attached to " + formComponent, e);
 			}
 		}
 	}

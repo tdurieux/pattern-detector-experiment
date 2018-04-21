@@ -199,13 +199,4 @@ public abstract class AbstractOptions<T> extends FormComponent<T>
 	public void updateModel()
 	{
 	}
-
-	/**
-	 * {@inheritDoc}
-	 */
-	@Override
-	protected String getModelValue()
-	{
-		return null;
-	}
 }

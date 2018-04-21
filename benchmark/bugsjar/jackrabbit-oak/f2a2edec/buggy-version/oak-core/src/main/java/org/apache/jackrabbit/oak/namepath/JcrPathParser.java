@@ -261,7 +261,6 @@ public class JcrPathParser {
 
     public static boolean validate(String jcrPath) {
         Listener listener = new Listener() {
-            int depth;
             boolean hasRoot;
             @Override
             public boolean root() {
@@ -281,8 +280,7 @@ public class JcrPathParser {
 
             @Override
             public boolean parent() {
-                depth--;
-                return !hasRoot || depth >= 0;
+                return true;
             }
 
             @Override
@@ -291,7 +289,6 @@ public class JcrPathParser {
 
             @Override
             public boolean name(String name, int index) {
-                depth++;
                 return true;
             }
 

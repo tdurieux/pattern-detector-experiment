@@ -88,12 +88,12 @@ public final class Server {
                 needsQuotes = true;
                 break;
             case '\r':
-                // drop \r characters: \\r gives "invalid escape sequence"
+                // replace by \\r, no need to quote
+                sb.append("\\r");
                 continue;
             case '\n':
-                // replace \n characters with \\n sequence
+                // replace by \\n, no need to quote
                 sb.append("\\n");
-                needsQuotes = true;
                 continue;
             }
             sb.append(c);
@@ -260,14 +260,13 @@ public final class Server {
      */
     public static void unregisterContext(String contextName, MBeanServer mbs) {
         final String pattern = LoggerContextAdminMBean.PATTERN;
-        final String safeContextName = escape(contextName);
-        final String search = String.format(pattern, safeContextName, "*");
+        final String search = String.format(pattern, contextName, "*");
         unregisterAllMatching(search, mbs); // unregister context mbean
-        unregisterLoggerConfigs(safeContextName, mbs);
-        unregisterAppenders(safeContextName, mbs);
-        unregisterAsyncAppenders(safeContextName, mbs);
-        unregisterAsyncLoggerRingBufferAdmins(safeContextName, mbs);
-        unregisterAsyncLoggerConfigRingBufferAdmins(safeContextName, mbs);
+        unregisterLoggerConfigs(contextName, mbs);
+        unregisterAppenders(contextName, mbs);
+        unregisterAsyncAppenders(contextName, mbs);
+        unregisterAsyncLoggerRingBufferAdmins(contextName, mbs);
+        unregisterAsyncLoggerConfigRingBufferAdmins(contextName, mbs);
     }
 
     private static void registerStatusLogger(final MBeanServer mbs, final Executor executor)

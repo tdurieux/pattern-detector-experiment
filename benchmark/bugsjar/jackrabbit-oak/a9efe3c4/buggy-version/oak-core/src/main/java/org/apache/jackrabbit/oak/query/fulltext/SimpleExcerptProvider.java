@@ -35,9 +35,6 @@ import org.apache.jackrabbit.oak.query.ast.OrImpl;
 
 import com.google.common.collect.ImmutableSet;
 
-/**
- * This class can extract excerpts from node.
- */
 public class SimpleExcerptProvider {
 
     private static final String REP_EXCERPT_FN = "rep:excerpt(.)";

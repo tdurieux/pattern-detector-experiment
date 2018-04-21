@@ -344,12 +344,10 @@ public class WicketMessageResolver implements IComponentResolver
 				while (markupStream.hasMore() && !markupStream.get().closes(openTag))
 				{
 					MarkupElement element = markupStream.get();
-
 					// If it a tag like <wicket..> or <span wicket:id="..." >
 					if ((element instanceof ComponentTag) && !markupStream.atCloseTag())
 					{
-						ComponentTag currentTag = (ComponentTag)element;
-						String id = currentTag.getId();
+						String id = ((ComponentTag)element).getId();
 
 						// Temporarily replace the web response with a String response
 						final Response webResponse = getResponse();
@@ -360,18 +358,6 @@ public class WicketMessageResolver implements IComponentResolver
 							getRequestCycle().setResponse(response);
 
 							Component component = getParent().get(id);
-							if (component == null)
-							{
-								component = ComponentResolvers.resolve(getParent(), markupStream,
-									currentTag, null);
-
-								// Must not be a Page and it must be connected to a parent.
-								if (component.getParent() == null)
-								{
-									component = null;
-								}
-							}
-
 							if (component != null)
 							{
 								component.render();

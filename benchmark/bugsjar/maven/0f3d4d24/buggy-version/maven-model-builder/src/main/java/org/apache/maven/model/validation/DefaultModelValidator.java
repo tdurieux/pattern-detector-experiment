@@ -139,7 +139,8 @@ public class DefaultModelValidator
 
         validateStringNotEmpty( "version", problems, false, model.getVersion() );
 
-        boolean warnOnly = request.getValidationLevel() < ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_3_0;
+        boolean warnOnBadBoolean = request.getValidationLevel() < ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_3_0;
+        boolean warnOnBadDependencyScope = request.getValidationLevel() < ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_3_0;
 
         for ( Dependency d : model.getDependencies() )
         {
@@ -177,15 +178,12 @@ public class DefaultModelValidator
 
             if ( request.getValidationLevel() >= ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_2_0 )
             {
-                validateVersion( "dependencies.dependency.version", problems, warnOnly, d.getVersion(),
-                                 d.getManagementKey() );
-
-                validateBoolean( "dependencies.dependency.optional", problems, warnOnly, d.getOptional(),
+                validateBoolean( "dependencies.dependency.optional", problems, warnOnBadBoolean, d.getOptional(),
                                  d.getManagementKey() );
 
                 /*
                  * TODO: Extensions like Flex Mojos use custom scopes like "merged", "internal", "external", etc. In
-                 * order to don't break backward-compat with those, only warn but don't error out.
+                 * order to don't break backward-compat with those, only warn but don't error our.
                  */
                 validateEnum( "dependencies.dependency.scope", problems, true, d.getScope(),
                               d.getManagementKey(), "provided", "compile", "runtime", "test", "system" );
@@ -229,8 +227,8 @@ public class DefaultModelValidator
 
                 if ( request.getValidationLevel() >= ModelBuildingRequest.VALIDATION_LEVEL_MAVEN_2_0 )
                 {
-                    validateBoolean( "dependencyManagement.dependencies.dependency.optional", problems, warnOnly,
-                                     d.getOptional(), d.getManagementKey() );
+                    validateBoolean( "dependencyManagement.dependencies.dependency.optional", problems,
+                                     warnOnBadBoolean, d.getOptional(), d.getManagementKey() );
                 }
             }
         }
@@ -252,16 +250,16 @@ public class DefaultModelValidator
                     validateStringNotEmpty( "build.plugins.plugin.version", problems, warnOnMissingPluginVersion,
                                             p.getVersion(), p.getKey() );
 
-                    validateBoolean( "build.plugins.plugin.inherited", problems, warnOnly, p.getInherited(),
+                    validateBoolean( "build.plugins.plugin.inherited", problems, warnOnBadBoolean, p.getInherited(),
                                      p.getKey() );
 
-                    validateBoolean( "build.plugins.plugin.extensions", problems, warnOnly, p.getExtensions(),
+                    validateBoolean( "build.plugins.plugin.extensions", problems, warnOnBadBoolean, p.getExtensions(),
                                      p.getKey() );
 
                     for ( Dependency d : p.getDependencies() )
                     {
                         validateEnum( "build.plugins.plugin[" + p.getKey() + "].dependencies.dependency.scope",
-                                      problems, warnOnly, d.getScope(), d.getManagementKey(),
+                                      problems, warnOnBadDependencyScope, d.getScope(), d.getManagementKey(),
                                       "compile", "runtime", "system" );
                     }
                 }
@@ -580,12 +578,11 @@ public class DefaultModelValidator
 
         if ( sourceHint != null )
         {
-            addViolation( problems, warning, "'" + fieldName + "' must be 'true' or 'false' for " + sourceHint
-                + " but is '" + string + "'." );
+            addViolation( problems, warning, "'" + fieldName + "' must be 'true' or 'false' for " + sourceHint );
         }
         else
         {
-            addViolation( problems, warning, "'" + fieldName + "' must be 'true' or 'false' but is '" + string + "'." );
+            addViolation( problems, warning, "'" + fieldName + "' must be 'true' or 'false'." );
         }
 
         return false;
@@ -608,39 +605,11 @@ public class DefaultModelValidator
 
         if ( sourceHint != null )
         {
-            addViolation( problems, warning, "'" + fieldName + "' must be one of " + values + " for " + sourceHint
-                + " but is '" + string + "'." );
+            addViolation( problems, warning, "'" + fieldName + "' must be one of " + values + " for " + sourceHint );
         }
         else
         {
-            addViolation( problems, warning, "'" + fieldName + "' must be one of " + values + " but is '" + string
-                + "'." );
-        }
-
-        return false;
-    }
-
-    private boolean validateVersion( String fieldName, ModelProblemCollector problems, boolean warning, String string,
-                                     String sourceHint )
-    {
-        if ( string == null || string.length() <= 0 )
-        {
-            return true;
-        }
-
-        if ( !hasExpression( string ) )
-        {
-            return true;
-        }
-
-        if ( sourceHint != null )
-        {
-            addViolation( problems, warning, "'" + fieldName + "' must be a valid version for " + sourceHint
-                + " but is '" + string + "'." );
-        }
-        else
-        {
-            addViolation( problems, warning, "'" + fieldName + "' must be a valid version but is '" + string + "'." );
+            addViolation( problems, warning, "'" + fieldName + "' must be one of " + values );
         }
 
         return false;

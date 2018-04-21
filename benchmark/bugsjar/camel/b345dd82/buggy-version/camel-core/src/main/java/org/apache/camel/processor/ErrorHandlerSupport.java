@@ -24,8 +24,6 @@ import org.apache.camel.Exchange;
 import org.apache.camel.Processor;
 import org.apache.camel.impl.ServiceSupport;
 import org.apache.camel.model.OnExceptionDefinition;
-import org.apache.camel.model.ProcessorDefinitionHelper;
-import org.apache.camel.model.RouteDefinition;
 import org.apache.camel.processor.exceptionpolicy.DefaultExceptionPolicyStrategy;
 import org.apache.camel.processor.exceptionpolicy.ExceptionPolicyKey;
 import org.apache.camel.processor.exceptionpolicy.ExceptionPolicyStrategy;
@@ -51,9 +49,7 @@ public abstract class ErrorHandlerSupport extends ServiceSupport implements Erro
         List<Class> list = exceptionType.getExceptionClasses();
 
         for (Class clazz : list) {
-            RouteDefinition route = ProcessorDefinitionHelper.getRoute(exceptionType);
-            String routeId = route != null ? route.getId() : null;
-            ExceptionPolicyKey key = new ExceptionPolicyKey(routeId, clazz, exceptionType.getOnWhen());
+            ExceptionPolicyKey key = new ExceptionPolicyKey(clazz, exceptionType.getOnWhen());
             exceptionPolicies.put(key, exceptionType);
         }
     }

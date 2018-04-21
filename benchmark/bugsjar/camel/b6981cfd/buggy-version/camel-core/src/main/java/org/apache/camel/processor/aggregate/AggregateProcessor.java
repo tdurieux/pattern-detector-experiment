@@ -481,12 +481,8 @@ public class AggregateProcessor extends ServiceSupport implements AsyncProcessor
         }
         aggregated.setProperty(Exchange.AGGREGATED_CORRELATION_KEY, key);
 
-        // only remove if we have previous added (as we could potentially complete with only 1 exchange)
-        // (if we have previous added then we have that as the original exchange)
-        if (original != null) {
-            // remove from repository as its completed, we do this first as to trigger any OptimisticLockingException's
-            aggregationRepository.remove(aggregated.getContext(), key, original);
-        }
+        // remove from repository as its completed, we do this first as to trigger any OptimisticLockingException's
+        aggregationRepository.remove(aggregated.getContext(), key, original);
 
         if (!fromTimeout && timeoutMap != null) {
             // cleanup timeout map if it was a incoming exchange which triggered the timeout (and not the timeout checker)

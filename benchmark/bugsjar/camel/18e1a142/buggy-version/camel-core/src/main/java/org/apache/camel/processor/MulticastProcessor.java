@@ -174,16 +174,10 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
 
         // multicast uses fine grained error handling on the output processors
         // so use try .. catch to cater for this
-        boolean exhaust = false;
         try {
             boolean sync = true;
 
             pairs = createProcessorExchangePairs(exchange);
-
-            // after we have created the processors we consider the exchange as exhausted if an unhandled
-            // exception was thrown, (used in the catch block)
-            exhaust = true;
-
             if (isParallelProcessing()) {
                 // ensure an executor is set when running in parallel
                 ObjectHelper.notNull(executorService, "executorService", this);
@@ -200,14 +194,14 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
         } catch (Throwable e) {
             exchange.setException(e);
             // and do the done work
-            doDone(exchange, null, callback, true, exhaust);
+            doDone(exchange, null, callback, true);
             return true;
         }
 
         // multicasting was processed successfully
         // and do the done work
         Exchange subExchange = result.get() != null ? result.get() : null;
-        doDone(exchange, subExchange, callback, true, exhaust);
+        doDone(exchange, subExchange, callback, true);
         return true;
     }
 
@@ -461,7 +455,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
                             result.set(subExchange);
                         }
                         // and do the done work
-                        doDone(original, subExchange, callback, false, true);
+                        doDone(original, subExchange, callback, false);
                         return;
                     }
 
@@ -471,7 +465,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
                         // wrap in exception to explain where it failed
                         subExchange.setException(new CamelExchangeException("Sequential processing failed for number " + total, subExchange, e));
                         // and do the done work
-                        doDone(original, subExchange, callback, false, true);
+                        doDone(original, subExchange, callback, false);
                         return;
                     }
 
@@ -507,7 +501,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
                                 result.set(subExchange);
                             }
                             // and do the done work
-                            doDone(original, subExchange, callback, false, true);
+                            doDone(original, subExchange, callback, false);
                             return;
                         }
 
@@ -517,7 +511,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
                             // wrap in exception to explain where it failed
                             subExchange.setException(new CamelExchangeException("Sequential processing failed for number " + total, subExchange, e));
                             // and do the done work
-                            doDone(original, subExchange, callback, false, true);
+                            doDone(original, subExchange, callback, false);
                             return;
                         }
 
@@ -526,7 +520,7 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
 
                     // do the done work
                     subExchange = result.get() != null ? result.get() : null;
-                    doDone(original, subExchange, callback, false, true);
+                    doDone(original, subExchange, callback, false);
                 }
             });
         } finally {
@@ -595,16 +589,15 @@ public class MulticastProcessor extends ServiceSupport implements AsyncProcessor
      * @param subExchange the current sub exchange, can be <tt>null</tt> for the synchronous part
      * @param callback    the callback
      * @param doneSync    the <tt>doneSync</tt> parameter to call on callback
-     * @param exhaust     whether or not error handling is exhausted
      */
-    protected void doDone(Exchange original, Exchange subExchange, AsyncCallback callback, boolean doneSync, boolean exhaust) {
+    protected void doDone(Exchange original, Exchange subExchange, AsyncCallback callback, boolean doneSync) {
         // cleanup any per exchange aggregation strategy
         removeAggregationStrategyFromExchange(original);
         if (original.getException() != null) {
             // multicast uses error handling on its output processors and they have tried to redeliver
             // so we shall signal back to the other error handlers that we are exhausted and they should not
             // also try to redeliver as we will then do that twice
-            original.setProperty(Exchange.REDELIVERY_EXHAUSTED, exhaust);
+            original.setProperty(Exchange.REDELIVERY_EXHAUSTED, Boolean.TRUE);
         }
         if (subExchange != null) {
             // and copy the current result to original so it will contain this exception

@@ -82,7 +82,7 @@ public class DefaultArtifactCollector
                     if ( node.filterTrail( filter ) )
                     {
                         // If it was optional, we don't add it or its children, just allow the update of the version and scope
-                        if ( node.isChildOfRootNode() || !artifact.isOptional() )
+                        if ( !artifact.isOptional() )
                         {
                             artifact.setDependencyTrail( node.getDependencyTrail() );
 
@@ -224,7 +224,7 @@ public class DefaultArtifactCollector
             {
                 ResolutionNode child = (ResolutionNode) i.next();
                 // We leave in optional ones, but don't pick up its dependencies
-                if ( !child.isResolved() && ( !child.getArtifact().isOptional() || child.isChildOfRootNode() ) )
+                if ( !child.isResolved() && !child.getArtifact().isOptional() )
                 {
                     Artifact artifact = child.getArtifact();
                     try

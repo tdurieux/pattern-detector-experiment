@@ -132,7 +132,7 @@ public class DateTextField extends TextField<Date> implements ITextFormatProvide
 	 */
 	public static DateTextField forShortStyle(String id)
 	{
-		return forShortStyle(id, null, true);
+		return forShortStyle(id, null);
 	}
 
 	/**
@@ -144,10 +144,9 @@ public class DateTextField extends TextField<Date> implements ITextFormatProvide
 	 *            The model
 	 * @return DateTextField
 	 */
-	public static DateTextField forShortStyle(String id, IModel<Date> model,
-		boolean applyTimeZoneDifference)
+	public static DateTextField forShortStyle(String id, IModel<Date> model)
 	{
-		return new DateTextField(id, model, new StyleDateConverter(applyTimeZoneDifference));
+		return new DateTextField(id, model, new StyleDateConverter(true));
 	}
 
 	/**

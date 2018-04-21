@@ -274,7 +274,6 @@ public class OutputHandler<OUT> {
 		@Override
 		public void collect(T record) {
 			try {
-				operator.getRuntimeContext().setNextInput(record);
 				operator.processElement(serializer.copy(record));
 			} catch (Exception e) {
 				if (LOG.isErrorEnabled()) {

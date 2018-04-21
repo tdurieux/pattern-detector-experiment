@@ -144,9 +144,6 @@ public class RangeInputSplit extends InputSplit implements Writable {
   @Override
   public void readFields(DataInput in) throws IOException {
     range.readFields(in);
-    if (in.readBoolean()) {
-      table = in.readUTF();
-    }
     int numLocs = in.readInt();
     locations = new String[numLocs];
     for (int i = 0; i < numLocs; ++i)
@@ -223,12 +220,6 @@ public class RangeInputSplit extends InputSplit implements Writable {
   @Override
   public void write(DataOutput out) throws IOException {
     range.write(out);
-
-    out.writeBoolean(null != table);
-    if (null != table) {
-      out.writeUTF(table);
-    }
-
     out.writeInt(locations.length);
     for (int i = 0; i < locations.length; ++i)
       out.writeUTF(locations[i]);

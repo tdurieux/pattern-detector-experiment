@@ -78,6 +78,8 @@ public class ValidationErrorFeedback implements IClusterable
 	@Override
 	public String toString()
 	{
-		return message != null ? message.toString() : "";
+		return "ValidationErrorFeedback{" +
+				"message=" + message +
+				'}';
 	}
 }

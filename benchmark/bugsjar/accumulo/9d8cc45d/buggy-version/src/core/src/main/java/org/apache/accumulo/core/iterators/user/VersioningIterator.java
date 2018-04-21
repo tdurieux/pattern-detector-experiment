@@ -37,14 +37,25 @@ public class VersioningIterator extends WrappingIterator implements OptionDescri
   
   private Key currentKey = new Key();
   private int numVersions;
-  protected int maxVersions;
+  private int maxVersions;
   
   @Override
   public VersioningIterator deepCopy(IteratorEnvironment env) {
-    VersioningIterator copy = new VersioningIterator();
-    copy.setSource(getSource().deepCopy(env));
-    copy.maxVersions = maxVersions;
-    return copy;
+    return new VersioningIterator(this, env);
+  }
+  
+  private VersioningIterator(VersioningIterator other, IteratorEnvironment env) {
+    setSource(other.getSource().deepCopy(env));
+    maxVersions = other.maxVersions;
+  }
+  
+  public VersioningIterator() {}
+  
+  public VersioningIterator(SortedKeyValueIterator<Key,Value> iterator, int maxVersions) {
+    if (maxVersions < 1)
+      throw new IllegalArgumentException("maxVersions for versioning iterator must be >= 1");
+    this.setSource(iterator);
+    this.maxVersions = maxVersions;
   }
   
   @Override

@@ -96,12 +96,9 @@ public enum Level {
         if (sArg == null) {
             return defaultLevel;
         }
-        for (Level level : values()) {
-            if (level.name().equals(sArg)) {
-                return level;
-            }
-        }
-        return defaultLevel;
+
+        Level level = valueOf(sArg);
+        return (level == null) ? defaultLevel : level;
     }
 
     /**

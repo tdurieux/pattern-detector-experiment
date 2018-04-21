@@ -39,10 +39,9 @@ public class UrlUtils
 	 * @param url
 	 * @return <code>true</code> if url is relative, <code>false</code> otherwise
 	 */
-	public static boolean isRelative(final String url)
+	public static boolean isRelative(String url)
 	{
-		// the regex means "doesn't start with 'scheme://'"
-		if ((url != null) && (url.startsWith("/") == false) && (!url.matches("^\\w+\\:\\/\\/.*")) &&
+		if ((url != null) && (url.startsWith("/") == false) && (url.indexOf("://") < 0) &&
 			!(url.startsWith("#")))
 		{
 			return true;

@@ -1016,17 +1016,15 @@ public abstract class MarkupContainer extends Component implements Iterable<Comp
 	@Deprecated
 	public final Component get(int index)
 	{
-		final int requestedIndex = index;
 		Component childAtIndex = null;
 		Iterator<Component> childIterator = iterator();
-		while (index >= 0 && childIterator.hasNext())
+		while (index-- >= 0 && childIterator.hasNext())
 		{
 			childAtIndex = childIterator.next();
-			index--;
 		}
-		if(index >= 0 || childAtIndex == null)
+		if(childAtIndex == null) 
 		{
-			throw new ArrayIndexOutOfBoundsException(Integer.toString(requestedIndex));
+			throw new ArrayIndexOutOfBoundsException(Integer.toString(index));
 		}
 		return childAtIndex;
 	}

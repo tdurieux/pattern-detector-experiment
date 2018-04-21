@@ -620,7 +620,8 @@ class DocumentNodeStoreBranch implements NodeStoreBranch {
             try {
                 head = store.getRoot(
                         store.reset(branchHead.getRevision(), 
-                                ancestor.getRevision()));
+                                ancestor.getRevision(), 
+                                DocumentNodeStoreBranch.this));
             } catch (Exception e) {
                 CommitFailedException ex = new CommitFailedException(
                         OAK, 100, "Branch reset failed", e);

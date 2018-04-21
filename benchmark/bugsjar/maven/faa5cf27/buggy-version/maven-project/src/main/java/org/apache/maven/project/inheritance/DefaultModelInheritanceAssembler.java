@@ -107,6 +107,10 @@ public class DefaultModelInheritanceAssembler
             }
         }
 
+        // ----------------------------------------------------------------------
+        // Distribution
+        // ----------------------------------------------------------------------
+
         assembleDistributionInheritence( child, parent, childPathAdjustment, appendPaths );
 
         // issueManagement
@@ -173,11 +177,53 @@ public class DefaultModelInheritanceAssembler
 
         assembleDependencyManagementInheritance( child, parent );
 
+        assembleDistributionManagementInheritance( child, parent );
+
         Properties props = new Properties();
         props.putAll( parent.getProperties() );
         props.putAll( child.getProperties() );
 
         child.setProperties( props );
+    }
+
+    private void assembleDistributionManagementInheritance( Model child, Model parent )
+    {
+        DistributionManagement cDistMgmt = child.getDistributionManagement();
+        DistributionManagement pDistMgmt = parent.getDistributionManagement();
+
+        if ( cDistMgmt == null )
+        {
+            child.setDistributionManagement( pDistMgmt );
+        }
+        else if ( pDistMgmt != null )
+        {
+            if ( cDistMgmt.getRepository() == null )
+            {
+                cDistMgmt.setRepository( pDistMgmt.getRepository() );
+            }
+
+            if ( cDistMgmt.getSnapshotRepository() == null )
+            {
+                cDistMgmt.setSnapshotRepository( pDistMgmt.getSnapshotRepository() );
+            }
+
+            if ( StringUtils.isEmpty( cDistMgmt.getDownloadUrl() ) )
+            {
+                cDistMgmt.setDownloadUrl( pDistMgmt.getDownloadUrl() );
+            }
+
+            if ( cDistMgmt.getRelocation() == null )
+            {
+                cDistMgmt.setRelocation( pDistMgmt.getRelocation() );
+            }
+
+            if ( cDistMgmt.getSite() == null )
+            {
+                cDistMgmt.setSite( pDistMgmt.getSite() );
+            }
+
+            // NOTE: We SHOULD NOT be inheriting status, since this is an assessment of the POM quality.
+        }
     }
 
     private void assembleDependencyManagementInheritance( Model child, Model parent )
@@ -440,8 +486,17 @@ public class DefaultModelInheritanceAssembler
             {
                 if ( parentDistMgmt.getRepository() != null )
                 {
-                    DeploymentRepository repository = copyDistributionRepository( parentDistMgmt.getRepository() );
+                    DeploymentRepository repository = new DeploymentRepository();
+
                     childDistMgmt.setRepository( repository );
+
+                    repository.setId( parentDistMgmt.getRepository().getId() );
+
+                    repository.setName( parentDistMgmt.getRepository().getName() );
+
+                    repository.setUrl( parentDistMgmt.getRepository().getUrl() );
+
+                    repository.setUniqueVersion( parentDistMgmt.getRepository().isUniqueVersion() );
                 }
             }
 
@@ -449,37 +504,20 @@ public class DefaultModelInheritanceAssembler
             {
                 if ( parentDistMgmt.getSnapshotRepository() != null )
                 {
-                    DeploymentRepository repository =
-                        copyDistributionRepository( parentDistMgmt.getSnapshotRepository() );
+                    DeploymentRepository repository = new DeploymentRepository();
+
                     childDistMgmt.setSnapshotRepository( repository );
+
+                    repository.setId( parentDistMgmt.getSnapshotRepository().getId() );
+
+                    repository.setName( parentDistMgmt.getSnapshotRepository().getName() );
+
+                    repository.setUrl( parentDistMgmt.getSnapshotRepository().getUrl() );
+
+                    repository.setUniqueVersion( parentDistMgmt.getSnapshotRepository().isUniqueVersion() );
                 }
             }
-
-            if ( StringUtils.isEmpty( childDistMgmt.getDownloadUrl() ) )
-            {
-                childDistMgmt.setDownloadUrl( parentDistMgmt.getDownloadUrl() );
-            }
-
-            // NOTE: We SHOULD NOT be inheriting status, since this is an assessment of the POM quality.
-            // NOTE: We SHOULD NOT be inheriting relocation, since this relates to a single POM
         }
-    }
-
-    private static DeploymentRepository copyDistributionRepository( DeploymentRepository parentRepository )
-    {
-        DeploymentRepository repository = new DeploymentRepository();
-
-        repository.setId( parentRepository.getId() );
-
-        repository.setName( parentRepository.getName() );
-
-        repository.setUrl( parentRepository.getUrl() );
-
-        repository.setLayout( parentRepository.getLayout() );
-
-        repository.setUniqueVersion( parentRepository.isUniqueVersion() );
-
-        return repository;
     }
 
     protected String appendPath( String parentPath, String childPath, String pathAdjustment, boolean appendPaths )

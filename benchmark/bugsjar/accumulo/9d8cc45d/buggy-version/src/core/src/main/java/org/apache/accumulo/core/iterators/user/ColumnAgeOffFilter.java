@@ -36,6 +36,15 @@ import org.apache.hadoop.io.Text;
  * Different thresholds are set for each column.
  */
 public class ColumnAgeOffFilter extends Filter {
+  
+  public ColumnAgeOffFilter() {}
+  
+  private ColumnAgeOffFilter(SortedKeyValueIterator<Key,Value> iterator, TTLSet ttls, long currentTime) {
+    setSource(iterator);
+    this.ttls = ttls;
+    this.currentTime = currentTime;
+  }
+  
   public static class TTLSet extends ColumnToClassMapping<Long> {
     public TTLSet(Map<String,String> objectStrings) {
       super();
@@ -78,10 +87,7 @@ public class ColumnAgeOffFilter extends Filter {
   
   @Override
   public SortedKeyValueIterator<Key,Value> deepCopy(IteratorEnvironment env) {
-    ColumnAgeOffFilter copy = (ColumnAgeOffFilter) super.deepCopy(env);
-    copy.currentTime = currentTime;
-    copy.ttls = ttls;
-    return copy;
+    return new ColumnAgeOffFilter(getSource(), ttls, currentTime);
   }
   
   public void overrideCurrentTime(long ts) {
@@ -117,7 +123,7 @@ public class ColumnAgeOffFilter extends Filter {
   public static void addTTL(IteratorSetting is, IteratorSetting.Column column, Long ttl) {
     is.addOption(ColumnSet.encodeColumns(column.getFirst(), column.getSecond()), Long.toString(ttl));
   }
-  
+
   /**
    * A convenience method for removing an age off threshold for a column.
    * 

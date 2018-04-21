@@ -35,7 +35,6 @@ import org.slf4j.LoggerFactory;
 public class GenericFile<T> implements WrappedFile<T>  {
     private static final Logger LOG = LoggerFactory.getLogger(GenericFile.class);
 
-    private String copyFromAbsoluteFilePath;
     private String endpointPath;
     private String fileName;
     private String fileNameOnly;
@@ -67,7 +66,6 @@ public class GenericFile<T> implements WrappedFile<T>  {
         } catch (Exception e) {
             throw ObjectHelper.wrapRuntimeCamelException(e);
         }
-        result.setCopyFromAbsoluteFilePath(source.getAbsoluteFilePath());
         result.setEndpointPath(source.getEndpointPath());
         result.setAbsolute(source.isAbsolute());
         result.setDirectory(source.isDirectory());
@@ -365,14 +363,6 @@ public class GenericFile<T> implements WrappedFile<T>  {
 
     public void setDirectory(boolean directory) {
         this.directory = directory;
-    }
-
-    public String getCopyFromAbsoluteFilePath() {
-        return copyFromAbsoluteFilePath;
-    }
-
-    public void setCopyFromAbsoluteFilePath(String copyFromAbsoluteFilePath) {
-        this.copyFromAbsoluteFilePath = copyFromAbsoluteFilePath;
     }
 
     /**

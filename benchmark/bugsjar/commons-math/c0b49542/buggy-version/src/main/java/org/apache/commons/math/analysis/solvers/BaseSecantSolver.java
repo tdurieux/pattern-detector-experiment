@@ -19,7 +19,6 @@ package org.apache.commons.math.analysis.solvers;
 
 import org.apache.commons.math.util.FastMath;
 import org.apache.commons.math.analysis.UnivariateRealFunction;
-import org.apache.commons.math.exception.ConvergenceException;
 import org.apache.commons.math.exception.MathInternalError;
 
 /**
@@ -62,8 +61,8 @@ public abstract class BaseSecantSolver
     /**
      * Construct a solver.
      *
-     * @param absoluteAccuracy Absolute accuracy.
-     * @param method <em>Secant</em>-based root-finding method to use.
+     * @param absoluteAccuracy absolute accuracy
+     * @param method <em>Secant</em>-based root-finding method to use
      */
     protected BaseSecantSolver(final double absoluteAccuracy, final Method method) {
         super(absoluteAccuracy);
@@ -74,9 +73,9 @@ public abstract class BaseSecantSolver
     /**
      * Construct a solver.
      *
-     * @param relativeAccuracy Relative accuracy.
-     * @param absoluteAccuracy Absolute accuracy.
-     * @param method <em>Secant</em>-based root-finding method to use.
+     * @param relativeAccuracy relative accuracy
+     * @param absoluteAccuracy absolute accuracy
+     * @param method <em>Secant</em>-based root-finding method to use
      */
     protected BaseSecantSolver(final double relativeAccuracy,
                                final double absoluteAccuracy,
@@ -184,11 +183,7 @@ public abstract class BaseSecantSolver
                     f0 *= f1 / (f1 + fx);
                     break;
                 case REGULA_FALSI:
-                    // Detect early that algorithm is stuck, instead of waiting
-                    // for the maximum number of iterations to be exceeded.
-                    if (x == x1) {
-                        throw new ConvergenceException();
-                    }
+                    // Nothing.
                     break;
                 default:
                     // Should never happen.

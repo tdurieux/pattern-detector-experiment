@@ -142,10 +142,10 @@ public class BufferedWebResponse extends WebResponse implements IMetaDataBufferi
 			{
 				for (IResponseFilter filter : responseFilters)
 				{
-					responseBuffer = filter.filter(responseBuffer);
+					filter.filter(responseBuffer);
 				}
 			}
-			response.write(responseBuffer);
+			response.write(builder);
 		}
 
 		@Override

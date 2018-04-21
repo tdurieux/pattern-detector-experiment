@@ -18,7 +18,6 @@
 package org.apache.commons.math4.ode;
 
 import org.apache.commons.math4.exception.DimensionMismatchException;
-import org.apache.commons.math4.exception.MathIllegalStateException;
 import org.apache.commons.math4.exception.MaxCountExceededException;
 import org.apache.commons.math4.exception.NoBracketingException;
 import org.apache.commons.math4.exception.NumberIsTooSmallException;
@@ -248,9 +247,6 @@ public abstract class MultistepIntegrator extends AdaptiveStepsizeIntegrator {
 
                 }, t0, y0, t, new double[y0.length]);
             }
-
-            // we should not reach this step
-            throw new MathIllegalStateException(LocalizedFormats.MULTISTEP_STARTER_STOPPED_EARLY);
 
         } catch (InitializationCompletedMarkerException icme) { // NOPMD
             // this is the expected nominal interruption of the start integrator

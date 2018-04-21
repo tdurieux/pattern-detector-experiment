@@ -28,28 +28,27 @@ import java.util.List;
 public class KernelNodeStateBuilder implements NodeStateBuilder {
     private final NodeStateBuilderContext context;
 
-    private KernelNodeStateBuilder parent;
-    private String name;
+    private String path;
 
-    private KernelNodeStateBuilder(NodeStateBuilderContext context, KernelNodeStateBuilder parent, String name) {
+    private KernelNodeStateBuilder(NodeStateBuilderContext context, String path) {
         this.context = context;
-        this.parent = parent;
-        this.name = name;
+        this.path = path;
     }
 
     public static NodeStateBuilder create(NodeStateBuilderContext context) {
-        return new KernelNodeStateBuilder(context, null, "");
+        return new KernelNodeStateBuilder(context, "");
     }
+
 
     @Override
     public NodeState getNodeState() {
-        return context.getNodeState(getPath());
+        return context.getNodeState(path);
     }
 
     @Override
     public NodeStateBuilder getChildBuilder(String name) {
         return hasChild(name)
-            ? new KernelNodeStateBuilder(context, this, name)
+            ? new KernelNodeStateBuilder(context, PathUtils.concat(path, name))
             : null;
     }
 
@@ -59,9 +58,9 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
             return null;
         }
         else {
-            String targetPath = PathUtils.concat(getPath(), name);
+            String targetPath = PathUtils.concat(path, name);
             context.addNode(nodeState, targetPath);
-            return new KernelNodeStateBuilder(context, this, name);
+            return new KernelNodeStateBuilder(context, targetPath);
         }
     }
 
@@ -71,16 +70,16 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
             return null;
         }
         else {
-            String targetPath = PathUtils.concat(getPath(), name);
+            String targetPath = PathUtils.concat(path, name);
             context.addNode(targetPath);
-            return new KernelNodeStateBuilder(context, this, name);
+            return new KernelNodeStateBuilder(context, targetPath);
         }
     }
 
     @Override
     public boolean removeNode(String name) {
         if (hasChild(name)) {
-            context.removeNode(PathUtils.concat(getPath(), name));
+            context.removeNode(PathUtils.concat(path, name));
             return true;
         }
         else {
@@ -92,10 +91,10 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
     public PropertyState setProperty(String name, CoreValue value) {
         PropertyState property = new PropertyStateImpl(name, value);
         if (hasProperty(name)) {
-            context.setProperty(property, getPath());
+            context.setProperty(property, path);
         }
         else {
-            context.addProperty(property, getPath());
+            context.addProperty(property, path);
         }
         return property;
     }
@@ -104,10 +103,10 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
     public PropertyState setProperty(String name, List<CoreValue> values) {
         PropertyState property = new PropertyStateImpl(name, values);
         if (hasProperty(name)) {
-            context.setProperty(property, getPath());
+            context.setProperty(property, path);
         }
         else {
-            context.addProperty(property, getPath());
+            context.addProperty(property, path);
         }
         return property;
     }
@@ -115,7 +114,7 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
     @Override
     public void removeProperty(String name) {
         if (hasProperty(name)) {
-            context.removeProperty(PathUtils.concat(getPath(), name));
+            context.removeProperty(PathUtils.concat(path, name));
         }
     }
 
@@ -130,13 +129,10 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
         }
 
         KernelNodeStateBuilder destParentBuilder = (KernelNodeStateBuilder) destParent;
-        String destPath = PathUtils.concat(destParentBuilder.getPath(), destName);
+        String destPath = PathUtils.concat(destParentBuilder.path, destName);
 
-        context.moveNode(getPath(), destPath);
-
-        name = destName;
-        parent = destParentBuilder;
-
+        context.moveNode(path, destPath);
+        path = destPath;
         return true;
     }
 
@@ -151,9 +147,9 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
         }
 
         KernelNodeStateBuilder destParentBuilder = (KernelNodeStateBuilder) destParent;
-        String destPath = PathUtils.concat(destParentBuilder.getPath(), destName);
+        String destPath = PathUtils.concat(destParentBuilder.path, destName);
 
-        context.copyNode(getPath(), destPath);
+        context.copyNode(path, destPath);
         return true;
     }
 
@@ -164,27 +160,6 @@ public class KernelNodeStateBuilder implements NodeStateBuilder {
     }
 
     //------------------------------------------------------------< private >---
-
-    private String getPath() {
-        // Shortcut for root
-        if (parent == null) {
-            return "";
-        }
-
-        StringBuilder sb = new StringBuilder();
-        buildPath(sb);
-        return sb.toString();
-    }
-
-    private void buildPath(StringBuilder sb) {
-        if (parent != null) {
-            parent.buildPath(sb);
-            if (sb.length() > 0) {
-                sb.append('/');
-            }
-            sb.append(name);
-        }
-    }
 
     private boolean hasChild(String name) {
         return getNodeState().getChildNode(name) != null;
