@@ -1,0 +1,568 @@
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/BufferedDeletesStream.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/BufferedDeletesStream.java
+index 745117da..4cf4c22b 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/BufferedDeletesStream.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/BufferedDeletesStream.java
+@@ -28,10 +28,10 @@
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.lucene.index.IndexReader.AtomicReaderContext;
+-import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
+ import org.apache.lucene.search.Query;
+-import org.apache.lucene.search.Scorer;
+-import org.apache.lucene.search.Weight;
++import org.apache.lucene.search.QueryWrapperFilter;
+ 
+ /* Tracks the stream of {@link BufferedDeletes}.
+  * When DocumentsWriterPerThread flushes, its buffered
+@@ -434,18 +434,16 @@ public QueryAndLimit(Query query, int limit) {
+   // Delete by query
+   private synchronized long applyQueryDeletes(Iterable<QueryAndLimit> queriesIter, SegmentReader reader) throws IOException {
+     long delCount = 0;
+-    IndexSearcher searcher = new IndexSearcher(reader);
+-    assert searcher.getTopReaderContext().isAtomic;
+-    final AtomicReaderContext readerContext = (AtomicReaderContext) searcher.getTopReaderContext();
+-    try {
++    final AtomicReaderContext readerContext = (AtomicReaderContext) reader.getTopReaderContext();
+       for (QueryAndLimit ent : queriesIter) {
+         Query query = ent.query;
+         int limit = ent.limit;
+-        Weight weight = query.weight(searcher);
+-        Scorer scorer = weight.scorer(readerContext, Weight.ScorerContext.def());
+-        if (scorer != null) {
++      final DocIdSet docs = new QueryWrapperFilter(query).getDocIdSet(readerContext);
++      if (docs != null) {
++        final DocIdSetIterator it = docs.iterator();
++        if (it != null) {
+           while(true)  {
+-            int doc = scorer.nextDoc();
++            int doc = it.nextDoc();
+             if (doc >= limit)
+               break;
+ 
+@@ -459,8 +457,6 @@ private synchronized long applyQueryDeletes(Iterable<QueryAndLimit> queriesIter,
+           }
+         }
+       }
+-    } finally {
+-      searcher.close();
+     }
+ 
+     return delCount;
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/IndexSearcher.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/IndexSearcher.java
+index 1be99ded..a5711208 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/IndexSearcher.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/IndexSearcher.java
+@@ -289,7 +289,7 @@ public TopDocs search(Query query, int n)
+    */
+   public TopDocs search(Query query, Filter filter, int n)
+     throws IOException {
+-    return search(createWeight(query), filter, n);
++    return search(createNormalizedWeight(query), filter, n);
+   }
+ 
+   /** Lower-level search API.
+@@ -310,7 +310,7 @@ public TopDocs search(Query query, Filter filter, int n)
+    */
+   public void search(Query query, Filter filter, Collector results)
+     throws IOException {
+-    search(leafContexts, createWeight(query), filter, results);
++    search(leafContexts, createNormalizedWeight(query), filter, results);
+   }
+ 
+   /** Lower-level search API.
+@@ -328,7 +328,7 @@ public void search(Query query, Filter filter, Collector results)
+   */
+   public void search(Query query, Collector results)
+     throws IOException {
+-    search(leafContexts, createWeight(query), null, results);
++    search(leafContexts, createNormalizedWeight(query), null, results);
+   }
+   
+   /** Search implementation with arbitrary sorting.  Finds
+@@ -344,7 +344,7 @@ public void search(Query query, Collector results)
+    */
+   public TopFieldDocs search(Query query, Filter filter, int n,
+                              Sort sort) throws IOException {
+-    return search(createWeight(query), filter, n, sort);
++    return search(createNormalizedWeight(query), filter, n, sort);
+   }
+ 
+   /**
+@@ -357,7 +357,7 @@ public TopFieldDocs search(Query query, Filter filter, int n,
+    */
+   public TopFieldDocs search(Query query, int n,
+                              Sort sort) throws IOException {
+-    return search(createWeight(query), null, n, sort);
++    return search(createNormalizedWeight(query), null, n, sort);
+   }
+ 
+   /** Expert: Low-level search implementation.  Finds the top <code>n</code>
+@@ -623,7 +623,7 @@ public Query rewrite(Query original) throws IOException {
+    * entire index.
+    */
+   public Explanation explain(Query query, int doc) throws IOException {
+-    return explain(createWeight(query), doc);
++    return explain(createNormalizedWeight(query), doc);
+   }
+ 
+   /** Expert: low-level implementation method
+@@ -665,11 +665,21 @@ public void setDefaultFieldSortScoring(boolean doTrackScores, boolean doMaxScore
+   }
+ 
+   /**
+-   * creates a weight for <code>query</code>
+-   * @return new weight
++   * Creates a normalized weight for a top-level {@link Query}.
++   * The query is rewritten by this method and {@link Query#createWeight} called,
++   * afterwards the {@link Weight} is normalized. The returned {@code Weight}
++   * can then directly be used to get a {@link Scorer}.
++   * @lucene.internal
+    */
+-  protected Weight createWeight(Query query) throws IOException {
+-    return query.weight(this);
++  public Weight createNormalizedWeight(Query query) throws IOException {
++    query = rewrite(query);
++    Weight weight = query.createWeight(this);
++    float sum = weight.sumOfSquaredWeights();
++    float norm = getSimilarityProvider().queryNorm(sum);
++    if (Float.isInfinite(norm) || Float.isNaN(norm))
++      norm = 1.0f;
++    weight.normalize(norm);
++    return weight;
+   }
+ 
+   /**
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/Query.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/Query.java
+index 40ec80d4..714b6283 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/Query.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/Query.java
+@@ -91,21 +91,6 @@ public Weight createWeight(IndexSearcher searcher) throws IOException {
+     throw new UnsupportedOperationException();
+   }
+ 
+-  /**
+-   * Expert: Constructs and initializes a Weight for a top-level query.
+-   */
+-  public Weight weight(IndexSearcher searcher) throws IOException {
+-    Query query = searcher.rewrite(this);
+-    Weight weight = query.createWeight(searcher);
+-    float sum = weight.sumOfSquaredWeights();
+-    float norm = searcher.getSimilarityProvider().queryNorm(sum);
+-    if (Float.isInfinite(norm) || Float.isNaN(norm))
+-      norm = 1.0f;
+-    weight.normalize(norm);
+-    return weight;
+-  }
+-  
+-
+   /** Expert: called to re-write queries into primitive queries. For example,
+    * a PrefixQuery will be rewritten into a BooleanQuery that consists
+    * of TermQuerys.
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/QueryWrapperFilter.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/QueryWrapperFilter.java
+index 175e36d2..c0cb638f 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/QueryWrapperFilter.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/QueryWrapperFilter.java
+@@ -52,7 +52,7 @@ public DocIdSet getDocIdSet(final AtomicReaderContext context) throws IOExceptio
+     // get a private context that is used to rewrite, createWeight and score eventually
+     assert context.reader.getTopReaderContext().isAtomic;
+     final AtomicReaderContext privateContext = (AtomicReaderContext) context.reader.getTopReaderContext();
+-    final Weight weight = query.weight(new IndexSearcher(privateContext));
++    final Weight weight = new IndexSearcher(privateContext).createNormalizedWeight(query);
+     return new DocIdSet() {
+       @Override
+       public DocIdSetIterator iterator() throws IOException {
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/function/CustomScoreQuery.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/function/CustomScoreQuery.java
+index 8a5ba9ab..9ea258f3 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/function/CustomScoreQuery.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/search/function/CustomScoreQuery.java
+@@ -187,7 +187,7 @@ protected CustomScoreProvider getCustomScoreProvider(IndexReader reader) throws
+     boolean qStrict;
+ 
+     public CustomWeight(IndexSearcher searcher) throws IOException {
+-      this.subQueryWeight = subQuery.weight(searcher);
++      this.subQueryWeight = subQuery.createWeight(searcher);
+       this.valSrcWeights = new Weight[valSrcQueries.length];
+       for(int i = 0; i < valSrcQueries.length; i++) {
+         this.valSrcWeights[i] = valSrcQueries[i].createWeight(searcher);
+diff --git a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java
+index 272384b0..e8a6b69a 100644
+--- a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java
++++ b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestDisjunctionMaxQuery.java
+@@ -173,7 +173,7 @@ public void testSkipToFirsttimeMiss() throws IOException {
+     
+     QueryUtils.check(random, dq, s);
+     assertTrue(s.getTopReaderContext().isAtomic);
+-    final Weight dw = dq.weight(s);
++    final Weight dw = s.createNormalizedWeight(dq);
+     final Scorer ds = dw.scorer((AtomicReaderContext)s.getTopReaderContext(), ScorerContext.def());
+     final boolean skipOk = ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS;
+     if (skipOk) {
+@@ -188,7 +188,7 @@ public void testSkipToFirsttimeHit() throws IOException {
+     dq.add(tq("dek", "DOES_NOT_EXIST"));
+     assertTrue(s.getTopReaderContext().isAtomic);
+     QueryUtils.check(random, dq, s);
+-    final Weight dw = dq.weight(s);
++    final Weight dw = s.createNormalizedWeight(dq);
+     final Scorer ds = dw.scorer((AtomicReaderContext)s.getTopReaderContext(), ScorerContext.def());
+     assertTrue("firsttime skipTo found no match",
+         ds.advance(3) != DocIdSetIterator.NO_MORE_DOCS);
+diff --git a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTermScorer.java b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTermScorer.java
+index bf848098..c2f0dfe4 100644
+--- a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTermScorer.java
++++ b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTermScorer.java
+@@ -75,7 +75,7 @@ public void test() throws IOException {
+     Term allTerm = new Term(FIELD, "all");
+     TermQuery termQuery = new TermQuery(allTerm);
+     
+-    Weight weight = termQuery.weight(indexSearcher);
++    Weight weight = indexSearcher.createNormalizedWeight(termQuery);
+     assertTrue(indexSearcher.getTopReaderContext().isAtomic);
+     Scorer ts = weight.scorer((AtomicReaderContext)indexSearcher.getTopReaderContext(), ScorerContext.def().scoreDocsInOrder(true).topScorer(true));
+     // we have 2 documents with the term all in them, one document for all the
+@@ -136,7 +136,7 @@ public void testNext() throws Exception {
+     Term allTerm = new Term(FIELD, "all");
+     TermQuery termQuery = new TermQuery(allTerm);
+     
+-    Weight weight = termQuery.weight(indexSearcher);
++    Weight weight = indexSearcher.createNormalizedWeight(termQuery);
+     assertTrue(indexSearcher.getTopReaderContext().isAtomic);
+     Scorer ts = weight.scorer((AtomicReaderContext) indexSearcher.getTopReaderContext(), ScorerContext.def().scoreDocsInOrder(true).topScorer(true));
+     assertTrue("next did not return a doc",
+@@ -154,7 +154,7 @@ public void testAdvance() throws Exception {
+     Term allTerm = new Term(FIELD, "all");
+     TermQuery termQuery = new TermQuery(allTerm);
+     
+-    Weight weight = termQuery.weight(indexSearcher);
++    Weight weight = indexSearcher.createNormalizedWeight(termQuery);
+     assertTrue(indexSearcher.getTopReaderContext().isAtomic);
+ 
+     Scorer ts = weight.scorer((AtomicReaderContext) indexSearcher.getTopReaderContext(), ScorerContext.def().scoreDocsInOrder(true).topScorer(true));
+diff --git a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTopDocsMerge.java b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTopDocsMerge.java
+index 906a9dac..7c459f7f 100644
+--- a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTopDocsMerge.java
++++ b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestTopDocsMerge.java
+@@ -197,7 +197,7 @@ public void testSort() throws Exception {
+       }
+ 
+       // ... then all shards:
+-      final Weight w = query.weight(searcher);
++      final Weight w = searcher.createNormalizedWeight(query);
+ 
+       final TopDocs[] shardHits = new TopDocs[subSearchers.length];
+       for(int shardIDX=0;shardIDX<subSearchers.length;shardIDX++) {
+diff --git a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestNearSpansOrdered.java b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestNearSpansOrdered.java
+index 39102344..01fca299 100644
+--- a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestNearSpansOrdered.java
++++ b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestNearSpansOrdered.java
+@@ -170,22 +170,20 @@ public void testNearSpansSkipTo1() throws Exception {
+    */
+   public void testSpanNearScorerSkipTo1() throws Exception {
+     SpanNearQuery q = makeQuery();
+-    Weight w = q.weight(searcher);
++    Weight w = searcher.createNormalizedWeight(q);
+     ReaderContext topReaderContext = searcher.getTopReaderContext();
+     AtomicReaderContext[] leaves = ReaderUtil.leaves(topReaderContext);
+     Scorer s = w.scorer(leaves[0], ScorerContext.def());
+     assertEquals(1, s.advance(1));
+   }
++  
+   /**
+    * not a direct test of NearSpans, but a demonstration of how/when
+    * this causes problems
+    */
+   public void testSpanNearScorerExplain() throws Exception {
+     SpanNearQuery q = makeQuery();
+-    ReaderContext topReaderContext = searcher.getTopReaderContext();
+-    AtomicReaderContext[] leaves = ReaderUtil.leaves(topReaderContext);
+-
+-    Explanation e = q.weight(searcher).explain(leaves[0], 1);
++    Explanation e = searcher.explain(q, 1);
+     assertTrue("Scorer explanation value for doc#1 isn't positive: "
+                + e.toString(),
+                0.0f < e.getValue());
+diff --git a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestSpans.java b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestSpans.java
+index 04a54a44..393eb0e7 100644
+--- a/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestSpans.java
++++ b/lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestSpans.java
+@@ -434,7 +434,7 @@ public float sloppyFreq(int distance) {
+                                 slop,
+                                 ordered);
+   
+-        spanScorer = snq.weight(searcher).scorer(leaves[i], ScorerContext.def());
++        spanScorer = searcher.createNormalizedWeight(snq).scorer(leaves[i], ScorerContext.def());
+       } finally {
+         searcher.setSimilarityProvider(oldSim);
+       }
+diff --git a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/AssertingIndexSearcher.java b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/AssertingIndexSearcher.java
+index e69de29b..41541264 100644
+--- a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/AssertingIndexSearcher.java
++++ b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/AssertingIndexSearcher.java
+@@ -0,0 +1,90 @@
++package org.apache.lucene.search;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.concurrent.ExecutorService;
++import java.io.IOException;
++
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexReader.AtomicReaderContext;
++import org.apache.lucene.index.IndexReader.ReaderContext;
++
++/** 
++ * Helper class that adds some extra checks to ensure correct
++ * usage of {@code IndexSearcher} and {@code Weight}.
++ * TODO: Extend this by more checks, that's just a start.
++ */
++public class AssertingIndexSearcher extends IndexSearcher {
++  public  AssertingIndexSearcher(IndexReader r) {
++    super(r);
++  }
++  
++  public  AssertingIndexSearcher(ReaderContext context) {
++    super(context);
++  }
++  
++  public  AssertingIndexSearcher(IndexReader r, ExecutorService ex) {
++    super(r, ex);
++  }
++  
++  public  AssertingIndexSearcher(ReaderContext context, ExecutorService ex) {
++    super(context, ex);
++  }
++  
++  /** Ensures, that the returned {@code Weight} is not normalized again, which may produce wrong scores. */
++  @Override
++  public Weight createNormalizedWeight(Query query) throws IOException {
++    final Weight w = super.createNormalizedWeight(query);
++    return new Weight() {
++      @Override
++      public Explanation explain(AtomicReaderContext context, int doc) throws IOException {
++        return w.explain(context, doc);
++      }
++
++      @Override
++      public Query getQuery() {
++        return w.getQuery();
++      }
++
++      @Override
++      public float getValue() {
++        return w.getValue();
++      }
++
++      @Override
++      public void normalize(float norm) {
++        throw new IllegalStateException("Weight already normalized.");
++      }
++
++      @Override
++      public Scorer scorer(AtomicReaderContext context, ScorerContext scorerContext) throws IOException {
++        return w.scorer(context, scorerContext);
++      }
++
++      @Override
++      public float sumOfSquaredWeights() throws IOException {
++        throw new IllegalStateException("Weight already normalized.");
++      }
++
++      @Override
++      public boolean scoresDocsOutOfOrder() {
++        return w.scoresDocsOutOfOrder();
++      }
++    };
++  }
++}
+diff --git a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/QueryUtils.java b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/QueryUtils.java
+index 9cdec64a..699af49f 100644
+--- a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/QueryUtils.java
++++ b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/search/QueryUtils.java
+@@ -198,7 +198,7 @@ private static Directory makeEmptyIndex(Random random, final int numDeletedDocs)
+   public static void checkSkipTo(final Query q, final IndexSearcher s) throws IOException {
+     //System.out.println("Checking "+q);
+     final AtomicReaderContext[] readerContextArray = ReaderUtil.leaves(s.getTopReaderContext());
+-    if (q.weight(s).scoresDocsOutOfOrder()) return;  // in this case order of skipTo() might differ from that of next().
++    if (s.createNormalizedWeight(q).scoresDocsOutOfOrder()) return;  // in this case order of skipTo() might differ from that of next().
+ 
+     final int skip_op = 0;
+     final int next_op = 1;
+@@ -241,7 +241,7 @@ public void collect(int doc) throws IOException {
+             lastDoc[0] = doc;
+             try {
+               if (scorer == null) {
+-                Weight w = q.weight(s);
++                Weight w = s.createNormalizedWeight(q);
+                 scorer = w.scorer(readerContextArray[leafPtr], ScorerContext.def());
+               }
+               
+@@ -286,7 +286,7 @@ public void setNextReader(AtomicReaderContext context) throws IOException {
+             if (lastReader[0] != null) {
+               final IndexReader previousReader = lastReader[0];
+               IndexSearcher indexSearcher = LuceneTestCase.newSearcher(previousReader);
+-              Weight w = q.weight(indexSearcher);
++              Weight w = indexSearcher.createNormalizedWeight(q);
+               Scorer scorer = w.scorer((AtomicReaderContext)indexSearcher.getTopReaderContext(), ScorerContext.def());
+               if (scorer != null) {
+                 boolean more = scorer.advance(lastDoc[0] + 1) != DocIdSetIterator.NO_MORE_DOCS;
+@@ -312,7 +312,7 @@ public boolean acceptsDocsOutOfOrder() {
+           // previous reader, hits NO_MORE_DOCS
+           final IndexReader previousReader = lastReader[0];
+           IndexSearcher indexSearcher = LuceneTestCase.newSearcher(previousReader, false);
+-          Weight w = q.weight(indexSearcher);
++          Weight w = indexSearcher.createNormalizedWeight(q);
+           Scorer scorer = w.scorer((AtomicReaderContext)previousReader.getTopReaderContext(), ScorerContext.def());
+           if (scorer != null) {
+             boolean more = scorer.advance(lastDoc[0] + 1) != DocIdSetIterator.NO_MORE_DOCS;
+@@ -343,7 +343,7 @@ public void collect(int doc) throws IOException {
+         try {
+           long startMS = System.currentTimeMillis();
+           for (int i=lastDoc[0]+1; i<=doc; i++) {
+-            Weight w = q.weight(s);
++            Weight w = s.createNormalizedWeight(q);
+             Scorer scorer = w.scorer(context[leafPtr], ScorerContext.def());
+             Assert.assertTrue("query collected "+doc+" but skipTo("+i+") says no more docs!",scorer.advance(i) != DocIdSetIterator.NO_MORE_DOCS);
+             Assert.assertEquals("query collected "+doc+" but skipTo("+i+") got to "+scorer.docID(),doc,scorer.docID());
+@@ -370,7 +370,7 @@ public void setNextReader(AtomicReaderContext context) throws IOException {
+         if (lastReader[0] != null) {
+           final IndexReader previousReader = lastReader[0];
+           IndexSearcher indexSearcher = LuceneTestCase.newSearcher(previousReader);
+-          Weight w = q.weight(indexSearcher);
++          Weight w = indexSearcher.createNormalizedWeight(q);
+           Scorer scorer = w.scorer((AtomicReaderContext)indexSearcher.getTopReaderContext(), ScorerContext.def());
+           if (scorer != null) {
+             boolean more = scorer.advance(lastDoc[0] + 1) != DocIdSetIterator.NO_MORE_DOCS;
+@@ -394,7 +394,7 @@ public boolean acceptsDocsOutOfOrder() {
+       // previous reader, hits NO_MORE_DOCS
+       final IndexReader previousReader = lastReader[0];
+       IndexSearcher indexSearcher = LuceneTestCase.newSearcher(previousReader);
+-      Weight w = q.weight(indexSearcher);
++      Weight w = indexSearcher.createNormalizedWeight(q);
+       Scorer scorer = w.scorer((AtomicReaderContext)indexSearcher.getTopReaderContext(), ScorerContext.def());
+       if (scorer != null) {
+         boolean more = scorer.advance(lastDoc[0] + 1) != DocIdSetIterator.NO_MORE_DOCS;
+diff --git a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/util/LuceneTestCase.java b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/util/LuceneTestCase.java
+index 1df29025..2e3fb330 100644
+--- a/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/util/LuceneTestCase.java
++++ b/lucene/dev/trunk/lucene/src/test-framework/org/apache/lucene/util/LuceneTestCase.java
+@@ -55,6 +55,7 @@
+ import org.apache.lucene.search.BooleanQuery;
+ import org.apache.lucene.search.FieldCache;
+ import org.apache.lucene.search.FieldCache.CacheEntry;
++import org.apache.lucene.search.AssertingIndexSearcher;
+ import org.apache.lucene.search.IndexSearcher;
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.FSDirectory;
+@@ -1231,13 +1232,11 @@ public static IndexSearcher newSearcher(IndexReader r) throws IOException {
+    * with one that returns null for getSequentialSubReaders.
+    */
+   public static IndexSearcher newSearcher(IndexReader r, boolean maybeWrap) throws IOException {
+-
+     if (random.nextBoolean()) {
+       if (maybeWrap && rarely()) {
+-        return new IndexSearcher(new SlowMultiReaderWrapper(r));
+-      } else {
+-        return new IndexSearcher(r);
++        r = new SlowMultiReaderWrapper(r);
+       }
++      return random.nextBoolean() ? new AssertingIndexSearcher(r) : new AssertingIndexSearcher(r.getTopReaderContext());
+     } else {
+       int threads = 0;
+       final ExecutorService ex = (random.nextBoolean()) ? null
+@@ -1246,10 +1245,24 @@ public static IndexSearcher newSearcher(IndexReader r, boolean maybeWrap) throws
+       if (ex != null && VERBOSE) {
+         System.out.println("NOTE: newSearcher using ExecutorService with " + threads + " threads");
+       }
+-      return new IndexSearcher(r.getTopReaderContext(), ex) {
++      return random.nextBoolean() ? 
++        new AssertingIndexSearcher(r, ex) {
+         @Override
+         public void close() throws IOException {
+           super.close();
++            shutdownExecutorService(ex);
++          }
++        } : new AssertingIndexSearcher(r.getTopReaderContext(), ex) {
++          @Override
++          public void close() throws IOException {
++            super.close();
++            shutdownExecutorService(ex);
++          }
++        };
++    }
++  }
++  
++  static void shutdownExecutorService(ExecutorService ex) {
+           if (ex != null) {
+             ex.shutdown();
+             try {
+@@ -1259,9 +1272,6 @@ public void close() throws IOException {
+             }
+           }
+         }
+-      };
+-    }
+-  }
+ 
+   public String getName() {
+     return this.name;
+diff --git a/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/BoostedQuery.java b/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/BoostedQuery.java
+index c065aef4..ef26ad6d 100644
+--- a/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/BoostedQuery.java
++++ b/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/BoostedQuery.java
+@@ -67,7 +67,7 @@ public Weight createWeight(IndexSearcher searcher) throws IOException {
+ 
+     public BoostedWeight(IndexSearcher searcher) throws IOException {
+       this.searcher = searcher;
+-      this.qWeight = q.weight(searcher);
++      this.qWeight = q.createWeight(searcher);
+       this.fcontext = boostVal.newContext(searcher);
+       boostVal.createWeight(fcontext,searcher);
+     }
+diff --git a/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/QueryValueSource.java b/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/QueryValueSource.java
+index 433957df..c6f0fefe 100644
+--- a/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/QueryValueSource.java
++++ b/lucene/dev/trunk/solr/src/java/org/apache/solr/search/function/QueryValueSource.java
+@@ -68,7 +68,7 @@ public boolean equals(Object o) {
+ 
+   @Override
+   public void createWeight(Map context, IndexSearcher searcher) throws IOException {
+-    Weight w = q.weight(searcher);
++    Weight w = searcher.createNormalizedWeight(q);
+     context.put(this, w);
+   }
+ }
+@@ -98,7 +98,7 @@ public QueryDocValues(QueryValueSource vs, AtomicReaderContext readerContext, Ma
+     this.q = vs.q;
+     this.fcontext = fcontext;
+ 
+-    Weight w = fcontext==null ? null : (Weight)fcontext.get(q);
++    Weight w = fcontext==null ? null : (Weight)fcontext.get(vs);
+     if (w == null) {
+       IndexSearcher weightSearcher;
+       if(fcontext == null) {
+@@ -109,7 +109,8 @@ public QueryDocValues(QueryValueSource vs, AtomicReaderContext readerContext, Ma
+           weightSearcher = new IndexSearcher(ReaderUtil.getTopLevelContext(readerContext));
+         }
+       }
+-      w = q.weight(weightSearcher);
++      vs.createWeight(fcontext, weightSearcher);
++      w = (Weight)fcontext.get(vs);
+     }
+     weight = w;
+   }

@@ -1,0 +1,131 @@
+diff --git a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/OrNode.java b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/OrNode.java
+index 61e1c1d5..c7c91fa4 100644
+--- a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/OrNode.java
++++ b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/OrNode.java
+@@ -115,6 +115,25 @@ public ValueNode preprocess(int numTables,
+ 		 *	or:
+ 		 *		x = ColumnReference
+ 		 * where all ColumnReferences are from the same table.
++         *
++         * We only convert the OR chain to an IN list if it has been
++         * normalized to conjunctive normal form (CNF) first. That is, the
++         * shape of the chain must be something like this:
++         *
++         *               OR
++         *              /  \
++         *             =    OR
++         *                 /  \
++         *                =   OR
++         *                    / \
++         *                   =   FALSE
++         *
++         * Predicates in WHERE, HAVING and ON clauses will have been
++         * normalized by the time we get here. Boolean expressions other
++         * places in the query are not necessarily normalized, but they
++         * won't benefit from IN list conversion anyway, since they cannot
++         * be used as qualifiers in a multi-probe scan, so simply skip the
++         * conversion in those cases.
+ 		 */
+ 		if (firstOr)
+ 		{
+@@ -122,8 +141,11 @@ public ValueNode preprocess(int numTables,
+ 			ColumnReference	cr = null;
+ 			int				columnNumber = -1;
+ 			int				tableNumber = -1;
++            ValueNode       vn;
+ 
+-			for (ValueNode vn = this; vn instanceof OrNode; vn = ((OrNode) vn).getRightOperand())
++            for (vn = this;
++                    vn instanceof OrNode;
++                    vn = ((OrNode) vn).getRightOperand())
+ 			{
+ 				OrNode on = (OrNode) vn;
+ 				ValueNode left = on.getLeftOperand();
+@@ -210,6 +232,12 @@ else if (tableNumber != cr.getTableNumber() ||
+ 				}
+ 			}
+ 
++            // DERBY-6363: An OR chain on conjunctive normal form should be
++            // terminated by a false BooleanConstantNode. If it is terminated
++            // by some other kind of node, it is not on CNF, and it should
++            // not be converted to an IN list.
++            convert = convert && vn.isBooleanFalse();
++
+ 			/* So, can we convert the OR chain? */
+ 			if (convert)
+ 			{
+@@ -217,7 +245,9 @@ else if (tableNumber != cr.getTableNumber() ||
+ 													C_NodeTypes.VALUE_NODE_LIST,
+ 													getContextManager());
+ 				// Build the IN list 
+-				for (ValueNode vn = this; vn instanceof OrNode; vn = ((OrNode) vn).getRightOperand())
++                for (vn = this;
++                        vn instanceof OrNode;
++                        vn = ((OrNode) vn).getRightOperand())
+ 				{
+ 					OrNode on = (OrNode) vn;
+ 					BinaryRelationalOperatorNode bron =
+@@ -460,7 +490,7 @@ public boolean verifyChangeToCNF()
+ 			}
+ 			else
+ 			{
+-				isValid = leftOperand.verifyChangeToCNF();
++				isValid = isValid && leftOperand.verifyChangeToCNF();
+ 			}
+ 		}
+ 
+diff --git a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/BooleanValuesTest.java b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/BooleanValuesTest.java
+index c275d69d..757d4b8a 100644
+--- a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/BooleanValuesTest.java
++++ b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/BooleanValuesTest.java
+@@ -2139,6 +2139,50 @@ public void test_5972() throws SQLException {
+                 "values case when 1 or 2 then 1 else 0 end");
+     }
+     
++    /**
++     * Some BOOLEAN expressions used to be transformed to non-equivalent
++     * IN lists. Verify that they now return the correct results.
++     * Regression test case for DERBY-6363.
++     */
++    public void test_6363() throws SQLException {
++        Statement s = createStatement();
++        s.execute("create table d6363(a int, b char)");
++        s.execute("insert into d6363 values (1, 'a'), (2, 'b'), (3, 'a'), "
++                + "(4, 'b'), (5, 'a'), (6, 'b')");
++
++        JDBC.assertFullResultSet(s.executeQuery(
++            "select a, ((b = 'a' or b = 'b') and a < 4), "
++                    + "((b = 'a' or b = 'c' or b = 'b') and a < 4), "
++                    + "((b = 'a' or (b = 'c' or b = 'b')) and a < 4), "
++                    + "((b = 'a' or b in ('c', 'b')) and a < 4), "
++                    + "(a < 4 and (b = 'a' or b = 'b')) "
++                    + "from d6363 order by a"),
++            new String[][] {
++                { "1", "true", "true", "true", "true", "true" },
++                { "2", "true", "true", "true", "true", "true" },
++                { "3", "true", "true", "true", "true", "true" },
++                { "4", "false", "false", "false", "false", "false" },
++                { "5", "false", "false", "false", "false", "false" },
++                { "6", "false", "false", "false", "false", "false" },
++            });
++
++        JDBC.assertFullResultSet(s.executeQuery(
++            "select a, b, "
++            + "case when ((b = 'a' or b = 'b') and a < 4) "
++            + "then 'x' else '-' end, "
++            + "case when (a < 4 and (b = 'a' or b = 'b')) "
++            + "then 'y' else '-' end "
++            + "from d6363 order by a"),
++            new String[][] {
++                { "1", "a", "x", "y" },
++                { "2", "b", "x", "y" },
++                { "3", "a", "x", "y" },
++                { "4", "b", "-", "-" },
++                { "5", "a", "-", "-" },
++                { "6", "b", "-", "-" },
++            });
++    }
++
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // SQL ROUTINES

@@ -1,0 +1,341 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
+index b738ec27..157ed0a7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
+@@ -24,6 +24,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.io.IOException;
+ import java.net.SocketTimeoutException;
++import java.net.UnknownHostException;
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.reference.MessageId;
+ import org.apache.derby.iapi.reference.SQLState;
+@@ -47,6 +48,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.impl.store.replication.buffer.LogBufferFullException;
+ 
+ import java.util.Properties;
++import org.apache.derby.impl.store.replication.net.SlaveAddress;
+ 
+ /**
+  * <p> 
+@@ -78,8 +80,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private ReplicationLogger repLogger;
+ 
+     private String replicationMode;
+-    private String slavehost;
+-    private int slaveport;
++    private SlaveAddress slaveAddr;
+     private String dbname;
+     private int logBufferSize = 0;
+     
+@@ -202,8 +203,15 @@ public void startMaster(RawStoreFactory rawStore,
+                     (SQLState.REPLICATION_MASTER_ALREADY_BOOTED, dbname);
+         }
+ 
+-        this.slavehost = slavehost;
+-        this.slaveport = new Integer(slaveport).intValue();
++        try {
++            slaveAddr = new SlaveAddress(slavehost, 
++                    (new Integer(slaveport)).intValue());
++        } catch (UnknownHostException uhe) {
++            throw StandardException.newException
++                    (SQLState.REPLICATION_CONNECTION_EXCEPTION, uhe, 
++                     dbname, getHostName(), String.valueOf(getPortNumber()));
++        }
++        
+         this.dbname = dbname;
+ 
+         rawStoreFactory = rawStore;
+@@ -468,9 +476,8 @@ private void setupConnection() throws StandardException {
+             if (transmitter != null) {
+                 transmitter.tearDown();
+             }
+-            transmitter = new ReplicationMessageTransmit(slavehost,
+-                                                         slaveport,
+-                                                         dbname);
++            transmitter = new ReplicationMessageTransmit(slaveAddr);
++            
+             // getHighestShippedInstant is -1 until the first log
+             // chunk has been shipped to the slave. If a log chunk has
+             // been shipped, use the instant of the latest shipped log
+@@ -493,13 +500,13 @@ private void setupConnection() throws StandardException {
+         } catch (IOException ioe) {
+             throw StandardException.newException
+                     (SQLState.REPLICATION_CONNECTION_EXCEPTION, ioe, 
+-                     dbname, slavehost, String.valueOf(slaveport));
++                     dbname, getHostName(), String.valueOf(getPortNumber()));
+         } catch (StandardException se) {
+             throw se;
+         } catch (Exception e) {
+             throw StandardException.newException
+                     (SQLState.REPLICATION_CONNECTION_EXCEPTION, e,
+-                     dbname, slavehost, String.valueOf(slaveport));
++                     dbname, getHostName(), String.valueOf(getPortNumber()));
+         }
+     }
+     
+@@ -521,13 +528,7 @@ ReplicationMessageTransmit handleExceptions(Exception exception) {
+             
+             while (active) {
+                 try {
+-                    if (transmitter != null) {
+-                        transmitter.tearDown();
+-                    }
+-                    transmitter = new ReplicationMessageTransmit(slavehost,
+-                                                                 slaveport,
+-                                                                 dbname);
+-
++                    transmitter = new ReplicationMessageTransmit(slaveAddr);
+                     // see comment in setupConnection
+                     if (logShipper != null &&
+                         logShipper.getHighestShippedInstant() != -1) {
+@@ -624,4 +625,24 @@ private void teardownNetwork() {
+     String getDbName() {
+         return this.dbname;
+     }
++    
++    /**
++     * Used to return the host name of the slave being connected to.
++     *
++     * @return a String containing the host name of the slave being
++     *         connected to.
++     */
++    private String getHostName() {
++        return slaveAddr.getHostAddress().getHostName();
++    }
++    
++    /**
++     * Used to return the port number of the slave being connected to.
++     *
++     * @return an Integer that represents the port number of the slave
++     *         being connected to.
++     */
++    private int getPortNumber() {
++        return slaveAddr.getPortNumber();
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
+index c26c70df..0d2ee6bf 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
+@@ -25,7 +25,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.io.IOException;
+ import java.net.ServerSocket;
+ import java.net.Socket;
+-import java.net.UnknownHostException;
+ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+ import java.security.PrivilegedExceptionAction;
+@@ -93,36 +92,17 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      * the host name and port number that constitute the slave address as
+      * parameters.
+      *
+-     * @param hostName a <code>String</code> that contains the host name of
+-     *                 the slave to replicate to.
+-     * @param portNumber an integer that contains the port number of the
+-     *                   slave to replicate to.
+-     * @param dbname the name of the database
+-     *
+-     * @throws StandardException If an exception occurs while trying to
+-     *                           resolve the host name.
++     * @param slaveAddress the address (host name and port number) of the slave
++     *                     to connect to.
++     * @param dbname the name of the database.
+      */
+-    public ReplicationMessageReceive(String hostName, int portNumber, 
+-                                     String dbname)
+-        throws StandardException {
+-        try {
+-            slaveAddress = new SlaveAddress(hostName, portNumber);
++    public ReplicationMessageReceive(SlaveAddress slaveAddress, 
++                                     String dbname) {
++        this.slaveAddress = slaveAddress;
+             Monitor.logTextMessage(MessageId.REPLICATION_SLAVE_NETWORK_LISTEN, 
+-                                   dbname, getHostName(), 
+-                                   String.valueOf(getPort()));
+-        } catch (UnknownHostException uhe) {
+-            // cannot use getPort because SlaveAddress creator threw
+-            // exception and has therefore not been initialized
+-            String port;
+-            if (portNumber > 0) {
+-                port = String.valueOf(portNumber);
+-            } else {
+-                port = String.valueOf(SlaveAddress.DEFAULT_PORT_NO);
+-            }
+-            throw StandardException.newException
+-                (SQLState.REPLICATION_CONNECTION_EXCEPTION, uhe, 
+-                 dbname, hostName, port);
+-        }
++                               dbname, 
++                               slaveAddress.getHostAddress().getHostName(),
++                               String.valueOf(slaveAddress.getPortNumber()));
+     }
+     
+     /**
+@@ -441,26 +421,6 @@ public ReplicationMessage readMessage() throws
+         }
+     }
+ 
+-    /**
+-     * Used to get the host name the slave listens for master
+-     * connections on
+-     *
+-     * @return the host name 
+-     */
+-    public String getHostName() {
+-        return slaveAddress.getHostAddress().getHostName();
+-     }
+-
+-    /**
+-     * Used to get the port number the slave listens for master
+-     * connections on
+-     *
+-     * @return the port number
+-     */
+-    public int getPort() {
+-        return slaveAddress.getPortNumber();
+-     }
+-        
+     /**
+      * Verifies if the <code>SocketConnection</code> is valid.
+      *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
+index ee644418..c2c0ec82 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
+@@ -24,7 +24,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.net.SocketTimeoutException;
+-import java.net.UnknownHostException;
+ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+ import java.security.PrivilegedExceptionAction;
+@@ -80,20 +79,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     /**
+      * Constructor initializes the slave address used in replication.
+      *
+-     * @param hostName a <code>String</code> that contains the host name of
+-     *                 the slave to replicate to.
+-     * @param portNumber an integer that contains the port number of the
+-     *                   slave to replicate to.
+-     * @param dbname The name of the replicated database
+-     *
+-     * @throws UnknownHostException If an exception occurs while trying to
+-     *                              resolve the host name.
++     * @param slaveAddress contains the address (host name and port number)
++     *                     of the slave to connect to.
+      */
+-    public ReplicationMessageTransmit(String hostName, int portNumber,
+-                                      String dbname)
+-        throws UnknownHostException {
+-        this.dbname = dbname;
+-        slaveAddress = new SlaveAddress(hostName, portNumber);
++    public ReplicationMessageTransmit(SlaveAddress slaveAddress) {
++        this.slaveAddress = slaveAddress;
+     }
+     
+     /**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
+index ce64af73..d1b85920 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
+@@ -34,6 +34,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.impl.store.raw.log.LogCounter;
+ import org.apache.derby.iapi.store.raw.log.LogFactory;
+ import org.apache.derby.impl.store.raw.log.LogToFile;
++import org.apache.derby.impl.store.replication.net.SlaveAddress;
+ 
+ import org.apache.derby.impl.store.replication.ReplicationLogger;
+ import org.apache.derby.impl.store.replication.net.ReplicationMessage;
+@@ -43,6 +44,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.io.EOFException;
+ import java.io.IOException;
+ import java.net.SocketTimeoutException;
++import java.net.UnknownHostException;
+ import java.util.Properties;
+ 
+ /**
+@@ -76,8 +78,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private ReplicationMessageReceive receiver;
+     private ReplicationLogger repLogger;
+ 
+-    private String slavehost;
+-    private int slaveport;
++    private SlaveAddress slaveAddr;
+     private String dbname; // The name of the replicated database
+ 
+     /** The instant of the latest log record received from the master 
+@@ -130,11 +131,22 @@ public SlaveController() { }
+     public void boot(boolean create, Properties properties)
+         throws StandardException {
+ 
+-        slavehost = properties.getProperty(Attribute.REPLICATION_SLAVE_HOST);
+-
+         String port = properties.getProperty(Attribute.REPLICATION_SLAVE_PORT);
++        
++        try {
++            //if slavePort is -1 the default port
++            //value will be used.
++            int slavePort = -1;
+         if (port != null) {
+-            slaveport = new Integer(port).intValue();
++                slavePort = (new Integer(port)).intValue();
++            }
++            slaveAddr = new SlaveAddress(
++                    properties.getProperty(Attribute.REPLICATION_SLAVE_HOST), 
++                    slavePort);
++        } catch (UnknownHostException uhe) {
++            throw StandardException.newException
++                    (SQLState.REPLICATION_CONNECTION_EXCEPTION, uhe, 
++                     dbname, getHostName(), String.valueOf(getPortNumber()));
+         }
+ 
+         dbname = properties.getProperty(SlaveFactory.SLAVE_DB);
+@@ -222,11 +234,7 @@ public void startSlave(RawStoreFactory rawStore, LogFactory logFac)
+         // Retry to setup a connection with the master until a
+         // connection has been established or until we are no longer
+         // in replication slave mode
+-        receiver = new ReplicationMessageReceive(slavehost, slaveport, dbname);
+-        // If slaveport was not specified when starting the slave, the
+-        // receiver will use the default port. Set slaveport to the port
+-        // actually used by the receiver
+-        slaveport = receiver.getPort();
++        receiver = new ReplicationMessageReceive(slaveAddr, dbname);
+         while (!setupConnection()) {
+             if (!inReplicationSlaveMode) {
+                 // If we get here, another thread has called
+@@ -351,7 +359,7 @@ private boolean setupConnection() throws StandardException {
+             } else {
+                 throw StandardException.newException
+                     (SQLState.REPLICATION_CONNECTION_EXCEPTION, e,
+-                    dbname, slavehost, String.valueOf(slaveport));
++                    dbname, getHostName(), String.valueOf(getPortNumber()));
+             }
+         }
+     }
+@@ -465,6 +473,24 @@ private void teardownNetwork() {
+         }
+     }
+ 
++    /**
++     * Used to return the host name of the slave.
++     *
++     * @return a String containing the host name of the slave.
++     */
++    private String getHostName() {
++        return slaveAddr.getHostAddress().getHostName();
++    }
++    
++    /**
++     * Used to return the port number of the slave.
++     *
++     * @return an Integer that represents the port number of the slave.
++     */
++    private int getPortNumber() {
++        return slaveAddr.getPortNumber();
++    }
++
+     ///////////////////////////////////////////////////////////////////////////
+     // Inner Class - Thread used to apply chunks of log received from master //
+     ///////////////////////////////////////////////////////////////////////////

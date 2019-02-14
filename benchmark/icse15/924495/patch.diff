@@ -1,0 +1,433 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 024b8d29..99cd00dc 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -33,6 +33,7 @@
+ 
+ import java.io.*;
+ import java.util.*;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.zip.Checksum;
+ import java.util.zip.CRC32;
+ import java.util.concurrent.Callable;
+@@ -172,8 +173,7 @@ public boolean accept(File dir, String name)
+     public static void recover(File[] clogs) throws IOException
+     {
+         Set<Table> tablesRecovered = new HashSet<Table>();
+-        assert StageManager.getStage(StageManager.MUTATION_STAGE).getCompletedTaskCount() == 0;
+-        int rows = 0;
++        final AtomicInteger counter = new AtomicInteger(0);
+         for (File file : clogs)
+         {
+             int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
+@@ -246,16 +246,17 @@ public void runMayThrow() throws IOException
+                         {
+                             Table.open(rm.getTable()).apply(rm, null, false);
+                         }
++                        counter.decrementAndGet();
+                     }
+                 };
+-                StageManager.getStage(StageManager.MUTATION_STAGE).execute(runnable);
+-                rows++;
++                counter.incrementAndGet();
++                StageManager.getStage(StageManager.MUTATION_STAGE).submit(runnable);
+             }
+             reader.close();
+         }
+ 
+         // wait for all the writes to finish on the mutation stage
+-        while (StageManager.getStage(StageManager.MUTATION_STAGE).getCompletedTaskCount() < rows)
++        while (counter.get() > 0)
+         {
+             try
+             {
+@@ -424,6 +425,31 @@ void sync() throws IOException
+         currentSegment().sync();
+     }
+ 
++    public void forceNewSegment()
++    {
++        Callable task = new Callable()
++        {
++            public Object call() throws Exception
++            {
++                sync();
++                segments.add(new CommitLogSegment(currentSegment().getHeader().getColumnFamilyCount()));
++                return null;
++            }
++        };
++        try
++        {
++            executor.submit(task).get();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        catch (ExecutionException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
+     class LogRecordAdder implements Callable<CommitLogSegment.CommitLogContext>
+     {
+         final RowMutation rowMutation;
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/DeletionService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/DeletionService.java
+index 9a534fe4..30c9dd4d 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/DeletionService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/DeletionService.java
+@@ -23,10 +23,10 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+ 
+ import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.NamedThreadFactory;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.utils.WrappedRunnable;
+ 
+@@ -49,40 +49,8 @@ protected void runMayThrow() throws IOException
+         executor.submit(deleter);
+     }
+ 
+-    public static void submitDeleteWithRetry(String file)
++    public static void waitFor() throws InterruptedException, ExecutionException
+     {
+-        submitDeleteWithRetry(file, 0);
+-    }
+-
+-    private static void submitDeleteWithRetry(final String file, final int retryCount)
+-    {
+-        Runnable deleter = new WrappedRunnable()
+-        {
+-            @Override
+-            protected void runMayThrow() throws IOException
+-            {
+-                if (!new File(file).delete())
+-                {
+-                    if (retryCount > MAX_RETRIES)
+-                        throw new IOException("Unable to delete " + file + " after " + MAX_RETRIES + " tries");
+-                    new Thread(new Runnable()
+-                    {
+-                        public void run()
+-                        {
+-                            try
+-                            {
+-                                Thread.sleep(10000);
+-                            }
+-                            catch (InterruptedException e)
+-                            {
+-                                throw new AssertionError(e);
+-                            }
+-                            submitDeleteWithRetry(file, retryCount + 1);
+-                        }
+-                    }, "Delete submission: " + file).start();
+-                }
+-            }
+-        };
+-        executor.submit(deleter);
++        executor.submit(new Runnable() { public void run() { }}).get();
+     }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
+index 02453f14..f0269ba2 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
+@@ -164,7 +164,7 @@ public void sync() throws IOException
+     {
+         if (syncNeeded_)
+         {
+-            flush();
++            flushBuffer();
+             getChannel().force(true); // true, because file length counts as "metadata"
+             syncNeeded_ = false;
+         }
+@@ -172,20 +172,10 @@ public void sync() throws IOException
+ 
+     public void close() throws IOException
+     {
+-        this.flush();
++        sync();
+         this.buff_ = null;
+         super.close();
+     }
+-    
+-    /**
+-     * Flush any bytes in the file's buffer that have not yet been written to
+-     * disk. If the file was created read-only, this method is a no-op.
+-     */
+-    public void flush() throws IOException
+-    {        
+-        this.flushBuffer();
+-    }
+-    
+     /* Flush any dirty bytes in the buffer to disk. */
+     private void flushBuffer() throws IOException
+     {   
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
+index 47b5ccc7..a87ebd15 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -20,7 +20,6 @@
+ 
+ import org.apache.cassandra.concurrent.*;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.gms.FailureDetector;
+ import org.apache.cassandra.gms.IFailureDetectionEventListener;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.net.io.SerializerType;
+@@ -31,12 +30,14 @@
+ 
+ import org.apache.log4j.Logger;
+ 
++import java.io.IOError;
+ import java.io.IOException;
+ import java.net.ServerSocket;
+ import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
+ import java.nio.ByteBuffer;
++import java.nio.channels.AsynchronousCloseException;
+ import java.nio.channels.ServerSocketChannel;
+ import java.security.MessageDigest;
+ import java.util.*;
+@@ -52,8 +53,6 @@
+ 
+     /** we preface every message with this number so the recipient can validate the sender is sane */
+     public static final int PROTOCOL_MAGIC = 0xCA552DFA;
+-    /* Verb Handler for the Response */
+-    public static final String responseVerbHandler_ = "RESPONSE";
+ 
+     /* This records all the results mapped by message Id */
+     private static ExpiringMap<String, IAsyncCallback> callbackMap_;
+@@ -74,10 +73,7 @@
+     
+     public static final MessagingService instance = new MessagingService();
+ 
+-    public static int getVersion()
+-    {
+-        return version_;
+-    }
++    private SocketThread socketThread;
+ 
+     public Object clone() throws CloneNotSupportedException
+     {
+@@ -140,25 +136,8 @@ public void listen(InetAddress localEp) throws IOException
+         final ServerSocket ss = serverChannel.socket();
+         ss.setReuseAddress(true);
+         ss.bind(new InetSocketAddress(localEp, DatabaseDescriptor.getStoragePort()));
+-
+-        new Thread(new Runnable()
+-        {
+-            public void run()
+-            {
+-                while (true)
+-                {
+-                    try
+-                    {
+-                        Socket socket = ss.accept();
+-                        new IncomingTcpConnection(socket).start();
+-                    }
+-                    catch (IOException e)
+-                    {
+-                        throw new RuntimeException(e);
+-                    }
+-                }
+-            }
+-        }, "ACCEPT-" + localEp).start();
++        socketThread = new SocketThread(ss, "ACCEPT-" + localEp);
++        socketThread.start();
+     }
+ 
+     public static OutboundTcpConnectionPool getConnectionPool(InetAddress to)
+@@ -338,13 +317,30 @@ public void stream(String file, long startPosition, long endPosition, InetAddres
+         streamExecutor_.execute(streamingTask);
+     }
+ 
++    /** blocks until the processing pools are empty and done. */
++    public static void waitFor() throws InterruptedException
++    {
++        while (!messageDeserializerExecutor_.isTerminated())
++            messageDeserializerExecutor_.awaitTermination(5, TimeUnit.SECONDS);
++        while (!streamExecutor_.isTerminated())
++            streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
++    }
++
+     public static void shutdown()
+     {
+-        logger_.info("Shutting down ...");
++        logger_.info("Shutting down MessageService...");
++
++        try
++        {
++            instance.socketThread.close();
++        }
++        catch (IOException e)
++        {
++            throw new IOError(e);
++        }
+ 
+         messageDeserializerExecutor_.shutdownNow();
+         streamExecutor_.shutdownNow();
+-        StageManager.shutdownNow();
+ 
+         /* shut down the cachetables */
+         taskCompletionMap_.shutdown();
+@@ -396,11 +392,6 @@ public static void validateMagic(int magic) throws IOException
+             throw new IOException("invalid protocol header");
+     }
+     
+-    public static boolean isEqual(byte digestA[], byte digestB[])
+-    {
+-        return MessageDigest.isEqual(digestA, digestB);
+-    }
+-
+     public static int getBits(int x, int p, int n)
+     {
+         return x >>> (p + 1) - n & ~(-1 << n);
+@@ -466,4 +457,43 @@ public static ByteBuffer constructStreamHeader(boolean compress)
+         buffer.flip();
+         return buffer;
+     }
++    
++    private class SocketThread extends Thread
++    {
++        private final ServerSocket server;
++        
++        SocketThread(ServerSocket server, String name)
++        {
++            super(name);
++            this.server = server;
++        }
++
++        public void run()
++        {
++            while (true)
++            {
++                try
++                {
++                    Socket socket = server.accept();
++                    new IncomingTcpConnection(socket).start();
++                }
++                catch (AsynchronousCloseException e)
++                {
++                    // this happens when another thread calls close().
++                    logger_.info("MessagingService shutting down server thread.");
++                    break;
++                }
++                catch (IOException e)
++                {
++                    throw new RuntimeException(e);
++                }
++            }
++        }
++        
++        void close() throws IOException
++        {
++            server.close();
++        }
++    }
++
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+index f783066e..016f67d3 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+@@ -37,8 +37,10 @@
+ import org.apache.cassandra.concurrent.*;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
++import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.dht.*;
+ import org.apache.cassandra.gms.*;
++import org.apache.cassandra.io.DeletionService;
+ import org.apache.cassandra.io.SSTable;
+ import org.apache.cassandra.io.SSTableReader;
+ import org.apache.cassandra.locator.*;
+@@ -271,6 +273,7 @@ public void stopClient()
+         Gossiper.instance.unregister(this);
+         Gossiper.instance.stop();
+         MessagingService.shutdown();
++        StageManager.shutdownNow();
+     }
+ 
+     public synchronized void initClient() throws IOException
+@@ -1307,6 +1310,7 @@ public void run()
+             {
+                 Gossiper.instance.stop();
+                 MessagingService.shutdown();
++                StageManager.shutdownNow();
+                 setMode("Decommissioned", true);
+                 // let op be responsible for killing the process
+             }
+@@ -1509,6 +1513,46 @@ public String getOperationMode()
+         return operationMode;
+     }
+ 
++    /** shuts node off to writes, empties memtables and the commit log. */
++    public synchronized void drain() throws IOException, InterruptedException, ExecutionException
++    {
++        ExecutorService mutationStage = StageManager.getStage(StageManager.MUTATION_STAGE);
++        if (mutationStage.isTerminated())
++        {
++            logger_.warn("Cannot drain node (did it already happen?)");
++            return;
++        }
++        setMode("Starting drain process", true);
++        Gossiper.instance.stop();
++        setMode("Draining: shutting down MessageService", false);
++        MessagingService.shutdown();
++        setMode("Draining: emptying MessageService pools", false);
++        MessagingService.waitFor();
++       
++        // lets flush.
++        setMode("Draining: flushing column families", false);
++        for (String tableName : DatabaseDescriptor.getNonSystemTables())
++            for (Future f : Table.open(tableName).flush())
++                f.get();
++       
++
++        setMode("Draining: replaying commit log", false);
++        CommitLog.instance().forceNewSegment();
++        // want to make sure that any segments deleted as a result of flushing are gone.
++        DeletionService.waitFor();
++        CommitLog.recover();
++       
++        // commit log recovery just sends work to the mutation stage. (there could have already been work there anyway.  
++        // Either way, we need to let this one drain naturally, and then we're finished.
++        setMode("Draining: clearing mutation stage", false);
++        mutationStage.shutdown();
++        while (!mutationStage.isTerminated())
++            mutationStage.awaitTermination(5, TimeUnit.SECONDS);
++       
++        setMode("Node is drained", true);
++    }
++    
++
+     // Never ever do this at home. Used by tests.
+     Map<String, AbstractReplicationStrategy> setReplicationStrategyUnsafe(Map<String, AbstractReplicationStrategy> replacement)
+     {
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 638430ec..5d9c12dc 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -23,6 +23,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.FutureTask;
+ 
+ import org.apache.cassandra.dht.Range;
+@@ -165,4 +166,8 @@
+ 
+     /** get the operational mode (leaving, joining, normal, decommissioned, client) **/
+     public String getOperationMode();
++    
++    /** makes node unavailable for writes, flushes memtables and replays commitlog. */
++    public void drain() throws IOException, InterruptedException, ExecutionException;
++    
+ }

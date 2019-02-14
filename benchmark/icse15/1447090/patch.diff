@@ -1,0 +1,144 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index 98411192..319b79ae 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -221,7 +221,12 @@ public String getDataDir() {
+   }
+ 
+   public String getIndexDir() {  
+-    return dataDir + "index/";
++    synchronized (searcherLock) {
++      if (_searcher == null) return getNewIndexDir();
++      SolrIndexSearcher searcher = _searcher.get();
++      return searcher.getPath() == null ? dataDir + "index/" : searcher
++          .getPath();
++    }
+   }
+ 
+ 
+@@ -397,6 +402,11 @@ public SolrCore reload(SolrResourceLoader resourceLoader, SolrCore prev) throws
+     
+     solrCoreState.increfSolrCoreState();
+     
++    if (!getNewIndexDir().equals(getIndexDir())) {
++      // the directory is changing, don't pass on state
++      prev = null;
++    }
++    
+     SolrCore core = new SolrCore(getName(), getDataDir(), config,
+         schema, coreDescriptor, updateHandler, prev);
+     core.solrDelPolicy = this.solrDelPolicy;
+@@ -1366,7 +1376,7 @@ public UpdateHandler getUpdateHandler() {
+         }
+ 
+        // for now, turn off caches if this is for a realtime reader (caches take a little while to instantiate)
+-        tmp = new SolrIndexSearcher(this, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
++        tmp = new SolrIndexSearcher(this, newIndexDir, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
+ 
+       } else {
+         // newestSearcher == null at this point
+@@ -1376,7 +1386,7 @@ public UpdateHandler getUpdateHandler() {
+           // so that we pick up any uncommitted changes and so we don't go backwards
+           // in time on a core reload
+           DirectoryReader newReader = newReaderCreator.call();
+-          tmp = new SolrIndexSearcher(this, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
++          tmp = new SolrIndexSearcher(this, newIndexDir, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
+         } else {
+          // normal open that happens at startup
+         // verbose("non-reopen START:");
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+index 4df241d4..ecd074a0 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+@@ -103,7 +103,7 @@ void createSnapshot(final IndexCommit indexCommit, int numberToKeep, Replication
+       Collection<String> files = indexCommit.getFileNames();
+       FileCopier fileCopier = new FileCopier();
+       
+-      Directory dir = solrCore.getDirectoryFactory().get(solrCore.getNewIndexDir(), DirContext.DEFAULT, solrCore.getSolrConfig().indexConfig.lockType);
++      Directory dir = solrCore.getDirectoryFactory().get(solrCore.getIndexDir(), DirContext.DEFAULT, solrCore.getSolrConfig().indexConfig.lockType);
+       try {
+         fileCopier.copyFiles(dir, files, snapShotDir);
+       } finally {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
+index fbcaf278..eae3fe23 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
+@@ -610,13 +610,17 @@ protected boolean handleUnloadAction(SolrQueryRequest req,
+       }
+       if (params.getBool(CoreAdminParams.DELETE_INDEX, false)) {
+         core.addCloseHook(new CloseHook() {
++          private String indexDir;
++          
+           @Override
+-          public void preClose(SolrCore core) {}
++          public void preClose(SolrCore core) {
++            indexDir = core.getIndexDir();
++          }
+           
+           @Override
+           public void postClose(SolrCore core) {
+             try {
+-              core.getDirectoryFactory().remove(core.getIndexDir());
++              core.getDirectoryFactory().remove(indexDir);
+             } catch (IOException e) {
+               throw new RuntimeException(e);
+             }
+@@ -1026,11 +1030,8 @@ private long getIndexSize(SolrCore core) {
+     Directory dir;
+     long size = 0;
+     try {
+-      if (!core.getDirectoryFactory().exists(core.getIndexDir())) {
+-        dir = core.getDirectoryFactory().get(core.getNewIndexDir(), DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType);
+-      } else {
++
+         dir = core.getDirectoryFactory().get(core.getIndexDir(), DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType); 
+-      }
+ 
+       try {
+         size = DirectoryFactory.sizeOfDirectory(dir);
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+index 756e0a43..fd0801ba 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+@@ -117,26 +117,16 @@
+   private DirectoryFactory directoryFactory;
+   
+   private final AtomicReader atomicReader; 
++  private String path; 
+ 
+   public SolrIndexSearcher(SolrCore core, String path, IndexSchema schema, SolrIndexConfig config, String name, boolean enableCache, DirectoryFactory directoryFactory) throws IOException {
+     // we don't need to reserve the directory because we get it from the factory
+-    this(core, schema,name, core.getIndexReaderFactory().newReader(directoryFactory.get(path, DirContext.DEFAULT, config.lockType), core), true, enableCache, false, directoryFactory);
++    this(core, path, schema,name, core.getIndexReaderFactory().newReader(directoryFactory.get(path, DirContext.DEFAULT, config.lockType), core), true, enableCache, false, directoryFactory);
+   }
+ 
+-  private static String getIndexDir(Directory dir) {
+-    if (dir instanceof FSDirectory) {
+-      return ((FSDirectory)dir).getDirectory().getAbsolutePath();
+-    } else if (dir instanceof NRTCachingDirectory) {
+-      // recurse on the delegate
+-      return getIndexDir(((NRTCachingDirectory) dir).getDelegate());
+-    } else {
+-      log.warn("WARNING: Directory impl does not support setting indexDir: " + dir.getClass().getName());
+-      return null;
+-    }
+-  }
+-
+-  public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, DirectoryReader r, boolean closeReader, boolean enableCache, boolean reserveDirectory, DirectoryFactory directoryFactory) throws IOException {
++  public SolrIndexSearcher(SolrCore core, String path, IndexSchema schema, String name, DirectoryReader r, boolean closeReader, boolean enableCache, boolean reserveDirectory, DirectoryFactory directoryFactory) throws IOException {
+     super(r);
++    this.path = path;
+     this.directoryFactory = directoryFactory;
+     this.reader = r;
+     this.atomicReader = SlowCompositeReaderWrapper.wrap(r);
+@@ -211,6 +201,10 @@ public SolrIndexSearcher(SolrCore core, IndexSchema schema, String name, Directo
+     numOpens.incrementAndGet();
+   }
+ 
++  public String getPath() {
++    return path;
++  }
++
+   @Override
+   public String toString() {
+     return name + "{" + reader + "}";

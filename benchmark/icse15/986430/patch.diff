@@ -1,0 +1,212 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 5da2697a..ef0b1fee 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -134,7 +134,7 @@ public boolean accept(File dir, String name)
+ 
+     final CFMetaData metadata;
+ 
+-    ColumnFamilyStore(String table, String columnFamilyName, IPartitioner partitioner, int generation, CFMetaData metadata)
++    private ColumnFamilyStore(String table, String columnFamilyName, IPartitioner partitioner, int generation, CFMetaData metadata)
+     {
+         assert metadata != null : "null metadata for " + table + ":" + columnFamilyName;
+         table_ = table;
+@@ -147,47 +147,13 @@ public boolean accept(File dir, String name)
+ 
+         if (logger_.isDebugEnabled())
+             logger_.debug("Starting CFS {}", columnFamily_);
++        
+         // scan for data files corresponding to this CF
+         List<File> sstableFiles = new ArrayList<File>();
+-        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
+-        for (File file : files())
+-        {
+-            String filename = file.getName();
+-
+-            /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
+-            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
+-            if (matcher.matches())
+-            {
+-                String basePath = matcher.group(1);
+-                if (!new File(basePath + "-Data.db").exists())
+-                {
+-                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
+-                    try
+-                    {
+-                        FileUtils.deleteWithConfirm(file);
+-                    }
+-                    catch (IOException e)
+-                    {
+-                        throw new IOError(e);
+-                    }
+-                    continue;
+-                }
+-            }
+ 
+-            if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
+-            {
+-                try
++        for (File file : files(table, columnFamilyName))
+                 {
+-                    FileUtils.deleteWithConfirm(file);
+-                }
+-                catch (IOException e)
+-                {
+-                    throw new IOError(e);
+-                }
+-                continue;
+-            }
+-
+-            if (filename.contains("-Data.db"))
++            if (file.getName().contains("-Data.db"))
+             {
+                 sstableFiles.add(file.getAbsoluteFile());
+             }
+@@ -308,7 +274,7 @@ public static ColumnFamilyStore createColumnFamilyStore(String table, String col
+         return createColumnFamilyStore(table, columnFamily, StorageService.getPartitioner(), DatabaseDescriptor.getCFMetaData(table, columnFamily));
+     }
+ 
+-    public static ColumnFamilyStore createColumnFamilyStore(String table, String columnFamily, IPartitioner partitioner, CFMetaData metadata)
++    public static synchronized ColumnFamilyStore createColumnFamilyStore(String table, String columnFamily, IPartitioner partitioner, CFMetaData metadata)
+     {
+         /*
+          * Get all data files associated with old Memtables for this table.
+@@ -342,18 +308,92 @@ public static ColumnFamilyStore createColumnFamilyStore(String table, String col
+         return new ColumnFamilyStore(table, columnFamily, partitioner, value, metadata);
+     }
+ 
+-    private Set<File> files()
++    // remove unnecessary files from the cf directory. these include temp files, orphans and zero-length files.
++    static void scrubDataDirectories(String table, String columnFamily)
++    {
++        /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
++        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
++        for (File file : files(table, columnFamily))
++        {
++            String filename = file.getName();
++            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
++            if (matcher.matches())
++            {
++                String basePath = matcher.group(1);
++                if (!new File(basePath + "-Data.db").exists())
++                {
++                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
++                    try
++                    {
++                        FileUtils.deleteWithConfirm(file);
++                    }
++                    catch (IOException e)
++                    {
++                        throw new IOError(e);
++                    }
++                }
++            }
++            else if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
++            {
++                try
++                {
++                    FileUtils.deleteWithConfirm(file);
++                }
++                catch (IOException e)
++                {
++                    throw new IOError(e);
++                }
++            }
++        }
++    }
++    
++    // returns runnables that need to update the system table.
++    static Collection<Runnable> deleteCompactedFiles(String table, String columnFamily)
++    {
++        Collection<Runnable> runnables = new ArrayList<Runnable>();
++        for (File file : files(table, columnFamily))
++        {
++            if (file.getName().contains("-Data.db"))
++            {
++                if (SSTable.deleteIfCompacted(file.getAbsolutePath()))
++                {
++                    final String delPath = file.getAbsolutePath();
++                    runnables.add(new Runnable()
++                    {
++                        public void run()
++                        {
++                            try
++                            {
++                                StatisticsTable.deleteSSTableStatistics(delPath);
++                            }
++                            catch (IOException ex)
++                            {
++                                throw new RuntimeException(ex);
++                            }
++                        }
++                    });
++                }
++            }
++        }
++        return runnables;
++    }
++
++    private static Set<File> files(String table, String columnFamily)
+     {
++        assert table != null;
++        assert columnFamily != null;
+         Set<File> fileSet = new HashSet<File>();
+-        for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table_))
++        for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table))
+         {
+             File[] files = new File(directory).listFiles(DB_NAME_FILTER);
++            if (files == null)
++                continue;
+             for (File file : files)
+             {
+                 if (file.isDirectory())
+                     continue;
+                 String cfName = getColumnFamilyFromFileName(file.getAbsolutePath());
+-                if (cfName.equals(columnFamily_))
++                if (cfName.equals(columnFamily))
+                     fileSet.add(file);
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 1e8ec7f7..06d6ffc3 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -100,8 +100,18 @@ public static Table open(String table)
+                 tableInstance = instances.get(table);
+                 if (tableInstance == null)
+                 {
++                    // do some housekeeping on the column families.
++                    Collection<Runnable> systemTableUpdates = new ArrayList<Runnable>();
++                    for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
++                    {
++                        ColumnFamilyStore.scrubDataDirectories(table, cfm.cfName);
++                        systemTableUpdates.addAll(ColumnFamilyStore.deleteCompactedFiles(table, cfm.cfName)); 
++                    }
+                     tableInstance = new Table(table);
+                     instances.put(table, tableInstance);
++                    
++                    for (Runnable r : systemTableUpdates)
++                        r.run();
+                 }
+             }
+         }
+@@ -256,7 +266,6 @@ private Table(String table)
+             {
+                 throw new RuntimeException(e);
+             }
+-
+         }
+ 
+         // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+index ffa22f29..9b1b8833 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+@@ -133,7 +133,6 @@ public static boolean deleteIfCompacted(String dataFilename)
+                 FileUtils.deleteWithConfirm(new File(SSTable.indexFilename(dataFilename)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.filterFilename(dataFilename)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.compactedFilename(dataFilename)));
+-                StatisticsTable.deleteSSTableStatistics(dataFilename);
+             }
+             catch (IOException e)
+             {

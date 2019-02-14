@@ -1,0 +1,220 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraServer.java b/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraServer.java
+index 040a6347..c1f50d4b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraServer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraServer.java
+@@ -822,7 +822,7 @@ protected void checkKeyspaceAndLoginAuthorized(Permission perm) throws InvalidRe
+      */
+     private void schedule()
+     {
+-        requestScheduler.queue(Thread.currentThread(), clientState.getSchedulingId());
++        requestScheduler.queue(Thread.currentThread(), clientState.getSchedulingValue());
+     }
+ 
+     /**
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/RequestSchedulerOptions.java b/cassandra/trunk/src/java/org/apache/cassandra/config/RequestSchedulerOptions.java
+index 601b4a0a..1cf12b46 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/RequestSchedulerOptions.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/RequestSchedulerOptions.java
+@@ -1,4 +1,6 @@
+ package org.apache.cassandra.config;
++
++import java.util.Map;
+ /*
+  * 
+  * Licensed to the Apache Software Foundation (ASF) under one
+@@ -25,5 +27,10 @@
+  */
+ public class RequestSchedulerOptions
+ {
+-    public Integer throttle_limit = 80;
++    public static final Integer DEFAULT_THROTTLE_LIMIT = 80;
++    public static final Integer DEFAULT_WEIGHT = 1;
++
++    public Integer throttle_limit = DEFAULT_THROTTLE_LIMIT;
++    public Integer default_weight = DEFAULT_WEIGHT;
++    public Map<String, Integer> weights;
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/scheduler/RoundRobinScheduler.java b/cassandra/trunk/src/java/org/apache/cassandra/scheduler/RoundRobinScheduler.java
+index cf5949d0..09dbb8ae 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/scheduler/RoundRobinScheduler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/scheduler/RoundRobinScheduler.java
+@@ -26,6 +26,7 @@
+ import java.util.concurrent.SynchronousQueue;
+ 
+ import org.apache.cassandra.config.RequestSchedulerOptions;
++import org.apache.cassandra.utils.Pair;
+ import org.cliffc.high_scale_lib.NonBlockingHashMap;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -34,11 +35,14 @@
+  * A very basic Round Robin implementation of the RequestScheduler. It handles 
+  * request groups identified on user/keyspace by placing them in separate 
+  * queues and servicing a request from each queue in a RoundRobin fashion. 
++ * It optionally adds weights for each round.
+  */
+ public class RoundRobinScheduler implements IRequestScheduler
+ {
+     private static final Logger logger = LoggerFactory.getLogger(RoundRobinScheduler.class);
+-    private final NonBlockingHashMap<String, SynchronousQueue<Thread>> queues;
++
++    //The Pair is the weighted queue - the left is the weight and the right is the queue
++    private final NonBlockingHashMap<String, Pair<Integer, SynchronousQueue<Thread>>> queues;
+     private static boolean started = false;
+ 
+     private final Semaphore taskCount;
+@@ -46,12 +50,18 @@
+     // Used by the the scheduler thread so we don't need to busy-wait until there is a request to process
+     private final Semaphore queueSize = new Semaphore(0, false);
+ 
++    private Integer defaultWeight;
++    private Map<String, Integer> weights;
++
+     public RoundRobinScheduler(RequestSchedulerOptions options)
+     {
+         assert !started;
+ 
++        defaultWeight = options.default_weight;
++        weights = options.weights;
++
+         taskCount = new Semaphore(options.throttle_limit);
+-        queues = new NonBlockingHashMap<String, SynchronousQueue<Thread>>();
++        queues = new NonBlockingHashMap<String, Pair<Integer, SynchronousQueue<Thread>>>();
+         Runnable runnable = new Runnable()
+         {
+             public void run()
+@@ -70,12 +80,12 @@ public void run()
+ 
+     public void queue(Thread t, String id)
+     {
+-        SynchronousQueue<Thread> queue = getQueue(id);
++        Pair<Integer, SynchronousQueue<Thread>> weightedQueue = getWeightedQueue(id);
+ 
+         try
+         {
+             queueSize.release();
+-            queue.put(t);
++            weightedQueue.right.put(t);
+         }
+         catch (InterruptedException e)
+         {
+@@ -90,16 +100,28 @@ public void release()
+ 
+     private void schedule()
+     {
++        int weight;
++        SynchronousQueue<Thread> queue;
++        Thread t;
++
+         queueSize.acquireUninterruptibly();
+-        for (SynchronousQueue<Thread> queue : queues.values())
++        for (Map.Entry<String,Pair<Integer, SynchronousQueue<Thread>>> request : queues.entrySet())
+         {
+-            Thread t = queue.poll();
+-            if (t != null)
++            weight = request.getValue().left;
++            queue = request.getValue().right;
++            //Using the weight, process that many requests at a time (for that scheduler id)
++            for (int i=0; i<weight; i++)
++            {
++                t = queue.poll();
++                if (t == null)
++                    break;
++                else
+             {
+                 taskCount.acquireUninterruptibly();
+                 queueSize.acquireUninterruptibly();
+             }
+         }
++        }
+         queueSize.release();
+     }
+ 
+@@ -107,25 +129,32 @@ private void schedule()
+      * Get the Queue for the respective id, if one is not available 
+      * create a new queue for that corresponding id and return it
+      */
+-    private SynchronousQueue<Thread> getQueue(String id)
++    private Pair<Integer, SynchronousQueue<Thread>> getWeightedQueue(String id)
+     {
+-        SynchronousQueue<Thread> queue = queues.get(id);
+-        if (queue != null)
++        Pair<Integer, SynchronousQueue<Thread>> weightedQueue = queues.get(id);
++        if (weightedQueue != null)
+             // queue existed
+-            return queue;
++            return weightedQueue;
+ 
+-        SynchronousQueue<Thread> maybenew = new SynchronousQueue<Thread>(true);
+-        queue = queues.putIfAbsent(id, maybenew);
+-        if (queue == null)
++        Pair<Integer, SynchronousQueue<Thread>> maybenew = new Pair(getWeight(id), new SynchronousQueue<Thread>(true));
++        weightedQueue = queues.putIfAbsent(id, maybenew);
++        if (weightedQueue == null)
+             // created new queue
+             return maybenew;
+ 
+         // another thread created the queue
+-        return queue;
++        return weightedQueue;
+     }
+ 
+     Semaphore getTaskCount()
+     {
+         return taskCount;
+     }
++
++    private int getWeight(String weightingVar)
++    {
++        return (weights != null && weights.containsKey(weightingVar))
++                ? weights.get(weightingVar)
++                : defaultWeight;
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/ClientState.java b/cassandra/trunk/src/java/org/apache/cassandra/service/ClientState.java
+index cd536f19..1c2cd35d 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/ClientState.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/ClientState.java
+@@ -39,9 +39,6 @@
+ {
+     private static Logger logger = LoggerFactory.getLogger(ClientState.class);
+     
+-    // true if the keyspace should be used as the scheduling id
+-    private final boolean SCHEDULE_ON_KEYSPACE = DatabaseDescriptor.getRequestSchedulerId().equals(RequestSchedulerId.keyspace);
+-
+     // Current user for the session
+     private final ThreadLocal<AuthenticatedUser> user = new ThreadLocal<AuthenticatedUser>()
+     {
+@@ -80,11 +77,16 @@ public void setKeyspace(String ks)
+         updateKeyspaceAccess();
+     }
+ 
+-    public String getSchedulingId()
++    public String getSchedulingValue()
+     {
+-        if (SCHEDULE_ON_KEYSPACE)
+-            return keyspace.get();
+-        return "default";
++        String schedulingValue = "default";
++        switch(DatabaseDescriptor.getRequestSchedulerId())
++        {
++            case keyspace:
++                schedulingValue = keyspace.get();
++                break;
++        }
++        return schedulingValue;
+     }
+ 
+     /**
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+index f3ac08a9..434d6434 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+@@ -615,7 +615,7 @@ public void login(AuthenticationRequest auth_request) throws AuthenticationExcep
+      */
+     private void schedule()
+     {
+-        requestScheduler.queue(Thread.currentThread(), clientState.getSchedulingId());
++        requestScheduler.queue(Thread.currentThread(), clientState.getSchedulingValue());
+     }
+ 
+     /**

@@ -1,0 +1,146 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
+index 0eabbab8..214cae88 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
+@@ -35,9 +35,11 @@
+ {
+     private static ICompactSerializer<FileStatus> serializer_;
+ 
+-    public static enum StreamCompletionAction
++    static enum Action
+     {
++        // was received successfully, and can be deleted from the source node
+         DELETE,
++        // needs to be streamed (or restreamed)
+         STREAM
+     }
+ 
+@@ -51,15 +53,18 @@
+         return serializer_;
+     }
+ 
+-    private String file_;
+-    private long expectedBytes_;
+-    private StreamCompletionAction action_;
++    private final String file_;
++    private final long expectedBytes_;
++    private Action action_;
+ 
++    /**
++     * Create a FileStatus with the default Action: STREAM.
++     */
+     public FileStatus(String file, long expectedBytes)
+     {
+         file_ = file;
+         expectedBytes_ = expectedBytes;
+-        action_ = StreamCompletionAction.DELETE;
++        action_ = Action.STREAM;
+     }
+ 
+     public String getFile()
+@@ -72,12 +77,12 @@ public long getExpectedBytes()
+         return expectedBytes_;
+     }
+ 
+-    public void setAction(StreamCompletionAction action)
++    public void setAction(Action action)
+     {
+         action_ = action;
+     }
+ 
+-    public StreamCompletionAction getAction()
++    public Action getAction()
+     {
+         return action_;
+     }
+@@ -106,14 +111,12 @@ public FileStatus deserialize(DataInputStream dis) throws IOException
+             FileStatus streamStatus = new FileStatus(targetFile, expectedBytes);
+ 
+             int ordinal = dis.readInt();
+-            if ( ordinal == StreamCompletionAction.DELETE.ordinal() )
+-            {
+-                streamStatus.setAction(StreamCompletionAction.DELETE);
+-            }
+-            else if ( ordinal == StreamCompletionAction.STREAM.ordinal() )
+-            {
+-                streamStatus.setAction(StreamCompletionAction.STREAM);
+-            }
++            if (ordinal == Action.DELETE.ordinal())
++                streamStatus.setAction(Action.DELETE);
++            else if (ordinal == Action.STREAM.ordinal())
++                streamStatus.setAction(Action.STREAM);
++            else
++                throw new IOException("Bad FileStatus.Action: " + ordinal);
+ 
+             return streamStatus;
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+index f207aed3..fd0dff4a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+@@ -42,16 +42,15 @@
+ 
+     public void onStatusChange(InetAddress host, PendingFile pendingFile, FileStatus streamStatus) throws IOException
+     {
+-        if (FileStatus.StreamCompletionAction.STREAM == streamStatus.getAction())
++        if (FileStatus.Action.STREAM == streamStatus.getAction())
+         {
+             // file needs to be restreamed
+-            logger.warn("Streaming of file " + pendingFile + " from " + host + " failed, but will be retried.");
+-            // request that the source node re-stream the file
++            logger.warn("Streaming of file " + pendingFile + " from " + host + " failed: requesting a retry.");
+             MessagingService.instance.sendOneWay(streamStatus.makeStreamStatusMessage(), host);
+             return;
+         }
+-        assert FileStatus.StreamCompletionAction.DELETE == streamStatus.getAction() :
+-            "Unknown stream status: " + streamStatus.getAction();
++        assert FileStatus.Action.DELETE == streamStatus.getAction() :
++            "Unknown stream action: " + streamStatus.getAction();
+ 
+         // file was successfully streamed: if it was the last component of an sstable, assume that the rest
+         // have already arrived
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index ae69aa37..90d51a87 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -68,7 +68,7 @@ public void read() throws IOException
+         catch (IOException ex)
+         {
+             /* Ask the source node to re-stream this file. */
+-            streamStatus.setAction(FileStatus.StreamCompletionAction.STREAM);
++            streamStatus.setAction(FileStatus.Action.STREAM);
+             handleFileStatus(remoteAddress.getAddress());
+             /* Delete the orphaned file. */
+             File file = new File(pendingFile.getFilename());
+@@ -84,10 +84,9 @@ public void read() throws IOException
+         if (bytesRead == pendingFile.getExpectedBytes())
+         {
+             if (logger.isDebugEnabled())
+-            {
+                 logger.debug("Removing stream context " + pendingFile);
+-            }
+             fc.close();
++            streamStatus.setAction(FileStatus.Action.DELETE);
+             handleFileStatus(remoteAddress.getAddress());
+         }
+     }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
+index 54d5788e..3024e724 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
+@@ -53,13 +53,12 @@ public void doVerb(Message message)
+                     break;
+ 
+                 case STREAM:
+-                    if (logger.isDebugEnabled())
+-                        logger.debug("Need to re-stream file " + streamStatus.getFile());
++                    logger.warn("Need to re-stream file " + streamStatus.getFile() + " to " + message.getFrom());
+                     StreamOutManager.get(message.getFrom()).startNext();
+                     break;
+ 
+                 default:
+-                    break;
++                    throw new RuntimeException("Cannot handle FileStatus.Action: " + streamStatus.getAction());
+             }
+         }
+         catch (IOException ex)

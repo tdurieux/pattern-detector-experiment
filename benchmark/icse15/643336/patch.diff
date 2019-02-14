@@ -1,0 +1,153 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+index 3e875741..05424510 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+@@ -269,12 +269,13 @@ is at the default location (underneath the database directory), this
+ 
+ 	/**	
+ 	 * redoing a checkpoint  during rollforward recovery
+-	 @param cinstant The LogInstant of the checkpoint
+-	 @param redoLWM  Redo Low Water Mark in the check point record
+-	 @param df - the data factory
+-	 @exception StandardException - encounter exception during checkpoint
++	 * @param cinstant The LogInstant of the checkpoint
++	 * @param redoLWM  Redo Low Water Mark in the check point record
++	 * @param undoLWM Undo Low Water Mark in the checkpoint
++	 * @param df - the data factory
++	 * @exception StandardException - encounter exception during checkpoint
+ 	 */
+-	public void checkpointInRFR(LogInstant cinstant, long redoLWM, 
++	public void checkpointInRFR(LogInstant cinstant, long redoLWM, long undoLWM,
+ 								DataFactory df) throws StandardException;
+ 
+ 	
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/xact/RawTransaction.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/xact/RawTransaction.java
+index 4b2c92b1..2895fc8e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/xact/RawTransaction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/xact/RawTransaction.java
+@@ -321,10 +321,16 @@ public void notifyObservers(Object arg) {
+ 
+ 
+ 	/**	
+-	 * redo a checkpoint during rollforward recovery
++     * Redo a checkpoint during rollforward recovery.
++     *
++     * @param cinstant The LogInstant of the checkpoint
++     * @param redoLWM  Redo Low Water Mark in the check point record
++     * @param undoLWM Undo Low Water Mark in the checkpoint
++     * @exception StandardException Exception encountered during checkpoint
+ 	 */
+ 	public abstract void checkpointInRollForwardRecovery(LogInstant cinstant,
+-														 long redoLWM) 
++														 long redoLWM,
++														 long undoLWM)
+ 		throws StandardException;
+ 
+ 	
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/CheckpointOperation.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/CheckpointOperation.java
+index b1983314..75fae6e9 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/CheckpointOperation.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/CheckpointOperation.java
+@@ -132,7 +132,8 @@ public void doMe(Transaction xact, LogInstant instant, LimitObjectInput in) thro
+ 		//redo the checkpoint if we are in roll-forward recovery only
+ 		if(((RawTransaction)xact).inRollForwardRecovery())
+ 		{
+-			((RawTransaction)xact).checkpointInRollForwardRecovery(instant, redoLWM);
++			((RawTransaction)xact).
++				checkpointInRollForwardRecovery(instant, redoLWM, undoLWM);
+ 		}
+ 		return;
+ 	}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+index 15b9c7fa..4a3baa45 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+@@ -2194,13 +2194,20 @@ private void flushBuffer(long fileNumber, long wherePosition)
+ 	 */
+ 	private void truncateLog(CheckpointOperation checkpoint)
+ 	{
+-		long oldFirstLog;
+ 		long firstLogNeeded;
++		if ((firstLogNeeded = getFirstLogNeeded(checkpoint))==-1)
++			return;
++		truncateLog(firstLogNeeded);
++	}
+ 
++	/** Get rid of old and unnecessary log files
++	 * @param firstLogNeeded The log file number of the oldest log file
++	 * needed for recovery.
++	 */
++	private void truncateLog(long firstLogNeeded) {
++		long oldFirstLog;
+ 		if (keepAllLogs)
+ 			return;
+-		if ((firstLogNeeded = getFirstLogNeeded(checkpoint))==-1)
+-			return;
+ 		
+ 		// when  backup is in progress, log files that are yet to
+         // be copied to the backup should not be deleted,  even 
+@@ -5049,8 +5056,12 @@ public boolean inRFR()
+ 
+ 	/**	
+ 	 *	redo a checkpoint during rollforward recovery
++     * 
++     * @throws org.apache.derby.iapi.error.StandardException 
+ 	*/
+-	public void checkpointInRFR(LogInstant cinstant, long redoLWM, DataFactory df) throws StandardException
++	public void checkpointInRFR(LogInstant cinstant, long redoLWM,
++								long undoLWM, DataFactory df)
++								throws StandardException
+ 	{
+ 		//sync the data
+ 		df.checkpoint();
+@@ -5073,6 +5084,9 @@ public void checkpointInRFR(LogInstant cinstant, long redoLWM, DataFactory df) t
+ 		//remove the stub files
+ 		df.removeDroppedContainerFileStubs(new LogCounter(redoLWM));
+ 		
++		if (inReplicationSlaveMode) {
++			truncateLog(LogCounter.getLogFileNumber(undoLWM));
++		}
+ 	}
+ 
+     /**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
+index 550bcab8..c9bdf2a8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
+@@ -321,9 +321,11 @@ public boolean inRFR()
+ 	}
+ 
+ 	/**	
+-		perform a  checkpoint during rollforward recovery
++	 *	Perform a checkpoint during rollforward recovery.
++     * 
++     * @throws org.apache.derby.iapi.error.StandardException 
+ 	*/
+-	public void checkpointInRFR(LogInstant cinstant, long redoLWM, 
++	public void checkpointInRFR(LogInstant cinstant, long redoLWM, long undoLWM,
+ 								DataFactory df) throws StandardException
+ 	{
+ 		//do nothing
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
+index a969d0f5..3f910a6d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
+@@ -2745,13 +2745,15 @@ public boolean inRollForwardRecovery()
+ 
+ 
+ 	/**	
+-		perform a  checkpoint during rollforward recovery
++	 * Perform a checkpoint during rollforward recovery.
++     * 
++     * @throws org.apache.derby.iapi.error.StandardException 
+ 	*/
+ 	public void checkpointInRollForwardRecovery(LogInstant cinstant,
+-												long redoLWM) 
++												long redoLWM, long undoLWM)
+ 		throws StandardException
+ 	{
+-		logFactory.checkpointInRFR(cinstant, redoLWM, dataFactory);
++		logFactory.checkpointInRFR(cinstant, redoLWM, undoLWM, dataFactory);
+ 	}
+ 
+ }

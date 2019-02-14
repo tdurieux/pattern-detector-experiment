@@ -1,0 +1,304 @@
+diff --git a/lucene/dev/branches/branch_3x/solr/src/common/org/apache/solr/common/params/SpellingParams.java b/lucene/dev/branches/branch_3x/solr/src/common/org/apache/solr/common/params/SpellingParams.java
+index 71d2aa5f..fb175215 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/common/org/apache/solr/common/params/SpellingParams.java
++++ b/lucene/dev/branches/branch_3x/solr/src/common/org/apache/solr/common/params/SpellingParams.java
+@@ -96,6 +96,14 @@
+    * </p>
+    */
+   public static final String SPELLCHECK_MAX_COLLATION_TRIES = SPELLCHECK_PREFIX + "maxCollationTries";
++  /**
++   * <p>
++   * The maximum number of word correction combinations to rank and evaluate prior to deciding which collation
++   * candidates to test against the index.  This is a performance safety-net in cases a user enters a query with
++   * many misspelled words.  The default is 10,000 combinations. 
++   * </p>
++   */
++  public static final String SPELLCHECK_MAX_COLLATION_EVALUATIONS = SPELLCHECK_PREFIX + "maxCollationEvaluations";
+   
+   /**
+    * <p>
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/SpellCheckComponent.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/SpellCheckComponent.java
+index aa667c2e..ed63971f 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/SpellCheckComponent.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/SpellCheckComponent.java
+@@ -172,11 +172,12 @@ protected void addCollationsToResponse(SolrParams params, SpellingResult spellin
+ 			NamedList response) {
+ 		int maxCollations = params.getInt(SPELLCHECK_MAX_COLLATIONS, 1);
+ 		int maxCollationTries = params.getInt(SPELLCHECK_MAX_COLLATION_TRIES, 0);
++		int maxCollationEvaluations = params.getInt(SPELLCHECK_MAX_COLLATION_EVALUATIONS, 10000);
+ 		boolean collationExtendedResults = params.getBool(SPELLCHECK_COLLATE_EXTENDED_RESULTS, false);
+ 		boolean shard = params.getBool(ShardParams.IS_SHARD, false);
+ 
+ 		SpellCheckCollator collator = new SpellCheckCollator();
+-		List<SpellCheckCollation> collations = collator.collate(spellingResult, q, rb, maxCollations, maxCollationTries);
++		List<SpellCheckCollation> collations = collator.collate(spellingResult, q, rb, maxCollations, maxCollationTries, maxCollationEvaluations);
+ 		//by sorting here we guarantee a non-distributed request returns all 
+ 		//results in the same order as a distributed request would, 
+ 		//even in cases when the internal rank is the same.
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/PossibilityIterator.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/PossibilityIterator.java
+index ec3aaa7d..f1a8ac91 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/PossibilityIterator.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/PossibilityIterator.java
+@@ -17,12 +17,13 @@
+  */
+ 
+ import java.util.ArrayList;
+-import java.util.Collections;
++import java.util.Arrays;
+ import java.util.Iterator;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.NoSuchElementException;
++import java.util.PriorityQueue;
+ 
+ import org.apache.lucene.analysis.Token;
+ 
+@@ -38,8 +39,7 @@
+  */
+ public class PossibilityIterator implements Iterator<RankedSpellPossibility> {
+ 	private List<List<SpellCheckCorrection>> possibilityList = new ArrayList<List<SpellCheckCorrection>>();
+-	private List<RankedSpellPossibility> rankedPossibilityList = new ArrayList<RankedSpellPossibility>();
+-	private Iterator<RankedSpellPossibility> rankedPossibilityIterator;
++	private Iterator<RankedSpellPossibility> rankedPossibilityIterator = null;
+ 	private int correctionIndex[];
+ 	private boolean done = false;
+ 
+@@ -56,7 +56,7 @@ private PossibilityIterator() {
+ 	 * 
+ 	 * @param suggestions
+ 	 */
+-	public PossibilityIterator(Map<Token, LinkedHashMap<String, Integer>> suggestions) {
++	public PossibilityIterator(Map<Token, LinkedHashMap<String, Integer>> suggestions, int maximumRequiredSuggestions, int maxEvaluations) {
+ 		for (Map.Entry<Token, LinkedHashMap<String, Integer>> entry : suggestions.entrySet()) {
+ 			Token token = entry.getKey();
+ 			List<SpellCheckCorrection> possibleCorrections = new ArrayList<SpellCheckCorrection>();
+@@ -85,11 +85,26 @@ public PossibilityIterator(Map<Token, LinkedHashMap<String, Integer>> suggestion
+ 			}
+ 		}
+ 
+-		while (internalHasNext()) {
+-			rankedPossibilityList.add(internalNext());
++		long count = 0;
++		PriorityQueue<RankedSpellPossibility> rankedPossibilities = new PriorityQueue<RankedSpellPossibility>();		
++		while (count < maxEvaluations && internalHasNext()) {
++			RankedSpellPossibility rsp = internalNext();
++			count++;			
++			
++			if(rankedPossibilities.size() >= maximumRequiredSuggestions && rsp.getRank() >= rankedPossibilities.peek().getRank()) {
++				continue;
++			}
++			rankedPossibilities.offer(rsp);
++			if(rankedPossibilities.size() > maximumRequiredSuggestions) {
++				rankedPossibilities.poll();
++			}
++		}
++		
++		RankedSpellPossibility[] rpArr = new RankedSpellPossibility[rankedPossibilities.size()];
++		for(int i=rankedPossibilities.size() - 1  ; i>=0 ; i--) {
++			rpArr[i] = rankedPossibilities.remove();
+ 		}
+-		Collections.sort(rankedPossibilityList);
+-		rankedPossibilityIterator = rankedPossibilityList.iterator();
++		rankedPossibilityIterator = Arrays.asList(rpArr).iterator();		
+ 	}
+ 
+ 	private boolean internalHasNext() {
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/RankedSpellPossibility.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/RankedSpellPossibility.java
+index 02103f9c..61093fc7 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/RankedSpellPossibility.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/RankedSpellPossibility.java
+@@ -22,8 +22,9 @@
+ 	private List<SpellCheckCorrection> corrections;
+ 	private int rank;
+ 
++	//Rank poorer suggestions ahead of better ones for use with a PriorityQueue
+ 	public int compareTo(RankedSpellPossibility rcl) {
+-		return new Integer(rank).compareTo(rcl.rank);
++		return new Integer(rcl.rank).compareTo(rank);		
+ 	}
+ 
+ 	public List<SpellCheckCorrection> getCorrections() {
+@@ -41,4 +42,17 @@ public int getRank() {
+ 	public void setRank(int rank) {
+ 		this.rank = rank;
+ 	}
++	
++	
++	public String toString() {
++		StringBuilder sb = new StringBuilder();
++		sb.append("rank=").append(rank);
++		if(corrections != null) {
++			for(SpellCheckCorrection corr : corrections) {
++				sb.append("     ");
++				sb.append(corr.getOriginal()).append(">").append(corr.getCorrection()).append(" (").append(corr.getNumberOfOccurences()).append(")");
++			}
++		}
++		return sb.toString();
++	}
+ }
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/SpellCheckCollator.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/SpellCheckCollator.java
+index 7499c33b..5eb6bfca 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/SpellCheckCollator.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/spelling/SpellCheckCollator.java
+@@ -36,7 +36,7 @@
+   private static final Logger LOG = LoggerFactory.getLogger(SpellCheckCollator.class);
+ 
+   public List<SpellCheckCollation> collate(SpellingResult result, String originalQuery, ResponseBuilder ultimateResponse,
+-                                           int maxCollations, int maxTries) {
++                                           int maxCollations, int maxTries, int maxEvaluations) {
+     List<SpellCheckCollation> collations = new ArrayList<SpellCheckCollation>();
+ 
+     QueryComponent queryComponent = null;
+@@ -62,7 +62,7 @@
+ 
+     int tryNo = 0;
+     int collNo = 0;
+-    PossibilityIterator possibilityIter = new PossibilityIterator(result.getSuggestions());
++    PossibilityIterator possibilityIter = new PossibilityIterator(result.getSuggestions(), maxTries, maxEvaluations);
+     while (tryNo < maxTries && collNo < maxCollations && possibilityIter.hasNext()) {
+ 
+       RankedSpellPossibility possibility = possibilityIter.next();
+diff --git a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/client/solrj/response/TestSpellCheckResponse.java b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/client/solrj/response/TestSpellCheckResponse.java
+index 646d8bca..7b11bf0f 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/client/solrj/response/TestSpellCheckResponse.java
++++ b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/client/solrj/response/TestSpellCheckResponse.java
+@@ -143,7 +143,7 @@ public void testSpellCheckCollationResponse() throws Exception {
+     
+     //Test Expanded Collation Results
+     query.set(SpellingParams.SPELLCHECK_COLLATE_EXTENDED_RESULTS, true);
+-    query.set(SpellingParams.SPELLCHECK_MAX_COLLATION_TRIES, 5);
++    query.set(SpellingParams.SPELLCHECK_MAX_COLLATION_TRIES, 10);
+     query.set(SpellingParams.SPELLCHECK_MAX_COLLATIONS, 2); 
+     request = new QueryRequest(query);
+     response = request.process(server).getSpellCheckResponse();
+diff --git a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellCheckCollatorTest.java b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellCheckCollatorTest.java
+index 669676f6..c819c9f8 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellCheckCollatorTest.java
++++ b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellCheckCollatorTest.java
+@@ -60,8 +60,8 @@ public void testCollateWithFilter() throws Exception
+ 		params.add(SpellCheckComponent.SPELLCHECK_BUILD, "true");
+ 		params.add(SpellCheckComponent.SPELLCHECK_COUNT, "10");		
+ 		params.add(SpellCheckComponent.SPELLCHECK_COLLATE, "true");
+-		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATION_TRIES, "5");
+-		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATIONS, "2");
++		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATION_TRIES, "10");
++		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATIONS, "10");
+ 		params.add(CommonParams.Q, "lowerfilt:(+fauth +home +loane)");
+ 		params.add(CommonParams.FQ, "NOT(id:1)");
+ 		
+@@ -77,8 +77,10 @@ public void testCollateWithFilter() throws Exception
+ 		NamedList spellCheck = (NamedList) values.get("spellcheck");
+ 		NamedList suggestions = (NamedList) spellCheck.get("suggestions");
+ 		List<String> collations = suggestions.getAll("collation");
+-		assertTrue(collations.size() == 1);
+-		assertTrue(collations.get(0).equals("lowerfilt:(+faith +hope +love)"));		
++		assertTrue(collations.size() > 0);
++		for(String collation : collations) {
++			assertTrue(!collation.equals("lowerfilt:(+faith +hope +loaves)"));	
++		}
+ 	}
+ 	
+ 	@Test
+@@ -180,7 +182,7 @@ public void testExtendedCollate() throws Exception {
+ 		// combination exists.
+ 		params.remove(SpellCheckComponent.SPELLCHECK_MAX_COLLATION_TRIES);
+ 		params.remove(SpellCheckComponent.SPELLCHECK_MAX_COLLATIONS);
+-		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATION_TRIES, "5");
++		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATION_TRIES, "10");
+ 		params.add(SpellCheckComponent.SPELLCHECK_MAX_COLLATIONS, "2");
+ 		handler = core.getRequestHandler("spellCheckCompRH");
+ 		rsp = new SolrQueryResponse();
+diff --git a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellPossibilityIteratorTest.java b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellPossibilityIteratorTest.java
+index 34a95095..4faecd87 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellPossibilityIteratorTest.java
++++ b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/spelling/SpellPossibilityIteratorTest.java
+@@ -28,6 +28,7 @@
+ public class SpellPossibilityIteratorTest extends SolrTestCaseJ4 {
+ 
+ 	private static Map<Token, LinkedHashMap<String, Integer>> suggestions = new LinkedHashMap<Token, LinkedHashMap<String, Integer>>();
++	private static Map<Token, LinkedHashMap<String, Integer>> lotsaSuggestions = new LinkedHashMap<Token, LinkedHashMap<String, Integer>>();
+ 
+ 	@BeforeClass
+ 	public static void beforeClass() throws Exception {
+@@ -71,21 +72,57 @@ public static void beforeClass() throws Exception {
+ 		suggestions.put(new Token("AYE", 0, 2), AYE);
+ 		suggestions.put(new Token("BEE", 0, 2), BEE);
+ 		suggestions.put(new Token("CEE", 0, 2), CEE);
++		
++		lotsaSuggestions.put(new Token("AYE", 0, 2), AYE);
++		lotsaSuggestions.put(new Token("BEE", 0, 2), BEE);
++		lotsaSuggestions.put(new Token("CEE", 0, 2), CEE);
++		
++		lotsaSuggestions.put(new Token("AYE1", 0, 3), AYE);
++		lotsaSuggestions.put(new Token("BEE1", 0, 3), BEE);
++		lotsaSuggestions.put(new Token("CEE1", 0, 3), CEE);
++		
++		lotsaSuggestions.put(new Token("AYE2", 0, 3), AYE);
++		lotsaSuggestions.put(new Token("BEE2", 0, 3), BEE);
++		lotsaSuggestions.put(new Token("CEE2", 0, 3), CEE);
++		
++		lotsaSuggestions.put(new Token("AYE3", 0, 3), AYE);
++		lotsaSuggestions.put(new Token("BEE3", 0, 3), BEE);
++		lotsaSuggestions.put(new Token("CEE3", 0, 3), CEE);
++		
++		lotsaSuggestions.put(new Token("AYE4", 0, 3), AYE);
++		lotsaSuggestions.put(new Token("BEE4", 0, 3), BEE);
++		lotsaSuggestions.put(new Token("CEE4", 0, 3), CEE);
++	}
++
++	@Test
++	public void testScalability() throws Exception {
++		PossibilityIterator iter = new PossibilityIterator(lotsaSuggestions, 1000, 10000);
++		int count = 0;
++		while (iter.hasNext()) {			
++			RankedSpellPossibility rsp = iter.next();
++			count++;
++		}
++		assertTrue(count==1000);
+ 	}
+ 
+ 	@Test
+ 	public void testSpellPossibilityIterator() throws Exception {
+-		PossibilityIterator iter = new PossibilityIterator(suggestions);
++		PossibilityIterator iter = new PossibilityIterator(suggestions, 1000, 10000);
+ 		int count = 0;
+ 		while (iter.hasNext()) {
+ 			
+-			iter.next();
++			RankedSpellPossibility rsp = iter.next();
++			if(count==0) {
++				assertTrue("I".equals(rsp.getCorrections().get(0).getCorrection()));
++				assertTrue("alpha".equals(rsp.getCorrections().get(1).getCorrection()));
++				assertTrue("one".equals(rsp.getCorrections().get(2).getCorrection()));
++			}
+ 			count++;
+ 		}
+ 		assertTrue(("Three maps (8*9*10) should return 720 iterations but instead returned " + count), count == 720);
+ 
+ 		suggestions.remove(new Token("CEE", 0, 2));
+-		iter = new PossibilityIterator(suggestions);
++		iter = new PossibilityIterator(suggestions, 100, 10000);
+ 		count = 0;
+ 		while (iter.hasNext()) {
+ 			iter.next();
+@@ -94,16 +131,16 @@ public void testSpellPossibilityIterator() throws Exception {
+ 		assertTrue(("Two maps (8*9) should return 72 iterations but instead returned " + count), count == 72);
+ 
+ 		suggestions.remove(new Token("BEE", 0, 2));
+-		iter = new PossibilityIterator(suggestions);
++		iter = new PossibilityIterator(suggestions, 5, 10000);
+ 		count = 0;
+ 		while (iter.hasNext()) {
+ 			iter.next();
+ 			count++;
+ 		}
+-		assertTrue(("One map of 8 should return 8 iterations but instead returned " + count), count == 8);
++		assertTrue(("We requested 5 suggestions but got " + count), count == 5);
+ 
+ 		suggestions.remove(new Token("AYE", 0, 2));
+-		iter = new PossibilityIterator(suggestions);
++		iter = new PossibilityIterator(suggestions, Integer.MAX_VALUE, 10000);
+ 		count = 0;
+ 		while (iter.hasNext()) {
+ 			iter.next();

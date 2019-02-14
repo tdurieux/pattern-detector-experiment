@@ -1,0 +1,363 @@
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
+index cf32ecfc..d61d0881 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
+@@ -293,6 +293,7 @@ that represents a constant expression (eg where 1 = 2).
+ 				Boolean restriction() throws StandardException;
+ 			</verbatim>
+ 		@param mapArrayItem	Item # for mapping of source to target columns
++        @param cloneMapItem Item # for columns that need cloning
+ 		@param reuseResult	Whether or not to reuse the result row.
+ 		@param doesProjection	Whether or not this PRN does a projection
+ 		@param optimizerEstimatedRowCount	Estimated total # of rows by
+@@ -307,6 +308,7 @@ NoPutResultSet getProjectRestrictResultSet(NoPutResultSet source,
+ 		GeneratedMethod projection, int resultSetNumber,
+ 		GeneratedMethod constantRestriction,
+ 		int mapArrayItem,
++        int cloneMapItem,
+ 		boolean reuseResult,
+ 		boolean doesProjection,
+ 		double optimizerEstimatedRowCount,
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/HashTableNode.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/HashTableNode.java
+index 2e35f354..bc0a89ec 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/HashTableNode.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/HashTableNode.java
+@@ -256,7 +256,11 @@ private void generateMinion(ExpressionClassBuilder acb,
+ 
+ 
+ 		// Map the result columns to the source columns
+-		int[] mapArray = resultColumns.mapSourceColumns();
++        ResultColumnList.ColumnMapping  mappingArrays =
++            resultColumns.mapSourceColumns();
++
++        int[] mapArray = mappingArrays.mapArray;
++
+ 		int mapArrayItem = acb.addItem(new ReferencedColumnsDescriptorImpl(mapArray));
+ 
+ 		// Save the hash key columns 
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
+index e48402b0..7e2f4c3e 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
+@@ -1423,8 +1423,15 @@ private void generateMinion(ExpressionClassBuilder acb,
+ 
+ 	
+ 		// Map the result columns to the source columns
+-		int[] mapArray = resultColumns.mapSourceColumns();
++
++        ResultColumnList.ColumnMapping mappingArrays =
++            resultColumns.mapSourceColumns();
++
++        int[] mapArray = mappingArrays.mapArray;
++        boolean[] cloneMap = mappingArrays.cloneMap;
++
+ 		int mapArrayItem = acb.addItem(new ReferencedColumnsDescriptorImpl(mapArray));
++        int cloneMapItem = acb.addItem(cloneMap);
+ 
+ 		/* Will this node do a projection? */
+ 		boolean doesProjection = true;
+@@ -1462,12 +1469,13 @@ private void generateMinion(ExpressionClassBuilder acb,
+ 		 *  arg6: constantExpress - Expression for constant restriction
+ 		 *			(for example, where 1 = 2)
+ 		 *  arg7: mapArrayItem - item # for mapping of source columns
+-		 *  arg8: reuseResult - whether or not the result row can be reused
++         *  arg8: cloneMapItem - item # for mapping of columns that need cloning
++         *  arg9: reuseResult - whether or not the result row can be reused
+ 		 *						(ie, will it always be the same)
+-		 *  arg9: doesProjection - does this node do a projection
+-		 *  arg10: estimated row count
+-		 *  arg11: estimated cost
+-		 *  arg12: close method
++         *  arg10: doesProjection - does this node do a projection
++         *  arg11: estimated row count
++         *  arg12: estimated cost
++         *  arg13: close method
+ 		 */
+ 		
+ 		acb.pushGetResultSetFactoryExpression(mb);
+@@ -1597,13 +1605,14 @@ private void generateMinion(ExpressionClassBuilder acb,
+ 		}
+ 		
+ 		mb.push(mapArrayItem);
++        mb.push(cloneMapItem);
+ 		mb.push(resultColumns.reusableResult());
+ 		mb.push(doesProjection);
+ 		mb.push(costEstimate.rowCount());
+ 		mb.push(costEstimate.getEstimatedCost());
+ 
+ 		mb.callMethod(VMOpcode.INVOKEINTERFACE, (String) null, "getProjectRestrictResultSet",
+-					ClassName.NoPutResultSet, 10);
++                    ClassName.NoPutResultSet, 11);
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+index ea100c94..c39d55d9 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+@@ -26,6 +26,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.sql.Types;
+ import java.util.Hashtable;
+ import java.util.Vector;
++import java.util.Map;
++import java.util.HashMap;
+ 
+ import org.apache.derby.catalog.types.DefaultInfoImpl;
+ import org.apache.derby.iapi.error.StandardException;
+@@ -3504,14 +3506,23 @@ boolean allExpressionsAreColumns(ResultSetNode sourceRS)
+ 	 * -1.
+ 	 * This is useful for determining if we need to do reflection
+ 	 * at execution time.
++     * <p/>
++     * Also build an array of boolean for columns that point to the same virtual
++     * column and have types that are streamable to be able to determine if
++     * cloning is needed at execution time.
+ 	 *
+ 	 * @return	Array representiong mapping of RCs to source RCs.
+ 	 */
+-	int[] mapSourceColumns()
++    ColumnMapping mapSourceColumns()
+ 	{
+ 		int[]			mapArray = new int[size()];
++        boolean[] cloneMap = new boolean[size()];
++
+ 		ResultColumn	resultColumn;
+ 
++        // key: virtual column number, value: index
++        Map seenMap = new HashMap();
++
+ 		int size = size();
+ 
+ 		for (int index = 0; index < size; index++)
+@@ -3529,7 +3540,9 @@ boolean allExpressionsAreColumns(ResultSetNode sourceRS)
+ 				else
+ 				{
+ 					// Virtual column #s are 1-based
+-					mapArray[index] = vcn.getSourceColumn().getVirtualColumnId();
++                    ResultColumn rc = vcn.getSourceColumn();
++                    updateArrays(mapArray, cloneMap, seenMap, rc, index);
++
+ 				}
+ 			}
+ 			else if (resultColumn.getExpression() instanceof ColumnReference)
+@@ -3544,7 +3557,9 @@ else if (resultColumn.getExpression() instanceof ColumnReference)
+ 				else
+ 				{
+ 					// Virtual column #s are 1-based
+-					mapArray[index] = cr.getSource().getVirtualColumnId();
++                    ResultColumn rc = cr.getSource();
++
++                    updateArrays(mapArray, cloneMap, seenMap, rc, index);
+ 				}
+ 			}
+ 			else
+@@ -3553,7 +3568,8 @@ else if (resultColumn.getExpression() instanceof ColumnReference)
+ 			}
+ 		}
+ 
+-		return mapArray;
++        ColumnMapping result = new ColumnMapping(mapArray, cloneMap);
++        return result;
+ 	}
+ 
+ 	/** Set the nullability of every ResultColumn in this list 
+@@ -4231,6 +4247,7 @@ public boolean containsWindowFunctionResultColumn()
+ 		return false;
+ 	}
+ 
++
+ 	/*
+ 	 * Remove all window functions columns from this list
+ 	 */
+@@ -4250,4 +4267,52 @@ void removeWindowFunctionColumns() {
+ 		resetVirtualColumnIds();
+ 	}
+ 
++
++    private static boolean streamableType(ResultColumn rc) {
++        DataTypeDescriptor dtd = rc.getType();
++        TypeId s = TypeId.getBuiltInTypeId(dtd.getTypeName());
++
++        if (s != null) {
++            return s.streamStorable();
++        } else {
++            return false;
++        }
++    }
++
++
++    private static void updateArrays(int[] mapArray,
++                             boolean[] cloneMap,
++                             Map seenMap,
++                             ResultColumn rc,
++                             int index) {
++
++        int vcId = rc.getVirtualColumnId();
++
++        mapArray[index] = vcId;
++
++        if (streamableType(rc)) {
++            Integer seenIndex =
++                (Integer)seenMap.get(new Integer(vcId));
++
++            if (seenIndex != null) {
++                // We have already mapped this column at index
++                // seenIndex, so mark occurence 2..n  for cloning.
++                cloneMap[index] = true;
++            } else {
++                seenMap.put(new Integer(vcId), new Integer(index));
++            }
++        }
++    }
++
++
++    public class ColumnMapping {
++
++        public final int[] mapArray;
++        public final boolean[] cloneMap;
++
++        public ColumnMapping(int[] mapArray, boolean[] cloneMap) {
++            this.mapArray = mapArray;
++            this.cloneMap = cloneMap;
++        }
++    }
+ }
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
+index 07383842..4a78ac25 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
+@@ -212,6 +212,7 @@ public NoPutResultSet getProjectRestrictResultSet(NoPutResultSet source,
+ 		GeneratedMethod projection, int resultSetNumber,
+ 		GeneratedMethod constantRestriction,
+ 		int mapRefItem,
++        int cloneMapItem,
+ 		boolean reuseResult,
+ 		boolean doesProjection,
+ 		double optimizerEstimatedRowCount,
+@@ -220,7 +221,7 @@ public NoPutResultSet getProjectRestrictResultSet(NoPutResultSet source,
+ 	{
+ 		return new ProjectRestrictResultSet(source, source.getActivation(), 
+ 			restriction, projection, resultSetNumber, 
+-			constantRestriction, mapRefItem, 
++            constantRestriction, mapRefItem, cloneMapItem,
+ 			reuseResult,
+ 			doesProjection,
+ 		    optimizerEstimatedRowCount,
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/ProjectRestrictResultSet.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/ProjectRestrictResultSet.java
+index 040db981..9abd8e39 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/ProjectRestrictResultSet.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/execute/ProjectRestrictResultSet.java
+@@ -24,6 +24,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.monitor.Monitor;
+ 
+ import org.apache.derby.iapi.services.sanity.SanityManager;
++import org.apache.derby.iapi.services.io.StreamStorable;
+ 
+ import org.apache.derby.iapi.services.stream.HeaderPrintWriter;
+ import org.apache.derby.iapi.services.stream.InfoStreams;
+@@ -69,6 +70,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	public boolean doesProjection;
+     private GeneratedMethod projection;
+ 	private int[]			projectMapping;
++
++    /**
++     * Holds columns present more than once in the result set and which may be
++     * represented by a stream, since such columns need to be cloned.
++     */
++    private boolean[] cloneMap;
++
+ 	private boolean runTimeStatsOn;
+ 	private ExecRow			mappedResultRow;
+ 	public boolean reuseResult;
+@@ -87,6 +95,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 					int resultSetNumber,
+ 					GeneratedMethod cr,
+ 					int mapRefItem,
++                    int cloneMapItem,
+ 					boolean reuseResult,
+ 					boolean doesProjection,
+ 				    double optimizerEstimatedRowCount,
+@@ -115,6 +124,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 			mappedResultRow = activation.getExecutionFactory().getValueRow(projectMapping.length);
+ 		}
+ 
++        cloneMap =
++            ((boolean[])a.getPreparedStatement().getSavedObject(cloneMapItem));
++
+ 		/* Remember whether or not RunTimeStatistics is on */
+ 		runTimeStatsOn = getLanguageConnectionContext().getRunTimeStatisticsMode();
+ 		recordConstructorTime();
+@@ -507,7 +519,28 @@ private ExecRow doProjection(ExecRow sourceRow)
+ 		{
+ 			if (projectMapping[index] != -1)
+ 			{
+-				result.setColumn(index + 1, sourceRow.getColumn(projectMapping[index]));
++                DataValueDescriptor dvd =
++                        sourceRow.getColumn(projectMapping[index]);
++
++                // See if the column has been marked for cloning.
++                // If the value isn't a stream, don't bother cloning it.
++                if (cloneMap[index] && dvd.getStream() != null) {
++
++                    // Enable this code after DERBY-3650 is in: FIXME
++                    //
++                    // long length = dvd.getLengthIfKnown();
++                    //
++                    // If the stream isn't clonable, we have to load the stream.
++                    // if ((length > 32*1024 || length == -1) &&
++                    //     dvd.getStream() instanceof CloneableStream) {
++                    //     // Copy the stream, the value may be large.
++                    //     dvd = dvd.copyForRead();
++                    // } else {
++                    //     // Load the stream, then we don't have to clone.
++                    ((StreamStorable)dvd).loadStream();
++                    // }
++                }
++                result.setColumn(index + 1, dvd);
+ 			}
+ 		}
+ 
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+index 7ff2d004..e1233595 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+@@ -40,8 +40,6 @@
+ import java.io.InputStream;
+ import java.util.Random;
+ 
+-import org.apache.derbyTesting.functionTests.util.streams.LoopingAlphabetStream;
+-
+ /**
+  * Tests reading and updating binary large objects (BLOBs).
+  */
+@@ -388,11 +386,14 @@ public void testBlobCastInValuesClause()
+         rs.close();
+     }
+ 
++
+     /**
+      * Tests that a lob can be safely occur multiple times in a SQL select.
+      * <p/>
+      * See DERBY-4477.
+      * <p/>
++     * @see org.apache.derbyTesting.functionTests.tests.memory.BlobMemTest#testDerby4477_3645_3646_Repro_lowmem
++     * @see org.apache.derbyTesting.functionTests.tests.memory.ClobMemTest#testDerby4477_3645_3646_Repro_lowmem_clob
+      */
+     public void testDerby4477_3645_3646_Repro() throws SQLException, IOException {
+         setAutoCommit(false);
+@@ -721,6 +722,7 @@ private void verifyNewValueInTable(final int newVal,
+         stmt.close();
+     }
+                           
++
+     /**
+      * Verifies that the blob is consistent
+      * @param expectedVal the InputStream for the Blob should return this value
+@@ -768,7 +770,6 @@ public static Test suite()
+     public final void setUp() 
+         throws Exception
+     {
+-        println("Setup of: " + getName());
+         getConnection().setAutoCommit(false);
+     }
+ }

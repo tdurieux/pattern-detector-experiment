@@ -1,0 +1,159 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+index 15089716..c63fba00 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+@@ -180,14 +180,6 @@
+ 
+   private int clientTimeout;
+ 
+-
+-  public ZkController(final CoreContainer cc, String zkServerAddress, int zkClientTimeout, int zkClientConnectTimeout, String localHost, String locaHostPort,
+-      String localHostContext, final CurrentCoreDescriptorProvider registerOnReconnect) throws InterruptedException,
+-      TimeoutException, IOException {
+-    this(cc, zkServerAddress, zkClientTimeout, zkClientConnectTimeout, localHost, locaHostPort, localHostContext, null, registerOnReconnect);
+-  }
+-  
+-
+   public ZkController(final CoreContainer cc, String zkServerAddress, int zkClientTimeout, int zkClientConnectTimeout, String localHost, String locaHostPort,
+       String localHostContext, String leaderVoteWait, final CurrentCoreDescriptorProvider registerOnReconnect) throws InterruptedException,
+       TimeoutException, IOException {
+@@ -641,7 +633,10 @@ public String register(String coreName, final CoreDescriptor desc, boolean recov
+       throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR, "", e);
+     }
+     
+-    String leaderUrl = getLeader(cloudDesc);
++
++    // in this case, we want to wait for the leader as long as the leader might 
++    // wait for a vote, at least
++    String leaderUrl = getLeader(cloudDesc, Integer.parseInt(leaderVoteWait) + 1000);
+     
+     String ourUrl = ZkCoreNodeProps.getCoreUrl(baseUrl, coreName);
+     log.info("We are " + ourUrl + " and leader is " + leaderUrl);
+@@ -693,7 +688,9 @@ public String register(String coreName, final CoreDescriptor desc, boolean recov
+     return shardId;
+   }
+ 
+-  private String getLeader(final CloudDescriptor cloudDesc) {
++  // timeoutms is the timeout for the first call to get the leader - there is then
++  // a longer wait to make sure that leader matches our local state
++  private String getLeader(final CloudDescriptor cloudDesc, int timeoutms) {
+     
+     String collection = cloudDesc.getCollectionName();
+     String shardId = cloudDesc.getShardId();
+@@ -702,7 +699,7 @@ private String getLeader(final CloudDescriptor cloudDesc) {
+     // cluster state node that won't be updated for a moment
+     String leaderUrl;
+     try {
+-      leaderUrl = getLeaderProps(collection, cloudDesc.getShardId())
++      leaderUrl = getLeaderProps(collection, cloudDesc.getShardId(), timeoutms)
+           .getCoreUrl();
+       
+       // now wait until our currently cloud state contains the latest leader
+@@ -720,7 +717,7 @@ private String getLeader(final CloudDescriptor cloudDesc) {
+         tries++;
+         clusterStateLeader = zkStateReader.getLeaderUrl(collection, shardId,
+             30000);
+-        leaderUrl = getLeaderProps(collection, cloudDesc.getShardId())
++        leaderUrl = getLeaderProps(collection, cloudDesc.getShardId(), timeoutms)
+             .getCoreUrl();
+       }
+       
+@@ -736,8 +733,8 @@ private String getLeader(final CloudDescriptor cloudDesc) {
+    * Get leader props directly from zk nodes.
+    */
+   public ZkCoreNodeProps getLeaderProps(final String collection,
+-      final String slice) throws InterruptedException {
+-    return getLeaderProps(collection, slice, false);
++      final String slice, int timeoutms) throws InterruptedException {
++    return getLeaderProps(collection, slice, timeoutms, false);
+   }
+   
+   /**
+@@ -746,8 +743,8 @@ public ZkCoreNodeProps getLeaderProps(final String collection,
+    * @return leader props
+    */
+   public ZkCoreNodeProps getLeaderProps(final String collection,
+-      final String slice, boolean failImmediatelyOnExpiration) throws InterruptedException {
+-    int iterCount = 60;
++      final String slice, int timeoutms, boolean failImmediatelyOnExpiration) throws InterruptedException {
++    int iterCount = timeoutms / 1000;
+     Exception exp = null;
+     while (iterCount-- > 0) {
+       try {
+@@ -764,10 +761,10 @@ public ZkCoreNodeProps getLeaderProps(final String collection,
+           throw new RuntimeException("Session has expired - could not get leader props", exp);
+         }
+         exp = e;
+-        Thread.sleep(500);
++        Thread.sleep(1000);
+       }  catch (Exception e) {
+         exp = e;
+-        Thread.sleep(500);
++        Thread.sleep(1000);
+       }
+       if (cc.isShutDown()) {
+         throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "CoreContainer is shutdown");
+@@ -845,6 +842,7 @@ public void publish(final CoreDescriptor cd, final String state) throws KeeperEx
+    * Publish core state to overseer.
+    */
+   public void publish(final CoreDescriptor cd, final String state, boolean updateLastState) throws KeeperException, InterruptedException {
++    log.info("publishing core={} state={}", cd.getName(), state);
+     //System.out.println(Thread.currentThread().getStackTrace()[3]);
+     Integer numShards = cd.getCloudDescriptor().getNumShards();
+     if (numShards == null) { //XXX sys prop hack
+@@ -1135,7 +1133,7 @@ private ZkCoreNodeProps waitForLeaderToSeeDownState(
+     for (int i = 0; i < retries; i++) {
+       try {
+         // go straight to zk, not the cloud state - we must have current info
+-        leaderProps = getLeaderProps(collection, shard);
++        leaderProps = getLeaderProps(collection, shard, 30000);
+         break;
+       } catch (Exception e) {
+         SolrException.log(log, "There was a problem finding the leader in zk", e);
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CoreContainer.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CoreContainer.java
+index 720a9caa..711eaa57 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CoreContainer.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CoreContainer.java
+@@ -154,7 +154,7 @@
+   protected LogWatcher logging = null;
+   private String zkHost;
+   private Map<SolrCore,String> coreToOrigName = new ConcurrentHashMap<SolrCore,String>();
+-  private String leaderVoteWait;
++  private String leaderVoteWait = LEADER_VOTE_WAIT;
+   private int coreLoadThreads;
+   
+   {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ZkControllerTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ZkControllerTest.java
+index d6bb54b1..34879322 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ZkControllerTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ZkControllerTest.java
+@@ -82,7 +82,7 @@ public void testReadConfigName() throws Exception {
+       cc = getCoreContainer();
+       
+       ZkController zkController = new ZkController(cc, server.getZkAddress(), TIMEOUT, 10000,
+-          "127.0.0.1", "8983", "solr", new CurrentCoreDescriptorProvider() {
++          "127.0.0.1", "8983", "solr", "0", new CurrentCoreDescriptorProvider() {
+             
+             @Override
+             public List<CoreDescriptor> getCurrentDescriptors() {
+@@ -122,7 +122,7 @@ public void testUploadToCloud() throws Exception {
+       cc = getCoreContainer();
+       
+       zkController = new ZkController(cc, server.getZkAddress(),
+-          TIMEOUT, 10000, "127.0.0.1", "8983", "solr", new CurrentCoreDescriptorProvider() {
++          TIMEOUT, 10000, "127.0.0.1", "8983", "solr", "0", new CurrentCoreDescriptorProvider() {
+             
+             @Override
+             public List<CoreDescriptor> getCurrentDescriptors() {
+diff --git a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/AbstractZkTestCase.java b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/AbstractZkTestCase.java
+index 54af9112..0dc28f4c 100644
+--- a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/AbstractZkTestCase.java
++++ b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/AbstractZkTestCase.java
+@@ -78,7 +78,6 @@
+ 
+   @BeforeClass
+   public static void azt_beforeClass() throws Exception {
+-    System.out.println("azt beforeclass");
+     createTempDir();
+     zkDir = dataDir.getAbsolutePath() + File.separator
+         + "zookeeper/server1/data";

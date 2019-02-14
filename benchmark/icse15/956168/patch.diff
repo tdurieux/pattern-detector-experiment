@@ -1,0 +1,233 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+index bbd05b75..11a03eb2 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+@@ -89,14 +89,14 @@ private void stream(SocketChannel channel) throws IOException
+             assert buffer.remaining() == 0;
+             
+             // stream sections of the file as returned by PendingFile.currentSection
+-            Pair<Long,Long> section;
+-            while ((section = file.currentSection()) != null)
++            for (Pair<Long, Long> section : file.sections)
+             {
+-                long length = Math.min(CHUNK_SIZE, section.right - section.left);
+-                long bytesTransferred = fc.transferTo(section.left, length, channel);
++                long length = section.right - section.left;
++                long bytesTransferred = 0;
++                while (bytesTransferred < length)
++                    bytesTransferred += fc.transferTo(section.left + bytesTransferred, length - bytesTransferred, channel);
+                 if (logger.isDebugEnabled())
+                     logger.debug("Bytes transferred " + bytesTransferred);
+-                file.update(section.left + bytesTransferred);
+             }
+         }
+         finally
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+index 85478a4f..241041ee 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+@@ -19,7 +19,6 @@
+ 
+ package org.apache.cassandra.streaming;
+ 
+-import java.io.File;
+ import java.io.IOException;
+ import java.net.InetAddress;
+ 
+@@ -55,10 +54,10 @@ public void onStatusChange(InetAddress host, PendingFile pendingFile, FileStatus
+             "Unknown stream action: " + streamStatus.getAction();
+ 
+         // file was successfully streamed
+-        Descriptor desc = pendingFile.getDescriptor();
++        Descriptor desc = pendingFile.desc;
+         try
+         {
+-            SSTableReader sstable = SSTableWriter.recoverAndOpen(pendingFile.getDescriptor());
++            SSTableReader sstable = SSTableWriter.recoverAndOpen(pendingFile.desc);
+             Table.open(desc.ksname).getColumnFamilyStore(desc.cfname).addSSTable(sstable);
+             logger.info("Streaming added " + sstable);
+         }
+@@ -76,7 +75,7 @@ public void onStatusChange(InetAddress host, PendingFile pendingFile, FileStatus
+         // if all files have been received from this host, remove from bootstrap sources
+         if (StreamInManager.isDone(host) && StorageService.instance.isBootstrapMode())
+         {
+-            StorageService.instance.removeBootstrapSource(host, pendingFile.getDescriptor().ksname);
++            StorageService.instance.removeBootstrapSource(host, pendingFile.desc.ksname);
+         }
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index 3f6f9fad..15f3dc67 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -27,6 +27,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.net.FileStreamTask;
+ import org.apache.cassandra.utils.Pair;
+ 
+@@ -62,15 +63,13 @@ public void read() throws IOException
+         long offset = 0;
+         try
+         {
+-            Pair<Long,Long> section;
+-            while ((section = pendingFile.currentSection()) != null)
++            for (Pair<Long, Long> section : pendingFile.sections)
+             {
+-                long length = Math.min(FileStreamTask.CHUNK_SIZE, section.right - section.left);
+-                long bytesRead = fc.transferFrom(socketChannel, offset, length);
+-                // offset in the remote file
+-                pendingFile.update(section.left + bytesRead);
+-                // offset in the local file
+-                offset += bytesRead;
++                long length = section.right - section.left;
++                long bytesRead = 0;
++                while (bytesRead < length)
++                    bytesRead += fc.transferFrom(socketChannel, offset + bytesRead, length - bytesRead);
++                offset += length;
+             }
+         }
+         catch (IOException ex)
+@@ -80,10 +79,7 @@ public void read() throws IOException
+             streamStatus.setAction(FileStatus.Action.STREAM);
+             handleFileStatus(remoteAddress.getAddress());
+             /* Delete the orphaned file. */
+-            File file = new File(pendingFile.getFilename());
+-            file.delete();
+-            /* Reset our state. */
+-            pendingFile.update(0);
++            FileUtils.deleteWithConfirm(new File(pendingFile.getFilename()));
+             throw ex;
+         }
+         finally
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+index 007e6630..78c32095 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+@@ -48,10 +48,9 @@
+         return serializer_;
+     }
+ 
+-    private final Descriptor desc;
+-    private final String component;
+-    private final List<Pair<Long,Long>> sections;
+-    private long ptr;
++    public final Descriptor desc;
++    public final String component;
++    public final List<Pair<Long,Long>> sections;
+ 
+     public PendingFile(Descriptor desc, PendingFile pf)
+     {
+@@ -63,34 +62,6 @@ public PendingFile(Descriptor desc, String component, List<Pair<Long,Long>> sect
+         this.desc = desc;
+         this.component = component;
+         this.sections = sections;
+-        ptr = 0;
+-    }
+-
+-    public void update(long ptr)
+-    {
+-        this.ptr = ptr;
+-    }
+-
+-    /**
+-     * @return The current section of the file, as an (offset,end) pair, or null if nothing left to stream.
+-     */
+-    public Pair<Long,Long> currentSection()
+-    {
+-        // linear search for the first appropriate section
+-        for (Pair<Long,Long> section : sections)
+-            if (ptr < section.right)
+-                return new Pair<Long,Long>(Long.valueOf(Math.max(ptr, section.left)), section.right);
+-        return null;
+-    }
+-
+-    public String getComponent()
+-    {
+-        return component;
+-    }
+-
+-    public Descriptor getDescriptor()
+-    {
+-        return desc;
+     }
+     
+     public String getFilename()
+@@ -114,7 +85,7 @@ public int hashCode()
+ 
+     public String toString()
+     {
+-        return getFilename() + ":" + ptr + "/" + sections;
++        return getFilename() + "/" + sections;
+     }
+ 
+     private static class PendingFileSerializer implements ICompactSerializer<PendingFile>
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+index 6fed8f8e..7a2b26f7 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+@@ -105,7 +105,7 @@ public void doVerb(Message message)
+         LinkedHashMap<PendingFile, PendingFile> mapping = new LinkedHashMap<PendingFile, PendingFile>();
+         for (PendingFile remote : remoteFiles)
+         {
+-            Descriptor remotedesc = remote.getDescriptor();
++            Descriptor remotedesc = remote.desc;
+ 
+             // new local sstable
+             Table table = Table.open(remotedesc.ksname);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+index ef0c6d9b..7e1d656a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+@@ -117,19 +117,6 @@ public void addFilesToStream(PendingFile[] pendingFiles)
+         }
+     }
+ 
+-    /**
+-     * An (offset,end) pair representing the current section of the file to stream.
+-     */
+-    public Pair<Long,Long> currentSection(String path)
+-    {
+-        return fileMap.get(path).currentSection();
+-    }
+-
+-    public void update(String path, long pos)
+-    {
+-        fileMap.get(path).update(pos);
+-    }
+-    
+     public void startNext()
+     {
+         if (files.size() > 0)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+index 2e9c6c09..afcd7a91 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+@@ -108,7 +108,7 @@ public String getStatus()
+         List<String> files = new ArrayList<String>();
+         for (PendingFile pf : StreamInManager.getIncomingFiles(InetAddress.getByName(host)))
+         {
+-            files.add(String.format("%s: %s", pf.getDescriptor().ksname, pf.toString()));
++            files.add(String.format("%s: %s", pf.desc.ksname, pf.toString()));
+         }
+         return files;
+     }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+index eff841b8..df9061f6 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+@@ -51,9 +51,9 @@ public void testGetNewNames() throws IOException
+             assert !inContext.getFilename().equals(outContext.getFilename());
+ 
+             // nothing else should
+-            assertEquals(inContext.getComponent(), outContext.getComponent());
+-            assertEquals(inContext.getDescriptor().ksname, outContext.getDescriptor().ksname);
+-            assertEquals(inContext.getDescriptor().cfname, outContext.getDescriptor().cfname);
++            assertEquals(inContext.component, outContext.component);
++            assertEquals(inContext.desc.ksname, outContext.desc.ksname);
++            assertEquals(inContext.desc.cfname, outContext.desc.cfname);
+         }
+     }
+ }

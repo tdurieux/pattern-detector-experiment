@@ -1,0 +1,976 @@
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/AbstractServiceReferenceRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/AbstractServiceReferenceRecipe.java
+index 328a4706..d325c95e 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/AbstractServiceReferenceRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/AbstractServiceReferenceRecipe.java
+@@ -151,7 +151,11 @@ public void start(SatisfactionListener listener) {
+     public void stop() {
+         if (started.compareAndSet(true, false)) {
+             synchronized (monitor) {
++                try {
+                 getBundleContextForServiceLookup().removeServiceListener(this);
++                } catch (IllegalStateException e) {
++                    // Ignore in case bundle context is already invalidated
++                }
+                 doStop();
+                 for (Iterator<ServiceReference> it = references.iterator(); it.hasNext();) {
+                     ServiceReference ref = it.next();
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintContainerImpl.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintContainerImpl.java
+index 5c5609a8..80821a4d 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintContainerImpl.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintContainerImpl.java
+@@ -126,13 +126,15 @@
+     }
+ 
+     private final BundleContext bundleContext;
++    private final Bundle bundle;
+     private final Bundle extenderBundle;
+     private final BlueprintListener eventDispatcher;
+     private final NamespaceHandlerRegistry handlers;
+     private final List<Object> pathList;
+     private final ComponentDefinitionRegistryImpl componentDefinitionRegistry;
+     private final AggregateConverter converter;
+-    private final ScheduledExecutorService executors;
++    private final ExecutorService executors;
++    private final ScheduledExecutorService timer;
+     private Set<URI> namespaces;
+     private State state = State.Unknown;
+     private NamespaceHandlerSet handlerSet;
+@@ -148,23 +150,24 @@
+     private boolean xmlValidation = true;
+     private ScheduledFuture timeoutFuture;
+     private final AtomicBoolean scheduled = new AtomicBoolean();
+-    private final AtomicBoolean running = new AtomicBoolean();
+-    private Thread runningThread;
+     private List<ServiceRecipe> services;
+     private AccessControlContext accessControlContext;
+     private final IdSpace tempRecipeIdSpace = new IdSpace();
+     private ProxyManager proxyManager;
+ 
+     public BlueprintContainerImpl(BundleContext bundleContext, Bundle extenderBundle, BlueprintListener eventDispatcher,
+-                                  NamespaceHandlerRegistry handlers, ScheduledExecutorService executors, List<Object> pathList, ProxyManager proxyManager) {
++                                  NamespaceHandlerRegistry handlers, ExecutorService executor, ScheduledExecutorService timer,
++                                  List<Object> pathList, ProxyManager proxyManager) {
+         this.bundleContext = bundleContext;
++        this.bundle = bundleContext.getBundle();
+         this.extenderBundle = extenderBundle;
+         this.eventDispatcher = eventDispatcher;
+         this.handlers = handlers;
+         this.pathList = pathList;
+         this.converter = new AggregateConverter(this);
+         this.componentDefinitionRegistry = new ComponentDefinitionRegistryImpl();
+-        this.executors = executors;
++        this.executors = new ExecutorServiceWrapper(executor);
++        this.timer = timer;
+         this.processors = new ArrayList<Processor>();
+         if (System.getSecurityManager() != null) {
+             this.accessControlContext = BlueprintDomainCombiner.createAccessControlContext(bundleContext);
+@@ -199,7 +202,6 @@ public BlueprintListener getEventDispatcher() {
+     }
+ 
+     private void readDirectives() {
+-        Bundle bundle = bundleContext.getBundle();
+         Dictionary headers = bundle.getHeaders();
+         String symbolicName = (String)headers.get(Constants.BUNDLE_SYMBOLICNAME);
+         List<PathElement> paths = HeaderParser.parseHeader(symbolicName);
+@@ -230,6 +232,7 @@ public void schedule() {
+     }
+ 
+     public void reload() {
++        synchronized (scheduled) {
+         tidyupComponents();
+         this.componentDefinitionRegistry.reset();
+         this.repository = null;
+@@ -237,26 +240,20 @@ public void reload() {
+         timeout = 5 * 60 * 1000;
+         waitForDependencies = true;
+         xmlValidation = true;
++            if (handlerSet != null) {
++                handlerSet.removeListener(this);
++                handlerSet.destroy();
++                handlerSet = null;
++            }
+         state = State.Unknown;
+         schedule();
+     }
++    }
+ 
+     public void run() {
+         scheduled.set(false);
+         synchronized (scheduled) {
+-            synchronized (running) {
+-                runningThread = Thread.currentThread();
+-                running.set(true);
+-            }
+-            try {
+                 doRun();
+-            } finally {
+-                synchronized (running) {
+-                    running.set(false);
+-                    runningThread = null;
+-                    running.notifyAll();
+-                }
+-            }
+         }
+     }
+ 
+@@ -269,17 +266,24 @@ private void doRun() {
+                 if (destroyed) {
+                     return;
+                 }
+-                LOGGER.debug("Running blueprint container for bundle {} in state {}", bundleContext.getBundle().getSymbolicName(), state);
++                if (bundle.getState() != Bundle.ACTIVE && bundle.getState() != Bundle.STARTING) {
++                    return;
++                }
++                if (bundle.getBundleContext() != bundleContext) {
++                    return;
++                }
++                LOGGER.debug("Running blueprint container for bundle {} in state {}", bundle.getSymbolicName(), state);
+                 switch (state) {
+                     case Unknown:
+                         readDirectives();
+-                        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.CREATING, getBundleContext().getBundle(), getExtenderBundle()));
++                        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.CREATING, getBundle(), getExtenderBundle()));
+                         parser = new Parser();
+                         parser.parse(getResources());
+                         namespaces = parser.getNamespaces();
+-                        handlerSet = handlers.getNamespaceHandlers(namespaces, getBundleContext().getBundle());
++                        handlerSet = handlers.getNamespaceHandlers(namespaces, getBundle());
+                         handlerSet.addListener(this);
+                         state = State.WaitForNamespaceHandlers;
++                        break;
+                     case WaitForNamespaceHandlers:
+                     {
+                         List<String> missing = new ArrayList<String>();
+@@ -291,13 +295,13 @@ private void doRun() {
+                             }
+                         }
+                         if (missing.size() > 0) {
+-                            LOGGER.info("Bundle {} is waiting for namespace handlers {}", bundleContext.getBundle().getSymbolicName(), missingURIs);
+-                            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundleContext().getBundle(), getExtenderBundle(), missing.toArray(new String[missing.size()])));
++                            LOGGER.info("Bundle {} is waiting for namespace handlers {}", getBundle().getSymbolicName(), missingURIs);
++                            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundle(), getExtenderBundle(), missing.toArray(new String[missing.size()])));
+                             return;
+                         }
+                         componentDefinitionRegistry.reset();
+                         componentDefinitionRegistry.registerComponentDefinition(new PassThroughMetadataImpl("blueprintContainer", this));
+-                        componentDefinitionRegistry.registerComponentDefinition(new PassThroughMetadataImpl("blueprintBundle", bundleContext.getBundle()));
++                        componentDefinitionRegistry.registerComponentDefinition(new PassThroughMetadataImpl("blueprintBundle", bundle));
+                         componentDefinitionRegistry.registerComponentDefinition(new PassThroughMetadataImpl("blueprintBundleContext", bundleContext));
+                         componentDefinitionRegistry.registerComponentDefinition(new PassThroughMetadataImpl("blueprintConverter", converter));
+                         if (xmlValidation) {
+@@ -305,6 +309,7 @@ private void doRun() {
+                         }
+                         parser.populate(handlerSet, componentDefinitionRegistry);
+                         state = State.Populated;
++                        break;
+                     }
+                     case Populated:
+                         getRepository();
+@@ -316,53 +321,58 @@ public void run() {
+                                     state = State.Failed;
+                                     String[] missingDependecies = getMissingDependencies();
+                                     tidyupComponents();
+-                                    LOGGER.error("Unable to start blueprint container for bundle " + bundleContext.getBundle().getSymbolicName() + " due to unresolved dependencies " + Arrays.asList(missingDependecies), t);
+-                                    eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, getBundleContext().getBundle(), getExtenderBundle(), missingDependecies, t));
++                                    LOGGER.error("Unable to start blueprint container for bundle " + getBundle().getSymbolicName() + " due to unresolved dependencies " + Arrays.asList(missingDependecies), t);
++                                    eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, getBundle(), getExtenderBundle(), missingDependecies, t));
+                                 }
+                             }
+                         };
+-                        timeoutFuture = executors.schedule(r, timeout, TimeUnit.MILLISECONDS);
++                        timeoutFuture = timer.schedule(r, timeout, TimeUnit.MILLISECONDS);
+                         state = State.WaitForInitialReferences;
++                        break;
+                     case WaitForInitialReferences:
+                         if (waitForDependencies) {
+                             String[] missingDependencies = getMissingDependencies();
+                             if (missingDependencies.length > 0) {
+-                                LOGGER.info("Bundle {} is waiting for dependencies {}", bundleContext.getBundle().getSymbolicName(), Arrays.asList(missingDependencies));
+-                                eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundleContext().getBundle(), getExtenderBundle(), missingDependencies));
++                                LOGGER.info("Bundle {} is waiting for dependencies {}", getBundle().getSymbolicName(), Arrays.asList(missingDependencies));
++                                eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundle(), getExtenderBundle(), missingDependencies));
+                                 return;
+                             }
+                         }
+                         state = State.InitialReferencesSatisfied;
++                        break;
+                     case InitialReferencesSatisfied:
+                         processTypeConverters();
+                         processProcessors();
+                         state = State.WaitForInitialReferences2;
++                        break;
+                     case WaitForInitialReferences2:
+                         if (waitForDependencies) {
+                             String[] missingDependencies = getMissingDependencies();
+                             if (missingDependencies.length > 0) {
+-                                LOGGER.info("Bundle {} is waiting for dependencies {}", bundleContext.getBundle().getSymbolicName(), Arrays.asList(missingDependencies));
+-                                eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundleContext().getBundle(), getExtenderBundle(), missingDependencies));
++                                LOGGER.info("Bundle {} is waiting for dependencies {}", getBundle().getSymbolicName(), Arrays.asList(missingDependencies));
++                                eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.GRACE_PERIOD, getBundle(), getExtenderBundle(), missingDependencies));
+                                 return;
+                             }
+                         }                       
+                         state = State.Create;
++                        break;
+                     case Create:
+                         cancelFutureIfPresent();
+                         registerServices();
+                         instantiateEagerComponents();
+                         // Register the BlueprintContainer in the OSGi registry
+-                        int bs = bundleContext.getBundle().getState();
++                        int bs = bundle.getState();
+                         if (registration == null && (bs == Bundle.ACTIVE || bs == Bundle.STARTING)) {
+                             Properties props = new Properties();
+                             props.put(BlueprintConstants.CONTAINER_SYMBOLIC_NAME_PROPERTY,
+-                                      bundleContext.getBundle().getSymbolicName());
++                                      bundle.getSymbolicName());
+                             props.put(BlueprintConstants.CONTAINER_VERSION_PROPERTY,
+-                                      JavaUtils.getBundleVersion(bundleContext.getBundle()));
++                                      JavaUtils.getBundleVersion(bundle));
+                             registration = registerService(new String [] { BlueprintContainer.class.getName() }, this, props);
+                         }
+-                        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.CREATED, getBundleContext().getBundle(), getExtenderBundle()));
++                        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.CREATED, getBundle(), getExtenderBundle()));
+                         state = State.Created;
++                        break;
+                     case Created:
+                     case Failed:
+                         return;
+@@ -372,8 +382,8 @@ public void run() {
+             state = State.Failed;
+             cancelFutureIfPresent();
+             tidyupComponents();
+-            LOGGER.error("Unable to start blueprint container for bundle " + bundleContext.getBundle().getSymbolicName(), t);
+-            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, getBundleContext().getBundle(), getExtenderBundle(), t));
++            LOGGER.error("Unable to start blueprint container for bundle " + getBundle().getSymbolicName(), t);
++            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, getBundle(), getExtenderBundle(), t));
+         }
+     }
+ 
+@@ -383,7 +393,7 @@ public void run() {
+             if (path instanceof URL) {
+                 resources.add((URL) path);                
+             } else if (path instanceof String) {
+-                URL url = bundleContext.getBundle().getEntry((String) path);
++                URL url = bundle.getEntry((String) path);
+                 if (url == null) {
+                     throw new FileNotFoundException("Unable to find configuration file for " + path);
+                 } else {
+@@ -398,12 +408,12 @@ public void run() {
+     
+     public Class loadClass(final String name) throws ClassNotFoundException {
+         if (accessControlContext == null) {
+-            return bundleContext.getBundle().loadClass(name);
++            return bundle.loadClass(name);
+         } else {
+             try {
+                 return AccessController.doPrivileged(new PrivilegedExceptionAction<Class>() {
+                     public Class run() throws Exception {
+-                        return bundleContext.getBundle().loadClass(name);
++                        return bundle.loadClass(name);
+                     }            
+                 }, accessControlContext);
+             } catch (PrivilegedActionException e) {
+@@ -475,7 +485,7 @@ private void processTypeConverters() throws Exception {
+     }
+ 
+     private void processProcessors() throws Exception {
+-        // Instanciate ComponentDefinitionRegistryProcessor and BeanProcessor
++        // Instantiate ComponentDefinitionRegistryProcessor and BeanProcessor
+         for (BeanMetadata bean : getMetadata(BeanMetadata.class)) {
+             if (bean instanceof ExtendedBeanMetadata && !((ExtendedBeanMetadata) bean).isProcessor()) {
+                 continue;
+@@ -598,7 +608,7 @@ private void untrackServiceReference(SatisfiableRecipe recipe, Set<String> stopp
+ 
+     public void notifySatisfaction(SatisfiableRecipe satisfiable) {
+         LOGGER.debug("Notified satisfaction {} in bundle {}: {}",
+-                new Object[] { satisfiable.getName(), bundleContext.getBundle().getSymbolicName(), satisfiable.isSatisfied() });
++                new Object[] { satisfiable.getName(), bundle.getSymbolicName(), satisfiable.isSatisfied() });
+         if (state == State.Create || state == State.Created ) {
+             Map<String, List<SatisfiableRecipe>> dependencies = getSatisfiableDependenciesMap();
+             for (Map.Entry<String, List<SatisfiableRecipe>> entry : dependencies.entrySet()) {
+@@ -812,27 +822,21 @@ public BundleContext getBundleContext() {
+         return bundleContext;
+     }
+     
++    public Bundle getBundle() {
++        return bundle;
++    }
++
+     public void destroy() {
++//        synchronized (scheduled) {
+         destroyed = true;
+-        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYING, getBundleContext().getBundle(), getExtenderBundle()));
++            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYING, getBundle(), getExtenderBundle()));
++            executors.shutdownNow();
+ 
+         cancelFutureIfPresent();
+         AriesFrameworkUtil.safeUnregisterService(registration);
+         
+         unregisterServices();
+ 
+-        synchronized (running) {
+-            while (running.get()) {
+-                if (runningThread != null) {
+-                    runningThread.interrupt();
+-                }
+-                try {
+-                    running.wait();
+-                } catch (InterruptedException e) {
+-                    // Ignore
+-                }
+-            }
+-        }
+         if (handlerSet != null) {
+             handlerSet.removeListener(this);
+             handlerSet.destroy();
+@@ -842,13 +846,20 @@ public void destroy() {
+         
+         untrackServiceReferences();
+ 
+-        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYED, getBundleContext().getBundle(), getExtenderBundle()));
++            try {
++                executors.awaitTermination(5 * 60, TimeUnit.SECONDS);
++            } catch (InterruptedException e) {
++                LOGGER.debug("Interrupted waiting for executor to shut down");
++            }
++
++            eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYED, getBundle(), getExtenderBundle()));
+         LOGGER.debug("Blueprint container destroyed: {}", this.bundleContext);
++//        }
+     }
+     
+     protected void quiesce() {
+         destroyed = true;
+-        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYING, getBundleContext().getBundle(), getExtenderBundle()));
++        eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.DESTROYING, getBundle(), getExtenderBundle()));
+ 
+         cancelFutureIfPresent();
+         AriesFrameworkUtil.safeUnregisterService(registration);
+@@ -856,7 +867,7 @@ protected void quiesce() {
+             handlerSet.removeListener(this);
+             handlerSet.destroy();
+         }
+-        LOGGER.debug("Blueprint container quiesced: {}", this.bundleContext);
++        LOGGER.debug("Blueprint container quiesced: {}", getBundleContext());
+     }
+ 
+     private void cancelFutureIfPresent()
+@@ -874,6 +885,7 @@ public void namespaceHandlerRegistered(URI uri) {
+ 
+     public void namespaceHandlerUnregistered(URI uri) {
+         if (namespaces != null && namespaces.contains(uri)) {
++            synchronized (scheduled) {
+             tidyupComponents();
+             this.componentDefinitionRegistry.reset();
+             this.repository = null;
+@@ -881,6 +893,7 @@ public void namespaceHandlerUnregistered(URI uri) {
+             schedule();
+         }
+     }
++    }
+ 
+     private void tidyupComponents()
+     {
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintExtender.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintExtender.java
+index 72886a53..65c2948a 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintExtender.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintExtender.java
+@@ -27,10 +27,7 @@
+ import java.util.Enumeration;
+ import java.util.Hashtable;
+ import java.util.List;
+-import java.util.Map;
+-import java.util.concurrent.ConcurrentHashMap;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.*;
+ 
+ import org.apache.aries.blueprint.BlueprintConstants;
+ import org.apache.aries.blueprint.annotation.service.BlueprintAnnotationScanner;
+@@ -52,7 +49,6 @@
+ import org.osgi.framework.Constants;
+ import org.osgi.framework.ServiceReference;
+ import org.osgi.framework.ServiceRegistration;
+-import org.osgi.framework.SynchronousBundleListener;
+ import org.osgi.service.blueprint.container.BlueprintContainer;
+ import org.osgi.service.blueprint.container.BlueprintEvent;
+ import org.osgi.util.tracker.BundleTrackerCustomizer;
+@@ -64,7 +60,7 @@
+  *
+  * @version $Rev$, $Date$
+  */
+-public class BlueprintExtender implements BundleActivator, SynchronousBundleListener {
++public class BlueprintExtender implements BundleActivator, BundleTrackerCustomizer {
+ 
+     /** The QuiesceParticipant implementation class name */
+     private static final String QUIESCE_PARTICIPANT_CLASS = "org.apache.aries.quiesce.participant.QuiesceParticipant";
+@@ -72,13 +68,16 @@
+ 
+     private BundleContext context;
+     private ScheduledExecutorService executors;
+-    private Map<Bundle, BlueprintContainerImpl> containers;
++    private final ConcurrentMap<Bundle, BlueprintContainerImpl> containers = new ConcurrentHashMap<Bundle, BlueprintContainerImpl>();
++    private final ConcurrentMap<Bundle, FutureTask> destroying = new ConcurrentHashMap<Bundle, FutureTask>();
+     private BlueprintEventDispatcher eventDispatcher;
+     private NamespaceHandlerRegistry handlers;
+     private RecursiveBundleTracker bt;
+     private ServiceRegistration parserServiceReg;
+     private ServiceRegistration quiesceParticipantReg;
+     private SingleServiceTracker<ProxyManager> proxyManager;
++    private ExecutorServiceFinder executorServiceFinder;
++    private volatile boolean stopping;
+     
+     public void start(BundleContext ctx) {
+         LOGGER.debug("Starting blueprint extender...");
+@@ -92,11 +91,9 @@ public ScheduledExecutorService create(String name)
+           }
+         });
+         eventDispatcher = new BlueprintEventDispatcher(ctx, executors);
+-        containers = new ConcurrentHashMap<Bundle, BlueprintContainerImpl>();
+ 
+-        int stateMask = Bundle.INSTALLED | Bundle.RESOLVED | Bundle.STARTING | Bundle.ACTIVE
+-        | Bundle.STOPPING;
+-        bt = new RecursiveBundleTracker(ctx, stateMask, new BlueprintBundleTrackerCustomizer());
++        int mask = Bundle.INSTALLED | Bundle.RESOLVED | Bundle.STARTING | Bundle.STOPPING | Bundle.ACTIVE;
++        bt = new RecursiveBundleTracker(ctx, mask, this);
+         
+         proxyManager = new SingleServiceTracker<ProxyManager>(ctx, ProxyManager.class, new SingleServiceListener() {
+           public void serviceFound() {
+@@ -114,7 +111,7 @@ public void serviceReplaced() {
+         // Create and publish a ParserService
+         parserServiceReg = ctx.registerService(ParserService.class.getName(), 
+             new ParserServiceImpl (handlers), 
+-            new Hashtable<Object, Object>()); 
++            new Hashtable<String, Object>());
+ 
+         try{
+             ctx.getBundle().loadClass(QUIESCE_PARTICIPANT_CLASS);
+@@ -122,7 +119,7 @@ public void serviceReplaced() {
+ 
+             quiesceParticipantReg = ctx.registerService(QUIESCE_PARTICIPANT_CLASS, 
+               new BlueprintQuiesceParticipant(ctx, this), 
+-              new Hashtable<Object, Object>()); 
++              new Hashtable<String, Object>());
+         } 
+         catch (ClassNotFoundException e) 
+         {
+@@ -132,35 +129,10 @@ public void serviceReplaced() {
+         LOGGER.debug("Blueprint extender started");
+     }
+ 
+-    /**
+-     * this method checks the initial bundle that are installed/active before
+-     * bundle tracker is opened.
+-     *
+-     * @param b the bundle to check
+-     */
+-    private void checkInitialBundle(Bundle b) {
+-        // If the bundle is active, check it
+-        if (b.getState() == Bundle.ACTIVE) {
+-            checkBundle(b);
+-            // Also check bundles in the starting state with a lazy activation
+-            // policy
+-        } else if (b.getState() == Bundle.STARTING) {
+-            String activationPolicyHeader = (String) b.getHeaders().get(
+-                    Constants.BUNDLE_ACTIVATIONPOLICY);
+-            if (activationPolicyHeader != null
+-                    && activationPolicyHeader
+-                            .startsWith(Constants.ACTIVATION_LAZY)) {
+-                checkBundle(b);
+-            }
+-        }
+-        
+-    }
+-
+     public void stop(BundleContext context) {
+         LOGGER.debug("Stopping blueprint extender...");
+-        if (bt != null) {
+-            bt.close();
+-        }
++
++        stopping = true;
+         
+         AriesFrameworkUtil.safeUnregisterService(parserServiceReg);
+ 
+@@ -169,86 +141,131 @@ public void stop(BundleContext context) {
+         // Orderly shutdown of containers
+         while (!containers.isEmpty()) {
+             for (Bundle bundle : getBundlesToDestroy()) {
+-                destroyContext(bundle);
++                destroyContainer(bundle);
+             }
+         }
++
++        bt.close();
++        proxyManager.close();
++
+         this.eventDispatcher.destroy();
+         this.handlers.destroy();
+         executors.shutdown();
+         LOGGER.debug("Blueprint extender stopped");
+     }
+     
+-    private List<Bundle> getBundlesToDestroy() {
+-        List<Bundle> bundlesToDestroy = new ArrayList<Bundle>();
+-        for (Bundle bundle : containers.keySet()) {
+-            ServiceReference[] references = bundle.getRegisteredServices();
+-            int usage = 0;
+-            if (references != null) {
+-                for (ServiceReference reference : references) {
+-                    usage += getServiceUsage(reference);
++    /*
++     * BundleTrackerCustomizer
++     */
++
++    public Object addingBundle(Bundle bundle, BundleEvent event) {
++        modifiedBundle(bundle, event, bundle);
++        return bundle;
+                 }
++
++    public void modifiedBundle(Bundle bundle, BundleEvent event, Object object) {
++        if (bundle.getState() != Bundle.ACTIVE && bundle.getState() != Bundle.STARTING) {
++            // The bundle is not in STARTING or ACTIVE state anymore
++            // so destroy the context
++            destroyContainer(bundle);
++            return;
+             }
+-            LOGGER.debug("Usage for bundle {} is {}", bundle, usage);
+-            if (usage == 0) {
+-                bundlesToDestroy.add(bundle);
++        // Do not track bundles given we are stopping
++        if (stopping) {
++            return;
+             }
++        // For starting bundles, ensure, it's a lazy activation,
++        // else we'll wait for the bundle to become ACTIVE
++        if (bundle.getState() == Bundle.STARTING) {
++            String activationPolicyHeader = (String) bundle.getHeaders().get(Constants.BUNDLE_ACTIVATIONPOLICY);
++            if (activationPolicyHeader == null || !activationPolicyHeader.startsWith(Constants.ACTIVATION_LAZY)) {
++                // Do not track this bundle yet
++                return;
+         }
+-        if (!bundlesToDestroy.isEmpty()) {
+-            Collections.sort(bundlesToDestroy, new Comparator<Bundle>() {
+-                public int compare(Bundle b1, Bundle b2) {
+-                    return (int) (b2.getLastModified() - b1.getLastModified());
+                 }
+-            });
+-            LOGGER.debug("Selected bundles {} for destroy (no services in use)", bundlesToDestroy);
+-        } else {
+-            ServiceReference ref = null;
+-            for (Bundle bundle : containers.keySet()) {
+-                ServiceReference[] references = bundle.getRegisteredServices();
+-                for (ServiceReference reference : references) {
+-                    if (getServiceUsage(reference) == 0) {
+-                        continue;
++        createContainer(bundle);
+                     }
+-                    if (ref == null || reference.compareTo(ref) < 0) {
+-                        LOGGER.debug("Currently selecting bundle {} for destroy (with reference {})", bundle, reference);
+-                        ref = reference;
++
++    public void removedBundle(Bundle bundle, BundleEvent event, Object object) {
++        // Nothing to do
++        destroyContainer(bundle);
+                     }
++
++    private boolean createContainer(Bundle bundle) {
++        try {
++            List<Object> paths = getBlueprintPaths(bundle);
++            if (paths == null) {
++                // This bundle is not a blueprint bundle, so ignore it
++                return false;
++            }
++            BlueprintContainerImpl blueprintContainer = new BlueprintContainerImpl(bundle.getBundleContext(),
++                                                                context.getBundle(), eventDispatcher,
++                                                                handlers, getExecutorService(bundle),
++                                                                executors, paths,
++                                                                proxyManager.getService());
++            synchronized (containers) {
++                if (containers.putIfAbsent(bundle, blueprintContainer) != null) {
++                    return false;
+                 }
+             }
+-            bundlesToDestroy.add(ref.getBundle());
+-            LOGGER.debug("Selected bundle {} for destroy (lowest ranking service)", bundlesToDestroy);
++            String val = context.getProperty("org.apache.aries.blueprint.synchronous");
++            if (Boolean.parseBoolean(val)) {
++                LOGGER.debug("Starting creation of blueprint bundle {} synchronously", bundle.getSymbolicName());
++                blueprintContainer.run();
++            } else {
++                LOGGER.debug("Scheduling creation of blueprint bundle {} asynchronously", bundle.getSymbolicName());
++                blueprintContainer.schedule();
+         }
+-        return bundlesToDestroy;
++            return true;
++        } catch (Throwable t) {
++            LOGGER.warn("Error while creating blueprint container for bundle " + bundle, t);
++            return false;
+     }
+-
+-    private static int getServiceUsage(ServiceReference ref) {
+-        Bundle[] usingBundles = ref.getUsingBundles();
+-        return (usingBundles != null) ? usingBundles.length : 0;        
+     }
+     
+-    public void bundleChanged(BundleEvent event) {
+-        Bundle bundle = event.getBundle();
+-        if (event.getType() == BundleEvent.LAZY_ACTIVATION) {
+-            checkBundle(bundle);
+-        } else if (event.getType() == BundleEvent.STARTED) {
+-            BlueprintContainerImpl blueprintContainer = containers.get(bundle);
+-            if (blueprintContainer == null) {
+-                checkBundle(bundle);
++    private void destroyContainer(final Bundle bundle) {
++        FutureTask future;
++        synchronized (containers) {
++            LOGGER.debug("Starting BlueprintContainer destruction process for bundle {}", bundle.getSymbolicName());
++            future = destroying.get(bundle);
++            if (future == null) {
++                final BlueprintContainerImpl blueprintContainer = containers.remove(bundle);
++                if (blueprintContainer != null) {
++                    LOGGER.debug("Scheduling BlueprintContainer destruction for {}.", bundle.getSymbolicName());
++                    future = new FutureTask<Void>(new Runnable() {
++                        public void run() {
++                            LOGGER.info("Destroying BlueprintContainer for bundle {}", bundle.getSymbolicName());
++                            try {
++                                blueprintContainer.destroy();
++                            } finally {
++                                LOGGER.debug("Finished destroying BlueprintContainer for bundle {}", bundle.getSymbolicName());
++                                eventDispatcher.removeBlueprintBundle(bundle);
++                                synchronized (containers) {
++                                    destroying.remove(bundle);
+             }
+-        } else if (event.getType() == BundleEvent.STOPPING) {
+-            destroyContext(bundle);
+         }
+     }
+-
+-    private void destroyContext(Bundle bundle) {
+-        BlueprintContainerImpl blueprintContainer = containers.remove(bundle);
+-        if (blueprintContainer != null) {
+-            LOGGER.debug("Destroying BlueprintContainer for bundle {}", bundle.getSymbolicName());
+-            blueprintContainer.destroy();
++                    }, null);
++                    destroying.put(bundle, future);
++                } else {
++                    LOGGER.debug("Not a blueprint bundle or destruction of BlueprintContainer already finished for {}.", bundle.getSymbolicName());
++                }
++            } else {
++                LOGGER.debug("Destruction already scheduled for {}.", bundle.getSymbolicName());
++            }
++        }
++        if (future != null) {
++            try {
++                LOGGER.debug("Waiting for BlueprintContainer destruction for {}.", bundle.getSymbolicName());
++                future.run();
++                future.get();
++            } catch (Throwable t) {
++                LOGGER.warn("Error while destroying blueprint container for bundle " + bundle, t);
++            }
+         }
+-        eventDispatcher.removeBlueprintBundle(bundle);
+     }
+     
+-    private void checkBundle(Bundle bundle) {
++    private List<Object> getBlueprintPaths(Bundle bundle) {
+         LOGGER.debug("Scanning bundle {} for blueprint application", bundle.getSymbolicName());
+         try {
+             List<Object> pathList = new ArrayList<Object>();
+@@ -280,53 +297,105 @@ private void checkBundle(Bundle bundle) {
+                     }                    
+                 }
+             }
+-            
++            // Check annotations
+             if (pathList.isEmpty() && blueprintHeaderAnnotation != null && blueprintHeaderAnnotation.trim().equalsIgnoreCase("true")) {
+                 LOGGER.debug("Scanning bundle {} for blueprint annotations", bundle.getSymbolicName());
+-                ServiceReference sr = this.context.getServiceReference("org.apache.aries.blueprint.annotation.service.BlueprintAnnotationScanner");
+-                           
++                ServiceReference sr = this.context.getServiceReference(BlueprintAnnotationScanner.class.getName());
+                 if (sr != null) {
+-                    BlueprintAnnotationScanner bas = (BlueprintAnnotationScanner)this.context.getService(sr);
++                    BlueprintAnnotationScanner bas = (BlueprintAnnotationScanner) this.context.getService(sr);
++                    try {
+                     // try to generate the blueprint definition XML
+                     URL url = bas.createBlueprintModel(bundle);
+-                        
+                     if (url != null) {
+                         pathList.add(url);
+                     }
+-                    
++                    } finally {
+                     this.context.ungetService(sr);
+                 }
+-             
+             }
+-            
++            }
+             if (!pathList.isEmpty()) {
+                 LOGGER.debug("Found blueprint application in bundle {} with paths: {}", bundle.getSymbolicName(), pathList);
+                 // Check compatibility
+                 // TODO: For lazy bundles, the class is either loaded from an imported package or not found, so it should
+                 // not trigger the activation.  If it does, we need to use something else like package admin or
+                 // ServiceReference, or just not do this check, which could be quite harmful.
+-                boolean compatible = isCompatible(bundle);
+-                if (compatible) {
+-                    final BlueprintContainerImpl blueprintContainer = new BlueprintContainerImpl(bundle.getBundleContext(), context.getBundle(), eventDispatcher, handlers, executors, pathList, proxyManager.getService());
+-                    containers.put(bundle, blueprintContainer);
+-                    String val = context.getProperty("org.apache.aries.blueprint.synchronous");
+-                    if (Boolean.parseBoolean(val)) {
+-                        LOGGER.debug("Starting creation of blueprint bundle {} synchronously", bundle.getSymbolicName());
+-                        blueprintContainer.run();
+-                    } else {
+-                        LOGGER.debug("Scheduling creation of blueprint bundle {} asynchronously", bundle.getSymbolicName());
+-                        blueprintContainer.schedule();
+-                    }
++                if (isCompatible(bundle)) {
++                    return pathList;
+                 } else {
+                     LOGGER.info("Bundle {} is not compatible with this blueprint extender", bundle.getSymbolicName());
+                 }
+-
+             } else {
+                 LOGGER.debug("No blueprint application found in bundle {}", bundle.getSymbolicName());   
+             }
+         } catch (Throwable t) {
++            if (!stopping) {
++                LOGGER.warn("Error creating blueprint container for bundle " + bundle.getSymbolicName(), t);
+             eventDispatcher.blueprintEvent(new BlueprintEvent(BlueprintEvent.FAILURE, bundle, context.getBundle(), t));
+         }
++    }
++        return null;
++    }
++
++    private List<Bundle> getBundlesToDestroy() {
++        List<Bundle> bundlesToDestroy = new ArrayList<Bundle>();
++        for (Bundle bundle : containers.keySet()) {
++            ServiceReference[] references = bundle.getRegisteredServices();
++            int usage = 0;
++            if (references != null) {
++                for (ServiceReference reference : references) {
++                    usage += getServiceUsage(reference);
++                }
++            }
++            LOGGER.debug("Usage for bundle {} is {}", bundle, usage);
++            if (usage == 0) {
++                bundlesToDestroy.add(bundle);
++            }
++        }
++        if (!bundlesToDestroy.isEmpty()) {
++            Collections.sort(bundlesToDestroy, new Comparator<Bundle>() {
++                public int compare(Bundle b1, Bundle b2) {
++                    return (int) (b2.getLastModified() - b1.getLastModified());
++                }
++            });
++            LOGGER.debug("Selected bundles {} for destroy (no services in use)", bundlesToDestroy);
++        } else {
++            ServiceReference ref = null;
++            for (Bundle bundle : containers.keySet()) {
++                ServiceReference[] references = bundle.getRegisteredServices();
++                for (ServiceReference reference : references) {
++                    if (getServiceUsage(reference) == 0) {
++                        continue;
++                    }
++                    if (ref == null || reference.compareTo(ref) < 0) {
++                        LOGGER.debug("Currently selecting bundle {} for destroy (with reference {})", bundle, reference);
++                        ref = reference;
++                    }
++                }
++            }
++            bundlesToDestroy.add(ref.getBundle());
++            LOGGER.debug("Selected bundle {} for destroy (lowest ranking service)", bundlesToDestroy);
++        }
++        return bundlesToDestroy;
++    }
++
++    private static int getServiceUsage(ServiceReference ref) {
++        Bundle[] usingBundles = ref.getUsingBundles();
++        return (usingBundles != null) ? usingBundles.length : 0;
++    }
++
++    private ExecutorService getExecutorService(Bundle bundle) {
++        if (executorServiceFinder != null) {
++            return executorServiceFinder.find(bundle);
++        } else {
++            return executors;
++        }
++    }
++
++    interface ExecutorServiceFinder {
++
++        public ExecutorService find( Bundle bundle );
++
+     }
+ 
+     private boolean isCompatible(Bundle bundle) {
+@@ -407,40 +476,6 @@ private void addEntries(Bundle bundle, String path, String filePattern, List<Obj
+         }
+     }
+     
+-    // blueprint bundle tracker calls bundleChanged to minimize changes.
+-    private class BlueprintBundleTrackerCustomizer implements
+-            BundleTrackerCustomizer {
+-
+-        public BlueprintBundleTrackerCustomizer() {
+-        }
+-
+-        public Object addingBundle(Bundle b, BundleEvent event) {
+-            if (event == null) {
+-                // existing bundles first added to the tracker with no event change
+-                checkInitialBundle(b);
+-            } else {
+-                bundleChanged(event);
+-            }
+-
+-            return b;
+-        }
+-
+-        public void modifiedBundle(Bundle b, BundleEvent event, Object arg2) {
+-            if (event == null) {
+-                // cannot think of why we would be interested in a modified bundle with no bundle event
+-                return;
+-            }
+-
+-            bundleChanged(event);
+-
+-        }
+-
+-        // don't think we would be interested in removedBundle, as that is
+-        // called when bundle is removed from the tracker
+-        public void removedBundle(Bundle b, BundleEvent event, Object arg2) {
+-        }
+-    }
+-    
+     protected BlueprintContainerImpl getBlueprintContainerImpl(Bundle bundle)
+     {
+         return containers.get(bundle);
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ExecutorServiceWrapper.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ExecutorServiceWrapper.java
+index e69de29b..c1c16522 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ExecutorServiceWrapper.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ExecutorServiceWrapper.java
+@@ -0,0 +1,123 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.blueprint.container;
++
++import java.util.ArrayList;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Queue;
++import java.util.concurrent.*;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++public class ExecutorServiceWrapper extends AbstractExecutorService implements Runnable {
++
++    private final ExecutorService delegate;
++    private final ConcurrentLinkedQueue<Runnable> queue = new ConcurrentLinkedQueue<Runnable>();
++    private final AtomicBoolean triggered = new AtomicBoolean();
++    private final AtomicBoolean shutdown = new AtomicBoolean();
++    private Thread runningThread;
++
++    public ExecutorServiceWrapper(ExecutorService delegate) {
++        this.delegate = delegate;
++    }
++
++    public void shutdown() {
++        shutdown.set(true);
++    }
++
++    public List<Runnable> shutdownNow() {
++        List<Runnable> pending = new ArrayList<Runnable>();
++        if (shutdown.compareAndSet(false, true)) {
++            Runnable runnable;
++            while ((runnable = queue.poll()) != null) {
++                pending.add(runnable);
++            }
++        }
++        return pending;
++    }
++
++    public boolean isShutdown() {
++        return shutdown.get();
++    }
++
++    public boolean isTerminated() {
++        return delegate.isTerminated() || isShutdown() && queue.isEmpty() && !triggered.get();
++    }
++
++    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException {
++        long millis = unit.toMillis(timeout);
++        if (millis > 0) {
++            long max = System.currentTimeMillis() + millis;
++            synchronized (triggered) {
++                while (System.currentTimeMillis() < max) {
++                    if (isTerminated()) {
++                        return true;
++                    } else {
++                        triggered.wait(millis);
++                    }
++                }
++            }
++        }
++        return isTerminated();
++    }
++
++    public void execute(Runnable command) {
++        if (isShutdown()) {
++            throw new RejectedExecutionException("Executor has been shut down");
++        }
++        queue.add(command);
++        triggerExecution();
++    }
++
++    protected void triggerExecution() {
++        if( triggered.compareAndSet(false, true) ) {
++            delegate.execute(this);
++        }
++    }
++
++    public void run() {
++        try {
++            Runnable runnable;
++            synchronized (triggered) {
++                runningThread = Thread.currentThread();
++            }
++            while (true) {
++                runnable = queue.poll();
++                if (runnable == null) {
++                    return;
++                }
++                try {
++                    runnable.run();
++                } catch (Throwable e) {
++                    Thread thread = Thread.currentThread();
++                    thread.getUncaughtExceptionHandler().uncaughtException(thread, e);
++                }
++            }
++        } finally {
++            synchronized (triggered) {
++                runningThread = null;
++                triggered.set(false);
++                triggered.notifyAll();
++            }
++            if (!isShutdown() && !queue.isEmpty()) {
++                triggerExecution();
++            }
++        }
++    }
++}

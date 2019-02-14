@@ -1,0 +1,1165 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index c96cbb43..17988a61 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -254,7 +254,7 @@ public static ColumnFamilyStore createColumnFamilyStore(String table, String col
+             
+             for (File file : files)
+             {
+-                String filename = file.getName();
++                String filename = file.getAbsolutePath();
+                 String cfName = getColumnFamilyFromFileName(filename);
+ 
+                 if (cfName.equals(columnFamily))
+@@ -290,7 +290,7 @@ public static ColumnFamilyStore createColumnFamilyStore(String table, String col
+             File[] files = new File(directory).listFiles();
+             for (File file : files)
+             {
+-                String cfName = getColumnFamilyFromFileName(file.getName());
++                String cfName = getColumnFamilyFromFileName(file.getAbsolutePath());
+                 if (cfName.equals(columnFamily_))
+                     fileSet.add(file);
+             }
+@@ -308,33 +308,12 @@ public String getColumnFamilyName()
+ 
+     private static String getColumnFamilyFromFileName(String filename)
+             {
+-        return filename.split("-")[0];
++        return SSTable.Descriptor.fromFilename(filename).cfname;
+     }
+ 
+     public static int getGenerationFromFileName(String filename)
+     {
+-        /*
+-         * File name is of the form <table>-<column family>-<index>-Data.db.
+-         * This tokenizer will strip the .db portion.
+-         */
+-        StringTokenizer st = new StringTokenizer(filename, "-");
+-        /*
+-         * Now I want to get the index portion of the filename. We accumulate
+-         * the indices and then sort them to get the max index.
+-         */
+-        int count = st.countTokens();
+-        int i = 0;
+-        String index = null;
+-        while (st.hasMoreElements())
+-        {
+-            index = (String) st.nextElement();
+-            if (i == (count - 2))
+-            {
+-                break;
+-            }
+-            ++i;
+-        }
+-        return Integer.parseInt(index);
++        return SSTable.Descriptor.fromFilename(filename).generation;
+     }
+ 
+     /*
+@@ -348,13 +327,17 @@ public String getFlushPath()
+         String location = DatabaseDescriptor.getDataFileLocationForTable(table_, guessedSize);
+         if (location == null)
+             throw new RuntimeException("Insufficient disk space to flush");
+-        return new File(location, getTempSSTableFileName()).getAbsolutePath();
++        return getTempSSTablePath(location);
+     }
+ 
+-    public String getTempSSTableFileName()
++    public String getTempSSTablePath(String directory)
+     {
+-        return String.format("%s-%s-%s-Data.db",
+-                             columnFamily_, SSTable.TEMPFILE_MARKER, fileIndexGenerator_.incrementAndGet());
++        SSTable.Descriptor desc = new SSTable.Descriptor(new File(directory),
++                                                         table_,
++                                                         columnFamily_,
++                                                         fileIndexGenerator_.incrementAndGet(),
++                                                         true);
++        return desc.filenameFor("Data.db");
+     }
+ 
+     /** flush the given memtable and swap in a new one for its CFS, if it hasn't been frozen already.  threadsafe. */
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index ee6cf6b1..fbd5ebbb 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -290,7 +290,7 @@ int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int
+                 return 0;
+             }
+ 
+-            String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
++            String newFilename = new File(cfs.getTempSSTablePath(compactionFileLocation)).getAbsolutePath();
+             writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+ 
+             // validate the CF as we iterate over it
+@@ -370,7 +370,7 @@ int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int
+                 if (writer == null)
+                 {
+                     FileUtils.createDirectory(compactionFileLocation);
+-                    String newFilename = new File(compactionFileLocation, cfs.getTempSSTableFileName()).getAbsolutePath();
++                    String newFilename = new File(cfs.getTempSSTablePath(compactionFileLocation)).getAbsolutePath();
+                     writer = new SSTableWriter(newFilename, expectedBloomFilterSize, StorageService.getPartitioner());
+                 }
+                 writer.append(row.key, row.buffer);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
+index dafd2d67..c6d36456 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
+@@ -26,6 +26,7 @@
+ import java.util.List;
+ import java.util.Arrays;
+ import java.util.Map;
++import java.util.StringTokenizer;
+ 
+ import org.apache.log4j.Logger;
+ import org.apache.commons.lang.StringUtils;
+@@ -35,6 +36,8 @@
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.db.DecoratedKey;
+ 
++import com.google.common.base.Objects;
++
+ /**
+  * This class is built on top of the SequenceFile. It stores
+  * data on disk in sorted fashion. However the sorting is upto
+@@ -52,26 +55,34 @@
+     static final Logger logger = Logger.getLogger(SSTable.class);
+ 
+     public static final int FILES_ON_DISK = 3; // data, index, and bloom filter
++    public static final String COMPONENT_DATA = "Data.db";
++    public static final String COMPONENT_INDEX = "Index.db";
++    public static final String COMPONENT_FILTER = "Filter.db";
++
++    public static final String COMPONENT_COMPACTED = "Compacted";
+ 
+-    protected String path;
++    protected Descriptor desc;
+     protected IPartitioner partitioner;
+     protected BloomFilter bf;
+     protected List<KeyPosition> indexPositions;
+     protected Map<KeyPosition, PositionSize> spannedIndexDataPositions; // map of index position, to data position, for index entries spanning mmap segments
+-    protected String columnFamilyName;
+ 
+     /* Every 128th index entry is loaded into memory so we know where to start looking for the actual key w/o seeking */
+     public static final int INDEX_INTERVAL = 128;/* Required extension for temporary files created during compactions. */
+     public static final String TEMPFILE_MARKER = "tmp";
+ 
+-    public SSTable(String filename, IPartitioner partitioner)
++    protected SSTable(String filename, IPartitioner partitioner)
+     {
+-        assert filename.endsWith("-Data.db");
+-        columnFamilyName = parseColumnFamilyName(filename);
+-        this.path = filename;
++        assert filename.endsWith("-" + COMPONENT_DATA);
++        this.desc = Descriptor.fromFilename(filename);
+         this.partitioner = partitioner;
+     }
+ 
++    public Descriptor getDescriptor()
++    {
++        return desc;
++    }
++
+     protected static String parseColumnFamilyName(String filename)
+     {
+         return new File(filename).getName().split("-")[0];
+@@ -79,21 +90,17 @@ protected static String parseColumnFamilyName(String filename)
+ 
+     public static String indexFilename(String dataFile)
+     {
+-        String[] parts = dataFile.split("-");
+-        parts[parts.length - 1] = "Index.db";
+-        return StringUtils.join(parts, "-");
++        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_INDEX);
+     }
+ 
+     public String indexFilename()
+     {
+-        return indexFilename(path);
++        return desc.filenameFor(COMPONENT_INDEX);
+     }
+ 
+     protected static String compactedFilename(String dataFile)
+     {
+-        String[] parts = dataFile.split("-");
+-        parts[parts.length - 1] = "Compacted";
+-        return StringUtils.join(parts, "-");
++        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_COMPACTED);
+     }
+ 
+     /**
+@@ -121,46 +128,44 @@ public static boolean deleteIfCompacted(String dataFilename) throws IOException
+ 
+     protected String compactedFilename()
+     {
+-        return compactedFilename(path);
++        return desc.filenameFor(COMPONENT_COMPACTED);
+     }
+ 
+     protected static String filterFilename(String dataFile)
+     {
+-        String[] parts = dataFile.split("-");
+-        parts[parts.length - 1] = "Filter.db";
+-        return StringUtils.join(parts, "-");
++        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_FILTER);
+     }
+ 
+     public String filterFilename()
+     {
+-        return filterFilename(path);
++        return desc.filenameFor(COMPONENT_FILTER);
+     }
+ 
+     public String getFilename()
+     {
+-        return path;
++        return desc.filenameFor(COMPONENT_DATA);
+     }
+ 
+-    /** @return full paths to all the files associated w/ this SSTable */
+-    public List<String> getAllFilenames()
++    /** @return component names for files associated w/ this SSTable */
++    public List<String> getAllComponents()
+     {
+         // TODO streaming relies on the -Data (getFilename) file to be last, this is clunky
+-        return Arrays.asList(indexFilename(), filterFilename(), getFilename());
++        return Arrays.asList(COMPONENT_FILTER, COMPONENT_INDEX, COMPONENT_DATA);
+     }
+ 
+     public String getColumnFamilyName()
+     {
+-        return columnFamilyName;
++        return desc.cfname;
+     }
+ 
+     public String getTableName()
+     {
+-        return parseTableName(path);
++        return desc.ksname;
+     }
+ 
+     public static String parseTableName(String filename)
+     {
+-        return new File(filename).getParentFile().getName();        
++        return Descriptor.fromFilename(filename).ksname;        
+     }
+ 
+     public static long getTotalBytes(Iterable<SSTableReader> sstables)
+@@ -203,9 +208,9 @@ public String toString()
+     public long bytesOnDisk()
+     {
+         long bytes = 0;
+-        for (String fname : getAllFilenames())
++        for (String cname : getAllComponents())
+         {
+-            bytes += new File(fname).length();
++            bytes += new File(desc.filenameFor(cname)).length();
+         }
+         return bytes;
+     }
+@@ -214,7 +219,7 @@ public long bytesOnDisk()
+     public String toString()
+     {
+         return getClass().getName() + "(" +
+-               "path='" + path + '\'' +
++               "path='" + getFilename() + '\'' +
+                ')';
+     }
+ 
+@@ -229,4 +234,140 @@ public PositionSize(long position, long size)
+             this.size = size;
+         }
+     }
++
++    /**
++     * A SSTable is described by the keyspace and column family it contains data
++     * for, a generation (where higher generations contain more recent data) and
++     * an alphabetic version string.
++     *
++     * A descriptor can be marked as temporary, which influences generated filenames.
++     */
++    public static class Descriptor
++    {
++        public static final String LEGACY_VERSION = "a";
++        public static final String CURRENT_VERSION = "b";
++
++        public final File directory;
++        public final String version;
++        public final String ksname;
++        public final String cfname;
++        public final int generation;
++        public final boolean temporary;
++
++        /**
++         * A descriptor that assumes CURRENT_VERSION.
++         */
++        public Descriptor(File directory, String ksname, String cfname, int generation, boolean temp)
++        {
++            this(CURRENT_VERSION, directory, ksname, cfname, generation, temp);
++        }
++
++        public Descriptor(String version, File directory, String ksname, String cfname, int generation, boolean temp)
++        {
++            assert version != null && directory != null && ksname != null && cfname != null;
++            this.version = version;
++            this.directory = directory;
++            this.ksname = ksname;
++            this.cfname = cfname;
++            this.generation = generation;
++            temporary = temp;
++        }
++
++        /**
++         * @param suffix A component suffix, such as 'Data.db'/'Index.db'/etc
++         * @return A filename for this descriptor with the given suffix.
++         */
++        public String filenameFor(String suffix)
++        {
++            StringBuilder buff = new StringBuilder();
++            buff.append(directory).append(File.separatorChar);
++            buff.append(cfname).append("-");
++            if (temporary)
++                buff.append(TEMPFILE_MARKER).append("-");
++            if (!LEGACY_VERSION.equals(version))
++                buff.append(version).append("-");
++            buff.append(generation).append("-");
++            buff.append(suffix);
++            return buff.toString();
++        }
++
++        /**
++         * Filename of the form "<ksname>/<cfname>-[tmp-][<version>-]<gen>-*"
++         * @param name A full SSTable filename, including the directory.
++         * @return A SSTable.Descriptor for the filename. 
++         */
++        public static Descriptor fromFilename(String filename)
++        {
++            int separatorPos = filename.lastIndexOf(File.separatorChar);
++            assert separatorPos != -1 : "Filename must include parent directory.";
++            File directory = new File(filename.substring(0, separatorPos));
++            String name = filename.substring(separatorPos+1, filename.length());
++
++            // name of parent directory is keyspace name
++            String ksname = directory.getName();
++
++            // tokenize the filename
++            StringTokenizer st = new StringTokenizer(name, "-");
++            String nexttok = null;
++            
++            // all filenames must start with a column family
++            String cfname = st.nextToken();
++
++            // optional temporary marker
++            nexttok = st.nextToken();
++            boolean temporary = false;
++            if (nexttok.equals(TEMPFILE_MARKER))
++            {
++                temporary = true;
++                nexttok = st.nextToken();
++            }
++
++            // optional version string
++            String version = LEGACY_VERSION;
++            if (versionValidate(nexttok))
++            {
++                version = nexttok;
++                nexttok = st.nextToken();
++            }
++            int generation = Integer.parseInt(nexttok);
++
++            return new Descriptor(version, directory, ksname, cfname, generation, temporary);
++        }
++        
++        /**
++         * @return True if the given version string is not empty, and
++         * contains all lowercase letters, as defined by java.lang.Character.
++         */
++        private static boolean versionValidate(String ver)
++        {
++            if (ver.length() < 1) return false;
++            for (char ch : ver.toCharArray())
++                if (!Character.isLetter(ch) || !Character.isLowerCase(ch))
++                    return false;
++            return true;
++        }
++
++        @Override
++        public String toString()
++        {
++            return this.filenameFor("<>");
++        }
++
++        @Override
++        public boolean equals(Object o)
++        {
++            if (o == this)
++                return true;
++            if (!(o instanceof Descriptor))
++                return false;
++            Descriptor that = (Descriptor)o;
++            return that.directory.equals(this.directory) && that.generation == this.generation && that.ksname.equals(this.ksname) && that.cfname.equals(this.cfname);
++        }
++
++        @Override
++        public int hashCode()
++        {
++            return Objects.hashCode(directory, generation, ksname, cfname);
++        }
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableDeletingReference.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableDeletingReference.java
+index d145f5bc..be22d9af 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableDeletingReference.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableDeletingReference.java
+@@ -28,7 +28,7 @@
+     {
+         super(referent, q);
+         this.tracker = tracker;
+-        this.path = referent.path;
++        this.path = referent.getFilename();
+         this.size = referent.bytesOnDisk();
+     }
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
+index 179edf27..2904310f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
+@@ -109,6 +109,11 @@ public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
+         return count;
+     }
+ 
++    public static SSTableReader open(Descriptor desc) throws IOException
++    {
++        return open(desc.filenameFor(COMPONENT_DATA));
++    }
++
+     public static SSTableReader open(String dataFileName) throws IOException
+     {
+         return open(dataFileName,
+@@ -178,12 +183,12 @@ public static SSTableReader open(String dataFileName, IPartitioner partitioner,
+ 
+         if (DatabaseDescriptor.getDiskAccessMode() == DatabaseDescriptor.DiskAccessMode.mmap)
+         {
+-            int bufferCount = 1 + (int) (new File(path).length() / BUFFER_SIZE);
++            int bufferCount = 1 + (int) (new File(getFilename()).length() / BUFFER_SIZE);
+             buffers = new MappedByteBuffer[bufferCount];
+             long remaining = length();
+             for (int i = 0; i < bufferCount; i++)
+             {
+-                buffers[i] = mmap(path, i * BUFFER_SIZE, (int) Math.min(remaining, BUFFER_SIZE));
++                buffers[i] = mmap(getFilename(), i * BUFFER_SIZE, (int) Math.min(remaining, BUFFER_SIZE));
+                 remaining -= BUFFER_SIZE;
+             }
+         }
+@@ -412,7 +417,7 @@ public long getNearestPosition(DecoratedKey decoratedKey) throws IOException
+         }
+ 
+         // can't use a MappedFileDataInput here, since we might cross a segment boundary while scanning
+-        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(path), "r");
++        BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
+         input.seek(sampledPosition.position);
+         try
+         {
+@@ -441,18 +446,18 @@ public long getNearestPosition(DecoratedKey decoratedKey) throws IOException
+ 
+     public long length()
+     {
+-        return new File(path).length();
++        return new File(getFilename()).length();
+     }
+ 
+     public int compareTo(SSTableReader o)
+     {
+-        return ColumnFamilyStore.getGenerationFromFileName(path) - ColumnFamilyStore.getGenerationFromFileName(o.path);
++        return desc.generation - o.desc.generation;
+     }
+ 
+     public void markCompacted() throws IOException
+     {
+         if (logger.isDebugEnabled())
+-            logger.debug("Marking " + path + " compacted");
++            logger.debug("Marking " + getFilename() + " compacted");
+         if (!new File(compactedFilename()).createNewFile())
+         {
+             throw new IOException("Unable to create compaction marker");
+@@ -484,11 +489,11 @@ public FileDataInput getFileDataInput(DecoratedKey decoratedKey, int bufferSize)
+ 
+         if (buffers == null || (bufferIndex(info.position) != bufferIndex(info.position + info.size)))
+         {
+-            BufferedRandomAccessFile file = new BufferedRandomAccessFile(path, "r", bufferSize);
++            BufferedRandomAccessFile file = new BufferedRandomAccessFile(getFilename(), "r", bufferSize);
+             file.seek(info.position);
+             return file;
+         }
+-        return new MappedFileDataInput(buffers[bufferIndex(info.position)], path, (int) (info.position % BUFFER_SIZE));
++        return new MappedFileDataInput(buffers[bufferIndex(info.position)], getFilename(), (int) (info.position % BUFFER_SIZE));
+     }
+ 
+     static int bufferIndex(long position)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
+index 4696715b..1c3e7439 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
+@@ -51,7 +51,7 @@
+     public SSTableWriter(String filename, long keyCount, IPartitioner partitioner) throws IOException
+     {
+         super(filename, partitioner);
+-        dataFile = new BufferedRandomAccessFile(path, "rw", (int)(DatabaseDescriptor.getFlushDataBufferSizeInMB() * 1024 * 1024));
++        dataFile = new BufferedRandomAccessFile(getFilename(), "rw", (int)(DatabaseDescriptor.getFlushDataBufferSizeInMB() * 1024 * 1024));
+         indexFile = new BufferedRandomAccessFile(indexFilename(), "rw", (int)(DatabaseDescriptor.getFlushIndexBufferSizeInMB() * 1024 * 1024));
+         bf = BloomFilter.getFilter(keyCount, 15);
+     }
+@@ -66,7 +66,7 @@ private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+         {
+             logger.info("Last written key : " + lastWrittenKey);
+             logger.info("Current key : " + decoratedKey);
+-            logger.info("Writing into file " + path);
++            logger.info("Writing into file " + getFilename());
+             throw new IOException("Keys must be written in ascending order.");
+         }
+         return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
+@@ -134,7 +134,8 @@ public SSTableReader closeAndOpenReader(double cacheFraction) throws IOException
+     }
+ 
+     /**
+-     * Renames temporary SSTable files to valid data, index, and bloom filter files
++     * Renames temporary SSTable files to valid data, index, and bloom filter files.
++     * The SSTableWriter object will no longer be valid.
+      */
+     public SSTableReader closeAndOpenReader(double cacheFraction, boolean temporary) throws IOException
+     {
+@@ -153,15 +154,16 @@ public SSTableReader closeAndOpenReader(double cacheFraction, boolean temporary)
+         // main data
+         dataFile.close(); // calls force
+ 
++        String newpath = getFilename();
+         if (!temporary)
+         {
+             rename(indexFilename());
+             rename(filterFilename());
+-            path = rename(path); // important to do this last since index & filter file names are derived from it
++            newpath = rename(newpath); // important to do this last since index & filter file names are derived from it
+         }
+ 
+         InstrumentedCache<DecoratedKey, PositionSize> keyCache = SSTableReader.createKeyCache((int)(cacheFraction * keysWritten));
+-        return new SSTableReader(path, partitioner, indexPositions, spannedIndexDataPositions, bf, keyCache);
++        return new SSTableReader(newpath, partitioner, indexPositions, spannedIndexDataPositions, bf, keyCache);
+     }
+ 
+     static String rename(String tmpFilename)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index e6f454a0..a7893c7f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -50,8 +50,8 @@ public void read() throws IOException
+     {
+         InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+         if (logger.isDebugEnabled())
+-          logger.debug("Creating file for " + pendingFile.getTargetFile());
+-        FileOutputStream fos = new FileOutputStream(pendingFile.getTargetFile(), true);
++          logger.debug("Creating file for " + pendingFile.getFilename());
++        FileOutputStream fos = new FileOutputStream(pendingFile.getFilename(), true);
+         FileChannel fc = fos.getChannel();
+ 
+         long bytesRead = 0;
+@@ -68,7 +68,7 @@ public void read() throws IOException
+             streamStatus.setAction(CompletedFileStatus.StreamCompletionAction.STREAM);
+             handleStreamCompletion(remoteAddress.getAddress());
+             /* Delete the orphaned file. */
+-            File file = new File(pendingFile.getTargetFile());
++            File file = new File(pendingFile.getFilename());
+             file.delete();
+             throw ex;
+         }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+index 442309df..3f7bf414 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+@@ -5,6 +5,7 @@
+ import java.io.IOException;
+ 
+ import org.apache.cassandra.io.ICompactSerializer;
++import org.apache.cassandra.io.SSTable;
+ 
+ class PendingFile
+ {
+@@ -20,47 +21,47 @@
+         return serializer_;
+     }
+ 
+-    private String targetFile_;
+-    private final long expectedBytes_;
+-    private final String table_;
+-    private long ptr_;
++    private SSTable.Descriptor desc;        
++    private String component;
++    private long expectedBytes;                     
++    private long ptr;
+ 
+-    public PendingFile(String targetFile, long expectedBytes, String table)
++    public PendingFile(SSTable.Descriptor desc, String component, long expectedBytes)
+     {
+-        targetFile_ = targetFile;
+-        expectedBytes_ = expectedBytes;
+-        table_ = table;
+-        ptr_ = 0;
++        this.desc = desc;
++        this.component = component;
++        this.expectedBytes = expectedBytes;         
++        ptr = 0;
+     }
+ 
+     public void update(long ptr)
+     {
+-        ptr_ = ptr;
++        this.ptr = ptr;
+     }
+ 
+     public long getPtr()
+     {
+-        return ptr_;
++        return ptr;
+     }
+ 
+-    public String getTable()
++    public String getComponent()
+     {
+-        return table_;
++        return component;
+     }
+ 
+-    public String getTargetFile()
++    public SSTable.Descriptor getDescriptor()
+     {
+-        return targetFile_;
++        return desc;
+     }
+ 
+-    public void setTargetFile(String file)
++    public String getFilename()
+     {
+-        targetFile_ = file;
++        return desc.filenameFor(component);
+     }
+ 
+     public long getExpectedBytes()
+     {
+-        return expectedBytes_;
++        return expectedBytes;
+     }
+ 
+     public boolean equals(Object o)
+@@ -69,7 +70,7 @@ public boolean equals(Object o)
+             return false;
+ 
+         PendingFile rhs = (PendingFile)o;
+-        return targetFile_.hashCode() == rhs.hashCode();
++        return getFilename().equals(rhs.getFilename());
+     }
+ 
+     public int hashCode()
+@@ -79,24 +80,24 @@ public int hashCode()
+ 
+     public String toString()
+     {
+-        return targetFile_ + ":" + expectedBytes_;
++        return getFilename() + ":" + expectedBytes;
+     }
+ 
+     private static class InitiatedFileSerializer implements ICompactSerializer<PendingFile>
+     {
+         public void serialize(PendingFile sc, DataOutputStream dos) throws IOException
+         {
+-            dos.writeUTF(sc.targetFile_);
+-            dos.writeLong(sc.expectedBytes_);
+-            dos.writeUTF(sc.table_);
++            dos.writeUTF(sc.desc.filenameFor(sc.component));
++            dos.writeUTF(sc.component);
++            dos.writeLong(sc.expectedBytes);            
+         }
+ 
+         public PendingFile deserialize(DataInputStream dis) throws IOException
+         {
+-            String targetFile = dis.readUTF();
++            SSTable.Descriptor desc = SSTable.Descriptor.fromFilename(dis.readUTF());
++            String component = dis.readUTF();
+             long expectedBytes = dis.readLong();
+-            String table = dis.readUTF();
+-            return new PendingFile(targetFile, expectedBytes, table);
++            return new PendingFile(desc, component, expectedBytes);
+         }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamCompletionHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamCompletionHandler.java
+index f3a7f6d7..5a930212 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamCompletionHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamCompletionHandler.java
+@@ -27,24 +27,24 @@
+     public void onStreamCompletion(InetAddress host, PendingFile pendingFile, CompletedFileStatus streamStatus) throws IOException
+     {
+         /* Parse the stream context and the file to the list of SSTables in the associated Column Family Store. */
+-        if (pendingFile.getTargetFile().contains("-Data.db"))
++        if (pendingFile.getFilename().contains("-Data.db"))
+         {
+-            String tableName = pendingFile.getTable();
+-            File file = new File( pendingFile.getTargetFile() );
++            String tableName = pendingFile.getDescriptor().ksname;
++            File file = new File( pendingFile.getFilename() );
+             String fileName = file.getName();
+             String [] temp = fileName.split("-");
+ 
+             //Open the file to see if all parts are now here
+             try
+             {
+-                SSTableReader sstable = SSTableWriter.renameAndOpen(pendingFile.getTargetFile());
++                SSTableReader sstable = SSTableWriter.renameAndOpen(pendingFile.getFilename());
+                 //TODO add a sanity check that this sstable has all its parts and is ok
+                 Table.open(tableName).getColumnFamilyStore(temp[0]).addSSTable(sstable);
+                 logger.info("Streaming added " + sstable.getFilename());
+             }
+             catch (IOException e)
+             {
+-                throw new RuntimeException("Not able to add streamed file " + pendingFile.getTargetFile(), e);
++                throw new RuntimeException("Not able to add streamed file " + pendingFile.getFilename(), e);
+             }
+         }
+ 
+@@ -56,7 +56,7 @@ public void onStreamCompletion(InetAddress host, PendingFile pendingFile, Comple
+         /* If we're done with everything for this host, remove from bootstrap sources */
+         if (StreamInManager.isDone(host) && StorageService.instance.isBootstrapMode())
+         {
+-            StorageService.instance.removeBootstrapSource(host, pendingFile.getTable());
++            StorageService.instance.removeBootstrapSource(host, pendingFile.getDescriptor().ksname);
+         }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+index 0451ebbb..3cf7818d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+@@ -2,20 +2,18 @@
+ 
+ import java.io.*;
+ import java.net.InetAddress;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.Map;
+-import java.util.Set;
++import java.util.*;
+ 
+ import org.apache.log4j.Logger;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.db.Table;
+-import org.apache.cassandra.streaming.StreamInitiateMessage;
++import org.apache.cassandra.io.SSTable;
+ import org.apache.cassandra.net.IVerbHandler;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.streaming.StreamInitiateMessage;
+ import org.apache.cassandra.streaming.StreamInManager;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -52,24 +50,21 @@ public void doVerb(Message message)
+                 return;
+             }
+ 
+-            Map<String, String> fileNames = getNewNames(pendingFiles);
+-            Map<String, String> pathNames = new HashMap<String, String>();
+-            for (String ssName : fileNames.keySet())
+-                pathNames.put(ssName, DatabaseDescriptor.getNextAvailableDataLocation());
+             /*
+-             * For each of stream context's in the incoming message
+-             * generate the new file names and store the new file names
+-             * in the StreamContextManager.
++             * For each of the remote files in the incoming message
++             * generate a local pendingFile and store it in the StreamInManager.
+             */
+-            for (PendingFile pendingFile : pendingFiles)
++            for (Map.Entry<PendingFile, PendingFile> pendingFile : getContextMapping(pendingFiles).entrySet())
+             {
+-                CompletedFileStatus streamStatus = new CompletedFileStatus(pendingFile.getTargetFile(), pendingFile.getExpectedBytes() );
+-                String file = getNewFileNameFromOldContextAndNames(fileNames, pathNames, pendingFile);
++                PendingFile remoteFile = pendingFile.getKey();
++                PendingFile localFile = pendingFile.getValue();
++
++                CompletedFileStatus streamStatus = new CompletedFileStatus(remoteFile.getFilename(),
++                                                                           remoteFile.getExpectedBytes());
+ 
+                 if (logger.isDebugEnabled())
+-                  logger.debug("Received Data from  : " + message.getFrom() + " " + pendingFile.getTargetFile() + " " + file);
+-                pendingFile.setTargetFile(file);
+-                addStreamContext(message.getFrom(), pendingFile, streamStatus);
++                  logger.debug("Preparing to receive stream from " + message.getFrom() + ": " + remoteFile + " -> " + localFile);
++                addStreamContext(message.getFrom(), localFile, streamStatus);
+             }
+ 
+             StreamInManager.registerStreamCompletionHandler(message.getFrom(), new StreamCompletionHandler());
+@@ -84,56 +79,34 @@ public void doVerb(Message message)
+         }
+     }
+ 
+-    public String getNewFileNameFromOldContextAndNames(Map<String, String> fileNames,
+-                                                       Map<String, String> pathNames,
+-                                                       PendingFile pendingFile)
+-    {
+-        File sourceFile = new File( pendingFile.getTargetFile() );
+-        String[] piece = FBUtilities.strip(sourceFile.getName(), "-");
+-        String cfName = piece[0];
+-        String ssTableNum = piece[1];
+-        String typeOfFile = piece[2];
+-
+-        String newFileNameExpanded = fileNames.get(pendingFile.getTable() + "-" + cfName + "-" + ssTableNum);
+-        String path = pathNames.get(pendingFile.getTable() + "-" + cfName + "-" + ssTableNum);
+-        //Drop type (Data.db) from new FileName
+-        String newFileName = newFileNameExpanded.replace("Data.db", typeOfFile);
+-        return path + File.separator + pendingFile.getTable() + File.separator + newFileName;
+-    }
+-
+-    // todo: this method needs to be private, or package at the very least for easy unit testing.
+-    public Map<String, String> getNewNames(PendingFile[] pendingFiles) throws IOException
+-    {
+-        /*
+-         * Mapping for each file with unique CF-i ---> new file name. For eg.
+-         * for a file with name <CF>-<i>-Data.db there is a corresponding
+-         * <CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
+-         * generated file name.
++    /**
++     * Translates remote files to local files by creating a local sstable
++     * per remote sstable.
+         */
+-        Map<String, String> fileNames = new HashMap<String, String>();
+-        /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index/Filter file set */
+-        Set<String> distinctEntries = new HashSet<String>();
+-        for ( PendingFile pendingFile : pendingFiles)
++    public LinkedHashMap<PendingFile, PendingFile> getContextMapping(PendingFile[] remoteFiles) throws IOException
+         {
+-            String[] pieces = FBUtilities.strip(new File(pendingFile.getTargetFile()).getName(), "-");
+-            distinctEntries.add(pendingFile.getTable() + "-" + pieces[0] + "-" + pieces[1] );
+-        }
+-
+-        /* Generate unique file names per entry */
+-        for ( String distinctEntry : distinctEntries )
++        /* Create a local sstable for each remote sstable */
++        LinkedHashMap<PendingFile, PendingFile> mapping = new LinkedHashMap<PendingFile, PendingFile>();
++        Map<SSTable.Descriptor, SSTable.Descriptor> sstables = new HashMap<SSTable.Descriptor, SSTable.Descriptor>();
++        for (PendingFile remote : remoteFiles)
++        {
++            SSTable.Descriptor remotedesc = remote.getDescriptor();
++            SSTable.Descriptor localdesc = sstables.get(remotedesc);
++            if (localdesc == null)
+         {
+-            String tableName;
+-            String[] pieces = FBUtilities.strip(distinctEntry, "-");
+-            tableName = pieces[0];
+-            Table table = Table.open( tableName );
++                // new local sstable
++                Table table = Table.open(remotedesc.ksname);
++                ColumnFamilyStore cfStore = table.getColumnFamilyStore(remotedesc.cfname);
+ 
+-            ColumnFamilyStore cfStore = table.getColumnFamilyStore(pieces[1]);
+-            if (logger.isDebugEnabled())
+-              logger.debug("Generating file name for " + distinctEntry + " ...");
+-            fileNames.put(distinctEntry, cfStore.getTempSSTableFileName());
++                localdesc = SSTable.Descriptor.fromFilename(cfStore.getFlushPath());
++                sstables.put(remotedesc, localdesc);
++            }
++
++            // add a local file for this component
++            mapping.put(remote, new PendingFile(localdesc, remote.getComponent(), remote.getExpectedBytes()));
+         }
+ 
+-        return fileNames;
++        return mapping;
+     }
+ 
+     private void addStreamContext(InetAddress host, PendingFile pendingFile, CompletedFileStatus streamStatus)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+index 57988ed5..4913b9b5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+@@ -118,10 +118,11 @@ public static void transferSSTables(InetAddress target, List<SSTableReader> ssta
+         int i = 0;
+         for (SSTableReader sstable : sstables)
+         {
+-            for (String filename : sstable.getAllFilenames())
++            for (String component : sstable.getAllComponents())
+             {
+-                File file = new File(filename);
+-                pendingFiles[i++] = new PendingFile(file.getAbsolutePath(), file.length(), table);
++                SSTable.Descriptor desc = sstable.getDescriptor();
++                long filelen = new File(desc.filenameFor(component)).length();
++                pendingFiles[i++] = new PendingFile(desc, component, filelen);
+             }
+         }
+         if (logger.isDebugEnabled())
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+index 5cf078a6..699c5d1d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+@@ -84,9 +84,9 @@ public void addFilesToStream(PendingFile[] pendingFiles)
+         for (PendingFile pendingFile : pendingFiles)
+         {
+             if (logger.isDebugEnabled())
+-              logger.debug("Adding file " + pendingFile.getTargetFile() + " to be streamed.");
++              logger.debug("Adding file " + pendingFile.getFilename() + " to be streamed.");
+             files.add(pendingFile);
+-            fileMap.put(pendingFile.getTargetFile(), pendingFile);
++            fileMap.put(pendingFile.getFilename(), pendingFile);
+             totalBytes += pendingFile.getExpectedBytes();
+         }
+     }
+@@ -102,7 +102,7 @@ public void startNext()
+     {
+         if (files.size() > 0)
+         {
+-            File file = new File(files.get(0).getTargetFile());
++            File file = new File(files.get(0).getFilename());
+             if (logger.isDebugEnabled())
+               logger.debug("Streaming " + file.length() + " length file " + file + " ...");
+             MessagingService.instance.stream(file.getAbsolutePath(), 0L, file.length(), FBUtilities.getLocalAddress(), to);
+@@ -117,7 +117,7 @@ public void finishAndStartNext(String file) throws IOException
+         FileUtils.delete(file);
+         PendingFile pf = files.remove(0);
+         if (pf != null)
+-            fileMap.remove(pf.getTargetFile());
++            fileMap.remove(pf.getFilename());
+         if (files.size() > 0)
+         {
+             startNext();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+index 1021b096..93bc45aa 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+@@ -68,7 +68,7 @@ private StreamingService()
+         
+         StreamOutManager manager = StreamOutManager.get(dest);
+         for (PendingFile f : manager.getFiles())
+-            files.add(String.format("%s %d/%d", f.getTargetFile(), f.getPtr(), f.getExpectedBytes()));
++            files.add(String.format("%s %d/%d", f.getFilename(), f.getPtr(), f.getExpectedBytes()));
+         return files;
+     }
+ 
+@@ -84,7 +84,7 @@ private StreamingService()
+         List<String> files = new ArrayList<String>();
+         for (PendingFile pf : StreamInManager.getIncomingFiles(InetAddress.getByName(host)))
+         {
+-            files.add(String.format("%s: %s %d/%d", pf.getTable(), pf.getTargetFile(), pf.getPtr(), pf.getExpectedBytes()));
++            files.add(String.format("%s: %s %d/%d", pf.getDescriptor().ksname, pf.getFilename(), pf.getPtr(), pf.getExpectedBytes()));
+         }
+         return files;
+     }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
+index 05924046..5750b55a 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
+@@ -18,10 +18,12 @@
+ */
+ package org.apache.cassandra.io;
+ 
++import java.io.File;
+ import java.io.IOException;
+ import java.util.*;
+ 
+ import org.junit.Test;
++import static org.junit.Assert.*;
+ 
+ import org.apache.cassandra.CleanupHelper;
+ import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+@@ -45,13 +47,13 @@ public void testSingleWrite() throws IOException {
+ 
+         // verify
+         verifySingle(ssTable, bytes, key);
+-        ssTable = SSTableReader.open(ssTable.path); // read the index from disk
++        ssTable = SSTableReader.open(ssTable.getDescriptor()); // read the index from disk
+         verifySingle(ssTable, bytes, key);
+     }
+ 
+     private void verifySingle(SSTableReader sstable, byte[] bytes, String key) throws IOException
+     {
+-        BufferedRandomAccessFile file = new BufferedRandomAccessFile(sstable.path, "r");
++        BufferedRandomAccessFile file = new BufferedRandomAccessFile(sstable.getFilename(), "r");
+         file.seek(sstable.getPosition(sstable.partitioner.decorateKey(key)).position);
+         assert key.equals(file.readUTF());
+         int size = file.readInt();
+@@ -73,7 +75,7 @@ public void testManyWrites() throws IOException {
+ 
+         // verify
+         verifyMany(ssTable, map);
+-        ssTable = SSTableReader.open(ssTable.path); // read the index from disk
++        ssTable = SSTableReader.open(ssTable.getDescriptor()); // read the index from disk
+         verifyMany(ssTable, map);
+     }
+ 
+@@ -81,7 +83,7 @@ private void verifyMany(SSTableReader sstable, TreeMap<String, byte[]> map) thro
+     {
+         List<String> keys = new ArrayList<String>(map.keySet());
+         Collections.shuffle(keys);
+-        BufferedRandomAccessFile file = new BufferedRandomAccessFile(sstable.path, "r");
++        BufferedRandomAccessFile file = new BufferedRandomAccessFile(sstable.getFilename(), "r");
+         for (String key : keys)
+         {
+             file.seek(sstable.getPosition(sstable.partitioner.decorateKey(key)).position);
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableUtils.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableUtils.java
+index 10172ef2..6bf7830f 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableUtils.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableUtils.java
+@@ -64,9 +64,11 @@ public static File tempSSTableFile(String tablename, String cfname) throws IOExc
+         File tabledir = new File(tempdir, tablename);
+         tabledir.mkdir();
+         tabledir.deleteOnExit();
+-        return File.createTempFile(cfname + "-",
+-                                   "-" + SSTable.TEMPFILE_MARKER + "-Data.db",
+-                                   tabledir);
++        File datafile = new File(new SSTable.Descriptor(tabledir, tablename, cfname, 0,
++                                                        false).filenameFor("Data.db"));
++        assert datafile.createNewFile();
++        datafile.deleteOnExit();
++        return datafile;
+     }
+ 
+     public static SSTableReader writeSSTable(Set<String> keys) throws IOException
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+index 4e2134ac..07682fdc 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+@@ -27,6 +27,7 @@
+ import java.util.Map;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.io.SSTable;
+ 
+ import org.junit.Test;
+ 
+@@ -35,23 +36,26 @@
+     @Test
+     public void testGetNewNames() throws IOException
+     {
+-        PendingFile[] pendingFiles = new PendingFile[3];
+-        pendingFiles[0] = new PendingFile("/baz/foo/Standard1-500-Data.db", 100, "Keyspace1");
+-        pendingFiles[1] = new PendingFile("/bar/foo/Standard1-500-Index.db", 100, "Keyspace1");
+-        pendingFiles[2] = new PendingFile("/bad/foo/Standard1-500-Filter.db", 100, "Keyspace1");
++        SSTable.Descriptor desc = SSTable.Descriptor.fromFilename("/Keyspace1/Standard1-500-Data.db");
++        PendingFile[] pendingFiles = new PendingFile[]{
++            new PendingFile(desc, "Data.db", 100),
++            new PendingFile(desc, "Index.db", 100),
++            new PendingFile(desc, "Filter.db",100)};
+         StreamInitiateVerbHandler bivh = new StreamInitiateVerbHandler();
+-        Map<String, String> fileNames = bivh.getNewNames(pendingFiles);
+-        Map<String, String> paths = new HashMap<String, String>();
+-        for (String ssName : fileNames.keySet())
+-            paths.put(ssName, DatabaseDescriptor.getNextAvailableDataLocation());
+-        assertEquals(1, paths.size());
+-        String result = fileNames.get("Keyspace1-Standard1-500");
+-        assertEquals(true, result.contains("Standard1"));
+-        assertEquals(true, result.contains("Data.db"));
+-        assertEquals(1, fileNames.entrySet().size());
+ 
+-        assertTrue(new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, paths, pendingFiles[0])).getName().matches("Standard1-tmp-\\d+-Data.db"));
+-        assertTrue(new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, paths, pendingFiles[1])).getName().matches("Standard1-tmp-\\d+-Index.db"));
+-        assertTrue(new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, paths, pendingFiles[2])).getName().matches("Standard1-tmp-\\d+-Filter.db"));
++        // map the input (remote) contexts to output (local) contexts
++        Map<PendingFile, PendingFile> mapping = bivh.getContextMapping(pendingFiles);
++        assertEquals(pendingFiles.length, mapping.size());
++        for (PendingFile inContext : pendingFiles)
++        {
++            PendingFile outContext = mapping.get(inContext);
++            // filename and generation are expected to have changed
++            assert !inContext.getFilename().equals(outContext.getFilename());
++
++            // nothing else should
++            assertEquals(inContext.getComponent(), outContext.getComponent());
++            assertEquals(inContext.getDescriptor().ksname, outContext.getDescriptor().ksname);
++            assertEquals(inContext.getDescriptor().cfname, outContext.getDescriptor().cfname);
++        }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+index 6f52b7af..4f067dea 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+@@ -32,7 +32,7 @@
+ import org.apache.cassandra.io.SSTableReader;
+ import org.apache.cassandra.io.SSTableWriter;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+-import static org.apache.cassandra.Util.createTemporarySSTable;
++import static org.apache.cassandra.io.SSTableUtils.tempSSTableFile;
+ import static org.apache.cassandra.utils.FBUtilities.hexToBytes;
+ import static org.junit.Assert.assertTrue;
+ 
+@@ -47,7 +47,7 @@
+     @Test
+     public void testEnumeratekeys() throws IOException
+     {
+-        File tempSS = createTemporarySSTable("Keyspace1", "Standard1");
++        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+         ColumnFamily cfamily = ColumnFamily.create("Keyspace1", "Standard1");
+         IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+         DataOutputBuffer dob = new DataOutputBuffer();
+@@ -85,7 +85,7 @@ public void testEnumeratekeys() throws IOException
+ 
+     @Test
+     public void testExportSimpleCf() throws IOException    {
+-        File tempSS = createTemporarySSTable("Keyspace1", "Standard1");
++        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+         ColumnFamily cfamily = ColumnFamily.create("Keyspace1", "Standard1");
+         IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+         DataOutputBuffer dob = new DataOutputBuffer();
+@@ -125,7 +125,7 @@ public void testExportSimpleCf() throws IOException    {
+     @Test
+     public void testExportSuperCf() throws IOException
+     {
+-        File tempSS = createTemporarySSTable("Keyspace1", "Super4");
++        File tempSS = tempSSTableFile("Keyspace1", "Super4");
+         ColumnFamily cfamily = ColumnFamily.create("Keyspace1", "Super4");
+         IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+         DataOutputBuffer dob = new DataOutputBuffer();
+@@ -165,7 +165,7 @@ public void testExportSuperCf() throws IOException
+     @Test
+     public void testRoundTripStandardCf() throws IOException, ParseException
+     {
+-        File tempSS = createTemporarySSTable("Keyspace1", "Standard1");
++        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+         ColumnFamily cfamily = ColumnFamily.create("Keyspace1", "Standard1");
+         IPartitioner<?> partitioner = DatabaseDescriptor.getPartitioner();
+         DataOutputBuffer dob = new DataOutputBuffer();
+@@ -185,7 +185,7 @@ public void testRoundTripStandardCf() throws IOException, ParseException
+         SSTableExport.export(reader, new PrintStream(tempJson.getPath()));
+         
+         // Import JSON to another SSTable file
+-        File tempSS2 = createTemporarySSTable("Keyspace1", "Standard1");
++        File tempSS2 = tempSSTableFile("Keyspace1", "Standard1");
+         SSTableImport.importJson(tempJson.getPath(), "Keyspace1", "Standard1", tempSS2.getPath());        
+         
+         reader = SSTableAccessor.getSSTableReader(tempSS2.getPath(), DatabaseDescriptor.getPartitioner());
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
+index ae3a7447..10f3585f 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
+@@ -29,7 +29,7 @@
+ import org.apache.cassandra.io.SSTableAccessor;
+ import org.apache.cassandra.io.SSTableReader;
+ import static org.apache.cassandra.utils.FBUtilities.hexToBytes;
+-import static org.apache.cassandra.Util.createTemporarySSTable;
++import static org.apache.cassandra.io.SSTableUtils.tempSSTableFile;
+ import org.json.simple.parser.ParseException;
+ import org.junit.Test;
+ 
+@@ -40,7 +40,7 @@ public void testImportSimpleCf() throws IOException, ParseException
+     {
+         // Import JSON to temp SSTable file
+         String jsonUrl = getClass().getClassLoader().getResource("SimpleCF.json").getPath();
+-        File tempSS = createTemporarySSTable("Keyspace1", "Standard1");
++        File tempSS = tempSSTableFile("Keyspace1", "Standard1");
+         SSTableImport.importJson(jsonUrl, "Keyspace1", "Standard1", tempSS.getPath());
+ 
+         // Verify results
+@@ -54,7 +54,7 @@ public void testImportSimpleCf() throws IOException, ParseException
+     public void testImportSuperCf() throws IOException, ParseException
+     {
+         String jsonUrl = getClass().getClassLoader().getResource("SuperCF.json").getPath();
+-        File tempSS = createTemporarySSTable("Keyspace1", "Super4");
++        File tempSS = tempSSTableFile("Keyspace1", "Super4");
+         SSTableImport.importJson(jsonUrl, "Keyspace1", "Super4", tempSS.getPath());
+         
+         // Verify results

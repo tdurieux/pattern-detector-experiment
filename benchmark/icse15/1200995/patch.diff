@@ -1,0 +1,275 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
+index 97787476..4b25c9e6 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
+@@ -56,6 +56,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ public class InterruptStatus {
+ 
++    /**
++     * Constants used by code that retries file operations after seeing the
++     * NIO file channel closed due to interrupts.
++     */
++    public final static int MAX_INTERRUPT_RETRIES = 120;
++    public final static int INTERRUPT_RETRY_SLEEP = 500; // millis
++
+     /**
+      * Use thread local variable to store interrupt status flag *only* if we
+      * don't have lcc, e.g. during database creation, shutdown etc.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/io/DirFile4.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/io/DirFile4.java
+index 57f5bde0..35755b8c 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/io/DirFile4.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/io/DirFile4.java
+@@ -31,12 +31,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.RandomAccessFile;
++import java.nio.channels.AsynchronousCloseException;
++import java.nio.channels.ClosedChannelException;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.FileLock;
+ import java.nio.channels.OverlappingFileLockException;
+-import java.security.AccessControlException;
+ import org.apache.derby.iapi.error.StandardException;
+-import org.apache.derby.shared.common.reference.SQLState;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /**
+  * This class implements the StorageFile interface using features of Java 1.4 not available in earlier
+@@ -154,24 +155,42 @@ public synchronized int getExclusiveFileLock() throws StandardException
+ 			//If we can acquire a reliable exclusive lock , try to get it.
+ 			if(validExclusiveLock)
+ 			{
++                int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
++                while (true) {
+ 				lockFileOpen = new RandomAccessFile((File) this, "rw");
+                 limitAccessToOwner(); // tamper-proof..
+ 				lockFileChannel = lockFileOpen.getChannel();
++
++                    try {
+ 				dbLock =lockFileChannel.tryLock();
+-				if(dbLock == null)
+-				{
++                        if(dbLock == null) {
+ 					lockFileChannel.close();
+ 					lockFileChannel=null;
+ 					lockFileOpen.close();
+ 					lockFileOpen = null;
+ 					status = EXCLUSIVE_FILE_LOCK_NOT_AVAILABLE;
+-				}
+-				else
+-				{	
++                        } else {
+ 					lockFileOpen.writeInt(EXCLUSIVE_FILE_LOCK);
+ 					lockFileChannel.force(true);
+ 					status = EXCLUSIVE_FILE_LOCK;
+ 				}
++                    } catch (AsynchronousCloseException e) {
++                        // JDK bug 6979009: use AsynchronousCloseException
++                        // instead of the logically correct
++                        // ClosedByInterruptException
++
++                        InterruptStatus.setInterrupted();
++                        lockFileOpen.close();
++
++                        if (retries-- > 0) {
++                            continue;
++                        } else {
++                            throw e;
++                        }
++                    }
++
++                    break;
++                }
+ 			}
+ 			else
+ 			{
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+index 251c8093..698138d3 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+@@ -1511,8 +1511,6 @@ protected final void incrementReusableRecordIdSequenceNumber()
+ 		}
+ 	}
+ 
+-    protected final static int INTERRUPT_RETRY_SLEEP = 500; // millis
+-    protected final static int MAX_INTERRUPT_RETRIES = 120; // i.e. 60s
+ 
+ 	/**
+ 	  Create a new page in the container.
+@@ -1587,7 +1585,7 @@ protected BasePage newPage(BaseContainerHandle userHandle,
+ 		boolean retry;
+ 		int numtries = 0;
+ 
+-        int maxTries = MAX_INTERRUPT_RETRIES;
++        int maxTries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+         long startSearch = lastAllocatedPage;
+ 
+@@ -1674,7 +1672,8 @@ protected BasePage newPage(BaseContainerHandle userHandle,
+                             // we re-grab monitor on "this" (which recovery
+                             // needs) and retry writeRAFHeader.
+                             try {
+-                                Thread.sleep(INTERRUPT_RETRY_SLEEP);
++                                Thread.sleep(
++                                    InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                             } catch (InterruptedException ee) {
+                                 // This thread received an interrupt as
+                                 // well, make a note.
+@@ -2069,7 +2068,7 @@ private boolean pageValid(BaseContainerHandle handle, long pagenum)
+ 	{
+ 		boolean retval = false;
+         boolean done;
+-        int maxTries = MAX_INTERRUPT_RETRIES;
++        int maxTries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+         do {
+             done = true;
+@@ -2095,7 +2094,7 @@ private boolean pageValid(BaseContainerHandle handle, long pagenum)
+                         // we re-grab monitor on "this" (which recovery
+                         // needs) and retry writeRAFHeader.
+                         try {
+-                            Thread.sleep(INTERRUPT_RETRY_SLEEP);
++                            Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                         } catch (InterruptedException ee) {
+                             // This thread received an interrupt as
+                             // well, make a note.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index 2a77b1f7..637c37d3 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -435,7 +435,7 @@ public void clean(boolean forRemove) throws StandardException
+         // release our monitor on "this" and to retry writeRAFHeader, so be
+         // prepared to retry.
+         boolean success = false;
+-        int maxTries = MAX_INTERRUPT_RETRIES; // ca 60s = (120 * 0.5s)
++        int maxTries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+         while (!success) {
+             success = true;
+@@ -512,7 +512,8 @@ public void clean(boolean forRemove) throws StandardException
+                             // we re-grab monitor on "this" (which recovery
+                             // needs) and retry writeRAFHeader.
+                             try {
+-                                Thread.sleep(INTERRUPT_RETRY_SLEEP);
++                                Thread.sleep(
++                                    InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                             } catch (InterruptedException ee) {
+                                 // This thread received an interrupt as
+                                 // well, make a note.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+index 32cd47aa..fb535d92 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+@@ -324,7 +324,7 @@ private void readPage(long pageNumber, byte[] pageData, long offset)
+             synchronized (channelCleanupMonitor) {
+ 
+                 // Gain entry
+-                int retries = MAX_INTERRUPT_RETRIES;
++                int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+                 while (restoreChannelInProgress) {
+                     if (retries-- == 0) {
+@@ -333,7 +333,8 @@ private void readPage(long pageNumber, byte[] pageData, long offset)
+                     }
+ 
+                     try {
+-                        channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
++                        channelCleanupMonitor.wait(
++                            InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                     } catch (InterruptedException e) {
+                         InterruptStatus.setInterrupted();
+                     }
+@@ -346,7 +347,7 @@ private void readPage(long pageNumber, byte[] pageData, long offset)
+ 
+ 
+         boolean success = false;
+-        int retries = MAX_INTERRUPT_RETRIES;
++        int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+       try {
+         while (!success) {
+@@ -498,7 +499,7 @@ protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+             synchronized (channelCleanupMonitor) {
+ 
+                 // Gain entry
+-                int retries = MAX_INTERRUPT_RETRIES;
++                int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+                 while (restoreChannelInProgress) {
+                     if (retries-- == 0) {
+@@ -507,7 +508,8 @@ protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+                     }
+ 
+                     try {
+-                        channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
++                        channelCleanupMonitor.wait(
++                            InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                     } catch (InterruptedException e) {
+                         InterruptStatus.setInterrupted();
+                     }
+@@ -519,7 +521,7 @@ protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+         }
+ 
+         boolean success = false;
+-        int retries = MAX_INTERRUPT_RETRIES;
++        int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+       try {
+         while (!success) {
+@@ -648,7 +650,8 @@ private void handleClosedChannel(ClosedChannelException e,
+      * <p/>
+      * If {@code stealthMode == false}, maximum wait time for the container to
+      * become available again is determined by the product {@code
+-     * FileContainer#MAX_INTERRUPT_RETRIES * FileContainer#INTERRUPT_RETRY_SLEEP}.
++     * InterruptStatus.MAX_INTERRUPT_RETRIES *
++     * InterruptStatus.INTERRUPT_RETRY_SLEEP}.
+      * There is a chance this thread will not see any recovery occuring (yet),
+      * in which case it waits for a bit and just returns, so the caller must
+      * retry IO until success.
+@@ -721,7 +724,7 @@ private void awaitRestoreChannel (Exception e,
+                             "already waited " + timesWaited + " times");
+                     }
+ 
+-                    if (timesWaited > MAX_INTERRUPT_RETRIES) {
++                    if (timesWaited > InterruptStatus.MAX_INTERRUPT_RETRIES) {
+                         // Max, give up, probably way too long anyway,
+                         // but doesn't hurt?
+                         throw StandardException.newException(
+@@ -729,7 +732,8 @@ private void awaitRestoreChannel (Exception e,
+                     }
+ 
+                     try {
+-                        channelCleanupMonitor.wait(INTERRUPT_RETRY_SLEEP);
++                        channelCleanupMonitor.wait(
++                            InterruptStatus.INTERRUPT_RETRY_SLEEP);
+                     } catch (InterruptedException we) {
+                         InterruptStatus.setInterrupted();
+                     }
+@@ -763,7 +767,7 @@ private void awaitRestoreChannel (Exception e,
+             // have raced past the interrupted thread, so let's wait a
+             // bit before we attempt a new I/O.
+             try {
+-                Thread.sleep(INTERRUPT_RETRY_SLEEP);
++                Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+             } catch (InterruptedException we) {
+                 // This thread is getting hit, too..
+                 InterruptStatus.setInterrupted();
+@@ -849,7 +853,7 @@ private boolean recoverContainerAfterInterrupt(
+         // Wait till other concurrent threads hit the wall
+         // (ClosedChannelException) and are a ready waiting for us to clean up,
+         // so we can set them loose when we're done.
+-        int retries = MAX_INTERRUPT_RETRIES;
++        int retries = InterruptStatus.MAX_INTERRUPT_RETRIES;
+ 
+         while (true) {
+             synchronized (channelCleanupMonitor) {
+@@ -870,7 +874,7 @@ private boolean recoverContainerAfterInterrupt(
+             }
+ 
+             try {
+-                Thread.sleep(INTERRUPT_RETRY_SLEEP);
++                Thread.sleep(InterruptStatus.INTERRUPT_RETRY_SLEEP);
+             } catch (InterruptedException te) {
+                 InterruptStatus.setInterrupted();
+             }

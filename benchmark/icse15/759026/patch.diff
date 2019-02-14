@@ -1,0 +1,4755 @@
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/AbstractColumnFactory.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/AbstractColumnFactory.java
+index 8e65d998..52b253ab 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/AbstractColumnFactory.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/AbstractColumnFactory.java
+@@ -50,7 +50,6 @@ static AbstractColumnFactory getColumnFactory(String columnType)
+ 	public abstract IColumn createColumn(String name);
+ 	public abstract IColumn createColumn(String name, byte[] value);
+     public abstract IColumn createColumn(String name, byte[] value, long timestamp);
+-    public abstract IColumn createColumn(String name, byte[] value, long timestamp, boolean deleted);
+     public abstract ICompactSerializer2<IColumn> createColumnSerializer();
+ }
+ 
+@@ -71,10 +70,6 @@ public IColumn createColumn(String name, byte[] value, long timestamp)
+ 		return new Column(name, value, timestamp);
+ 	}
+ 
+-    public IColumn createColumn(String name, byte[] value, long timestamp, boolean deleted) {
+-        return new Column(name, value, timestamp, deleted);
+-    }
+-
+     public ICompactSerializer2<IColumn> createColumnSerializer()
+     {
+         return Column.serializer();
+@@ -111,21 +106,22 @@ public IColumn createColumn(String name)
+ 
+ 	public IColumn createColumn(String name, byte[] value)
+ 	{
+-        return createColumn(name, value, 0);
++		String[] values = SuperColumnFactory.getSuperColumnAndColumn(name);
++        if ( values.length != 2 )
++            throw new IllegalArgumentException("Super Column " + name + " in invalid format. Must be in <super column name>:<column name> format.");
++        IColumn superColumn = new SuperColumn(values[0]);
++        IColumn subColumn = new Column(values[1], value);
++        superColumn.addColumn(values[1], subColumn);
++		return superColumn;
+ 	}
+ 
+     public IColumn createColumn(String name, byte[] value, long timestamp)
+     {
+-        return createColumn(name, value, timestamp, false);
+-    }
+-
+-    public IColumn createColumn(String name, byte[] value, long timestamp, boolean deleted)
+-	{
+ 		String[] values = SuperColumnFactory.getSuperColumnAndColumn(name);
+         if ( values.length != 2 )
+             throw new IllegalArgumentException("Super Column " + name + " in invalid format. Must be in <super column name>:<column name> format.");
+         IColumn superColumn = new SuperColumn(values[0]);
+-        IColumn subColumn = new Column(values[1], value, timestamp, deleted);
++        IColumn subColumn = new Column(values[1], value, timestamp);
+         superColumn.addColumn(values[1], subColumn);
+ 		return superColumn;
+ 	}
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/BinaryMemtable.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/BinaryMemtable.java
+index 05cc733a..002d8d98 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/BinaryMemtable.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/BinaryMemtable.java
+@@ -29,9 +29,8 @@
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.io.SSTable;
+-
++import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.log4j.Logger;
+ import org.cliffc.high_scale_lib.NonBlockingHashMap;
+ 
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Column.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Column.java
+index 47f4977e..bf69390b 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Column.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Column.java
+@@ -18,41 +18,60 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.DataInput;
+ import java.io.DataInputStream;
++import java.io.DataOutput;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.util.Collection;
+-
+-import org.apache.commons.lang.ArrayUtils;
+-
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import org.apache.cassandra.io.DataInputBuffer;
++import org.apache.cassandra.io.IFileReader;
++import org.apache.cassandra.io.IFileWriter;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.HashingSchemes;
++import org.apache.cassandra.utils.LogUtil;
++import org.apache.log4j.Logger;
+ 
+ 
+ /**
+- * Column is immutable, which prevents all kinds of confusion in a multithreaded environment.
+- * (TODO: look at making SuperColumn immutable too.  This is trickier but is probably doable
+- *  with something like PCollections -- http://code.google.com
+- *
+- * Author : Avinash Lakshman ( alakshman@facebook.com ) & Prashant Malik ( pmalik@facebook.com )
++ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+  */
+ 
+-public final class Column implements IColumn
++public final class Column implements IColumn, Serializable
+ {
+-    private static ColumnSerializer serializer_ = new ColumnSerializer();
++	private static Logger logger_ = Logger.getLogger(SuperColumn.class);
++    private static ICompactSerializer2<IColumn> serializer_;
++	private final static String seperator_ = ":";
++    static
++    {
++        serializer_ = new ColumnSerializer();
++    }
+ 
+-    static ColumnSerializer serializer()
++    static ICompactSerializer2<IColumn> serializer()
+     {
+         return serializer_;
+     }
+ 
+-    private final String name;
+-    private final byte[] value;
+-    private final long timestamp;
+-    private final boolean isMarkedForDelete;
++    private String name_;
++    private byte[] value_ = new byte[0];
++    private long timestamp_ = 0;
++
++    private transient AtomicBoolean isMarkedForDelete_;
++
++    /* CTOR for JAXB */
++    Column()
++    {
++    }
+ 
+     Column(String name)
+     {
+-        this(name, ArrayUtils.EMPTY_BYTE_ARRAY);
++        name_ = name;
+     }
+ 
+     Column(String name, byte[] value)
+@@ -62,32 +81,19 @@ static ColumnSerializer serializer()
+ 
+     Column(String name, byte[] value, long timestamp)
+     {
+-        this(name, value, timestamp, false);
+-    }
+-
+-    Column(String name, byte[] value, long timestamp, boolean isDeleted)
+-    {
+-        assert name != null;
+-        assert value != null;
+-        this.name = name;
+-        this.value = value;
+-        this.timestamp = timestamp;
+-        isMarkedForDelete = isDeleted;
++        this(name);
++        value_ = value;
++        timestamp_ = timestamp;
+     }
+ 
+     public String name()
+     {
+-        return name;
+-    }
+-
+-    public IColumn getSubColumn(String columnName)
+-    {
+-        throw new UnsupportedOperationException("This operation is unsupported on simple columns.");
++        return name_;
+     }
+ 
+     public byte[] value()
+     {
+-        return value;
++        return value_;
+     }
+ 
+     public byte[] value(String key)
+@@ -100,6 +106,11 @@ public IColumn getSubColumn(String columnName)
+         throw new UnsupportedOperationException("This operation is unsupported on simple columns.");
+     }
+ 
++    public IColumn getSubColumn( String columnName )
++    {
++    	throw new UnsupportedOperationException("This operation is unsupported on simple columns.");
++    }
++
+     public int getObjectCount()
+     {
+         return 1;
+@@ -107,7 +118,7 @@ public int getObjectCount()
+ 
+     public long timestamp()
+     {
+-        return timestamp;
++        return timestamp_;
+     }
+ 
+     public long timestamp(String key)
+@@ -117,16 +128,7 @@ public long timestamp(String key)
+ 
+     public boolean isMarkedForDelete()
+     {
+-        return isMarkedForDelete;
+-    }
+-
+-    public long getMarkedForDeleteAt()
+-    {
+-        if (!isMarkedForDelete())
+-        {
+-            throw new IllegalStateException("column is not marked for delete");
+-        }
+-        return timestamp;
++        return (isMarkedForDelete_ != null) ? isMarkedForDelete_.get() : false;
+     }
+ 
+     public int size()
+@@ -144,7 +146,7 @@ public int size()
+            * We store the string as UTF-8 encoded, so when we calculate the length, it
+            * should be converted to UTF-8.
+            */
+-        return IColumn.UtfPrefix_ + FBUtilities.getUTF8Length(name) + DBConstants.boolSize_ + DBConstants.tsSize_ + DBConstants.intSize_ + value.length;
++        return IColumn.UtfPrefix_ + FBUtilities.getUTF8Length(name_) + DBConstants.boolSize_ + DBConstants.tsSize_ + DBConstants.intSize_ + value_.length;
+     }
+ 
+     /*
+@@ -161,37 +163,106 @@ public void addColumn(String name, IColumn column)
+         throw new UnsupportedOperationException("This operation is not supported for simple columns.");
+     }
+ 
++    public void delete()
++    {
++        if ( isMarkedForDelete_ == null )
++            isMarkedForDelete_ = new AtomicBoolean(true);
++        else
++            isMarkedForDelete_.set(true);
++    	value_ = new byte[0];
++    }
++
++    public void repair(IColumn column)
++    {
++    	if( timestamp() < column.timestamp() )
++    	{
++    		value_ = column.value();
++    		timestamp_ = column.timestamp();
++    	}
++    }
+     public IColumn diff(IColumn column)
+     {
+-        if (timestamp() < column.timestamp())
++    	IColumn  columnDiff = null;
++    	if( timestamp() < column.timestamp() )
+         {
+-            return column;
++    		columnDiff = new Column(column.name(),column.value(),column.timestamp());
+         }
+-        return null;
++    	return columnDiff;
++    }
++
++    /*
++     * Resolve the column by comparing timestamps
++     * if a newer vaue is being input
++     * take the change else ignore .
++     *
++     */
++    public boolean putColumn(IColumn column)
++    {
++    	if ( !(column instanceof Column))
++    		throw new UnsupportedOperationException("Only Column objects should be put here");
++    	if( !name_.equals(column.name()))
++    		throw new IllegalArgumentException("The name should match the name of the current column or super column");
++    	if(timestamp_ <= column.timestamp())
++    	{
++            return true;
++    	}
++        return false;
+     }
+ 
+     public String toString()
+     {
+         StringBuilder sb = new StringBuilder();
+-        sb.append(name);
++    	sb.append(name_);
+         sb.append(":");
+         sb.append(isMarkedForDelete());
+         sb.append(":");
+-        sb.append(value().length);
+-        sb.append("@");
+         sb.append(timestamp());
++    	sb.append(":");
++    	sb.append(value().length);
++    	sb.append(":");
++    	sb.append(value());
++    	sb.append(":");
+         return sb.toString();
+     }
+ 
+     public byte[] digest()
+     {
+         StringBuilder stringBuilder = new StringBuilder();
+-        stringBuilder.append(name);
+-        stringBuilder.append(":");
+-        stringBuilder.append(timestamp);
++  		stringBuilder.append(name_);
++  		stringBuilder.append(seperator_);
++  		stringBuilder.append(timestamp_);
+         return stringBuilder.toString().getBytes();
+     }
+ 
++    /**
++     * This method is basically implemented for Writable interface
++     * for M/R. 
++     */
++    public void readFields(DataInput in) throws IOException
++    {
++        name_ = in.readUTF();
++        boolean delete = in.readBoolean();
++        long ts = in.readLong();
++        int size = in.readInt();
++        byte[] value = new byte[size];
++        in.readFully(value);        
++        if ( delete )
++            delete();
++    }
++    
++    /**
++     * This method is basically implemented for Writable interface
++     * for M/R. 
++     */
++    public void write(DataOutput out) throws IOException
++    {
++        out.writeUTF(name_);
++        out.writeBoolean(isMarkedForDelete());
++        out.writeLong(timestamp_);
++        out.writeInt(value().length);
++        out.write(value());
++    }
++
+ }
+ 
+ class ColumnSerializer implements ICompactSerializer2<IColumn>
+@@ -213,7 +284,9 @@ private IColumn defreeze(DataInputStream dis, String name) throws IOException
+         int size = dis.readInt();
+         byte[] value = new byte[size];
+         dis.readFully(value);
+-        column = new Column(name, value, ts, delete);
++        column = new Column(name, value, ts);
++        if ( delete )
++            column.delete();
+         return column;
+     }
+ 
+@@ -297,4 +370,3 @@ public void skip(DataInputStream dis) throws IOException
+         dis.skip(size);
+     }
+ }
+-
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnComparatorFactory.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnComparatorFactory.java
+index 88e3d1d4..ef659c35 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnComparatorFactory.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnComparatorFactory.java
+@@ -41,7 +41,7 @@
+     {
+         Comparator<IColumn> columnComparator = timestampComparator_;
+ 
+-        switch (comparatorType)
++		switch(comparatorType)
+         {
+             case NAME:
+                 columnComparator = nameComparator_;
+@@ -61,17 +61,23 @@
+     {
+         ComparatorType comparatorType = ComparatorType.NAME;
+ 
+-        if (comparatorTypeInt == ComparatorType.NAME.ordinal())
++		if(comparatorTypeInt == ComparatorType.NAME.ordinal())
+         {
+             comparatorType = ComparatorType.NAME;
+         }
+-        else if (comparatorTypeInt == ComparatorType.TIMESTAMP.ordinal())
++		else if(comparatorTypeInt == ComparatorType.TIMESTAMP.ordinal())
+         {
+             comparatorType = ComparatorType.TIMESTAMP;
+         }
+         return getComparator(comparatorType);
+     }
+ 
++	public static void main(String[] args)
++	{
++		IColumn col1 = new Column("Column-9");
++		IColumn col2 = new Column("Column-10");
++		System.out.println("Result of compare: " + getComparator(ComparatorType.NAME).compare(col1, col2));
++	}
+ }
+ 
+ abstract class AbstractColumnComparator implements Comparator<IColumn>, Serializable
+@@ -99,19 +105,18 @@ public AbstractColumnComparator(ColumnComparatorFactory.ComparatorType comparato
+     /* if the time-stamps are the same then sort by names */
+     public int compare(IColumn column1, IColumn column2)
+     {
+-        assert column1.getClass() == column2.getClass();
+         /* inverse sort by time to get hte latest first */
+         long result = column2.timestamp() - column1.timestamp();
+         int finalResult = 0;
+-        if (result == 0)
++    	if(result == 0)
+         {
+             result = column1.name().compareTo(column2.name());
+         }
+-        if (result > 0)
++    	if(result > 0)
+         {
+             finalResult = 1;
+         }
+-        if (result < 0)
++    	if( result < 0 )
+         {
+             finalResult = -1;
+         }
+@@ -129,19 +134,18 @@ public int compare(IColumn column1, IColumn column2)
+     /* if the names are the same then sort by time-stamps */
+     public int compare(IColumn column1, IColumn column2)
+     {
+-        assert column1.getClass() == column2.getClass();
+         long result = column1.name().compareTo(column2.name());
+         int finalResult = 0;
+-        if (result == 0 && (column1 instanceof Column))
++    	if(result == 0)
+         {
+-            /* inverse sort by time to get the latest first */
++    		/* inverse sort by time to get hte latest first */
+             result = column2.timestamp() - column1.timestamp();
+         }
+-        if (result > 0)
++    	if(result > 0)
+         {
+             finalResult = 1;
+         }
+-        if (result < 0)
++    	if( result < 0 )
+         {
+             finalResult = -1;
+         }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamily.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamily.java
+index 158e7552..30946d3d 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamily.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamily.java
+@@ -18,29 +18,28 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.DataInput;
+ import java.io.DataInputStream;
++import java.io.DataOutput;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
++import java.io.Serializable;
+ import java.lang.reflect.Proxy;
+-import java.util.Collection;
+-import java.util.Comparator;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.SortedSet;
++import java.util.*;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import org.apache.commons.lang.StringUtils;
+-import org.apache.log4j.Logger;
+-
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.HashingSchemes;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+  */
+-public final class ColumnFamily
++
++public final class ColumnFamily implements Serializable
+ {
+     private static ICompactSerializer2<ColumnFamily> serializer_;
+     public static final short utfPrefix_ = 2;   
+@@ -71,7 +70,7 @@
+      * This method returns the serializer whose methods are
+      * preprocessed by a dynamic proxy.
+     */
+-    public static ICompactSerializer2<ColumnFamily> serializerWithIndexes()
++    public static ICompactSerializer2<ColumnFamily> serializer2()
+     {
+         return (ICompactSerializer2<ColumnFamily>)Proxy.newProxyInstance( ColumnFamily.class.getClassLoader(), new Class[]{ICompactSerializer2.class}, new CompactSerializerInvocationHandler<ColumnFamily>(serializer_) );
+     }
+@@ -96,7 +95,7 @@ public static String getColumnSortProperty(String columnIndexProperty)
+     private String name_;
+ 
+     private transient ICompactSerializer2<IColumn> columnSerializer_;
+-    private long markedForDeleteAt = Long.MIN_VALUE;
++    private transient AtomicBoolean isMarkedForDelete_;
+     private AtomicInteger size_ = new AtomicInteger(0);
+     private EfficientBidiMap columns_;
+ 
+@@ -124,15 +123,19 @@ public static String getColumnSortProperty(String columnIndexProperty)
+ 		return columnComparator_;
+ 	}
+ 
+-    public ColumnFamily(String cfName)
++    ColumnFamily()
+     {
+-        name_ = cfName;
++    }
++
++    public ColumnFamily(String cf)
++    {
++        name_ = cf;
+         createColumnFactoryAndColumnSerializer();
+     }
+ 
+-    public ColumnFamily(String cfName, String columnType)
++    public ColumnFamily(String cf, String columnType)
+     {
+-        this(cfName);
++        name_ = cf;
+         createColumnFactoryAndColumnSerializer(columnType);
+     }
+ 
+@@ -165,7 +168,7 @@ void createColumnFactoryAndColumnSerializer()
+     ColumnFamily cloneMe()
+     {
+     	ColumnFamily cf = new ColumnFamily(name_);
+-    	cf.markedForDeleteAt = markedForDeleteAt;
++    	cf.isMarkedForDelete_ = isMarkedForDelete_;
+     	cf.columns_ = columns_.cloneMe();
+     	return cf;
+     }
+@@ -175,15 +178,18 @@ public String name()
+         return name_;
+     }
+ 
+-    /*
++    /**
+      *  We need to go through each column
+      *  in the column family and resolve it before adding
+     */
+     void addColumns(ColumnFamily cf)
+     {
+-        for (IColumn column : cf.getAllColumns())
++        Map<String, IColumn> columns = cf.getColumns();
++        Set<String> cNames = columns.keySet();
++
++        for ( String cName : cNames )
+         {
+-            addColumn(column);
++        	addColumn(cName, columns.get(cName));
+         }
+     }
+ 
+@@ -193,9 +199,10 @@ void addColumns(ColumnFamily cf)
+     	return columnSerializer_;
+     }
+ 
+-    public void addColumn(String name)
++    public void createColumn(String name)
+     {
+-    	addColumn(columnFactory_.createColumn(name));
++    	IColumn column = columnFactory_.createColumn(name);
++    	addColumn(column.name(), column);
+     }
+ 
+     int getColumnCount()
+@@ -204,7 +211,7 @@ int getColumnCount()
+     	Map<String, IColumn> columns = columns_.getColumns();
+     	if( columns != null )
+     	{
+-    		if(!isSuper())
++    		if(!DatabaseDescriptor.getColumnType(name_).equals("Super"))
+     		{
+     			count = columns.size();
+     		}
+@@ -220,25 +227,16 @@ int getColumnCount()
+     	return count;
+     }
+ 
+-    public boolean isSuper()
+-    {
+-        return DatabaseDescriptor.getColumnType(name_).equals("Super");
+-    }
+-
+-    public void addColumn(String name, byte[] value)
++    public void createColumn(String name, byte[] value)
+     {
+-    	addColumn(name, value, 0);
++    	IColumn column = columnFactory_.createColumn(name, value);
++    	addColumn(column.name(), column);
+     }
+ 
+-    public void addColumn(String name, byte[] value, long timestamp)
+-    {
+-        addColumn(name, value, timestamp, false);
+-    }
+-
+-    public void addColumn(String name, byte[] value, long timestamp, boolean deleted)
++	public void createColumn(String name, byte[] value, long timestamp)
+ 	{
+-		IColumn column = columnFactory_.createColumn(name, value, timestamp, deleted);
+-		addColumn(column);
++		IColumn column = columnFactory_.createColumn(name, value, timestamp);
++		addColumn(column.name(), column);
+     }
+ 
+     void clear()
+@@ -250,30 +248,29 @@ void clear()
+      * If we find an old column that has the same name
+      * the ask it to resolve itself else add the new column .
+     */
+-    void addColumn(IColumn column)
++    void addColumn(String name, IColumn column)
+     {
+-        String name = column.name();
++    	int newSize = 0;
+         IColumn oldColumn = columns_.get(name);
+-        if (oldColumn != null)
+-        {
+-            if (oldColumn instanceof SuperColumn)
++        if ( oldColumn != null )
+             {
+                 int oldSize = oldColumn.size();
+-                ((SuperColumn) oldColumn).putColumn(column);
+-                size_.addAndGet(oldColumn.size() - oldSize);
+-            }
+-            else
+-            {
+-                if (oldColumn.timestamp() <= column.timestamp())
++            if( oldColumn.putColumn(column))
+                 {
++            	// This will never be called for super column as put column always returns false.
+                     columns_.put(name, column);
+-                    size_.addAndGet(column.size());
++            	newSize = column.size();
+                 }
++            else
++            {
++            	newSize = oldColumn.size();
+             }
++            size_.addAndGet(newSize - oldSize);
+         }
+         else
+         {
+-            size_.addAndGet(column.size());
++            newSize = column.size();
++            size_.addAndGet(newSize);
+             columns_.put(name, column);
+         }
+     }
+@@ -283,12 +280,12 @@ public IColumn getColumn(String name)
+         return columns_.get( name );
+     }
+ 
+-    public SortedSet<IColumn> getAllColumns()
++    public Collection<IColumn> getAllColumns()
+     {
+         return columns_.getSortedColumns();
+     }
+ 
+-    public Map<String, IColumn> getColumns()
++    Map<String, IColumn> getColumns()
+     {
+         return columns_.getColumns();
+     }
+@@ -298,14 +295,17 @@ public void remove(String columnName)
+     	columns_.remove(columnName);
+     }
+ 
+-    void delete(long timestamp)
++    void delete()
+     {
+-        markedForDeleteAt = timestamp;
++        if ( isMarkedForDelete_ == null )
++            isMarkedForDelete_ = new AtomicBoolean(true);
++        else
++            isMarkedForDelete_.set(true);
+     }
+ 
+-    public boolean isMarkedForDelete()
++    boolean isMarkedForDelete()
+     {
+-        return markedForDeleteAt > Long.MIN_VALUE;
++        return ( ( isMarkedForDelete_ == null ) ? false : isMarkedForDelete_.get() );
+     }
+ 
+     /*
+@@ -334,8 +334,28 @@ void merge(ColumnFamily columnFamily)
+      */
+     void repair(ColumnFamily columnFamily)
+     {
+-        for (IColumn column : columnFamily.getAllColumns()) {
+-            addColumn(column);
++        Map<String, IColumn> columns = columnFamily.getColumns();
++        Set<String> cNames = columns.keySet();
++
++        for ( String cName : cNames )
++        {
++        	IColumn columnInternal = columns_.get(cName);
++        	IColumn columnExternal = columns.get(cName);
++
++        	if( columnInternal == null )
++        	{                
++        		if(DatabaseDescriptor.getColumnFamilyType(name_).equals(ColumnFamily.getColumnType("Super")))
++        		{
++        			columnInternal = new SuperColumn(columnExternal.name());
++        			columns_.put(cName, columnInternal);
++        		}
++        		if(DatabaseDescriptor.getColumnFamilyType(name_).equals(ColumnFamily.getColumnType("Standard")))
++        		{
++        			columnInternal = columnExternal;
++        			columns_.put(cName, columnInternal);
++        		}
++        	}
++       		columnInternal.repair(columnExternal);
+         }
+     }
+ 
+@@ -357,14 +377,14 @@ ColumnFamily diff(ColumnFamily columnFamily)
+         	IColumn columnExternal = columns.get(cName);
+         	if( columnInternal == null )
+         	{
+-        		cfDiff.addColumn(columnExternal);
++        		cfDiff.addColumn(cName, columnExternal);
+         	}
+         	else
+         	{
+             	IColumn columnDiff = columnInternal.diff(columnExternal);
+         		if(columnDiff != null)
+         		{
+-        			cfDiff.addColumn(columnDiff);
++        			cfDiff.addColumn(cName, columnDiff);
+         		}
+         	}
+         }
+@@ -403,44 +423,45 @@ public boolean equals(Object o)
+     public String toString()
+     {
+     	StringBuilder sb = new StringBuilder();
+-        sb.append("ColumnFamily(");
+     	sb.append(name_);
+-
+-        if (isMarkedForDelete()) {
+-            sb.append(" -delete at " + getMarkedForDeleteAt() + "-");
++    	sb.append(":");
++    	sb.append(isMarkedForDelete());
++    	sb.append(":");
++    	Collection<IColumn> columns = getAllColumns();
++        sb.append(columns.size());
++        sb.append(":");
++
++        for ( IColumn column : columns )
++        {
++            sb.append(column.toString());
+         }
+-
+-    	sb.append(" [");
+-        sb.append(StringUtils.join(getAllColumns(), ", "));
+-        sb.append("])");
+-
++        sb.append(":");
+     	return sb.toString();
+     }
+ 
+     public byte[] digest()
+     {
+     	Set<IColumn> columns = columns_.getSortedColumns();
+-    	byte[] xorHash = null;
++    	byte[] xorHash = new byte[0];
++    	byte[] tmpHash = new byte[0];
+     	for(IColumn column : columns)
+     	{
+-    		if(xorHash == null)
++    		if(xorHash.length == 0)
+     		{
+     			xorHash = column.digest();
+     		}
+     		else
+     		{
+-                xorHash = FBUtilities.xor(xorHash, column.digest());
++    			tmpHash = column.digest();
++    			xorHash = FBUtilities.xor(xorHash, tmpHash);
+     		}
+     	}
+     	return xorHash;
+     }
++}
+ 
+-    public long getMarkedForDeleteAt() {
+-        return markedForDeleteAt;
+-    }
+-
+-    public static class ColumnFamilySerializer implements ICompactSerializer2<ColumnFamily>
+-    {
++class ColumnFamilySerializer implements ICompactSerializer2<ColumnFamily>
++{
+         /*
+          * We are going to create indexes, and write out that information as well. The format
+          * of the data serialized is as follows.
+@@ -472,11 +493,9 @@ public void serialize(ColumnFamily columnFamily, DataOutputStream dos) throws IO
+             /* write the column family id */
+             dos.writeUTF(columnFamily.name());
+             /* write if this cf is marked for delete */
+-            dos.writeLong(columnFamily.getMarkedForDeleteAt());
+-
++        dos.writeBoolean(columnFamily.isMarkedForDelete());
+             /* write the size is the number of columns */
+             dos.writeInt(columns.size());
+-
+             /* write the column data */
+             for ( IColumn column : columns )
+             {
+@@ -491,14 +510,22 @@ public void serialize(ColumnFamily columnFamily, DataOutputStream dos) throws IO
+         private ColumnFamily defreezeColumnFamily(DataInputStream dis) throws IOException
+         {
+             String name = dis.readUTF();
++        boolean delete = dis.readBoolean();
+             ColumnFamily cf = new ColumnFamily(name);
+-            cf.delete(dis.readLong());
++        if ( delete )
++            cf.delete();
+             return cf;
+         }
+ 
+-        public ColumnFamily deserialize(DataInputStream dis) throws IOException
++    /*
++     * This method fills the Column Family object with the column information
++     * from the DataInputStream. The "items" parameter tells us whether we need
++     * all the columns or just a subset of all the Columns that make up the
++     * Column Family. If "items" is -1 then we need all the columns if not we
++     * deserialize only as many columns as indicated by the "items" parameter.
++    */
++    private void fillColumnFamily(ColumnFamily cf,  DataInputStream dis) throws IOException
+         {
+-            ColumnFamily cf = defreezeColumnFamily(dis);
+             int size = dis.readInt();
+             IColumn column = null;
+             for ( int i = 0; i < size; ++i )
+@@ -506,9 +533,16 @@ public ColumnFamily deserialize(DataInputStream dis) throws IOException
+                 column = cf.getColumnSerializer().deserialize(dis);
+                 if(column != null)
+                 {
+-                    cf.addColumn(column);
++        		cf.addColumn(column.name(), column);
+                 }
+             }
++    }
++
++    public ColumnFamily deserialize(DataInputStream dis) throws IOException
++    {       
++        ColumnFamily cf = defreezeColumnFamily(dis);
++        if ( !cf.isMarkedForDelete() )
++            fillColumnFamily(cf,dis);
+             return cf;
+         }
+ 
+@@ -519,6 +553,8 @@ public ColumnFamily deserialize(DataInputStream dis) throws IOException
+         public ColumnFamily deserialize(DataInputStream dis, IFilter filter) throws IOException
+         {
+             ColumnFamily cf = defreezeColumnFamily(dis);
++        if ( !cf.isMarkedForDelete() )
++        {
+             int size = dis.readInt();
+             IColumn column = null;
+             for ( int i = 0; i < size; ++i )
+@@ -526,7 +562,7 @@ public ColumnFamily deserialize(DataInputStream dis, IFilter filter) throws IOEx
+                 column = cf.getColumnSerializer().deserialize(dis, filter);
+                 if(column != null)
+                 {
+-                    cf.addColumn(column);
++            		cf.addColumn(column.name(), column);
+                     column = null;
+                     if(filter.isDone())
+                     {
+@@ -534,6 +570,7 @@ public ColumnFamily deserialize(DataInputStream dis, IFilter filter) throws IOEx
+                     }
+                 }
+             }
++        }
+             return cf;
+         }
+ 
+@@ -553,6 +590,8 @@ public ColumnFamily deserialize(DataInputStream dis, String name, IFilter filter
+                 columnName = names[1]+ ":" + names[2];
+ 
+             ColumnFamily cf = defreezeColumnFamily(dis);
++        if ( !cf.isMarkedForDelete() )
++        {
+             /* read the number of columns */
+             int size = dis.readInt();
+             for ( int i = 0; i < size; ++i )
+@@ -560,10 +599,11 @@ public ColumnFamily deserialize(DataInputStream dis, String name, IFilter filter
+                 IColumn column = cf.getColumnSerializer().deserialize(dis, columnName, filter);
+                 if ( column != null )
+                 {
+-                    cf.addColumn(column);
++	                cf.addColumn(column.name(), column);
+                     break;
+                 }
+             }
++        }
+             return cf;
+         }
+ 
+@@ -571,6 +611,5 @@ public void skip(DataInputStream dis) throws IOException
+         {
+             throw new UnsupportedOperationException("This operation is not yet supported.");
+         }
+-    }
+-}
+ 
++}
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamilyStore.java
+index cb9496c2..2fe2a821 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -18,27 +18,18 @@
+ 
+ package org.apache.cassandra.db;
+ 
+-import java.io.File;
+-import java.io.IOException;
++import java.io.*;
+ import java.math.BigInteger;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.PriorityQueue;
+-import java.util.Set;
+-import java.util.StringTokenizer;
++import java.util.*;
+ import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+-
+-import org.apache.log4j.Logger;
+-
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.io.DataInputBuffer;
+@@ -47,10 +38,16 @@
+ import org.apache.cassandra.io.SSTable;
+ import org.apache.cassandra.io.SequenceFile;
+ import org.apache.cassandra.net.EndPoint;
++import org.apache.cassandra.net.Message;
++import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.service.PartitionerType;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.utils.FileUtils;
+ import org.apache.cassandra.utils.LogUtil;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
++import org.apache.cassandra.utils.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -80,7 +77,7 @@
+     private ReentrantReadWriteLock lock_ = new ReentrantReadWriteLock(true);
+ 
+     /* Flag indicates if a compaction is in process */
+-    private AtomicBoolean isCompacting_ = new AtomicBoolean(false);
++    public AtomicBoolean isCompacting_ = new AtomicBoolean(false);
+ 
+     ColumnFamilyStore(String table, String columnFamily) throws IOException
+     {
+@@ -130,7 +127,7 @@ void onStart() throws IOException
+             for (File file : files)
+             {
+                 String filename = file.getName();
+-                if(((file.length() == 0) || (filename.contains("-" + SSTable.temporaryFile_)) ) && (filename.contains(columnFamily_)))
++                if(((file.length() == 0) || (filename.indexOf("-" + SSTable.temporaryFile_) != -1) ) && (filename.indexOf(columnFamily_) != -1))
+                 {
+                 	file.delete();
+                 	continue;
+@@ -139,7 +136,7 @@ void onStart() throws IOException
+                 String[] tblCfName = getTableAndColumnFamilyName(filename);
+                 if (tblCfName[0].equals(table_)
+                         && tblCfName[1].equals(columnFamily_)
+-                        && filename.contains("-Data.db"))
++                        && filename.indexOf("-Data.db") != -1)
+                 {
+                     ssTables.add(file.getAbsoluteFile());
+                 }
+@@ -177,7 +174,7 @@ void onStart() throws IOException
+      * disk and the total space oocupied by the data files
+      * associated with this Column Family.
+     */
+-    public String cfStats(String newLineSeparator)
++    public String cfStats(String newLineSeparator, java.text.DecimalFormat df)
+     {
+         StringBuilder sb = new StringBuilder();
+         /*
+@@ -260,7 +257,7 @@ boolean forceCompaction(List<Range> ranges, EndPoint target, long skip, List<Str
+     	if( ranges != null)
+     		futurePtr = MinorCompactionManager.instance().submit(ColumnFamilyStore.this, ranges, target, fileList);
+     	else
+-    		MinorCompactionManager.instance().submitMajor(ColumnFamilyStore.this, skip);
++    		MinorCompactionManager.instance().submitMajor(ColumnFamilyStore.this, ranges, skip);
+     	
+         boolean result = true;
+         try
+@@ -333,7 +330,8 @@ String getNextFileName()
+     {
+     	// Psuedo increment so that we do not generate consecutive numbers 
+     	fileIndexGenerator_.incrementAndGet();
+-        return table_ + "-" + columnFamily_ + "-" + fileIndexGenerator_.incrementAndGet();
++        String name = table_ + "-" + columnFamily_ + "-" + fileIndexGenerator_.incrementAndGet();
++        return name;
+     }
+ 
+     /*
+@@ -343,7 +341,8 @@ String getTempFileName()
+     {
+     	// Psuedo increment so that we do not generate consecutive numbers 
+     	fileIndexGenerator_.incrementAndGet();
+-        return table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + fileIndexGenerator_.incrementAndGet();
++        String name = table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + fileIndexGenerator_.incrementAndGet() ;
++        return name;
+     }
+ 
+     /*
+@@ -365,7 +364,8 @@ String getTempFileName( List<String> files)
+    		
+    		index = lowestIndex + 1 ;
+ 
+-        return table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + index;
++        String name = table_ + "-" + columnFamily_ + "-" + SSTable.temporaryFile_ + "-" + index ;
++        return name;
+     }
+ 
+     
+@@ -382,6 +382,14 @@ void switchMemtable(String key, ColumnFamily columnFamily, CommitLog.CommitLogCo
+         	memtable_.get().put(key, columnFamily, cLogCtx);
+     }
+ 
++    /*
++     * This version is used when we forceflush.
++     */
++    void switchMemtable() throws IOException
++    {
++        memtable_.set( new Memtable(table_, columnFamily_) );
++    }
++
+     /*
+      * This version is used only on start up when we are recovering from logs.
+      * In the future we may want to parellelize the log processing for a table
+@@ -394,14 +402,14 @@ void switchBinaryMemtable(String key, byte[] buffer) throws IOException
+         binaryMemtable_.get().put(key, buffer);
+     }
+ 
+-    void forceFlush() throws IOException
++    void forceFlush(boolean fRecovery) throws IOException
+     {
+         //MemtableManager.instance().submit(getColumnFamilyName(), memtable_.get() , CommitLog.CommitLogContext.NULL);
+         //memtable_.get().flush(true, CommitLog.CommitLogContext.NULL);
+-        memtable_.get().forceflush(this);
++        memtable_.get().forceflush(this, fRecovery);
+     }
+ 
+-    void forceFlushBinary()
++    void forceFlushBinary() throws IOException
+     {
+         BinaryMemtableManager.instance().submit(getColumnFamilyName(), binaryMemtable_.get());
+         //binaryMemtable_.get().flush(true);
+@@ -430,36 +438,66 @@ void applyBinary(String key, byte[] buffer)
+         binaryMemtable_.get().put(key, buffer);
+     }
+ 
+-    public ColumnFamily getColumnFamily(String key, String columnFamilyColumn, IFilter filter) throws IOException
+-    {
+-        List<ColumnFamily> columnFamilies = getColumnFamilies(key, columnFamilyColumn, filter);
+-        return resolveAndRemoveDeleted(columnFamilies);
+-    }
+-
+     /**
+      *
+      * Get the column family in the most efficient order.
+      * 1. Memtable
+      * 2. Sorted list of files
+      */
+-    List<ColumnFamily> getColumnFamilies(String key, String columnFamilyColumn, IFilter filter) throws IOException
++    public ColumnFamily getColumnFamily(String key, String cf, IFilter filter) throws IOException
+     {
+-        List<ColumnFamily> columnFamilies1 = new ArrayList<ColumnFamily>();
++    	List<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>();
++    	ColumnFamily columnFamily = null;
++    	long start = System.currentTimeMillis();
+         /* Get the ColumnFamily from Memtable */
+-        getColumnFamilyFromCurrentMemtable(key, columnFamilyColumn, filter, columnFamilies1);
+-        if (columnFamilies1.size() == 0 || !filter.isDone())
++    	getColumnFamilyFromCurrentMemtable(key, cf, filter, columnFamilies);
++        if(columnFamilies.size() != 0)
+         {
++	        if(filter.isDone())
++	        	return columnFamilies.get(0);
++        }
+             /* Check if MemtableManager has any historical information */
+-            MemtableManager.instance().getColumnFamily(key, columnFamily_, columnFamilyColumn, filter, columnFamilies1);
++        MemtableManager.instance().getColumnFamily(key, columnFamily_, cf, filter, columnFamilies);
++        if(columnFamilies.size() != 0)
++        {
++        	columnFamily = resolve(columnFamilies);
++	        if(filter.isDone())
++	        	return columnFamily;
++	        columnFamilies.clear();
++	        columnFamilies.add(columnFamily);
+         }
+-        List<ColumnFamily> columnFamilies = columnFamilies1;
+-        if (columnFamilies.size() == 0 || !filter.isDone())
++        getColumnFamilyFromDisk(key, cf, columnFamilies, filter);
++        logger_.debug("DISK TIME: " + (System.currentTimeMillis() - start)
++                + " ms.");
++        columnFamily = resolve(columnFamilies);
++       
++        return columnFamily;
++    }
++    
++    public ColumnFamily getColumnFamilyFromMemory(String key, String cf, IFilter filter) 
+         {
++        List<ColumnFamily> columnFamilies = new ArrayList<ColumnFamily>();
++        ColumnFamily columnFamily = null;
+             long start = System.currentTimeMillis();
+-            getColumnFamilyFromDisk(key, columnFamilyColumn, columnFamilies, filter);
+-            logger_.debug("DISK TIME: " + (System.currentTimeMillis() - start) + " ms.");
++        /* Get the ColumnFamily from Memtable */
++        getColumnFamilyFromCurrentMemtable(key, cf, filter, columnFamilies);
++        if(columnFamilies.size() != 0)
++        {
++            if(filter.isDone())
++                return columnFamilies.get(0);
+         }
+-        return columnFamilies;
++        /* Check if MemtableManager has any historical information */
++        MemtableManager.instance().getColumnFamily(key, columnFamily_, cf, filter, columnFamilies);
++        if(columnFamilies.size() != 0)
++        {
++            columnFamily = resolve(columnFamilies);
++            if(filter.isDone())
++                return columnFamily;
++            columnFamilies.clear();
++            columnFamilies.add(columnFamily);
++        }
++        columnFamily = resolve(columnFamilies);
++        return columnFamily;
+     }
+ 
+     /**
+@@ -499,14 +537,33 @@ private void getColumnFamilyFromDisk(String key, String cf, List<ColumnFamily> c
+             long start = System.currentTimeMillis();
+             if (columnFamily != null)
+             {
++	            /*
++	             * TODO
++	             * By using the filter before removing deleted columns 
++	             * we have a efficient implementation of timefilter 
++	             * but for count filter this can return wrong results 
++	             * we need to take care of that later.
++	             */
++                /* suppress columns marked for delete */
++                Map<String, IColumn> columns = columnFamily.getColumns();
++                Set<String> cNames = columns.keySet();
++
++                for (String cName : cNames)
++                {
++                    IColumn column = columns.get(cName);
++                    if (column.isMarkedForDelete())
++                        columns.remove(cName);
++                }
+                 columnFamilies.add(columnFamily);
+                 if(filter.isDone())
+                 {
+                 	break;
+                 }
+             }
+-            logger_.debug("DISK Data structure population  TIME: " + (System.currentTimeMillis() - start) + " ms.");
++            logger_.debug("DISK Data structure population  TIME: " + (System.currentTimeMillis() - start)
++                    + " ms.");
+         }
++        files.clear();  	
+     }
+ 
+ 
+@@ -520,11 +577,12 @@ private ColumnFamily fetchColumnFamily(String key, String cf, IFilter filter, St
+ 		if (bufIn.getLength() == 0)
+ 			return null;
+         start = System.currentTimeMillis();
+-        ColumnFamily columnFamily = ColumnFamily.serializer().deserialize(bufIn, cf, filter);
++        ColumnFamily columnFamily = null;
++       	columnFamily = ColumnFamily.serializer().deserialize(bufIn, cf, filter);
+ 		logger_.debug("DISK Deserialize TIME: " + (System.currentTimeMillis() - start) + " ms.");
+ 		if (columnFamily == null)
+-			return null;
+ 		return columnFamily;
++		return (!columnFamily.isMarkedForDelete()) ? columnFamily : null;
+ 	}
+ 
+     private void getColumnFamilyFromCurrentMemtable(String key, String cf, IFilter filter, List<ColumnFamily> columnFamilies)
+@@ -533,66 +591,20 @@ private void getColumnFamilyFromCurrentMemtable(String key, String cf, IFilter f
+         ColumnFamily columnFamily = memtable_.get().get(key, cf, filter);
+         if (columnFamily != null)
+         {
++            if (!columnFamily.isMarkedForDelete())
+             columnFamilies.add(columnFamily);
+         }
+     }
+     
+-    /** merge all columnFamilies into a single instance, with only the newest versions of columns preserved. */
+-    static ColumnFamily resolve(List<ColumnFamily> columnFamilies)
++    private ColumnFamily resolve(List<ColumnFamily> columnFamilies)
+     {
+         int size = columnFamilies.size();
+         if (size == 0)
+             return null;
+-
+-        // start from nothing so that we don't include potential deleted columns from the first instance
+-        String cfname = columnFamilies.get(0).name();
+-        ColumnFamily cf = new ColumnFamily(cfname);
+-
+-        // merge
+-        for (ColumnFamily cf2 : columnFamilies)
+-        {
+-            assert cf.name().equals(cf2.name());
+-            cf.addColumns(cf2);
+-            cf.delete(Math.max(cf.getMarkedForDeleteAt(), cf2.getMarkedForDeleteAt()));
+-        }
+-        return cf;
+-    }
+-
+-    /** like resolve, but leaves the resolved CF as the only item in the list */
+-    private static void merge(List<ColumnFamily> columnFamilies)
++        ColumnFamily cf = columnFamilies.get(0);
++        for ( int i = 1; i < size ; ++i )
+     {
+-        ColumnFamily cf = resolve(columnFamilies);
+-        columnFamilies.clear();
+-        columnFamilies.add(cf);
+-    }
+-
+-    private static ColumnFamily resolveAndRemoveDeleted(List<ColumnFamily> columnFamilies) {
+-        ColumnFamily cf = resolve(columnFamilies);
+-        return removeDeleted(cf);
+-    }
+-
+-    static ColumnFamily removeDeleted(ColumnFamily cf) {
+-        if (cf == null) {
+-            return null;
+-        }
+-        for (String cname : new ArrayList<String>(cf.getColumns().keySet())) {
+-            IColumn c = cf.getColumns().get(cname);
+-            if (c instanceof SuperColumn) {
+-                long min_timestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
+-                // don't operate directly on the supercolumn, it could be the one in the memtable
+-                cf.remove(cname);
+-                IColumn sc = new SuperColumn(cname);
+-                for (IColumn subColumn : c.getSubColumns()) {
+-                    if (!subColumn.isMarkedForDelete() && subColumn.timestamp() >= min_timestamp) {
+-                        sc.addColumn(subColumn.name(), subColumn);
+-                    }
+-                }
+-                if (sc.getSubColumns().size() > 0) {
+-                    cf.addColumn(sc);
+-                }
+-            } else if (c.isMarkedForDelete() || c.timestamp() < cf.getMarkedForDeleteAt()) {
+-                cf.remove(cname);
+-            }
++            cf.addColumns(columnFamilies.get(i));
+         }
+         return cf;
+     }
+@@ -605,9 +617,21 @@ static ColumnFamily removeDeleted(ColumnFamily cf) {
+      */
+     void applyNow(String key, ColumnFamily columnFamily) throws IOException
+     {
++        if (!columnFamily.isMarkedForDelete())
+          memtable_.get().putOnRecovery(key, columnFamily);
+     }
+ 
++    /*
++     * Delete doesn't mean we can blindly delete. We need to write this to disk
++     * as being marked for delete. This is to prevent a previous value from
++     * resuscitating a column family that has been deleted.
++     */
++    void delete(String key, ColumnFamily columnFamily)
++            throws IOException
++    {
++        memtable_.get().remove(key, columnFamily);
++    }
++
+     /*
+      * This method is called when the Memtable is frozen and ready to be flushed
+      * to disk. This method informs the CommitLog that a particular ColumnFamily
+@@ -629,7 +653,7 @@ void onMemtableFlush(CommitLog.CommitLogContext cLogCtx) throws IOException
+      * param @ filename - filename just flushed to disk
+      * param @ bf - bloom filter which indicates the keys that are in this file.
+     */
+-    void storeLocation(String filename, BloomFilter bf)
++    void storeLocation(String filename, BloomFilter bf) throws IOException
+     {
+         boolean doCompaction = false;
+         int ssTableSize = 0;
+@@ -664,7 +688,7 @@ void storeLocation(String filename, BloomFilter bf)
+         }
+     }
+ 
+-    PriorityQueue<FileStruct> initializePriorityQueue(List<String> files, List<Range> ranges, int minBufferSize)
++    PriorityQueue<FileStruct> initializePriorityQueue(List<String> files, List<Range> ranges, int minBufferSize) throws IOException
+     {
+         PriorityQueue<FileStruct> pq = new PriorityQueue<FileStruct>();
+         if (files.size() > 1 || (ranges != null &&  files.size() > 0))
+@@ -675,9 +699,13 @@ void storeLocation(String filename, BloomFilter bf)
+             {
+             	try
+             	{
+-            		fs = new FileStruct(SequenceFile.bufferedReader(file, bufferSize));
+-	                fs.getNextKey();
+-	                if(fs.isExhausted())
++            		fs = new FileStruct();
++	                fs.bufIn_ = new DataInputBuffer();
++	                fs.bufOut_ = new DataOutputBuffer();
++	                fs.reader_ = SequenceFile.bufferedReader(file, bufferSize);                    
++	                fs.key_ = null;
++	                fs = getNextKey(fs);
++	                if(fs == null)
+ 	                	continue;
+ 	                pq.add(fs);
+             	}
+@@ -686,15 +714,16 @@ void storeLocation(String filename, BloomFilter bf)
+             		ex.printStackTrace();
+             		try
+             		{
+-            			if (fs != null)
++            			if(fs != null)
+             			{
+-            				fs.close();
++            				fs.reader_.close();
+             			}
+             		}
+             		catch(Exception e)
+             		{
+             			logger_.warn("Unable to close file :" + file);
+             		}
++                    continue;
+                 }
+             }
+         }
+@@ -747,7 +776,7 @@ void storeLocation(String filename, BloomFilter bf)
+     /*
+      * Break the files into buckets and then compact.
+      */
+-    void doCompaction()
++    void doCompaction()  throws IOException
+     {
+         isCompacting_.set(true);
+         List<String> files = new ArrayList<String>(ssTables_);
+@@ -789,6 +818,7 @@ void doCompaction()
+         {
+         	isCompacting_.set(false);
+         }
++        return;
+     }
+ 
+     void doMajorCompaction(long skip)  throws IOException
+@@ -796,13 +826,18 @@ void doMajorCompaction(long skip)  throws IOException
+     	doMajorCompactionInternal( skip );
+     }
+ 
++    void doMajorCompaction()  throws IOException
++    {
++    	doMajorCompactionInternal( 0 );
++    }
++    
+     /*
+      * Compact all the files irrespective of the size.
+      * skip : is the ammount in Gb of the files to be skipped
+      * all files greater than skip GB are skipped for this compaction.
+      * Except if skip is 0 , in that case this is ignored and all files are taken.
+      */
+-    void doMajorCompactionInternal(long skip)
++    void doMajorCompactionInternal(long skip)  throws IOException
+     {
+         isCompacting_.set(true);
+         List<String> filesInternal = new ArrayList<String>(ssTables_);
+@@ -835,6 +870,7 @@ void doMajorCompactionInternal(long skip)
+         {
+         	isCompacting_.set(false);
+         }
++        return ;
+     }
+ 
+     /*
+@@ -872,14 +908,41 @@ String getMaxSizeFile( List<String> files )
+     	return maxFile;
+     }
+ 
+-    boolean doAntiCompaction(List<Range> ranges, EndPoint target, List<String> fileList)
++    Range getMaxRange( List<Range> ranges )
++    {
++    	Range maxRange = new Range( BigInteger.ZERO, BigInteger.ZERO );
++    	for( Range range : ranges)
++    	{
++    		if( range.left().compareTo(maxRange.left()) > 0 )
++    		{
++    			maxRange = range;
++    		}
++    	}
++    	return maxRange;
++    }
++
++    boolean isLoopAround ( List<Range> ranges )
++    {
++    	boolean isLoop = false;
++    	for( Range range : ranges)
++    	{
++    		if( range.left().compareTo(range.right()) > 0 )
++    		{
++    			isLoop = true;
++    			break;
++    		}
++    	}
++    	return isLoop;
++    }
++
++    boolean doAntiCompaction(List<Range> ranges, EndPoint target, List<String> fileList) throws IOException
+     {
+         isCompacting_.set(true);
+         List<String> files = new ArrayList<String>(ssTables_);
+         boolean result = true;
+         try
+         {
+-        	 result = doFileAntiCompaction(files, ranges, target, fileList, null);
++        	 result = doFileAntiCompaction(files, ranges, target, bufSize_, fileList, null);
+         }
+         catch ( Exception ex)
+         {
+@@ -893,6 +956,38 @@ boolean doAntiCompaction(List<Range> ranges, EndPoint target, List<String> fileL
+ 
+     }
+ 
++    /*
++     * Read the next key from the data file , this fn will skip teh block index
++     * and read teh next available key into the filestruct that is passed.
++     * If it cannot read or a end of file is reached it will return null.
++     */
++    FileStruct getNextKey(FileStruct filestruct) throws IOException
++    {
++        filestruct.bufOut_.reset();
++        if (filestruct.reader_.isEOF())
++        {
++            filestruct.reader_.close();
++            return null;
++        }
++        
++        long bytesread = filestruct.reader_.next(filestruct.bufOut_);
++        if (bytesread == -1)
++        {
++            filestruct.reader_.close();
++            return null;
++        }
++
++        filestruct.bufIn_.reset(filestruct.bufOut_.getData(), filestruct.bufOut_.getLength());
++        filestruct.key_ = filestruct.bufIn_.readUTF();
++        /* If the key we read is the Block Index Key then we are done reading the keys so exit */
++        if ( filestruct.key_.equals(SSTable.blockIndexKey_) )
++        {
++            filestruct.reader_.close();
++            return null;
++        }
++        return filestruct;
++    }
++
+     void forceCleanup()
+     {
+     	MinorCompactionManager.instance().submitCleanup(ColumnFamilyStore.this);
+@@ -903,7 +998,7 @@ void forceCleanup()
+      * and only keeps keys that this node is responsible for.
+      * @throws IOException
+      */
+-    void doCleanupCompaction()
++    void doCleanupCompaction() throws IOException
+     {
+         isCompacting_.set(true);
+         List<String> files = new ArrayList<String>(ssTables_);
+@@ -937,7 +1032,7 @@ void doCleanup(String file) throws IOException
+     	Map<EndPoint, List<Range>> endPointtoRangeMap = StorageService.instance().constructEndPointToRangesMap();
+     	myRanges = endPointtoRangeMap.get(StorageService.getLocalStorageEndPoint());
+     	List<BloomFilter> compactedBloomFilters = new ArrayList<BloomFilter>();
+-        doFileAntiCompaction(files, myRanges, null, newFiles, compactedBloomFilters);
++        doFileAntiCompaction(files, myRanges, null, bufSize_, newFiles, compactedBloomFilters);
+         logger_.debug("Original file : " + file + " of size " + new File(file).length());
+         lock_.writeLock().lock();
+         try
+@@ -968,11 +1063,12 @@ void doCleanup(String file) throws IOException
+      * @param files
+      * @param ranges
+      * @param target
++     * @param minBufferSize
+      * @param fileList
+      * @return
+      * @throws IOException
+      */
+-    boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint target, List<String> fileList, List<BloomFilter> compactedBloomFilters)
++    boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint target, int minBufferSize, List<String> fileList, List<BloomFilter> compactedBloomFilters) throws IOException
+     {
+     	boolean result = false;
+         long startTime = System.currentTimeMillis();
+@@ -998,7 +1094,7 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 	                    + expectedRangeFileSize + "   is greater than the safe limit of the disk space available.");
+ 	            return result;
+ 	        }
+-	        PriorityQueue<FileStruct> pq = initializePriorityQueue(files, ranges, ColumnFamilyStore.bufSize_);
++	        PriorityQueue<FileStruct> pq = initializePriorityQueue(files, ranges, minBufferSize);
+ 	        if (pq.size() > 0)
+ 	        {
+ 	            mergedFileName = getTempFileName();
+@@ -1021,11 +1117,11 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 	                    fs = pq.poll();
+ 	                }
+ 	                if (fs != null
+-	                        && (lastkey == null || lastkey.compareTo(fs.getKey()) == 0))
++	                        && (lastkey == null || lastkey.compareTo(fs.key_) == 0))
+ 	                {
+ 	                    // The keys are the same so we need to add this to the
+ 	                    // ldfs list
+-	                    lastkey = fs.getKey();
++	                    lastkey = fs.key_;
+ 	                    lfs.add(fs);
+ 	                }
+ 	                else
+@@ -1040,30 +1136,38 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 		                    	try
+ 		                    	{
+ 	                                /* read the length although we don't need it */
+-	                                filestruct.getBufIn().readInt();
++	                                filestruct.bufIn_.readInt();
+ 	                                // Skip the Index
+-                                    IndexHelper.skipBloomFilterAndIndex(filestruct.getBufIn());
++                                    IndexHelper.skipBloomFilterAndIndex(filestruct.bufIn_);
+ 	                                // We want to add only 2 and resolve them right there in order to save on memory footprint
+ 	                                if(columnFamilies.size() > 1)
+ 	                                {
+ 	    		                        // Now merge the 2 column families
+-                                        merge(columnFamilies);
++	    			                    columnFamily = resolve(columnFamilies);
++	    			                    columnFamilies.clear();
++	    			                    if( columnFamily != null)
++	    			                    {
++		    			                    // add the merged columnfamily back to the list
++		    			                    columnFamilies.add(columnFamily);
++	    			                    }
++
+ 	                                }
+ 			                        // deserialize into column families
+-			                        columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.getBufIn()));
++			                        columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.bufIn_));
+ 		                    	}
+ 		                    	catch ( Exception ex)
+ 		                    	{
+                                     logger_.warn(LogUtil.throwableToString(ex));
++		                            continue;
+                                 }
+ 		                    }
+ 		                    // Now after merging all crap append to the sstable
+-		                    columnFamily = resolveAndRemoveDeleted(columnFamilies);
++		                    columnFamily = resolve(columnFamilies);
+ 		                    columnFamilies.clear();
+ 		                    if( columnFamily != null )
+ 		                    {
+ 			                	/* serialize the cf with column indexes */
+-			                    ColumnFamily.serializerWithIndexes().serialize(columnFamily, bufOut);
++			                    ColumnFamily.serializer2().serialize(columnFamily, bufOut);
+ 		                    }
+ 	                    }
+ 	                    else
+@@ -1072,17 +1176,17 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 	                    	try
+ 	                    	{
+ 		                        /* read the length although we don't need it */
+-		                        int size = filestruct.getBufIn().readInt();
+-		                        bufOut.write(filestruct.getBufIn(), size);
++		                        int size = filestruct.bufIn_.readInt();
++		                        bufOut.write(filestruct.bufIn_, size);
+ 	                    	}
+ 	                    	catch ( Exception ex)
+ 	                    	{
+ 	                    		logger_.warn(LogUtil.throwableToString(ex));
+-	                            filestruct.close();
++	                            filestruct.reader_.close();
+ 	                            continue;
+ 	                    	}
+ 	                    }
+-	                    if ( Range.isKeyInRanges(lastkey, ranges) )
++	                    if ( Range.isKeyInRanges(ranges, lastkey) )
+ 	                    {
+ 	                        if(ssTableRange == null )
+ 	                        {
+@@ -1106,28 +1210,28 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 	                    {
+ 	                    	try
+ 	                    	{
+-                                filestruct.getNextKey();
+-	                    		if (filestruct.isExhausted())
++	                    		filestruct = getNextKey	( filestruct );
++	                    		if(filestruct == null)
+ 	                    		{
+ 	                    			continue;
+ 	                    		}
+ 	                    		/* keep on looping until we find a key in the range */
+-	                            while ( !Range.isKeyInRanges(filestruct.getKey(), ranges) )
++	                            while ( !Range.isKeyInRanges(ranges, filestruct.key_ ) )
+ 	                            {
+-                                    filestruct.getNextKey();
+-                                    if (filestruct.isExhausted())
++		                    		filestruct = getNextKey	( filestruct );
++		                    		if(filestruct == null)
+ 		                    		{
+ 		                    			break;
+ 		                    		}
+ 	        	                    /* check if we need to continue , if we are done with ranges empty the queue and close all file handles and exit */
+-	        	                    //if( !isLoop && StorageService.token(filestruct.key).compareTo(maxRange.right()) > 0 && !filestruct.key.equals(""))
++	        	                    //if( !isLoop && StorageService.hash(filestruct.key).compareTo(maxRange.right()) > 0 && !filestruct.key.equals(""))
+ 	        	                    //{
+ 	                                    //filestruct.reader.close();
+ 	                                    //filestruct = null;
+ 	                                    //break;
+ 	        	                    //}
+ 	                            }
+-	                            if (!filestruct.isExhausted())
++	                            if ( filestruct != null)
+ 	                            {
+ 	                            	pq.add(filestruct);
+ 	                            }
+@@ -1139,7 +1243,8 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+ 	                    		// in any case we have read as far as possible from it
+ 	                    		// and it will be deleted after compaction.
+                                 logger_.warn(LogUtil.throwableToString(ex));
+-	                            filestruct.close();
++	                            filestruct.reader_.close();
++	                            continue;
+                             }
+ 	                    }
+ 	                    lfs.clear();
+@@ -1174,9 +1279,38 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+         return result;
+     }
+ 
+-    private void doFill(BloomFilter bf, String decoratedKey)
++    private void doWrite(SSTable ssTable, String key, DataOutputBuffer bufOut) throws IOException
+     {
+-        bf.fill(StorageService.getPartitioner().undecorateKey(decoratedKey));
++    	PartitionerType pType = StorageService.getPartitionerType();    	
++    	switch ( pType )
++    	{
++    		case OPHF:
++    			ssTable.append(key, bufOut);
++    			break;
++    			
++    	    default:
++    	    	String[] peices = key.split(":");
++    	    	key = peices[1];
++    	    	BigInteger hash = new BigInteger(peices[0]);
++    	    	ssTable.append(key, hash, bufOut);
++    	    	break;
++    	}
++    }
++    
++    private void doFill(BloomFilter bf, String key)
++    {
++    	PartitionerType pType = StorageService.getPartitionerType();    	
++    	switch ( pType )
++    {
++    		case OPHF:
++    			bf.fill(key);
++    			break;
++    			
++    	    default:
++    	    	String[] peices = key.split(":");    	    	
++    	    	bf.fill(peices[1]);
++    	    	break;
++    	}
+     }
+     
+     /*
+@@ -1190,7 +1324,7 @@ private void doFill(BloomFilter bf, String decoratedKey)
+      * to get the latest data.
+      *
+      */
+-    void  doFileCompaction(List<String> files,  int minBufferSize)
++    void  doFileCompaction(List<String> files,  int minBufferSize) throws IOException
+     {
+     	String newfile = null;
+         long startTime = System.currentTimeMillis();
+@@ -1234,11 +1368,11 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+ 	                    fs = pq.poll();                        
+ 	                }
+ 	                if (fs != null
+-	                        && (lastkey == null || lastkey.compareTo(fs.getKey()) == 0))
++	                        && (lastkey == null || lastkey.compareTo(fs.key_) == 0))
+ 	                {
+ 	                    // The keys are the same so we need to add this to the
+ 	                    // ldfs list
+-	                    lastkey = fs.getKey();
++	                    lastkey = fs.key_;
+ 	                    lfs.add(fs);
+ 	                }
+ 	                else
+@@ -1253,29 +1387,37 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+ 		                    	try
+ 		                    	{
+ 	                                /* read the length although we don't need it */
+-	                                filestruct.getBufIn().readInt();
++	                                filestruct.bufIn_.readInt();
+ 	                                // Skip the Index
+-                                    IndexHelper.skipBloomFilterAndIndex(filestruct.getBufIn());
++                                    IndexHelper.skipBloomFilterAndIndex(filestruct.bufIn_);
+ 	                                // We want to add only 2 and resolve them right there in order to save on memory footprint
+ 	                                if(columnFamilies.size() > 1)
+ 	                                {
+-	    		                        merge(columnFamilies);
++	    		                        // Now merge the 2 column families
++	    			                    columnFamily = resolve(columnFamilies);
++	    			                    columnFamilies.clear();
++	    			                    if( columnFamily != null)
++	    			                    {
++		    			                    // add the merged columnfamily back to the list
++		    			                    columnFamilies.add(columnFamily);
++	    			                    }
++
+ 	                                }
+ 			                        // deserialize into column families                                    
+-			                        columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.getBufIn()));
++			                        columnFamilies.add(ColumnFamily.serializer().deserialize(filestruct.bufIn_));
+ 		                    	}
+ 		                    	catch ( Exception ex)
+ 		                    	{
+-                                    logger_.warn("error in filecompaction", ex);
++		                            continue;
+                                 }
+ 		                    }
+ 		                    // Now after merging all crap append to the sstable
+-		                    columnFamily = resolveAndRemoveDeleted(columnFamilies);
++		                    columnFamily = resolve(columnFamilies);
+ 		                    columnFamilies.clear();
+ 		                    if( columnFamily != null )
+ 		                    {
+ 			                	/* serialize the cf with column indexes */
+-			                    ColumnFamily.serializerWithIndexes().serialize(columnFamily, bufOut);
++			                    ColumnFamily.serializer2().serialize(columnFamily, bufOut);
+ 		                    }
+ 	                    }
+ 	                    else
+@@ -1284,22 +1426,23 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+ 	                    	try
+ 	                    	{
+ 		                        /* read the length although we don't need it */
+-		                        int size = filestruct.getBufIn().readInt();
+-		                        bufOut.write(filestruct.getBufIn(), size);
++		                        int size = filestruct.bufIn_.readInt();
++		                        bufOut.write(filestruct.bufIn_, size);
+ 	                    	}
+ 	                    	catch ( Exception ex)
+ 	                    	{
+ 	                    		ex.printStackTrace();
+-	                            filestruct.close();
++	                            filestruct.reader_.close();
+ 	                            continue;
+ 	                    	}
+ 	                    }
+ 	                    	         
+ 	                    if ( ssTable == null )
+ 	                    {
+-	                    	ssTable = new SSTable(compactionFileLocation, mergedFileName);	                    	
++	                    	PartitionerType pType = StorageService.getPartitionerType();
++	                    	ssTable = new SSTable(compactionFileLocation, mergedFileName, pType);	                    	
+ 	                    }
+-                        ssTable.append(lastkey, bufOut);
++	                    doWrite(ssTable, lastkey, bufOut);	                 
+ 
+                         /* Fill the bloom filter with the key */
+ 	                    doFill(compactedBloomFilter, lastkey);                        
+@@ -1308,8 +1451,8 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+ 	                    {
+ 	                    	try
+ 	                    	{
+-                                filestruct.getNextKey();
+-	                    		if (filestruct.isExhausted())
++	                    		filestruct = getNextKey(filestruct);
++	                    		if(filestruct == null)
+ 	                    		{
+ 	                    			continue;
+ 	                    		}
+@@ -1321,7 +1464,8 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+ 	                    		// Ignore the exception as it might be a corrupted file
+ 	                    		// in any case we have read as far as possible from it
+ 	                    		// and it will be deleted after compaction.
+-	                            filestruct.close();
++	                            filestruct.reader_.close();
++	                            continue;
+                             }
+ 	                    }
+ 	                    lfs.clear();
+@@ -1373,25 +1517,6 @@ void  doFileCompaction(List<String> files,  int minBufferSize)
+         logger_.debug("Total bytes Read for compaction  ..." + totalBytesRead);
+         logger_.debug("Total bytes written for compaction  ..."
+                 + totalBytesWritten + "   Total keys read ..." + totalkeysRead);
+-    }
+-
+-    public boolean isSuper()
+-    {
+-        return DatabaseDescriptor.getColumnType(getColumnFamilyName()).equals("Super");
+-    }
+-
+-    public void flushMemtableOnRecovery() throws IOException
+-    {
+-        memtable_.get().flushOnRecovery();
+-    }
+-
+-    public Object getMemtable()
+-    {
+-        return memtable_.get();
+-    }
+-
+-    public Set<String> getSSTableFilenames()
+-    {
+-        return Collections.unmodifiableSet(ssTables_);
++        return;
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/CommitLog.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/CommitLog.java
+index e6b8a6d8..c395d496 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/CommitLog.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/CommitLog.java
+@@ -21,18 +21,22 @@
+ import java.io.*;
+ import java.util.*;
+ 
++import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.DataInputBuffer;
+ import org.apache.cassandra.io.DataOutputBuffer;
+ import org.apache.cassandra.io.IFileReader;
+ import org.apache.cassandra.io.IFileWriter;
+ import org.apache.cassandra.io.SequenceFile;
++import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.FileUtils;
+ import org.apache.cassandra.utils.LogUtil;
+ import org.apache.log4j.Logger;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
++import org.apache.cassandra.io.*;
++import org.apache.cassandra.utils.*;
+ 
+ /*
+  * Commit Log tracks every write operation into the system. The aim
+@@ -372,7 +376,7 @@ private void doRecovery(Stack<File> filesNeeded, byte[] header) throws IOExcepti
+                     try
+                     {                        
+                         Row row = Row.serializer().deserialize(bufIn);
+-                        Map<String, ColumnFamily> columnFamilies = new HashMap<String, ColumnFamily>(row.getColumnFamilyMap());
++                        Map<String, ColumnFamily> columnFamilies = new HashMap<String, ColumnFamily>(row.getColumnFamilies());
+                         /* remove column families that have already been flushed */
+                     	Set<String> cNames = columnFamilies.keySet();
+ 
+@@ -419,7 +423,7 @@ private void doRecovery(Stack<File> filesNeeded, byte[] header) throws IOExcepti
+     */
+     private void updateHeader(Row row) throws IOException
+     {
+-    	Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++    	Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         Table table = Table.open(table_);
+         Set<String> cNames = columnFamilies.keySet();
+         for ( String cName : cNames )
+@@ -627,6 +631,9 @@ public static void main(String[] args) throws Throwable
+     {
+         LogUtil.init();
+         
++        // the return value is not used in this case
++        DatabaseDescriptor.init();
++        
+         File logDir = new File(DatabaseDescriptor.getLogFileLocation());
+         File[] files = logDir.listFiles();
+         Arrays.sort( files, new FileUtils.FileComparator() );
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/CountFilter.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/CountFilter.java
+index 90fce64c..6a4315bb 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/CountFilter.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/CountFilter.java
+@@ -21,6 +21,7 @@
+ import java.io.IOException;
+ import java.util.Collection;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.DataInputBuffer;
+ import org.apache.cassandra.io.SSTable;
+ 
+@@ -61,7 +62,7 @@ public ColumnFamily filter(String cfNameParam, ColumnFamily columnFamily)
+     		Collection<IColumn> columns = columnFamily.getAllColumns();
+     		for(IColumn column : columns)
+     		{
+-    			filteredCf.addColumn(column);
++    			filteredCf.addColumn(column.name(), column);
+     			countLimit_--;
+     			if( countLimit_ <= 0 )
+     			{
+@@ -70,14 +71,14 @@ public ColumnFamily filter(String cfNameParam, ColumnFamily columnFamily)
+     			}
+     		}
+ 		}
+-		else if(values.length == 2 && columnFamily.isSuper())
++		else if(values.length == 2 && DatabaseDescriptor.getColumnType(cfName).equals("Super"))
+ 		{
+     		Collection<IColumn> columns = columnFamily.getAllColumns();
+     		for(IColumn column : columns)
+     		{
+     			SuperColumn superColumn = (SuperColumn)column;
+     			SuperColumn filteredSuperColumn = new SuperColumn(superColumn.name());
+-				filteredCf.addColumn(filteredSuperColumn);
++				filteredCf.addColumn(filteredSuperColumn.name(), filteredSuperColumn);
+         		Collection<IColumn> subColumns = superColumn.getSubColumns();
+         		for(IColumn subColumn : subColumns)
+         		{
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/DBManager.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/DBManager.java
+index 6e0b45a4..0c48ad77 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/DBManager.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/DBManager.java
+@@ -18,18 +18,27 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.File;
+ import java.io.IOException;
++import java.math.BigInteger;
++import java.net.InetAddress;
+ import java.util.Map;
++import java.util.Random;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
++import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.dht.IPartitioner;
+-import org.apache.cassandra.dht.Token;
++import org.apache.cassandra.io.DataOutputBuffer;
++import org.apache.cassandra.io.IFileWriter;
++import org.apache.cassandra.io.SequenceFile;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.BasicUtilities;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.GuidGenerator;
++import org.apache.cassandra.utils.HashingSchemes;
+ 
+ 
+ /**
+@@ -61,23 +70,23 @@ public static DBManager instance() throws Throwable
+ 
+     public static class StorageMetadata
+     {
+-        private Token myToken;
++        private BigInteger storageId_;
+         private int generation_;
+ 
+-        StorageMetadata(Token storageId, int generation)
++        StorageMetadata(BigInteger storageId, int generation)
+         {
+-            myToken = storageId;
++            storageId_ = storageId;
+             generation_ = generation;
+         }
+ 
+-        public Token getStorageId()
++        public BigInteger getStorageId()
+         {
+-            return myToken;
++            return storageId_;
+         }
+ 
+-        public void setStorageId(Token storageId)
++        public void setStorageId(BigInteger storageId)
+         {
+-            myToken = storageId;
++            storageId_ = storageId;
+         }
+ 
+         public int getGeneration()
+@@ -88,7 +97,10 @@ public int getGeneration()
+ 
+     public DBManager() throws Throwable
+     {
+-        Set<String> tables = DatabaseDescriptor.getTableToColumnFamilyMap().keySet();
++        /* Read the configuration file */
++        Map<String, Map<String, CFMetaData>> tableToColumnFamilyMap = DatabaseDescriptor.init();
++        storeMetadata(tableToColumnFamilyMap);
++        Set<String> tables = tableToColumnFamilyMap.keySet();
+         
+         for (String table : tables)
+         {
+@@ -100,6 +112,47 @@ public DBManager() throws Throwable
+         recoveryMgr.doRecovery();
+     }
+ 
++    /*
++     * Create the metadata tables. This table has information about
++     * the table name and the column families that make up the table.
++     * Each column family also has an associated ID which is an int.
++    */
++    private static void storeMetadata(Map<String, Map<String, CFMetaData>> tableToColumnFamilyMap) throws Throwable
++    {
++        AtomicInteger idGenerator = new AtomicInteger(0);
++        Set<String> tables = tableToColumnFamilyMap.keySet();
++
++        for ( String table : tables )
++        {
++            Table.TableMetadata tmetadata = Table.TableMetadata.instance();
++            if ( tmetadata.isEmpty() )
++            {
++                tmetadata = Table.TableMetadata.instance();
++                /* Column families associated with this table */
++                Map<String, CFMetaData> columnFamilies = tableToColumnFamilyMap.get(table);
++
++                for (String columnFamily : columnFamilies.keySet())
++                {
++                    tmetadata.add(columnFamily, idGenerator.getAndIncrement(), DatabaseDescriptor.getColumnType(columnFamily));
++                }
++
++                /*
++                 * Here we add all the system related column families. 
++                */
++                /* Add the TableMetadata column family to this map. */
++                tmetadata.add(Table.TableMetadata.cfName_, idGenerator.getAndIncrement());
++                /* Add the LocationInfo column family to this map. */
++                tmetadata.add(SystemTable.cfName_, idGenerator.getAndIncrement());
++                /* Add the recycle column family to this map. */
++                tmetadata.add(Table.recycleBin_, idGenerator.getAndIncrement());
++                /* Add the Hints column family to this map. */
++                tmetadata.add(Table.hints_, idGenerator.getAndIncrement(), ColumnFamily.getColumnType("Super"));
++                tmetadata.apply();
++                idGenerator.set(0);
++            }
++        }
++    }
++
+     /*
+      * This method reads the system table and retrieves the metadata
+      * associated with this storage instance. Currently we store the
+@@ -114,17 +167,22 @@ public DBManager() throws Throwable
+         SystemTable sysTable = SystemTable.openSystemTable(SystemTable.name_);
+         Row row = sysTable.get(FBUtilities.getHostName());
+ 
+-        IPartitioner p = StorageService.getPartitioner();
++        Random random = new Random();
+         if ( row == null )
+         {
+-            Token token = p.getDefaultToken();
++        	/* Generate a token for this Storage node */                       
++            String guid = GuidGenerator.guid();
++            BigInteger token = StorageService.hash(guid);
++            if ( token.signum() == -1 )
++                token = token.multiply(BigInteger.valueOf(-1L));
++
+             int generation = 1;
+ 
+             String key = FBUtilities.getHostName();
+             row = new Row(key);
+             ColumnFamily cf = new ColumnFamily(SystemTable.cfName_);
+-            cf.addColumn(new Column(SystemTable.token_, p.getTokenFactory().toByteArray(token)));
+-            cf.addColumn(new Column(SystemTable.generation_, BasicUtilities.intToByteArray(generation)) );
++            cf.addColumn(SystemTable.token_, new Column(SystemTable.token_, token.toByteArray()) );
++            cf.addColumn(SystemTable.generation_, new Column(SystemTable.generation_, BasicUtilities.intToByteArray(generation)) );
+             row.addColumnFamily(cf);
+             sysTable.apply(row);
+             storageMetadata = new StorageMetadata( token, generation);
+@@ -132,22 +190,22 @@ public DBManager() throws Throwable
+         else
+         {
+             /* we crashed and came back up need to bump generation # */
+-        	Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++        	Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         	Set<String> cfNames = columnFamilies.keySet();
+ 
+             for ( String cfName : cfNames )
+             {
+             	ColumnFamily columnFamily = columnFamilies.get(cfName);
+ 
+-                IColumn tokenColumn = columnFamily.getColumn(SystemTable.token_);
+-                Token token = p.getTokenFactory().fromByteArray(tokenColumn.value());
++                IColumn token = columnFamily.getColumn(SystemTable.token_);
++                BigInteger bi = new BigInteger( token.value() );
+ 
+                 IColumn generation = columnFamily.getColumn(SystemTable.generation_);
+                 int gen = BasicUtilities.byteArrayToInt(generation.value()) + 1;
+ 
+                 Column generation2 = new Column("Generation", BasicUtilities.intToByteArray(gen), generation.timestamp() + 1);
+-                columnFamily.addColumn(generation2);
+-                storageMetadata = new StorageMetadata(token, gen);
++                columnFamily.addColumn("Generation", generation2);
++                storageMetadata = new StorageMetadata( bi, gen );
+                 break;
+             }
+             sysTable.reset(row);
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStruct.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStruct.java
+index a39aaac8..cda94827 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStruct.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStruct.java
+@@ -19,189 +19,126 @@
+ package org.apache.cassandra.db;
+ 
+ import java.io.IOException;
+-import java.util.Iterator;
++import java.math.BigInteger;
+ 
+-import org.apache.cassandra.io.Coordinate;
++import org.apache.cassandra.continuations.Suspendable;
+ import org.apache.cassandra.io.DataInputBuffer;
+ import org.apache.cassandra.io.DataOutputBuffer;
+ import org.apache.cassandra.io.IFileReader;
+ import org.apache.cassandra.io.SSTable;
++import org.apache.cassandra.io.SequenceFile;
++import org.apache.cassandra.service.PartitionerType;
++import org.apache.cassandra.service.StorageService;
+ 
+ 
+-public class FileStruct implements Comparable<FileStruct>, Iterable<String>
++public class FileStruct implements Comparable<FileStruct>
+ {
++    IFileReader reader_;
++    String key_;        
++    DataInputBuffer bufIn_;
++    DataOutputBuffer bufOut_;
+     
+-    private String key = null;
+-    private boolean exhausted = false;
+-    private IFileReader reader;
+-    private DataInputBuffer bufIn;
+-    private DataOutputBuffer bufOut;
+-
+-    public FileStruct(IFileReader reader)
++    public FileStruct()
+     {
+-        this.reader = reader;
+-        bufIn = new DataInputBuffer();
+-        bufOut = new DataOutputBuffer();
+     }
+ 
+-    public String getFileName()
++    public FileStruct(String file, int bufSize) throws IOException
+     {
+-        return reader.getFileName();
+-    }
+-
+-    public void close() throws IOException
+-    {
+-        reader.close();
+-    }
+-
+-    public boolean isExhausted()
+-    {
+-        return exhausted;
+-    }
+-
+-    public DataInputBuffer getBufIn()
+-    {
+-        return bufIn;
++        bufIn_ = new DataInputBuffer();
++        bufOut_ = new DataOutputBuffer();
++        reader_ = SequenceFile.bufferedReader(file, bufSize);
++        long bytesRead = advance();
++        if ( bytesRead == -1L )
++            throw new IOException("Either the file is empty or EOF has been reached.");          
+     }
+ 
+     public String getKey()
+     {
+-        return key;
+-    }
+-
+-    public int compareTo(FileStruct f)
+-    {
+-        return key.compareTo(f.key);
+-    }
+-
+-    // we don't use SequenceReader.seekTo, since that (sometimes) throws an exception
+-    // if the key is not found.  unsure if this behavior is desired.
+-    public void seekTo(String seekKey)
++        String key = key_;
++        if ( !key.equals(SSTable.blockIndexKey_) )
+     {
+-        try
+-        {
+-            Coordinate range = SSTable.getCoordinates(seekKey, reader);
+-            reader.seek(range.end_);
+-            long position = reader.getPositionFromBlockIndex(seekKey);
+-            if (position == -1)
++            PartitionerType pType = StorageService.getPartitionerType();          
++            switch ( pType )
+             {
+-                reader.seek(range.start_);
+-            }
+-            else
+-            {
+-                reader.seek(position);
+-            }
++                case OPHF:                
++                    break;
+ 
+-            while (!exhausted)
+-            {
+-                getNextKey();
+-                if (key.compareTo(seekKey) >= 0)
+-                {
++                default:
++                    String[] peices = key.split(":");                    
++                    key = peices[1];                
+                     break;
+                 }
+             }
+-        }
+-        catch (IOException e)
+-        {
+-            throw new RuntimeException("corrupt sstable", e);
+-        }
++        return key;
+     }
+ 
+-    /*
+-     * Read the next key from the data file, skipping block indexes.
+-     * Caller must check isExhausted after each call to see if further
+-     * reads are valid.
+-     */
+-    public void getNextKey()
+-    {
+-        if (exhausted)
++    public DataOutputBuffer getBuffer()
+         {
+-            throw new IndexOutOfBoundsException();
++        return bufOut_;
+         }
+ 
+-        try
++    public long advance() throws IOException
+         {
+-            bufOut.reset();
+-            if (reader.isEOF())
++        long bytesRead = -1L;
++        bufOut_.reset();
++        /* advance and read the next key in the file. */           
++        if (reader_.isEOF())
+             {
+-                reader.close();
+-                exhausted = true;
+-                return;
++            reader_.close();
++            return bytesRead;
+             }
+ 
+-            long bytesread = reader.next(bufOut);
+-            if (bytesread == -1)
++        bytesRead = reader_.next(bufOut_);        
++        if (bytesRead == -1)
+             {
+-                reader.close();
+-                exhausted = true;
+-                return;
++            reader_.close();
++            return bytesRead;
+             }
+ 
+-            bufIn.reset(bufOut.getData(), bufOut.getLength());
+-            key = bufIn.readUTF();
++        bufIn_.reset(bufOut_.getData(), bufOut_.getLength());
++        key_ = bufIn_.readUTF();
+             /* If the key we read is the Block Index Key then omit and read the next key. */
+-            if (key.equals(SSTable.blockIndexKey_))
++        if ( key_.equals(SSTable.blockIndexKey_) )
+             {
+-                bufOut.reset();
+-                bytesread = reader.next(bufOut);
+-                if (bytesread == -1)
+-                {
+-                    reader.close();
+-                    exhausted = true;
+-                    return;
+-                }
+-                bufIn.reset(bufOut.getData(), bufOut.getLength());
+-                key = bufIn.readUTF();
+-            }
+-        }
+-        catch (IOException e)
++            bufOut_.reset();
++            bytesRead = reader_.next(bufOut_);
++            if (bytesRead == -1)
+         {
+-            throw new RuntimeException(e);
++                reader_.close();
++                return bytesRead;
+         }
++            bufIn_.reset(bufOut_.getData(), bufOut_.getLength());
++            key_ = bufIn_.readUTF();
+     }
+ 
+-    public Iterator<String> iterator()
+-    {
+-        return new FileStructIterator();
++        return bytesRead;
+     }
+ 
+-    private class FileStructIterator implements Iterator<String>
+-    {
+-        String saved;
+-
+-        public FileStructIterator()
+-        {
+-            if (getKey() == null && !isExhausted())
+-            {
+-                forward();
+-            }
+-        }
+-
+-        private void forward()
+-        {
+-            getNextKey();
+-            saved = isExhausted() ? null : getKey();
+-        }
+-
+-        public boolean hasNext()
++    public int compareTo(FileStruct f)
+         {
+-            return saved != null;
+-        }
+-
+-        public String next()
++    	int value = 0;
++        PartitionerType pType = StorageService.getPartitionerType();
++        switch( pType )
+         {
+-            if (saved == null)
+-            {
+-                throw new IndexOutOfBoundsException();
++            case OPHF:
++                value = key_.compareTo(f.key_);                    
++                break;
++
++            default:
++            	String lhs = key_.split(":")[0];            
++                BigInteger b = new BigInteger(lhs);
++                String rhs = f.key_.split(":")[0];
++                BigInteger b2 = new BigInteger(rhs);
++                value = b.compareTo(b2);
++                break;
+             }
+-            String key = saved;
+-            forward();
+-            return key;
++        return value;
+         }
+ 
+-        public void remove()
++    public void close() throws IOException
+         {
+-            throw new UnsupportedOperationException();
+-        }
++        bufIn_.close();
++        bufOut_.close();
++        reader_.close();
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStructComparator.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStructComparator.java
+index d7bd9aeb..157bfc08 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStructComparator.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/FileStructComparator.java
+@@ -6,6 +6,13 @@
+ {
+     public int compare(FileStruct f, FileStruct f2)
+     {
+-        return f.getFileName().compareTo(f2.getFileName());
++        return f.reader_.getFileName().compareTo(f2.reader_.getFileName());
++    }
++
++    public boolean equals(Object o)
++    {
++        if (!(o instanceof FileStructComparator))
++            return false;
++        return true;
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/HintedHandOffManager.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/HintedHandOffManager.java
+index 338c1588..fac014b5 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -24,8 +24,6 @@
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+-import org.apache.log4j.Logger;
+-
+ import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.ThreadFactoryImpl;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+@@ -34,7 +32,11 @@
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.service.IComponentShutdown;
++import org.apache.cassandra.service.IResponseResolver;
++import org.apache.cassandra.service.QuorumResponseHandler;
+ import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.service.WriteResponseResolver;
++import org.apache.log4j.Logger;
+ 
+ 
+ /**
+@@ -108,14 +110,14 @@ private boolean sendMessage(String endpointAddress, String key) throws Exception
+         private void deleteEndPoint(String endpointAddress, String key) throws Exception
+         {
+         	RowMutation rm = new RowMutation(DatabaseDescriptor.getTables().get(0), key_);
+-        	rm.delete(Table.hints_ + ":" + key + ":" + endpointAddress, System.currentTimeMillis());
++        	rm.delete(Table.hints_ + ":" + key + ":" + endpointAddress);
+         	rm.apply();
+         }
+ 
+         private void deleteKey(String key) throws Exception
+         {
+         	RowMutation rm = new RowMutation(DatabaseDescriptor.getTables().get(0), key_);
+-        	rm.delete(Table.hints_ + ":" + key, System.currentTimeMillis());
++        	rm.delete(Table.hints_ + ":" + key);
+         	rm.apply();
+         }
+ 
+@@ -140,7 +142,7 @@ private void runHints()
+             	if(hintedColumnFamily == null)
+             	{
+                     // Force flush now
+-                    columnFamilyStore_.forceFlush();
++                    columnFamilyStore_.forceFlush(false);
+             		return;
+             	}
+             	Collection<IColumn> keys = hintedColumnFamily.getAllColumns();
+@@ -175,7 +177,7 @@ private void runHints()
+                 	}
+             	}
+                 // Force flush now
+-                columnFamilyStore_.forceFlush();
++                columnFamilyStore_.forceFlush(false);
+ 
+                 // Now do a major compaction
+                 columnFamilyStore_.forceCompaction(null, null, 0, null);
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/IColumn.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/IColumn.java
+index e3b2049b..3e8a425f 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/IColumn.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/IColumn.java
+@@ -29,7 +29,6 @@
+ {
+     public static short UtfPrefix_ = 2;
+     public boolean isMarkedForDelete();
+-    public long getMarkedForDeleteAt();
+     public String name();
+     public int size();
+     public int serializedSize();
+@@ -40,7 +39,10 @@
+     public Collection<IColumn> getSubColumns();
+     public IColumn getSubColumn(String columnName);
+     public void addColumn(String name, IColumn column);
++    public void delete();
++    public void repair(IColumn column);
+     public IColumn diff(IColumn column);
++    public boolean putColumn(IColumn column);
+     public int getObjectCount();
+     public byte[] digest();
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Memtable.java
+index 4d3cac30..40d502e1 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Memtable.java
+@@ -20,14 +20,7 @@
+ 
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.Iterator;
+-import java.util.PriorityQueue;
++import java.util.*;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
+@@ -38,16 +31,19 @@
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+-import org.apache.log4j.Logger;
+-
+ import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.ThreadFactoryImpl;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.DataOutputBuffer;
+ import org.apache.cassandra.io.SSTable;
++import org.apache.cassandra.service.IComponentShutdown;
++import org.apache.cassandra.service.PartitionerType;
++import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.utils.LogUtil;
+-import org.apache.cassandra.utils.DestructivePQIterator;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
++import org.apache.cassandra.utils.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -82,6 +78,7 @@ public static void shutdown()
+     private Map<String, ColumnFamily> columnFamilies_ = new HashMap<String, ColumnFamily>();
+     /* Lock and Condition for notifying new clients about Memtable switches */
+     Lock lock_ = new ReentrantLock();
++    Condition condition_;
+ 
+     Memtable(String table, String cfName) throws IOException
+     {
+@@ -96,6 +93,7 @@ public static void shutdown()
+                     ));
+         }
+ 
++        condition_ = lock_.newCondition();
+         table_ = table;
+         cfName_ = cfName;
+         creationTime_ = System.currentTimeMillis();
+@@ -143,6 +141,24 @@ public ColumnFamily call()
+         }
+     }
+ 
++    class Remover implements Runnable
++    {
++        private String key_;
++        private ColumnFamily columnFamily_;
++
++        Remover(String key, ColumnFamily columnFamily)
++        {
++            key_ = key;
++            columnFamily_ = columnFamily;
++        }
++
++        public void run()
++        {
++        	columnFamily_.delete();
++            columnFamilies_.put(key_, columnFamily_);
++        }
++    }
++    
+     /**
+      * Flushes the current memtable to disk.
+      * 
+@@ -196,6 +212,13 @@ void resolveCount(int oldCount, int newCount)
+         currentObjectCount_.addAndGet(newCount - oldCount);
+     }
+ 
++    private boolean isLifetimeViolated()
++    {
++      /* Memtable lifetime in terms of milliseconds */
++      long lifetimeInMillis = DatabaseDescriptor.getMemtableLifetime() * 3600 * 1000;
++      return ( ( System.currentTimeMillis() - creationTime_ ) >= lifetimeInMillis );
++    }
++
+     boolean isThresholdViolated(String key)
+     {
+     	boolean bVal = false;//isLifetimeViolated();
+@@ -263,18 +286,14 @@ void put(String key, ColumnFamily columnFamily, CommitLog.CommitLogContext cLogC
+     /*
+      * This version is used to switch memtable and force flush.
+     */
+-    public void forceflush(ColumnFamilyStore cfStore) throws IOException
++    void forceflush(ColumnFamilyStore cfStore, boolean fRecovery) throws IOException
++    {
++        if(!fRecovery)
+     {
+         RowMutation rm = new RowMutation(DatabaseDescriptor.getTables().get(0), flushKey_);
+-
+         try
+         {
+-            if (cfStore.isSuper())
+-            {
+-                rm.add(cfStore.getColumnFamilyName() + ":SC1:Column", "0".getBytes(), 0);
+-            } else {
+-                rm.add(cfStore.getColumnFamilyName() + ":Column", "0".getBytes(), 0);
+-            }
++	            rm.add(cfStore.columnFamily_ + ":Column","0".getBytes());
+             rm.apply();
+         }
+         catch(ColumnFamilyNotDefinedException ex)
+@@ -282,10 +301,11 @@ public void forceflush(ColumnFamilyStore cfStore) throws IOException
+             logger_.debug(LogUtil.throwableToString(ex));
+         }
+     }
+-
+-    void flushOnRecovery() throws IOException {
++        else
++        {
+         flush(CommitLog.CommitLogContext.NULL);
+     }
++    }
+ 
+     private void resolve(String key, ColumnFamily columnFamily)
+     {
+@@ -299,7 +319,6 @@ private void resolve(String key, ColumnFamily columnFamily)
+             int newObjectCount = oldCf.getColumnCount();
+             resolveSize(oldSize, newSize);
+             resolveCount(oldObjectCount, newObjectCount);
+-            oldCf.delete(Math.max(oldCf.getMarkedForDeleteAt(), columnFamily.getMarkedForDeleteAt()));
+         }
+         else
+         {
+@@ -320,9 +339,9 @@ void putOnRecovery(String key, ColumnFamily columnFamily) throws IOException
+         	resolve(key, columnFamily);
+     }
+ 
+-    ColumnFamily getLocalCopy(String key, String columnFamilyColumn, IFilter filter)
++    ColumnFamily getLocalCopy(String key, String cfName, IFilter filter)
+     {
+-    	String[] values = RowMutation.getColumnAndColumnFamily(columnFamilyColumn);
++    	String[] values = RowMutation.getColumnAndColumnFamily(cfName);
+     	ColumnFamily columnFamily = null;
+         if(values.length == 1 )
+         {
+@@ -331,33 +350,55 @@ ColumnFamily getLocalCopy(String key, String columnFamilyColumn, IFilter filter)
+         else
+         {
+         	ColumnFamily cFamily = columnFamilies_.get(key);
+-        	if (cFamily == null) return null;
+-
+-        	if (values.length == 2) {
+-                IColumn column = cFamily.getColumn(values[1]); // super or normal column
+-                if (column != null )
++        	if(cFamily == null)
++        		return null;
++        	IColumn column = null;
++        	if(values.length == 2)
++        	{
++        		column = cFamily.getColumn(values[1]);
++        		if(column != null )
+                 {
+                     columnFamily = new ColumnFamily(cfName_);
+-                    columnFamily.addColumn(column);
++        			columnFamily.addColumn(column.name(), column);
+                 }
+         	}
+             else
+             {
+-                assert values.length == 3;
+-                SuperColumn superColumn = (SuperColumn)cFamily.getColumn(values[1]);
+-                if (superColumn != null)
++        		column = cFamily.getColumn(values[1]);
++        		if(column != null )
+                 {
+-                    IColumn subColumn = superColumn.getSubColumn(values[2]);
+-                    if (subColumn != null)
++        			 
++        			IColumn subColumn = ((SuperColumn)column).getSubColumn(values[2]);
++        			if(subColumn != null)
+                     {
+                         columnFamily = new ColumnFamily(cfName_);
+-                        columnFamily.addColumn(values[1] + ":" + values[2], subColumn.value(), subColumn.timestamp(), subColumn.isMarkedForDelete());
++	            		columnFamily.createColumn(values[1] + ":" + values[2], subColumn.value(), subColumn.timestamp());
+                     }
+                 }
+         	}
+         }
+         /* Filter unnecessary data from the column based on the provided filter */
+-        return filter.filter(columnFamilyColumn, columnFamily);
++        return filter.filter(cfName, columnFamily);
++    }
++
++    ColumnFamily get(String key, String cfName)
++    {
++    	printExecutorStats();
++    	Callable<ColumnFamily> call = new Getter(key, cfName);
++    	ColumnFamily cf = null;
++    	try
++    	{
++    		cf = apartments_.get(cfName_).submit(call).get();
++    	}
++    	catch ( ExecutionException ex )
++    	{
++    		logger_.debug(LogUtil.throwableToString(ex));
++    	}
++    	catch ( InterruptedException ex2 )
++    	{
++    		logger_.debug(LogUtil.throwableToString(ex2));
++    	}
++    	return cf;
+     }
+ 
+     ColumnFamily get(String key, String cfName, IFilter filter)
+@@ -380,6 +421,23 @@ ColumnFamily get(String key, String cfName, IFilter filter)
+     	return cf;
+     }
+ 
++    /*
++     * Although the method is named remove() we cannot remove the key
++     * from memtable. We add it to the memtable but mark it as deleted.
++     * The reason for this because we do not want a successive get()
++     * for the same key to scan the ColumnFamilyStore files for this key.
++    */
++    void remove(String key, ColumnFamily columnFamily) throws IOException
++    {
++    	printExecutorStats();
++    	Runnable deleter = new Remover(key, columnFamily);
++    	apartments_.get(cfName_).submit(deleter);
++    }
++
++    /*
++     * param recoveryMode - indicates if this was invoked during
++     *                      recovery.
++    */
+     void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
+     {
+         ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+@@ -392,9 +450,51 @@ void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
+             return;
+         }
+ 
++        PartitionerType pType = StorageService.getPartitionerType();
+         String directory = DatabaseDescriptor.getDataFileLocation();
+         String filename = cfStore.getNextFileName();
+-        SSTable ssTable = new SSTable(directory, filename);
++        SSTable ssTable = new SSTable(directory, filename, pType);
++        switch (pType) 
++        {
++            case OPHF:
++                flushForOrderPreservingPartitioner(ssTable, cfStore, cLogCtx);
++                break;
++                
++            default:
++                flushForRandomPartitioner(ssTable, cfStore, cLogCtx);
++                break;
++        }        
++    }
++    
++    private void flushForRandomPartitioner(SSTable ssTable, ColumnFamilyStore cfStore, CommitLog.CommitLogContext cLogCtx) throws IOException
++    {
++        /* List of primary keys in sorted order */
++        List<PrimaryKey> pKeys = PrimaryKey.create( columnFamilies_.keySet() );
++        DataOutputBuffer buffer = new DataOutputBuffer();
++        /* Use this BloomFilter to decide if a key exists in a SSTable */
++        BloomFilter bf = new BloomFilter(pKeys.size(), 15);
++        for ( PrimaryKey pKey : pKeys )
++        {
++            buffer.reset();
++            ColumnFamily columnFamily = columnFamilies_.get(pKey.key());
++            if ( columnFamily != null )
++            {
++                /* serialize the cf with column indexes */
++                ColumnFamily.serializer2().serialize( columnFamily, buffer );                                
++                /* Now write the key and value to disk */
++                ssTable.append(pKey.key(), pKey.hash(), buffer);
++                bf.fill(pKey.key());
++                columnFamily.clear();
++            }
++        }
++        ssTable.close(bf);
++        cfStore.onMemtableFlush(cLogCtx);
++        cfStore.storeLocation( ssTable.getDataFileLocation(), bf );
++        buffer.close();
++    }
++    
++    private void flushForOrderPreservingPartitioner(SSTable ssTable, ColumnFamilyStore cfStore, CommitLog.CommitLogContext cLogCtx) throws IOException
++    {
+         List<String> keys = new ArrayList<String>( columnFamilies_.keySet() );
+         Collections.sort(keys);
+         DataOutputBuffer buffer = new DataOutputBuffer();
+@@ -407,7 +507,7 @@ void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
+             if ( columnFamily != null )
+             {
+                 /* serialize the cf with column indexes */
+-                ColumnFamily.serializerWithIndexes().serialize( columnFamily, buffer );
++                ColumnFamily.serializer2().serialize( columnFamily, buffer );                                              
+                 /* Now write the key and value to disk */
+                 ssTable.append(key, buffer);
+                 bf.fill(key);
+@@ -418,13 +518,5 @@ void flush(CommitLog.CommitLogContext cLogCtx) throws IOException
+         cfStore.onMemtableFlush(cLogCtx);
+         cfStore.storeLocation( ssTable.getDataFileLocation(), bf );
+         buffer.close();
+-
+-        columnFamilies_.clear();
+     }
+-
+-    public Iterator<String> sortedKeyIterator()
+-    {
+-        return new DestructivePQIterator<String>(new PriorityQueue<String>(columnFamilies_.keySet()));
+-    }
+-
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/MemtableManager.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/MemtableManager.java
+index b11e7f81..3de3f036 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/MemtableManager.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/MemtableManager.java
+@@ -27,8 +27,10 @@
+ 
+ import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.ThreadFactoryImpl;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.utils.LogUtil;
+ import org.apache.log4j.Logger;
++import org.apache.cassandra.utils.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -40,7 +42,7 @@
+     private static Lock lock_ = new ReentrantLock();
+     private static Logger logger_ = Logger.getLogger(MemtableManager.class);
+     private ReentrantReadWriteLock rwLock_ = new ReentrantReadWriteLock(true);
+-    public static MemtableManager instance()
++    static MemtableManager instance() 
+     {
+         if ( instance_ == null )
+         {
+@@ -157,22 +159,7 @@ void getColumnFamily(String key, String cfName, String cf, IFilter filter, List<
+     	}
+     }
+ 
+-    public List<Memtable> getUnflushedMemtables(String cfName)
+-    {
+-        rwLock_.readLock().lock();
+-        try
+-        {
+-            List<Memtable> memtables = history_.get(cfName);
+-            if (memtables != null)
+-            {
+-                return new ArrayList<Memtable>(memtables);
+-            }
+-            return Arrays.asList(new Memtable[0]);
+-        }
+-        finally
+-        {
+-            rwLock_.readLock().unlock();
+-        }
+-    }
++
++
+ 
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/MinorCompactionManager.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/MinorCompactionManager.java
+index 44dc15c8..ba11b542 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/MinorCompactionManager.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/MinorCompactionManager.java
+@@ -87,6 +87,10 @@ public void run()
+             	columnFamilyStore_.doCompaction();
+                 logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
+             }
++            catch (IOException e)
++            {
++                logger_.debug( LogUtil.throwableToString(e) );
++            }
+             catch (Throwable th)
+             {
+                 logger_.error( LogUtil.throwableToString(th) );
+@@ -118,9 +122,16 @@ public void run()
+         public Boolean call()
+         {
+         	boolean result = true;
++            try
++            {
+             logger_.debug("Started  compaction ..."+columnFamilyStore_.columnFamily_);
+             result = columnFamilyStore_.doAntiCompaction(ranges_, target_,fileList_);
+             logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
++            }
++            catch (IOException e)
++            {
++                logger_.debug( LogUtil.throwableToString(e) );
++            }
+             return result;
+         }
+     }
+@@ -169,6 +180,10 @@ public void run()
+             	columnFamilyStore_.doCleanupCompaction();
+                 logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
+             }
++            catch (IOException e)
++            {
++                logger_.debug( LogUtil.throwableToString(e) );
++            }
+             catch (Throwable th)
+             {
+                 logger_.error( LogUtil.throwableToString(th) );
+@@ -210,7 +225,12 @@ public void submitCleanup(ColumnFamilyStore columnFamilyStore)
+         return compactor_.submit( new FileCompactor2(columnFamilyStore, ranges, target, fileList) );
+     }
+ 
+-    public void  submitMajor(ColumnFamilyStore columnFamilyStore, long skip)
++    public Future<Boolean> submit(ColumnFamilyStore columnFamilyStore, List<Range> ranges)
++    {
++        return compactor_.submit( new FileCompactor2(columnFamilyStore, ranges) );
++    }
++
++    public void  submitMajor(ColumnFamilyStore columnFamilyStore, List<Range> ranges, long skip)
+     {
+         compactor_.submit( new OnDemandCompactor(columnFamilyStore, skip) );
+     }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/NamesFilter.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/NamesFilter.java
+index c58237c9..f6beaeed 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/NamesFilter.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/NamesFilter.java
+@@ -32,11 +32,11 @@
+ public class NamesFilter implements IFilter
+ {
+     /* list of column names to filter against. */
+-    private List<String> names_;
++    private List<String> names_ = new ArrayList<String>();  
+ 
+     NamesFilter(List<String> names)
+     {
+-        names_ = new ArrayList<String>(names);
++        names_ = names;     
+     }
+ 
+     public ColumnFamily filter(String cf, ColumnFamily columnFamily)
+@@ -56,7 +56,7 @@ public ColumnFamily filter(String cf, ColumnFamily columnFamily)
+ 		        if ( names_.contains(column.name()) )
+ 		        {
+ 		            names_.remove(column.name());
+-					filteredCf.addColumn(column);
++					filteredCf.addColumn(column.name(), column);
+ 		        }
+ 				if( isDone() )
+ 				{
+@@ -64,14 +64,14 @@ public ColumnFamily filter(String cf, ColumnFamily columnFamily)
+ 				}
+ 			}
+ 		}
+-		else if ( values.length == 2 && DatabaseDescriptor.getColumnType(cfName).equals("Super"))
++		else if ( values.length == 2 && DatabaseDescriptor.getColumnType(cfName).equals("Super") )
+ 		{
+     		Collection<IColumn> columns = columnFamily.getAllColumns();
+     		for(IColumn column : columns)
+     		{
+     			SuperColumn superColumn = (SuperColumn)column;
+     			SuperColumn filteredSuperColumn = new SuperColumn(superColumn.name());
+-				filteredCf.addColumn(filteredSuperColumn);
++				filteredCf.addColumn(filteredSuperColumn.name(), filteredSuperColumn);
+         		Collection<IColumn> subColumns = superColumn.getSubColumns();
+         		for(IColumn subColumn : subColumns)
+         		{
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/PrimaryKey.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/PrimaryKey.java
+index e69de29b..c2fbcf8c 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/PrimaryKey.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/PrimaryKey.java
+@@ -0,0 +1,124 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.db;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.math.BigInteger;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.cassandra.io.ICompactSerializer;
++import org.apache.cassandra.service.PartitionerType;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.FBUtilities;
++
++
++public class PrimaryKey implements Comparable<PrimaryKey>
++{   
++    public static List<PrimaryKey> create(Set<String> keys)
++    {
++        List<PrimaryKey> list = new ArrayList<PrimaryKey>();
++        for ( String key : keys )
++        {
++            list.add( new PrimaryKey(key) );
++        }
++        Collections.sort(list);
++        return list;
++    }
++    
++    /* MD5 hash of the key_ */
++    private BigInteger hash_;
++    /* Key used by the application */
++    private String key_;
++    
++    PrimaryKey(String key)
++    {
++        PartitionerType pType = StorageService.getPartitionerType();
++        switch (pType)
++        {
++            case RANDOM:
++                hash_ = FBUtilities.hash(key);
++                break;
++            
++            case OPHF:
++                break;
++                
++            default:
++                hash_ = hash_ = FBUtilities.hash(key);
++                break;
++        }        
++        key_ = key;
++    }
++    
++    PrimaryKey(String key, BigInteger hash)
++    {
++        hash_ = hash;
++        key_ = key;
++    }
++    
++    public String key()
++    {
++        return key_;
++    }
++    
++    public BigInteger hash()
++    {
++        return hash_;
++    }
++    
++    /**
++     * This performs semantic comparison of Primary Keys.
++     * If the partition algorithm chosen is "Random" then
++     * the hash of the key is used for comparison. If it 
++     * is an OPHF then the key is used.
++     * 
++     * @param rhs primary against which we wish to compare.
++     * @return
++     */
++    public int compareTo(PrimaryKey rhs)
++    {
++        int value = 0;
++        PartitionerType pType = StorageService.getPartitionerType();
++        switch (pType)
++        {
++            case RANDOM:
++                value = hash_.compareTo(rhs.hash_);
++                break;
++            
++            case OPHF:
++                value = key_.compareTo(rhs.key_);
++                break;
++                
++            default:
++                value = hash_.compareTo(rhs.hash_);
++                break;
++        }        
++        return value;
++    }
++    
++    @Override
++    public String toString()
++    {
++        return (hash_ != null) ? (key_ + ":" + hash_) : key_;
++    }
++}
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RecoveryManager.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RecoveryManager.java
+index 513b1dcf..dcf3d51b 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RecoveryManager.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RecoveryManager.java
+@@ -93,6 +93,7 @@ private void recoverEachTable(Map<String, List<File>> tableToCommitLogs) throws
+     
+     public static void main(String[] args) throws Throwable
+     {
++        DatabaseDescriptor.init();
+         long start = System.currentTimeMillis();
+         RecoveryManager rm = RecoveryManager.instance();
+         rm.doRecovery();  
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Row.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Row.java
+index f53ce0b5..2f863669 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Row.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Row.java
+@@ -18,36 +18,43 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.DataInput;
+ import java.io.DataInputStream;
++import java.io.DataOutput;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
+-import java.util.Collection;
+-import java.util.HashMap;
+-import java.util.Hashtable;
+-import java.util.Map;
+-import java.util.Set;
+-
+-import org.apache.commons.lang.ArrayUtils;
+-import org.apache.commons.lang.StringUtils;
+-import org.apache.log4j.Logger;
++import java.io.Serializable;
++import java.util.*;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.cassandra.io.ICompactSerializer;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
+ 
+-public class Row
++/**
++ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
++ */
++public class Row implements Serializable
+ {
+-    private static RowSerializer serializer_ = new RowSerializer();
++    private static ICompactSerializer<Row> serializer_;
+     private static Logger logger_ = Logger.getLogger(Row.class);
+ 
+-    static RowSerializer serializer()
++    static
++    {
++        serializer_ = new RowSerializer();
++    }
++
++    static ICompactSerializer<Row> serializer()
+     {
+         return serializer_;
+     }
+ 
+     private String key_;
+-
+     private Map<String, ColumnFamily> columnFamilies_ = new Hashtable<String, ColumnFamily>();
++    private transient AtomicInteger size_ = new AtomicInteger(0);
+ 
++    /* Ctor for JAXB */
+     protected Row()
+     {
+     }
+@@ -67,58 +74,74 @@ void key(String key)
+         key_ = key;
+     }
+ 
+-    public Set<String> getColumnFamilyNames()
+-    {
+-        return columnFamilies_.keySet();
+-    }
+-
+-    public Collection<ColumnFamily> getColumnFamilies()
++    public ColumnFamily getColumnFamily(String cfName)
+     {
+-        return columnFamilies_.values();
++        return columnFamilies_.get(cfName);
+     }
+ 
+-    @Deprecated
+-    // (use getColumnFamilies or getColumnFamilyNames)
+-    public Map<String, ColumnFamily> getColumnFamilyMap()
++    public Map<String, ColumnFamily> getColumnFamilies()
+     {
+         return columnFamilies_;
+     }
+ 
+-    public ColumnFamily getColumnFamily(String cfName)
+-    {
+-        return columnFamilies_.get(cfName);
+-    }
+-
+     void addColumnFamily(ColumnFamily columnFamily)
+     {
+         columnFamilies_.put(columnFamily.name(), columnFamily);
++        size_.addAndGet(columnFamily.size());
+     }
+ 
+     void removeColumnFamily(ColumnFamily columnFamily)
+     {
+         columnFamilies_.remove(columnFamily.name());
+         int delta = (-1) * columnFamily.size();
++        size_.addAndGet(delta);
++    }
++
++    public int size()
++    {
++        return size_.get();
+     }
+ 
+     public boolean isEmpty()
+     {
+-        return (columnFamilies_.size() == 0);
++    	return ( columnFamilies_.size() == 0 );
+     }
++    
++    /**
++     * This is used as oldRow.merge(newRow). Basically we take the newRow
++     * and merge it into the oldRow.
++    */
++    void merge(Row row)
++    {
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
++        Set<String> cfNames = columnFamilies.keySet();
+ 
+-    /*
++        for ( String cfName : cfNames )
++        {
++            ColumnFamily cf = columnFamilies_.get(cfName);
++            if ( cf == null )
++                columnFamilies_.put(cfName, columnFamilies.get(cfName));
++            else
++            {
++                cf.merge(columnFamilies.get(cfName));
++            }
++        }
++    }
++
++    /**
+      * This function will repair the current row with the input row
+      * what that means is that if there are any differences between the 2 rows then
+      * this fn will make the current row take the latest changes .
+      */
+     public void repair(Row row)
+     {
+-        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         Set<String> cfNames = columnFamilies.keySet();
+ 
+-        for (String cfName : cfNames)
++        for ( String cfName : cfNames )
+         {
+             ColumnFamily cf = columnFamilies_.get(cfName);
+-            if (cf == null)
++            if ( cf == null )
+             {
+                 cf = new ColumnFamily(cfName);
+                 columnFamilies_.put(cfName, cf);
+@@ -128,7 +151,7 @@ public void repair(Row row)
+ 
+     }
+ 
+-    /*
++    /**
+      * This function will calculate the difference between 2 rows
+      * and return the resultant row. This assumes that the row that
+      * is being submitted is a super set of the current row so
+@@ -139,23 +162,23 @@ public void repair(Row row)
+     public Row diff(Row row)
+     {
+         Row rowDiff = new Row(key_);
+-        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++    	Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         Set<String> cfNames = columnFamilies.keySet();
+ 
+-        for (String cfName : cfNames)
++        for ( String cfName : cfNames )
+         {
+             ColumnFamily cf = columnFamilies_.get(cfName);
+             ColumnFamily cfDiff = null;
+-            if (cf == null)
+-                rowDiff.getColumnFamilyMap().put(cfName, columnFamilies.get(cfName));
++            if ( cf == null )
++            	rowDiff.getColumnFamilies().put(cfName, columnFamilies.get(cfName));
+             else
+             {
+                 cfDiff = cf.diff(columnFamilies.get(cfName));
+-                if (cfDiff != null)
+-                    rowDiff.getColumnFamilyMap().put(cfName, cfDiff);
++            	if(cfDiff != null)
++            		rowDiff.getColumnFamilies().put(cfName, cfDiff);
+             }
+         }
+-        if (rowDiff.getColumnFamilyMap().size() != 0)
++        if(rowDiff.getColumnFamilies().size() != 0)
+             return rowDiff;
+         else
+             return null;
+@@ -172,16 +195,17 @@ public Row cloneMe()
+     {
+         long start = System.currentTimeMillis();
+         Set<String> cfamilies = columnFamilies_.keySet();
+-        byte[] xorHash = ArrayUtils.EMPTY_BYTE_ARRAY;
+-        for (String cFamily : cfamilies)
++    	byte[] xorHash = new byte[0];
++    	byte[] tmpHash = new byte[0];
++    	for(String cFamily : cfamilies)
+         {
+-            if (xorHash.length == 0)
++    		if(xorHash.length == 0)
+             {
+                 xorHash = columnFamilies_.get(cFamily).digest();
+             }
+             else
+             {
+-                byte[] tmpHash = columnFamilies_.get(cFamily).digest();
++    			tmpHash = columnFamilies_.get(cFamily).digest();
+                 xorHash = FBUtilities.xor(xorHash, tmpHash);
+             }
+         }
+@@ -194,11 +218,6 @@ void clear()
+     {
+         columnFamilies_.clear();
+     }
+-
+-    public String toString()
+-    {
+-        return "Row(" + key_ + " [" + StringUtils.join(columnFamilies_.values(), ", ") + ")]";
+-    }
+ }
+ 
+ class RowSerializer implements ICompactSerializer<Row>
+@@ -206,14 +225,14 @@ public String toString()
+     public void serialize(Row row, DataOutputStream dos) throws IOException
+     {
+         dos.writeUTF(row.key());
+-        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         int size = columnFamilies.size();
+         dos.writeInt(size);
+ 
+-        if (size > 0)
++        if ( size > 0 )
+         {
+             Set<String> cNames = columnFamilies.keySet();
+-            for (String cName : cNames)
++            for ( String cName : cNames )
+             {
+                 ColumnFamily.serializer().serialize(columnFamilies.get(cName), dos);
+             }
+@@ -226,9 +245,9 @@ public Row deserialize(DataInputStream dis) throws IOException
+         Row row = new Row(key);
+         int size = dis.readInt();
+ 
+-        if (size > 0)
++        if ( size > 0 )
+         {
+-            for (int i = 0; i < size; ++i)
++            for ( int i = 0; i < size; ++i )
+             {
+                 ColumnFamily cf = ColumnFamily.serializer().deserialize(dis);
+                 row.addColumnFamily(cf);
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutation.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutation.java
+index 286f27d2..9ac834b8 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutation.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutation.java
+@@ -18,30 +18,13 @@
+ 
+ package org.apache.cassandra.db;
+ 
+-import java.io.ByteArrayOutputStream;
++import java.util.*;
+ import java.io.DataInputStream;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.io.Serializable;
+-import java.util.HashMap;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.Set;
+-import java.util.concurrent.ExecutionException;
+-
+-import org.apache.commons.lang.ArrayUtils;
+-import org.apache.commons.lang.StringUtils;
+ 
+ import org.apache.cassandra.io.ICompactSerializer;
+-import org.apache.cassandra.net.EndPoint;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.service.batch_mutation_super_t;
+-import org.apache.cassandra.service.batch_mutation_t;
+-import org.apache.cassandra.service.column_t;
+-import org.apache.cassandra.service.superColumn_t;
+-import org.apache.cassandra.utils.FBUtilities;
+ 
+ 
+ /**
+@@ -51,7 +34,6 @@
+ public class RowMutation implements Serializable
+ {
+     private static ICompactSerializer<RowMutation> serializer_;
+-    public static final String HINT = "HINT";
+ 
+     static
+     {
+@@ -66,6 +48,7 @@
+     private String table_;
+     private String key_;
+     protected Map<String, ColumnFamily> modifications_ = new HashMap<String, ColumnFamily>();
++    protected Map<String, ColumnFamily> deletions_ = new HashMap<String, ColumnFamily>();
+ 
+     /* Ctor for JAXB */
+     private RowMutation()
+@@ -82,17 +65,20 @@ public RowMutation(String table, Row row)
+     {
+         table_ = table;
+         key_ = row.key();
+-        for (ColumnFamily cf : row.getColumnFamilies())
++        Map<String, ColumnFamily> cfSet = row.getColumnFamilies();
++        Set<String> keyset = cfSet.keySet();
++        for(String cfName : keyset)
+         {
+-            add(cf);
++        	add(cfName, cfSet.get(cfName));
+         }
+     }
+ 
+-    protected RowMutation(String table, String key, Map<String, ColumnFamily> modifications)
++    protected RowMutation(String table, String key, Map<String, ColumnFamily> modifications, Map<String, ColumnFamily> deletions)
+     {
+         table_ = table;
+         key_ = key;
+         modifications_ = modifications;
++    	deletions_ = deletions;
+     }
+ 
+     public static String[] getColumnAndColumnFamily(String cf)
+@@ -113,7 +99,7 @@ public String key()
+     void addHints(String hint) throws IOException, ColumnFamilyNotDefinedException
+     {
+         String cfName = Table.hints_ + ":" + hint;
+-        add(cfName, ArrayUtils.EMPTY_BYTE_ARRAY, 0);
++        add(cfName, new byte[0]);
+     }
+ 
+     /*
+@@ -122,13 +108,24 @@ void addHints(String hint) throws IOException, ColumnFamilyNotDefinedException
+      * param @ cf - column family name
+      * param @ columnFamily - the column family.
+     */
+-    public void add(ColumnFamily columnFamily)
+-    {
+-        if (modifications_.containsKey(columnFamily.name()))
++    public void add(String cf, ColumnFamily columnFamily)
+         {
+-            throw new IllegalArgumentException("ColumnFamily " + columnFamily.name() + " is already being modified");
++        modifications_.put(cf, columnFamily);
+         }
+-        modifications_.put(columnFamily.name(), columnFamily);
++    
++    /*
++     * Specify a column name and a corresponding value for
++     * the column. Column name is specified as <column family>:column.
++     * This will result in a ColumnFamily associated with
++     * <column family> as name and a Column with <column>
++     * as name.
++     * 
++     * param @ cf - column name as <column family>:<column>
++     * param @ value - value associated with the column
++    */
++    public void add(String cf, byte[] value) throws IOException, ColumnFamilyNotDefinedException
++    {
++        add(cf, value, 0);
+     }
+ 
+     /*
+@@ -157,7 +154,7 @@ public void add(String cf, byte[] value, long timestamp)
+             {
+             	columnFamily = new ColumnFamily(values[0], ColumnFamily.getColumnType("Standard"));
+             }
+-        	columnFamily.addColumn(values[1], value, timestamp);
++        	columnFamily.createColumn(values[1], value, timestamp);
+         }
+         if( values.length == 3 )
+         {
+@@ -165,40 +162,40 @@ public void add(String cf, byte[] value, long timestamp)
+             {
+             	columnFamily = new ColumnFamily(values[0], ColumnFamily.getColumnType("Super"));
+             }
+-        	columnFamily.addColumn(values[1]+ ":" + values[2], value, timestamp);
++        	columnFamily.createColumn(values[1]+ ":" + values[2], value, timestamp);
+         }
+         modifications_.put(values[0], columnFamily);
+     }
+ 
+-    public void delete(String columnFamilyColumn, long timestamp)
+-    {
+-        String[] values = RowMutation.getColumnAndColumnFamily(columnFamilyColumn);
+-        String cfName = values[0];
+-        if (modifications_.containsKey(cfName))
++    /*
++     * Specify a column name to be deleted. Column name is
++     * specified as <column family>:column. This will result
++     * in a ColumnFamily associated with <column family> as
++     * name and perhaps Column with <column> as name being
++     * marked as deleted.
++     * TODO : Delete is NOT correct as we do not know 
++     * the CF type so we need to fix that.
++     * param @ cf - column name as <column family>:<column>     
++    */
++    public void delete(String cf)
+         {
+-            throw new IllegalArgumentException("ColumnFamily " + cfName + " is already being modified");
+-        }
++        String[] values = RowMutation.getColumnAndColumnFamily(cf);
+ 
+-        if (values.length == 0 || values.length > 3)
+-            throw new IllegalArgumentException("Column Family " + columnFamilyColumn + " in invalid format. Must be in <column family>:<column> format.");
++        if ( values.length == 0 || values.length > 3 )
++            throw new IllegalArgumentException("Column Family " + cf + " in invalid format. Must be in <column family>:<column> format.");
+ 
+-        ColumnFamily columnFamily = modifications_.get(cfName);
+-        if (columnFamily == null)
+-            columnFamily = new ColumnFamily(cfName);
+-        if (values.length == 2)
+-        {
+-            columnFamily.addColumn(values[1], ArrayUtils.EMPTY_BYTE_ARRAY, timestamp, true);
+-        }
+-        else if (values.length == 3)
++        ColumnFamily columnFamily = modifications_.get(values[0]);
++        if ( columnFamily == null )
++            columnFamily = new ColumnFamily(values[0]);
++        if(values.length == 2 )
+         {
+-            columnFamily.addColumn(values[1] + ":" + values[2], ArrayUtils.EMPTY_BYTE_ARRAY, timestamp, true);
++	        columnFamily.createColumn( values[1]);
+         }
+-        else
++        if(values.length == 3 )
+         {
+-            assert values.length == 1;
+-            columnFamily.delete(timestamp);
++	        columnFamily.createColumn( values[1] + ":" + values[2]);
+         }
+-        modifications_.put(cfName, columnFamily);
++        deletions_.put(values[0], columnFamily);
+     }
+ 
+     /*
+@@ -208,109 +205,69 @@ else if (values.length == 3)
+     public void apply() throws IOException, ColumnFamilyNotDefinedException
+     {
+         Row row = new Row(key_);
+-        apply(row);
++        Table table = Table.open(table_);
++        Set<String> cfNames = modifications_.keySet();
++        for (String cfName : cfNames )
++        {        
++            if ( !table.isValidColumnFamily(cfName) )
++                throw new ColumnFamilyNotDefinedException("Column Family " + cfName + " has not been defined.");
++            row.addColumnFamily( modifications_.get(cfName) );            
+     }
++        table.apply(row);
+ 
+-    /*
+-     * Allows RowMutationVerbHandler to optimize by re-using a single Row object.
+-    */
+-    void apply(Row emptyRow) throws IOException, ColumnFamilyNotDefinedException
++        Set<String> cfNames2 = deletions_.keySet();
++        for (String cfName : cfNames2 )
+     {
+-        assert emptyRow.getColumnFamilyMap().size() == 0;
+-        Table table = Table.open(table_);
+-        for (String cfName : modifications_.keySet())
+-        {
+-            if (!table.isValidColumnFamily(cfName))
++            if ( !table.isValidColumnFamily(cfName) )
+                 throw new ColumnFamilyNotDefinedException("Column Family " + cfName + " has not been defined.");
+-            emptyRow.addColumnFamily(modifications_.get(cfName));
++            row.addColumnFamily( deletions_.get(cfName) );        
+         }
+-        table.apply(emptyRow);
++        if ( deletions_.size() > 0 )
++            table.delete(row);
+     }
+ 
+     /*
+      * This is equivalent to calling commit. Applies the changes to
+      * to the table that is obtained by calling Table.open().
+     */
+-    void load(Row row) throws IOException, ColumnFamilyNotDefinedException, ExecutionException, InterruptedException
++    void apply(Row row) throws IOException, ColumnFamilyNotDefinedException
+     {
+         Table table = Table.open(table_);
+         Set<String> cfNames = modifications_.keySet();
+-        for (String cfName : cfNames)
++        for (String cfName : cfNames )
+         {
+-            if (!table.isValidColumnFamily(cfName))
++            if ( !table.isValidColumnFamily(cfName) )
+                 throw new ColumnFamilyNotDefinedException("Column Family " + cfName + " has not been defined.");
+-            row.addColumnFamily(modifications_.get(cfName));
+-        }
+-        table.load(row);
+-    }
+-
+-    public Message makeRowMutationMessage() throws IOException
+-    {
+-        return makeRowMutationMessage(StorageService.mutationVerbHandler_);
+-    }
+-
+-    public Message makeRowMutationMessage(String verbHandlerName) throws IOException
+-    {
+-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+-        DataOutputStream dos = new DataOutputStream(bos);
+-        serializer().serialize(this, dos);
+-        EndPoint local = StorageService.getLocalStorageEndPoint();
+-        EndPoint from = (local != null) ? local : new EndPoint(FBUtilities.getHostName(), 7000);
+-        return new Message(from, StorageService.mutationStage_, verbHandlerName, bos.toByteArray());
++            row.addColumnFamily( modifications_.get(cfName) );            
+     }
++        table.apply(row);
+ 
+-    public static RowMutation getRowMutation(batch_mutation_t batchMutation)
++        Set<String> cfNames2 = deletions_.keySet();
++        for (String cfName : cfNames2 )
+     {
+-        RowMutation rm = new RowMutation(batchMutation.table,
+-                                         batchMutation.key.trim());
+-        for (String cfname : batchMutation.cfmap.keySet())
+-        {
+-            List<column_t> list = batchMutation.cfmap.get(cfname);
+-            for (column_t columnData : list)
+-            {
+-                rm.add(cfname + ":" + columnData.columnName,
+-                       columnData.value.getBytes(), columnData.timestamp);
+-
+-            }
++            if ( !table.isValidColumnFamily(cfName) )
++                throw new ColumnFamilyNotDefinedException("Column Family " + cfName + " has not been defined.");
++            row.addColumnFamily( deletions_.get(cfName) );        
+         }
+-        return rm;
++        if ( deletions_.size() > 0 )
++            table.delete(row);
+     }
+ 
+-    public static RowMutation getRowMutation(batch_mutation_super_t batchMutationSuper)
+-    {
+-        RowMutation rm = new RowMutation(batchMutationSuper.table,
+-                                         batchMutationSuper.key.trim());
+-        Set keys = batchMutationSuper.cfmap.keySet();
+-        Iterator keyIter = keys.iterator();
+-        while (keyIter.hasNext())
+-        {
+-            Object key = keyIter.next(); // Get the next key.
+-            List<superColumn_t> list = batchMutationSuper.cfmap.get(key);
+-            for (superColumn_t superColumnData : list)
+-            {
+-                if (superColumnData.columns.size() != 0)
+-                {
+-                    for (column_t columnData : superColumnData.columns)
++    /* 
++     * This is equivalent to calling commit. Applies the changes to
++     * to the table that is obtained by calling Table.open().
++    */
++    void load(Row row) throws IOException, ColumnFamilyNotDefinedException
+                     {
+-                        rm.add(key.toString() + ":" + superColumnData.name + ":" + columnData.columnName,
+-                               columnData.value.getBytes(), columnData.timestamp);
+-                    }
+-                }
+-                else
++        Table table = Table.open(table_);        
++        Set<String> cfNames = modifications_.keySet();
++        for (String cfName : cfNames )
+                 {
+-                    rm.add(key.toString() + ":" + superColumnData.name, ArrayUtils.EMPTY_BYTE_ARRAY, 0);
+-                }
+-            }
+-        }
+-        return rm;
++            if ( !table.isValidColumnFamily(cfName) )
++                throw new ColumnFamilyNotDefinedException("Column Family " + cfName + " has not been defined.");
++            row.addColumnFamily( modifications_.get(cfName) );            
+     }
+-
+-    public String toString()
+-    {
+-        return "RowMutation(" +
+-               "key='" + key_ + '\'' +
+-               ", modifications=[" + StringUtils.join(modifications_.values(), ", ") + "]" +
+-               ')';
++        table.load(row);
+     }
+ }
+ 
+@@ -320,14 +277,14 @@ private void freezeTheMaps(Map<String, ColumnFamily> map, DataOutputStream dos)
+     {
+         int size = map.size();
+         dos.writeInt(size);
+-        if (size > 0)
++        if ( size > 0 )
+         {
+             Set<String> keys = map.keySet();
+-            for (String key : keys)
++            for( String key : keys )
+             {
+                 dos.writeUTF(key);
+                 ColumnFamily cf = map.get(key);
+-                if (cf != null)
++                if ( cf != null )
+                 {
+                     ColumnFamily.serializer().serialize(cf, dos);
+                 }
+@@ -342,13 +299,16 @@ public void serialize(RowMutation rm, DataOutputStream dos) throws IOException
+ 
+         /* serialize the modifications_ in the mutation */
+         freezeTheMaps(rm.modifications_, dos);
++        
++        /* serialize the deletions_ in the mutation */
++        freezeTheMaps(rm.deletions_, dos);
+     }
+ 
+     private Map<String, ColumnFamily> defreezeTheMaps(DataInputStream dis) throws IOException
+     {
+         Map<String, ColumnFamily> map = new HashMap<String, ColumnFamily>();
+         int size = dis.readInt();
+-        for (int i = 0; i < size; ++i)
++        for ( int i = 0; i < size; ++i )
+         {
+             String key = dis.readUTF();
+             ColumnFamily cf = ColumnFamily.serializer().deserialize(dis);
+@@ -361,7 +321,13 @@ public RowMutation deserialize(DataInputStream dis) throws IOException
+     {
+         String table = dis.readUTF();
+         String key = dis.readUTF();
++    	
++    	/* Defreeze the modifications_ map */
+         Map<String, ColumnFamily> modifications = defreezeTheMaps(dis);
+-        return new RowMutation(table, key, modifications);
++    	
++    	/* Defreeze the deletions_ map */
++    	Map<String, ColumnFamily> deletions = defreezeTheMaps(dis);
++    	
++    	return new RowMutation(table, key, modifications, deletions);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutationVerbHandler.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutationVerbHandler.java
+index 584d2904..f1d269a9 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutationVerbHandler.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/RowMutationVerbHandler.java
+@@ -53,7 +53,11 @@
+ 
+     public void doVerb(Message message)
+     {
+-        byte[] bytes = (byte[]) message.getMessageBody()[0];
++        /* For DEBUG only. Printing queue length */                         
++        logger_.info( "ROW MUTATION STAGE: " + StageManager.getStageTaskCount(StorageService.mutationStage_) );
++        /* END DEBUG */
++            
++        byte[] bytes = (byte[])message.getMessageBody()[0];
+         /* Obtain a Row Mutation Context from TLS */
+         RowMutationContext rowMutationCtx = tls_.get();
+         if ( rowMutationCtx == null )
+@@ -66,42 +70,46 @@ public void doVerb(Message message)
+ 
+         try
+         {
+-            RowMutation rm = RowMutation.serializer().deserialize(rowMutationCtx.buffer_);
+-            logger_.debug("Applying " + rm);
+-
++            RowMutationMessage rmMsg = RowMutationMessage.serializer().deserialize(rowMutationCtx.buffer_);
++            RowMutation rm = rmMsg.getRowMutation();
+             /* Check if there were any hints in this message */
+-            byte[] hintedBytes = message.getHeader(RowMutation.HINT);
++            byte[] hintedBytes = message.getHeader(RowMutationMessage.hint_);            
+             if ( hintedBytes != null && hintedBytes.length > 0 )
+             {
+             	EndPoint hint = EndPoint.fromBytes(hintedBytes);
+-                logger_.debug("Adding hint for " + hint);
+                 /* add necessary hints to this mutation */
++                try
++                {
+                 RowMutation hintedMutation = new RowMutation(rm.table(), HintedHandOffManager.key_);
+                 hintedMutation.addHints(rm.key() + ":" + hint.getHost());
+                 hintedMutation.apply();
+             }
++                catch ( ColumnFamilyNotDefinedException ex )
++                {
++                    logger_.debug(LogUtil.throwableToString(ex));
++                }
++            }
+ 
+             long start = System.currentTimeMillis();
+ 
+-            rowMutationCtx.row_.clear();
+             rowMutationCtx.row_.key(rm.key());
+             rm.apply(rowMutationCtx.row_);
+ 
+             long end = System.currentTimeMillis();
++            logger_.info("ROW MUTATION APPLY: " + (end - start) + " ms.");
+ 
+-            WriteResponse response = new WriteResponse(rm.table(), rm.key(), true);
+-            Message responseMessage = WriteResponse.makeWriteResponseMessage(message, response);
+-            logger_.debug("Mutation applied in " + (end - start) + "ms.  Sending response to " +  message.getFrom() + " for key :" + rm.key());
+-            MessagingService.getMessagingInstance().sendOneWay(responseMessage, message.getFrom());
++            /*WriteResponseMessage writeResponseMessage = new WriteResponseMessage(rm.table(), rm.key(), true);
++            Message response = message.getReply( StorageService.getLocalStorageEndPoint(), new Object[]{writeResponseMessage} );
++            logger_.debug("Sending teh response to " +  message.getFrom() + " for key :" + rm.key());
++            MessagingService.getMessagingInstance().sendOneWay(response, message.getFrom());  */                    
+         }
+-        catch(ColumnFamilyNotDefinedException ex)
++        catch( ColumnFamilyNotDefinedException ex )
+         {
+-            // TODO shouldn't this be checked before it's sent to us?
+-            logger_.warn("column family not defined, and no way to tell the client", ex);
++            logger_.debug(LogUtil.throwableToString(ex));
+         }
+-        catch (IOException e)
++        catch ( IOException e )
+         {
+-            logger_.error("Error in row mutation", e);
++            logger_.debug(LogUtil.throwableToString(e));            
+         }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SequentialScanner.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SequentialScanner.java
+index e69de29b..7fe62e2c 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SequentialScanner.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SequentialScanner.java
+@@ -0,0 +1,178 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.cassandra.db;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.PriorityQueue;
++import java.util.Queue;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.continuations.Suspendable;
++import org.apache.cassandra.db.ColumnFamilyNotDefinedException;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.FileStruct;
++import org.apache.cassandra.db.IScanner;
++import org.apache.cassandra.db.Row;
++import org.apache.cassandra.db.Table;
++import org.apache.cassandra.io.DataInputBuffer;
++import org.apache.cassandra.io.SSTable;
++import org.apache.cassandra.io.SequenceFile;
++import org.apache.cassandra.net.EndPoint;
++import org.apache.cassandra.net.IAsyncResult;
++import org.apache.cassandra.net.Message;
++import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.LogUtil;
++
++/**
++ * This class is used to scan through all the keys in disk
++ * in Iterator style. Usage is as follows:
++ * SequentialScanner scanner = new SequentialScanner("table");
++ * 
++ * while ( scanner.hasNext() )
++ * {
++ *     Row row = scanner.next();
++ *     // Do something with the row
++ * }
++ * 
++ * @author alakshman
++ *
++ */
++
++public class SequentialScanner implements IScanner<Row>
++{   
++    private static Logger logger_ = Logger.getLogger( SequentialScanner.class );
++    private final static int bufSize_ = 1024*1024;
++    
++    /* Table over which we want to perform a sequential scan. */
++    private String table_;     
++    private Queue<FileStruct> fsQueue_ = new PriorityQueue<FileStruct>();
++    
++    public SequentialScanner(String table) throws IOException
++    {
++        table_ = table;    
++        List<String> allFiles = Table.open(table_).getAllSSTablesOnDisk();
++        
++        for (String file : allFiles)
++        {                                         
++            FileStruct fs = new FileStruct(file, SequentialScanner.bufSize_);             
++            fsQueue_.add(fs);               
++        }
++    }
++    
++    /**
++     * Determines if there is anything more to be 
++     * scanned.
++     * @return true if more elements are remanining
++     * else false.
++     */
++    public boolean hasNext() throws IOException
++    {
++        boolean hasNext = ( fsQueue_.size() > 0 ) ? true : false;
++        return hasNext;
++    }
++    
++    /**
++     * Returns the next row associated with the smallest key
++     * on disk.
++     * 
++     * @return row of the next smallest key on disk.
++     */
++    public Row next() throws IOException
++    {
++        if ( fsQueue_.size() == 0 )
++            throw new IllegalStateException("Nothing in the stream to scan.");
++    
++        Row row = null;          
++        FileStruct fs = fsQueue_.poll();   
++        
++        // Process the key only if it is in the primary range and not a block index.
++        if ( StorageService.instance().isPrimary(fs.getKey()) && !fs.getKey().equals(SSTable.blockIndexKey_) )
++        {            
++            row = Table.open(table_).get(fs.getKey());                
++        }
++        
++        doCorrections(fs.getKey());        
++        long bytesRead = fs.advance();
++        if ( bytesRead != -1L )
++            fsQueue_.add(fs);
++        return row;
++    }
++    
++    /**
++     * This method advances the pointer in the file struct
++     * in the even the same key occurs in multiple files.
++     * 
++     * @param key key we are interested in.
++     * @throws IOException
++     */
++    private void doCorrections(String key) throws IOException
++    { 
++        List<FileStruct> lfs = new ArrayList<FileStruct>();
++        Iterator<FileStruct> it = fsQueue_.iterator();
++        
++        while ( it.hasNext() )
++        {
++            FileStruct fs = it.next();
++            /* 
++             * We encountered a key that is greater 
++             * than the key we are currently serving 
++             * so scram. 
++            */
++            if ( fs.getKey().compareTo(key) != 0 )
++            {                
++                break;
++            }
++            else
++            {                
++                lfs.add(fs);
++            }
++        }
++        
++        for ( FileStruct fs : lfs )
++        {
++            /* discard duplicate entries. */
++            fsQueue_.poll();
++            long bytesRead = fs.advance();
++            if ( bytesRead != -1L )
++            {                
++                fsQueue_.add(fs);
++            }
++        }
++    }
++    
++    public void close() throws IOException
++    {
++        if ( fsQueue_.size() > 0 )
++        {            
++            for ( int i = 0; i < fsQueue_.size(); ++i )
++            {
++                FileStruct fs = fsQueue_.poll();
++                fs.close();
++            }
++        }
++    }
++    
++    public void fetch(String key, String cf) throws IOException, ColumnFamilyNotDefinedException
++    {
++        throw new UnsupportedOperationException("This operation does not make sense in the SequentialScanner");
++    }
++}
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SuperColumn.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SuperColumn.java
+index 7f7a8a0f..d31f2756 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SuperColumn.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SuperColumn.java
+@@ -18,19 +18,21 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.DataInput;
+ import java.io.DataInputStream;
++import java.io.DataOutput;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.io.Serializable;
+-import java.util.Collection;
+-import java.util.Set;
++import java.io.UnsupportedEncodingException;
++import java.util.*;
++import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+-import org.apache.commons.lang.ArrayUtils;
+-import org.apache.commons.lang.StringUtils;
+-import org.apache.log4j.Logger;
+-
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.HashingSchemes;
++import org.apache.cassandra.utils.LogUtil;
++import org.apache.log4j.Logger;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -39,17 +41,22 @@
+ public final class SuperColumn implements IColumn, Serializable
+ {
+ 	private static Logger logger_ = Logger.getLogger(SuperColumn.class);
+-	private static SuperColumnSerializer serializer_ = new SuperColumnSerializer();
++	private static ICompactSerializer2<IColumn> serializer_;
+ 	private final static String seperator_ = ":";
+ 
+-    static SuperColumnSerializer serializer()
++    static
++    {
++        serializer_ = new SuperColumnSerializer();
++    }
++
++    static ICompactSerializer2<IColumn> serializer()
+     {
+         return serializer_;
+     }
+ 
+ 	private String name_;
+     private EfficientBidiMap columns_ = new EfficientBidiMap(ColumnComparatorFactory.getComparator(ColumnComparatorFactory.ComparatorType.TIMESTAMP));
+-	private long markedForDeleteAt = Long.MIN_VALUE;
++	private AtomicBoolean isMarkedForDelete_ = new AtomicBoolean(false);
+     private AtomicInteger size_ = new AtomicInteger(0);
+ 
+     SuperColumn()
+@@ -63,7 +70,7 @@ static SuperColumnSerializer serializer()
+ 
+ 	public boolean isMarkedForDelete()
+ 	{
+-		return markedForDeleteAt > Long.MIN_VALUE;
++		return isMarkedForDelete_.get();
+ 	}
+ 
+     public String name()
+@@ -76,10 +83,11 @@ public String name()
+     	return columns_.getSortedColumns();
+     }
+ 
+-    public IColumn getSubColumn(String columnName)
++    public IColumn getSubColumn( String columnName )
+     {
+         IColumn column = columns_.get(columnName);
+-        assert column instanceof Column;
++    	if ( column instanceof SuperColumn )
++    		throw new UnsupportedOperationException("A super column cannot hold other super columns.");
+         return column;
+     }
+ 
+@@ -140,7 +148,7 @@ int getSizeOfAllColumns()
+         return size;
+     }
+ 
+-    public void remove(String columnName)
++    protected void remove(String columnName)
+     {
+     	columns_.remove(columnName);
+     }
+@@ -168,7 +176,8 @@ public long timestamp(String key)
+     public byte[] value(String key)
+     {
+     	IColumn column = columns_.get(key);
+-    	assert column instanceof Column;
++    	if ( column instanceof SuperColumn )
++    		throw new UnsupportedOperationException("A super column cannot hold other super columns.");
+     	if ( column != null )
+     		return column.value();
+     	throw new IllegalArgumentException("Value was requested for a column that does not exist.");
+@@ -202,18 +211,19 @@ public void addColumn(String name, IColumn column)
+      * Go through each sub column if it exists then as it to resolve itself
+      * if the column does not exist then create it.
+      */
+-    public void putColumn(IColumn column)
++    public boolean putColumn(IColumn column)
+     {
+     	if ( !(column instanceof SuperColumn))
+     		throw new UnsupportedOperationException("Only Super column objects should be put here");
+     	if( !name_.equals(column.name()))
+     		throw new IllegalArgumentException("The name should match the name of the current column or super column");
++    	Collection<IColumn> columns = column.getSubColumns();
+ 
+-        for (IColumn subColumn : column.getSubColumns())
++        for ( IColumn subColumn : columns )
+         {
+         	addColumn(subColumn.name(), subColumn);
+         }
+-        markedForDeleteAt = Math.max(markedForDeleteAt, column.getMarkedForDeleteAt());
++        return false;
+     }
+ 
+     public int getObjectCount()
+@@ -221,8 +231,10 @@ public int getObjectCount()
+     	return 1 + columns_.size();
+     }
+ 
+-    public long getMarkedForDeleteAt() {
+-        return markedForDeleteAt;
++    public void delete()
++    {
++    	columns_.clear();
++    	isMarkedForDelete_.set(true);
+     }
+ 
+     int getColumnCount()
+@@ -230,6 +242,21 @@ int getColumnCount()
+     	return columns_.size();
+     }
+ 
++    public void repair(IColumn column)
++    {
++    	Collection<IColumn> columns = column.getSubColumns();
++
++        for ( IColumn subColumn : columns )
++        {
++        	IColumn columnInternal = columns_.get(subColumn.name());
++        	if( columnInternal == null )
++        		columns_.put(subColumn.name(), subColumn);
++        	else
++        		columnInternal.repair(subColumn);
++        }
++    }
++
++
+     public IColumn diff(IColumn column)
+     {
+     	IColumn  columnDiff = new SuperColumn(column.name());
+@@ -260,7 +287,7 @@ public IColumn diff(IColumn column)
+     public byte[] digest()
+     {
+     	Set<IColumn> columns = columns_.getSortedColumns();
+-    	byte[] xorHash = ArrayUtils.EMPTY_BYTE_ARRAY;
++    	byte[] xorHash = new byte[0];
+     	if(name_ == null)
+     		return xorHash;
+     	xorHash = name_.getBytes();
+@@ -275,23 +302,23 @@ public IColumn diff(IColumn column)
+     public String toString()
+     {
+     	StringBuilder sb = new StringBuilder();
+-        sb.append("SuperColumn(");
+     	sb.append(name_);
+-
+-        if (isMarkedForDelete()) {
+-            sb.append(" -delete at " + getMarkedForDeleteAt() + "-");
++    	sb.append(":");
++        sb.append(isMarkedForDelete());
++        sb.append(":");
++
++        Collection<IColumn> columns  = getSubColumns();
++        sb.append(columns.size());
++        sb.append(":");
++        sb.append(size());
++        sb.append(":");
++        for ( IColumn subColumn : columns )
++        {
++            sb.append(subColumn.toString());
+         }
+-
+-        sb.append(" [");
+-        sb.append(StringUtils.join(getSubColumns(), ", "));
+-        sb.append("])");
+-
++        sb.append(":");
+         return sb.toString();
+     }
+-
+-    public void markForDeleteAt(long timestamp) {
+-        this.markedForDeleteAt = timestamp;
+-    }
+ }
+ 
+ class SuperColumnSerializer implements ICompactSerializer2<IColumn>
+@@ -300,7 +327,7 @@ public void serialize(IColumn column, DataOutputStream dos) throws IOException
+     {
+     	SuperColumn superColumn = (SuperColumn)column;
+         dos.writeUTF(superColumn.name());
+-        dos.writeLong(superColumn.getMarkedForDeleteAt());
++        dos.writeBoolean(superColumn.isMarkedForDelete());
+ 
+         Collection<IColumn> columns  = column.getSubColumns();
+         int size = columns.size();
+@@ -327,14 +354,17 @@ public void serialize(IColumn column, DataOutputStream dos) throws IOException
+     private SuperColumn defreezeSuperColumn(DataInputStream dis) throws IOException
+     {
+         String name = dis.readUTF();
++        boolean delete = dis.readBoolean();
+         SuperColumn superColumn = new SuperColumn(name);
+-        superColumn.markForDeleteAt(dis.readLong());
++        if ( delete )
++            superColumn.delete();
+         return superColumn;
+     }
+ 
+     public IColumn deserialize(DataInputStream dis) throws IOException
+     {
+         SuperColumn superColumn = defreezeSuperColumn(dis);
++        if ( !superColumn.isMarkedForDelete() )
+         fillSuperColumn(superColumn, dis);
+         return superColumn;
+     }
+@@ -351,7 +381,8 @@ public void skip(DataInputStream dis) throws IOException
+ 
+     private void fillSuperColumn(IColumn superColumn, DataInputStream dis) throws IOException
+     {
+-        assert dis.available() != 0;
++        if ( dis.available() == 0 )
++            return;
+ 
+         /* read the number of columns */
+         int size = dis.readInt();
+@@ -373,6 +404,7 @@ public IColumn deserialize(DataInputStream dis, IFilter filter) throws IOExcepti
+         superColumn = filter.filter(superColumn, dis);
+         if(superColumn != null)
+         {
++            if ( !superColumn.isMarkedForDelete() )
+             fillSuperColumn(superColumn, dis);
+             return superColumn;
+         }
+@@ -402,6 +434,8 @@ public IColumn deserialize(DataInputStream dis, String name, IFilter filter) thr
+             IColumn superColumn = defreezeSuperColumn(dis);
+             if(name.equals(superColumn.name()))
+             {
++                if ( !superColumn.isMarkedForDelete() )
++                {
+                 /* read the number of columns stored */
+                 int size = dis.readInt();
+                 /* read the size of all columns */
+@@ -420,6 +454,7 @@ public IColumn deserialize(DataInputStream dis, String name, IFilter filter) thr
+                         }
+                     }
+                 }
++                }
+                 return superColumn;
+             }
+             else
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SystemTable.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SystemTable.java
+index acb051d8..2a435e42 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/SystemTable.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/SystemTable.java
+@@ -18,13 +18,25 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.File;
+ import java.io.IOException;
++import java.math.BigInteger;
++import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Hashtable;
++import java.util.List;
+ import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.locks.Lock;
+ 
+-import org.apache.log4j.Logger;
++import javax.xml.bind.annotation.XmlElement;
++import javax.xml.bind.annotation.adapters.XmlJavaTypeAdapter;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.io.DataInputBuffer;
+ import org.apache.cassandra.io.DataOutputBuffer;
+ import org.apache.cassandra.io.IFileReader;
+@@ -32,8 +44,9 @@
+ import org.apache.cassandra.io.SequenceFile;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.LogUtil;
+-import org.apache.cassandra.dht.Token;
+-import org.apache.cassandra.dht.IPartitioner;
++import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
++import org.apache.cassandra.utils.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -47,7 +60,7 @@
+     /* Name of the SystemTable */
+     public static final String name_ = "System";
+     /* Name of the only column family in the Table */
+-    public static final String cfName_ = "LocationInfo";
++    static final String cfName_ = "LocationInfo";
+     /* Name of columns in this table */
+     static final String generation_ = "Generation";
+     static final String token_ = "Token";
+@@ -150,20 +163,19 @@ void apply(Row row) throws IOException
+      * This method is used to update the SystemTable with the
+      * new token.
+     */
+-    public void updateToken(Token token) throws IOException
++    public void updateToken(BigInteger token) throws IOException
+     {
+-        IPartitioner p = StorageService.getPartitioner();
+         if ( systemRow_ != null )
+         {
+-            Map<String, ColumnFamily> columnFamilies = systemRow_.getColumnFamilyMap();
++            Map<String, ColumnFamily> columnFamilies = systemRow_.getColumnFamilies();
+             /* Retrieve the "LocationInfo" column family */
+             ColumnFamily columnFamily = columnFamilies.get(SystemTable.cfName_);
+             long oldTokenColumnTimestamp = columnFamily.getColumn(SystemTable.token_).timestamp();
+             /* create the "Token" whose value is the new token. */
+-            IColumn tokenColumn = new Column(SystemTable.token_, p.getTokenFactory().toByteArray(token), oldTokenColumnTimestamp + 1);
++            IColumn tokenColumn = new Column(SystemTable.token_, token.toByteArray(), oldTokenColumnTimestamp + 1);
+             /* replace the old "Token" column with this new one. */
+-            logger_.debug("Replacing old token " + p.getTokenFactory().fromByteArray(columnFamily.getColumn(SystemTable.token_).value()) + " with " + token);
+-            columnFamily.addColumn(tokenColumn);
++            logger_.debug("Replacing old token " + new BigInteger( columnFamily.getColumn(SystemTable.token_).value() ).toString() + " with token " + token.toString());
++            columnFamily.addColumn(SystemTable.token_, tokenColumn);
+             reset(systemRow_);
+         }
+     }
+@@ -183,7 +195,17 @@ public static void main(String[] args) throws Throwable
+     {
+         LogUtil.init();
+         StorageService.instance().start();
+-        SystemTable.openSystemTable(SystemTable.cfName_).updateToken(StorageService.token("503545744:0"));
++        SystemTable.openSystemTable(SystemTable.cfName_).updateToken( StorageService.hash("503545744:0") );
++        System.out.println("Done");
++
++        /*
++        BigInteger hash = StorageService.hash("304700067:0");
++        List<Range> ranges = new ArrayList<Range>();
++        ranges.add( new Range(new BigInteger("1218069462158869448693347920504606362273788442553"), new BigInteger("1092770595533781724218060956188429069")) );
++        if ( Range.isKeyInRanges(ranges, "304700067:0") )
++        {
+         System.out.println("Done");
+     }
++        */
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Table.java
+index d8520984..690fae92 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/Table.java
+@@ -19,14 +19,18 @@
+ package org.apache.cassandra.db;
+ 
+ import java.util.*;
++import java.io.ByteArrayInputStream;
+ import java.io.DataInputStream;
+ import java.io.DataOutputStream;
+ import java.io.IOException;
+ import java.io.File;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ import org.apache.cassandra.analytics.DBAnalyticsSource;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.continuations.Suspendable;
+ import org.apache.cassandra.dht.BootstrapInitiateMessage;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.io.DataInputBuffer;
+@@ -48,6 +52,9 @@
+ import org.apache.cassandra.utils.FileUtils;
+ import org.apache.cassandra.utils.LogUtil;
+ import org.apache.log4j.Logger;
++import org.apache.cassandra.io.*;
++import org.apache.cassandra.utils.*;
++import org.apache.cassandra.service.*;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -153,7 +160,7 @@ public void add(String cf, int id, String type)
+             cfTypeMap_.put(cf, type);
+         }
+         
+-        public boolean isEmpty()
++        boolean isEmpty()
+         {
+             return cfIdMap_.isEmpty();
+         }
+@@ -193,7 +200,7 @@ boolean isValidColumnFamily(String cfName)
+             return cfIdMap_.containsKey(cfName);
+         }
+         
+-        public void apply() throws IOException
++        void apply() throws IOException
+         {
+             String table = DatabaseDescriptor.getTables().get(0);
+             DataOutputBuffer bufOut = new DataOutputBuffer();
+@@ -454,7 +461,7 @@ public static Table open(String table)
+         return columnFamilyStores_;
+     }
+ 
+-    public ColumnFamilyStore getColumnFamilyStore(String cfName)
++    ColumnFamilyStore getColumnFamilyStore(String cfName)
+     {
+         return columnFamilyStores_.get(cfName);
+     }
+@@ -488,7 +495,7 @@ public String tableStats(String newLineSeparator, java.text.DecimalFormat df)
+         for ( String cfName : cfNames )
+         {
+             ColumnFamilyStore cfStore = columnFamilyStores_.get(cfName);
+-            sb.append(cfStore.cfStats(newLineSeparator));
++            sb.append(cfStore.cfStats(newLineSeparator, df));
+         }
+         int newLength = sb.toString().length();
+         
+@@ -592,7 +599,7 @@ public void forceCompaction() throws IOException
+         {
+             ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+             if ( cfStore != null )
+-                MinorCompactionManager.instance().submitMajor(cfStore, 0);
++                MinorCompactionManager.instance().submitMajor(cfStore, null, 0);
+         }
+     }
+ 
+@@ -685,6 +692,26 @@ public Row get(String key) throws IOException
+         return row;
+     }
+ 
++    public Row getRowFromMemory(String key)
++    {
++        Row row = new Row(key);
++        Set<String> columnFamilies = tableMetadata_.getColumnFamilies();
++        long start = System.currentTimeMillis();
++        for ( String columnFamily : columnFamilies )
++        {
++            ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily);
++            if ( cfStore != null )
++            {    
++                ColumnFamily cf = cfStore.getColumnFamilyFromMemory(key, columnFamily, new IdentityFilter());
++                if ( cf != null )
++                    row.addColumnFamily(cf);
++            }
++        }
++        long timeTaken = System.currentTimeMillis() - start;
++        dbAnalyticsSource_.updateReadStatistics(timeTaken);
++        return row;
++    }
++
+ 
+     /**
+      * Selects the specified column family for the specified key.
+@@ -788,18 +815,22 @@ public Row getRow(String key, String cf, List<String> columns) throws IOExceptio
+      * Once this happens the data associated with the individual column families
+      * is also written to the column family store's memtable.
+     */
+-    void apply(Row row) throws IOException
++    public void apply(Row row) throws IOException
+     {
++        String key = row.key();
+         /* Add row to the commit log. */
+         long start = System.currentTimeMillis();
+-        CommitLog.CommitLogContext cLogCtx = CommitLog.open(table_).add(row);
+ 
+-        for (ColumnFamily columnFamily : row.getColumnFamilies())
++        CommitLog.CommitLogContext cLogCtx = CommitLog.open(table_).add(row);
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
++        Set<String> cNames = columnFamilies.keySet();
++        for ( String cName : cNames )
+         {
++        	ColumnFamily columnFamily = columnFamilies.get(cName);
+             ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily.name());
+-            cfStore.apply(row.key(), columnFamily, cLogCtx);
++            cfStore.apply( key, columnFamily, cLogCtx);            
+         }
+-
++        row.clear();
+         long timeTaken = System.currentTimeMillis() - start;
+         dbAnalyticsSource_.updateWriteStatistics(timeTaken);
+     }
+@@ -807,7 +838,7 @@ void apply(Row row) throws IOException
+     void applyNow(Row row) throws IOException
+     {
+         String key = row.key();
+-        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+ 
+         Set<String> cNames = columnFamilies.keySet();
+         for ( String cName : cNames )
+@@ -823,12 +854,25 @@ public void flush(boolean fRecovery) throws IOException
+         Set<String> cfNames = columnFamilyStores_.keySet();
+         for ( String cfName : cfNames )
+         {
+-            if (fRecovery) {
+-                columnFamilyStores_.get(cfName).flushMemtableOnRecovery();
+-            } else {
+-                columnFamilyStores_.get(cfName).forceFlush();
++            columnFamilyStores_.get(cfName).forceFlush(fRecovery);
+             }
+         }
++
++    void delete(Row row) throws IOException
++    {
++        String key = row.key();
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
++
++        /* Add row to commit log */
++        CommitLog.open(table_).add(row);
++        Set<String> cNames = columnFamilies.keySet();
++
++        for ( String cName : cNames )
++        {
++        	ColumnFamily columnFamily = columnFamilies.get(cName);
++            ColumnFamilyStore cfStore = columnFamilyStores_.get(columnFamily.name());
++            cfStore.delete( key, columnFamily );
++        }
+     }
+ 
+     void load(Row row) throws IOException
+@@ -837,7 +881,7 @@ void load(Row row) throws IOException
+         /* Add row to the commit log. */
+         long start = System.currentTimeMillis();
+                 
+-        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilyMap();
++        Map<String, ColumnFamily> columnFamilies = row.getColumnFamilies();
+         Set<String> cNames = columnFamilies.keySet();
+         for ( String cName : cNames )
+         {
+@@ -858,7 +902,7 @@ else if(column.timestamp() == 2)
+     	            }
+     	            else if(column.timestamp() == 3)
+     	            {
+-    	            	cfStore.forceFlush();
++    	            	cfStore.forceFlush(false);
+     	            }
+     	            else if(column.timestamp() == 4)
+     	            {
+@@ -876,16 +920,12 @@ else if(column.timestamp() == 4)
+         dbAnalyticsSource_.updateWriteStatistics(timeTaken);
+     }
+ 
+-    public Set<String> getApplicationColumnFamilies()
+-    {
+-        Set<String> set = new HashSet<String>();
+-        for (String cfName : getColumnFamilies())
+-        {
+-            if (DatabaseDescriptor.isApplicationColumnFamily(cfName))
++    public static void main(String[] args) throws Throwable
+             {
+-                set.add(cfName);
+-            }
+-        }
+-        return set;
++        StorageService service = StorageService.instance();
++        service.start();
++        Table table = Table.open("Mailbox");
++        Row row = table.get("35300190:1");
++        System.out.println( row.key() );
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/TimeFilter.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/TimeFilter.java
+index 6aa3aff6..1ce26d1a 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/TimeFilter.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/TimeFilter.java
+@@ -47,9 +47,6 @@
+ 
+ 	public ColumnFamily filter(String cf, ColumnFamily columnFamily)
+ 	{
+-    	if (columnFamily == null)
+-    		return columnFamily;
+-
+         String[] values = RowMutation.getColumnAndColumnFamily(cf);
+ 		String cfName = columnFamily.name();
+ 		ColumnFamily filteredCf = new ColumnFamily(cfName);
+@@ -61,7 +58,7 @@ public ColumnFamily filter(String cf, ColumnFamily columnFamily)
+     		{
+     			if ( column.timestamp() >=  timeLimit_ )
+     			{
+-    				filteredCf.addColumn(column);
++    				filteredCf.addColumn(column.name(), column);
+     				++i;
+     			}
+     			else
+@@ -86,7 +83,7 @@ else if ( values.length == 2 && DatabaseDescriptor.getColumnType(cfName).equals(
+     		{
+     			SuperColumn superColumn = (SuperColumn)column;
+        			SuperColumn filteredSuperColumn = new SuperColumn(superColumn.name());
+-				filteredCf.addColumn(filteredSuperColumn);
++				filteredCf.addColumn(filteredSuperColumn.name(), filteredSuperColumn);
+         		Collection<IColumn> subColumns = superColumn.getSubColumns();
+         		int i = 0;
+         		for(IColumn subColumn : subColumns)
+@@ -146,6 +143,6 @@ public boolean isDone()
+ 
+ 	public DataInputBuffer next(String key, String cf, SSTable ssTable) throws IOException
+     {
+-    	return ssTable.next( key, cf, null, new IndexHelper.TimeRange( timeLimit_, System.currentTimeMillis() ) );
++    	return ssTable.next( key, cf, new IndexHelper.TimeRange( timeLimit_, System.currentTimeMillis() ) );
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/org/apache/cassandra/db/WriteResponseMessage.java b/incubator/cassandra/trunk/src/org/apache/cassandra/db/WriteResponseMessage.java
+index e69de29b..1a0c4206 100644
+--- a/incubator/cassandra/trunk/src/org/apache/cassandra/db/WriteResponseMessage.java
++++ b/incubator/cassandra/trunk/src/org/apache/cassandra/db/WriteResponseMessage.java
+@@ -0,0 +1,114 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.db;
++
++import java.io.ByteArrayOutputStream;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.io.Serializable;
++
++import javax.xml.bind.annotation.XmlElement;
++
++import org.apache.cassandra.io.ICompactSerializer;
++import org.apache.cassandra.net.Message;
++import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.service.StorageService;
++
++
++/*
++ * This message is sent back the row mutation verb handler 
++ * and basically specifes if the write succeeded or not for a particular 
++ * key in a table
++ * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
++ */
++public class WriteResponseMessage implements Serializable
++{
++private static ICompactSerializer<WriteResponseMessage> serializer_;	
++	
++    static
++    {
++        serializer_ = new WriteResponseMessageSerializer();
++    }
++
++    static ICompactSerializer<WriteResponseMessage> serializer()
++    {
++        return serializer_;
++    }
++	
++    public static Message makeWriteResponseMessage(WriteResponseMessage writeResponseMessage) throws IOException
++    {
++    	ByteArrayOutputStream bos = new ByteArrayOutputStream();
++        DataOutputStream dos = new DataOutputStream( bos );
++        WriteResponseMessage.serializer().serialize(writeResponseMessage, dos);
++        Message message = new Message(StorageService.getLocalStorageEndPoint(), MessagingService.responseStage_, MessagingService.responseVerbHandler_, new Object[]{bos.toByteArray()});         
++        return message;
++    }
++    
++	@XmlElement(name = "Table")
++	private String table_;
++
++	@XmlElement(name = "key")
++	private String key_;
++	
++	@XmlElement(name = "Status")
++	private boolean status_;
++	
++	private WriteResponseMessage() {
++	}
++
++	public WriteResponseMessage(String table, String key, boolean bVal) {
++		table_ = table;
++		key_ = key;
++		status_ = bVal;
++	}
++
++	public String table() 
++	{
++		return table_;
++	}
++
++	public String key() 
++	{
++		return key_;
++	}
++	
++	public boolean isSuccess()
++	{
++		return status_;
++	}
++}
++
++class WriteResponseMessageSerializer implements ICompactSerializer<WriteResponseMessage>
++{
++	public void serialize(WriteResponseMessage wm, DataOutputStream dos) throws IOException
++	{
++		dos.writeUTF(wm.table());
++		dos.writeUTF(wm.key());
++		dos.writeBoolean(wm.isSuccess());
++	}
++	
++    public WriteResponseMessage deserialize(DataInputStream dis) throws IOException
++    {
++    	String table = dis.readUTF();
++    	String key = dis.readUTF();
++    	boolean status = dis.readBoolean();
++    	return new WriteResponseMessage(table, key, status);
++    }
++}

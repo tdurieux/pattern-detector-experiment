@@ -1,0 +1,193 @@
+diff --git a/db/derby/code/branches/10.1/java/client/org/apache/derby/client/am/Connection.java b/db/derby/code/branches/10.1/java/client/org/apache/derby/client/am/Connection.java
+index 3f9d4964..c608cf3a 100644
+--- a/db/derby/code/branches/10.1/java/client/org/apache/derby/client/am/Connection.java
++++ b/db/derby/code/branches/10.1/java/client/org/apache/derby/client/am/Connection.java
+@@ -21,6 +21,7 @@
+ package org.apache.derby.client.am;
+ 
+ import org.apache.derby.jdbc.ClientDataSource;
++import java.sql.SQLException;
+ 
+ public abstract class Connection implements java.sql.Connection,
+         ConnectionCallbackInterface {
+@@ -74,6 +75,10 @@
+ 
+     // used to set transaction isolation level
+     private Statement setTransactionIsolationStmt = null;
++    
++    // used to get transaction isolation level
++    private Statement getTransactionIsolationStmt = null;
++    
+     // ------------------------dynamic properties---------------------------------
+ 
+     protected boolean open_ = true;
+@@ -680,6 +685,16 @@ private void closeResourcesX() throws SqlException {
+                 accumulatedExceptions = se;
+             }
+         }
++        setTransactionIsolationStmt = null;
++        if (getTransactionIsolationStmt != null) {
++            try {
++                getTransactionIsolationStmt.close();
++            } catch (SqlException se) {
++                accumulatedExceptions = Utils.accumulateSQLException(
++                        se, accumulatedExceptions);
++            }
++        }
++        getTransactionIsolationStmt = null;
+         try {
+             flowClose();
+         } catch (SqlException e) {
+@@ -857,13 +872,74 @@ synchronized public void setTransactionIsolation(int level) throws SqlException
+     }
+ 
+     public int getTransactionIsolation() throws SqlException {
++    	
++    	// Store the current auto-commit value and use it to restore 
++    	// at the end of this method.
++    	boolean currentAutoCommit = autoCommit_;
++    	java.sql.ResultSet rs = null;
++    	
++        try
++        {
+         checkForClosedConnection();
+         if (agent_.loggingEnabled()) {
+             agent_.logWriter_.traceExit(this, "getTransactionIsolation", isolation_);
+         }
++            
++            // Set auto-commit to false when executing the statement as we do not want to
++            // cause an auto-commit from getTransactionIsolation() method. 
++            autoCommit_ = false;
++            
++            // DERBY-1148 - Client reports wrong isolation level. We need to get the isolation
++            // level from the server. 'isolation_' maintained in the client's connection object
++            // can be out of sync with the real isolation when in an XA transaction. This can 
++            // also happen when isolation is set using SQL instead of JDBC. So we try to get the
++            // value from the server by calling the "current isolation" function. If we fail to 
++            // get the value, return the value stored in the client's connection object.
++            if (getTransactionIsolationStmt == null  || 
++            		!(getTransactionIsolationStmt.openOnClient_ &&
++            				getTransactionIsolationStmt.openOnServer_)) {
++                getTransactionIsolationStmt =
++                        createStatementX(java.sql.ResultSet.TYPE_FORWARD_ONLY,
++                                java.sql.ResultSet.CONCUR_READ_ONLY,
++                                holdability());
++            }
++            
++            rs = getTransactionIsolationStmt.executeQuery("values current isolation");
++            rs.next();
++            String isolationStr = rs.getString(1);
++            isolation_ = translateIsolation(isolationStr);
++            rs.close();	
++        }
++        catch(SQLException se) {
++        	throw new SqlException(agent_.logWriter_, se.getMessage());
++        }
++	    finally {
++        	// Restore auto-commit value
++        	autoCommit_ = currentAutoCommit;
++        }
++        
+         return isolation_;
+     }
+ 
++    /**
++     * Translates the isolation level from a SQL string to the JDBC int value
++     *  
++     * @param isolationStr SQL isolation string
++     * @return isolation level as a JDBC integer value 
++     */
++    private int translateIsolation(String isolationStr) {
++    	if(isolationStr.compareTo(DERBY_TRANSACTION_REPEATABLE_READ) == 0)
++    		return java.sql.Connection.TRANSACTION_REPEATABLE_READ;
++    	else if (isolationStr.compareTo(DERBY_TRANSACTION_SERIALIZABLE) == 0)
++    		return java.sql.Connection.TRANSACTION_SERIALIZABLE;
++    	else if (isolationStr.compareTo(DERBY_TRANSACTION_READ_COMMITTED) == 0)
++    		return java.sql.Connection.TRANSACTION_READ_COMMITTED;
++    	else if (isolationStr.compareTo(DERBY_TRANSACTION_READ_UNCOMMITTED) == 0)
++    		return java.sql.Connection.TRANSACTION_READ_UNCOMMITTED;
++    	else 
++    		return java.sql.Connection.TRANSACTION_NONE;
++    }
++
+     public java.sql.SQLWarning getWarnings() {
+         if (agent_.loggingEnabled()) {
+             agent_.logWriter_.traceExit(this, "getWarnings", warnings_);
+diff --git a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/checkDataSource.java b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/checkDataSource.java
+index 7d4281ba..beb4a536 100644
+--- a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/checkDataSource.java
++++ b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/checkDataSource.java
+@@ -70,16 +70,6 @@
+ 	private  boolean needRollbackBeforePCGetConnection = 
+ 		TestUtil.isDerbyNetClientFramework(); 
+ 	
+-	// DERBY-1035 With client, Connection.getTransactionIsolation() return value is 
+-	// wrong after changing the isolation level with an SQL statement such as 
+-	// "set current isolation = RS"
+-	// Tests for setting isolation level this way only run in embedded for now.
+-	private boolean canSetIsolationWithStatement = TestUtil.isEmbeddedFramework();
+-	  
+-	//	 DERBY-1148 - Client Connection state does not
+-	// get set properly when joining a global transaction.
+-	private static boolean isolationSetProperlyOnJoin = TestUtil.isEmbeddedFramework();
+-	
+ 	// DERBY-1183 getCursorName not correct after first statement execution
+ 	private static boolean hasGetCursorNameBug = TestUtil.isDerbyNetClientFramework();
+ 	
+@@ -366,14 +356,28 @@ protected void runTest(String[] args) throws Exception {
+ 		// and isolation level from the transaction,
+ 		// holdability remains that of this handle.
+ 		xar.start(xid, XAResource.TMJOIN);
+-		// DERBY-1148
+-		if (isolationSetProperlyOnJoin)
+ 			printState("re-join X1", cs1);
+ 		xar.end(xid, XAResource.TMSUCCESS);
+ 
+ 		// should be the same as the reset local
+ 		printState("back to local (same as reset)", cs1);
+ 
++		// test suspend/resume
++		// now re-join the transaction, should pick up the read-only
++		// and isolation level from the transaction,
++		// holdability remains that of this handle.
++		xar.start(xid, XAResource.TMJOIN);
++		printState("re-join X1 second time", cs1);
++		
++		xar.end(xid, XAResource.TMSUSPEND);
++		printState("local after suspend", cs1);
++		
++		xar.start(xid, XAResource.TMRESUME);
++		printState("resume X1", cs1);
++		
++		xar.end(xid, XAResource.TMSUCCESS);
++		printState("back to local (second time)", cs1);
++		
+ 		cs1.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
+ 		cs1.setReadOnly(true);
+ 		setHoldability(cs1, true);
+@@ -385,8 +389,6 @@ protected void runTest(String[] args) throws Exception {
+ 
+ 		xar.start(xid, XAResource.TMJOIN);
+ 		cs1 = xac.getConnection();
+-		// DERBY-1148
+-		if (isolationSetProperlyOnJoin)
+ 			printState("re-join with new handle X1", cs1);
+ 		cs1.close();
+ 		xar.end(xid, XAResource.TMSUCCESS);
+@@ -398,8 +400,6 @@ protected void runTest(String[] args) throws Exception {
+ 		cs1.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+ 		printState("pre-X1 commit - local", cs1);
+ 		xar.start(xid, XAResource.TMJOIN);
+-		// DERBY-1148
+-		if (isolationSetProperlyOnJoin)
+ 			printState("pre-X1 commit - X1", cs1);
+ 		xar.end(xid, XAResource.TMSUCCESS);
+ 		printState("post-X1 end - local", cs1);
+@@ -417,7 +417,6 @@ protected void runTest(String[] args) throws Exception {
+ 		cs1.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED);
+ 		printState("setTransactionIsolation in local", cs1);
+ 
+-		if (canSetIsolationWithStatement)
+ 			testSetIsolationWithStatement(s, xar, cs1);
+ 
+ 		// now check re-use of *Statement objects across local/global connections.

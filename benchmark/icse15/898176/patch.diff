@@ -1,0 +1,227 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 05df9ea8..cb3ac559 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -112,7 +112,7 @@
+     private AtomicReference<BinaryMemtable> binaryMemtable_;
+ 
+     /* SSTables on disk for this column family */
+-    private SSTableTracker ssTables_ = new SSTableTracker();
++    private SSTableTracker ssTables_;
+ 
+     private TimedStatsDeque readStats_ = new TimedStatsDeque(60000);
+     private TimedStatsDeque writeStats_ = new TimedStatsDeque(60000);
+@@ -127,11 +127,70 @@
+         fileIndexGenerator_.set(indexValue);
+         memtable_ = new Memtable(table_, columnFamily_);
+         binaryMemtable_ = new AtomicReference<BinaryMemtable>(new BinaryMemtable(table_, columnFamily_));
+-        int cacheSize = SSTableReader.estimatedKeys(columnFamilyName);
++
++        if (logger_.isDebugEnabled())
++            logger_.debug("Starting CFS " + columnFamily_);
++        // scan for data files corresponding to this CF
++        List<File> sstableFiles = new ArrayList<File>();
++        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
++        for (File file : files())
++        {
++            String filename = file.getName();
++
++            /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
++            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
++            if (matcher.matches())
++            {
++                String basePath = matcher.group(1);
++                if (!new File(basePath + "-Data.db").exists())
++                {
++                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
++                    FileUtils.deleteWithConfirm(file);
++                    continue;
++                }
++            }
++
++            if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
++            {
++                FileUtils.deleteWithConfirm(file);
++                continue;
++            }
++
++            if (filename.contains("-Data.db"))
++            {
++                sstableFiles.add(file.getAbsoluteFile());
++            }
++        }
++        Collections.sort(sstableFiles, new FileUtils.FileComparator());
++
++        /* Load the index files and the Bloom Filters associated with them. */
++        List<SSTableReader> sstables = new ArrayList<SSTableReader>();
++        for (File file : sstableFiles)
++        {
++            String filename = file.getAbsolutePath();
++            if (SSTable.deleteIfCompacted(filename))
++                continue;
++
++            SSTableReader sstable;
++            try
++            {
++                sstable = SSTableReader.open(filename);
++            }
++            catch (IOException ex)
++            {
++                logger_.error("Corrupt file " + filename + "; skipped", ex);
++                continue;
++            }
++            sstables.add(sstable);
++        }
++        ssTables_ = new SSTableTracker(sstables);
++
++        int cacheSize = (int)(0.1 * SSTableReader.estimatedKeys(columnFamilyName));
++        logger_.info("cache size for " + columnFamilyName + " is " + cacheSize);
+         rowCache = ConcurrentLinkedHashMap.create(ConcurrentLinkedHashMap.EvictionPolicy.SECOND_CHANCE, cacheSize);
+     }
+ 
+-    public static ColumnFamilyStore getColumnFamilyStore(String table, String columnFamily) throws IOException
++    public static ColumnFamilyStore createColumnFamilyStore(String table, String columnFamily) throws IOException
+     {
+         /*
+          * Get all data files associated with old Memtables for this table.
+@@ -165,8 +224,8 @@ public static ColumnFamilyStore getColumnFamilyStore(String table, String column
+         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+         try
+         {
+-            mbs.registerMBean(cfs, new ObjectName(
+-                    "org.apache.cassandra.db:type=ColumnFamilyStores,name=" + table + ",columnfamily=" + columnFamily));
++            String mbeanName = "org.apache.cassandra.db:type=ColumnFamilyStores,name=" + table + ",columnfamily=" + columnFamily;
++            mbs.registerMBean(cfs, new ObjectName(mbeanName));
+         }
+         catch (Exception e)
+         {
+@@ -178,7 +237,7 @@ public static ColumnFamilyStore getColumnFamilyStore(String table, String column
+ 
+     private Set<File> files()
+     {
+-        Set<File> fileSet = new HashSet<File>(3 * ssTables_.size() + 6); // 6 is fudge factor so we don't have to double if there's a couple uncompacted ones around
++        Set<File> fileSet = new HashSet<File>();
+         for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table_))
+         {
+             File[] files = new File(directory).listFiles();
+@@ -192,66 +251,6 @@ public static ColumnFamilyStore getColumnFamilyStore(String table, String column
+         return fileSet;
+     }
+ 
+-    void onStart() throws IOException
+-    {
+-        if (logger_.isDebugEnabled())
+-            logger_.debug("Starting CFS " + columnFamily_);
+-        // scan for data files corresponding to this CF
+-        List<File> sstableFiles = new ArrayList<File>();
+-        Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
+-        for (File file : files())
+-        {
+-            String filename = file.getName();
+-
+-            /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
+-            Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
+-            if (matcher.matches())
+-            {
+-                String basePath = matcher.group(1);
+-                if (!new File(basePath + "-Data.db").exists())
+-                {
+-                    logger_.info(String.format("Removing orphan %s", file.getAbsolutePath()));
+-                    FileUtils.deleteWithConfirm(file);
+-                    continue;
+-                }
+-            }
+-
+-            if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.contains("-" + SSTable.TEMPFILE_MARKER))))
+-            {
+-                FileUtils.deleteWithConfirm(file);
+-                continue;
+-            }
+-
+-            if (filename.contains("-Data.db"))
+-            {
+-                sstableFiles.add(file.getAbsoluteFile());
+-            }
+-        }
+-        Collections.sort(sstableFiles, new FileUtils.FileComparator());
+-
+-        /* Load the index files and the Bloom Filters associated with them. */
+-        List<SSTableReader> sstables = new ArrayList<SSTableReader>();
+-        for (File file : sstableFiles)
+-        {
+-            String filename = file.getAbsolutePath();
+-            if (SSTable.deleteIfCompacted(filename))
+-                continue;
+-
+-            SSTableReader sstable;
+-            try
+-            {
+-                sstable = SSTableReader.open(filename);
+-            }
+-            catch (IOException ex)
+-            {
+-                logger_.error("Corrupt file " + filename + "; skipped", ex);
+-                continue;
+-            }
+-            sstables.add(sstable);
+-        }
+-        ssTables_.onStart(sstables);
+-    }
+-
+     /*
+      * This method is called to obtain statistics about
+      * the Column Family represented by this Column Family
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 3e188cae..5137ef67 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -193,7 +193,6 @@ public static Table open(String table) throws IOException
+                 if (tableInstance == null)
+                 {
+                     tableInstance = new Table(table);
+-                    tableInstance.onStart();
+                     instances.put(table, tableInstance);
+                 }
+             }
+@@ -220,14 +219,6 @@ public ColumnFamilyStore getColumnFamilyStore(String cfName)
+         return columnFamilyStores.get(cfName);
+     }
+ 
+-    public void onStart() throws IOException
+-    {
+-        for (String columnFamily : tableMetadata.getColumnFamilies())
+-        {
+-            columnFamilyStores.get(columnFamily).onStart();
+-        }
+-    }
+-    
+     /** 
+      * Do a cleanup of keys that do not belong locally.
+      */
+@@ -349,7 +340,7 @@ private Table(String table) throws IOException
+         tableMetadata = Table.TableMetadata.instance(table);
+         for (String columnFamily : tableMetadata.getColumnFamilies())
+         {
+-            columnFamilyStores.put(columnFamily, ColumnFamilyStore.getColumnFamilyStore(table, columnFamily));
++            columnFamilyStores.put(columnFamily, ColumnFamilyStore.createColumnFamilyStore(table, columnFamily));
+         }
+ 
+         // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableTracker.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableTracker.java
+index 6bbeff94..f22da05a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableTracker.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableTracker.java
+@@ -27,11 +27,9 @@
+ 
+ public class SSTableTracker implements Iterable<SSTableReader>
+ {
+-    private volatile Set<SSTableReader> sstables = Collections.emptySet();
++    private volatile Set<SSTableReader> sstables;
+ 
+-    // TODO get rid of onstart crap.  this should really be part of the constructor,
+-    // but CFS isn't designed to set this up in the constructor, yet.
+-    public synchronized void onStart(Collection<SSTableReader> sstables)
++    public SSTableTracker(Collection<SSTableReader> sstables)
+     {
+         this.sstables = Collections.unmodifiableSet(new HashSet<SSTableReader>(sstables));
+     }

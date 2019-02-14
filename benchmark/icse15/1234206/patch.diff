@@ -1,0 +1,148 @@
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/SyncStrategy.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/SyncStrategy.java
+index 4eb48715..31a513de 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/SyncStrategy.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/SyncStrategy.java
+@@ -20,23 +20,21 @@
+ import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.util.ArrayList;
+-import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
+ 
+ import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.impl.CommonsHttpSolrServer;
+-import org.apache.solr.client.solrj.request.QueryRequest;
+ import org.apache.solr.client.solrj.request.CoreAdminRequest.RequestRecovery;
++import org.apache.solr.client.solrj.request.QueryRequest;
+ import org.apache.solr.common.cloud.CloudState;
+ import org.apache.solr.common.cloud.Slice;
+ import org.apache.solr.common.cloud.ZkCoreNodeProps;
+ import org.apache.solr.common.cloud.ZkNodeProps;
+ import org.apache.solr.common.cloud.ZkStateReader;
+-import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.params.CoreAdminParams.CoreAdminAction;
++import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.util.NamedList;
+-import org.apache.solr.common.util.StrUtils;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.update.PeerSync;
+ import org.slf4j.Logger;
+@@ -101,7 +99,7 @@ private boolean syncReplicas(ZkController zkController, SolrCore core,
+           for (ZkCoreNodeProps node : nodes) {
+             try {
+               syncToMe(zkController, collection, shardId, leaderProps,
+-                  node.getNodeProps());
++                  node.getNodeProps(), nodes);
+             } catch (Exception exception) {
+               exception.printStackTrace();
+               // nocommit
+@@ -186,12 +184,8 @@ private boolean syncWithReplicas(ZkController zkController, SolrCore core,
+   }
+   
+   private void syncToMe(ZkController zkController, String collection,
+-      String shardId, ZkNodeProps leaderProps, ZkNodeProps props)
++      String shardId, ZkNodeProps leaderProps, ZkNodeProps props, List<ZkCoreNodeProps> nodes)
+       throws MalformedURLException, SolrServerException, IOException {
+-    List<ZkCoreNodeProps> nodes = zkController.getZkStateReader()
+-        .getReplicaProps(collection, shardId,
+-            props.get(ZkStateReader.NODE_NAME_PROP),
+-            props.get(ZkStateReader.CORE_NAME_PROP));
+     
+     if (nodes == null) {
+       System.out.println("I have no replicas");
+@@ -210,7 +204,7 @@ private void syncToMe(ZkController zkController, String collection,
+         CommonsHttpSolrServer server = new CommonsHttpSolrServer(node.getCoreUrl());
+         
+         NamedList rsp = server.request(qr);
+-        System.out.println("response about syncing to leader:" + rsp);
++        System.out.println("response about syncing to leader:" + rsp + " node:" + node.getCoreUrl() + " me:" + zkController.getBaseUrl());
+         boolean success = (Boolean) rsp.get("sync");
+         System.out.println("success:" + success);
+         if (!success) {
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/PeerSync.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/PeerSync.java
+index 9c5f551c..5faae0ea 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/PeerSync.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/PeerSync.java
+@@ -17,14 +17,23 @@
+ 
+ package org.apache.solr.update;
+ 
++import java.io.IOException;
++import java.net.ConnectException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.commons.httpclient.NoHttpResponseException;
+ import org.apache.lucene.util.BytesRef;
+-import org.apache.solr.client.solrj.SolrRequest;
++import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrInputDocument;
+ import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.common.util.StrUtils;
+-import org.apache.solr.core.PluginInfo;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.handler.component.ShardHandler;
+ import org.apache.solr.handler.component.ShardHandlerFactory;
+@@ -37,16 +46,9 @@
+ import org.apache.solr.update.processor.DistributedUpdateProcessorFactory;
+ import org.apache.solr.update.processor.RunUpdateProcessorFactory;
+ import org.apache.solr.update.processor.UpdateRequestProcessor;
+-import org.apache.solr.util.plugin.PluginInfoInitialized;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import java.io.File;
+-import java.io.FilenameFilter;
+-import java.io.IOException;
+-import java.util.*;
+-import java.util.concurrent.*;
+-
+ /** @lucene.experimental */
+ public class PeerSync  {
+   public static Logger log = LoggerFactory.getLogger(PeerSync.class);
+@@ -163,8 +165,19 @@ private void requestVersions(String replica) {
+ 
+   private boolean handleResponse(ShardResponse srsp) {
+     if (srsp.getException() != null) {
++
++      // nocommit
++      if (srsp.getException() instanceof SolrServerException) {
++        Throwable solrException = ((SolrServerException) srsp.getException())
++            .getRootCause();
++        if (solrException instanceof ConnectException
++            || solrException instanceof NoHttpResponseException) {
++          return true;
++        }
++      }
+       // TODO: at least log???
+-      // srsp.getException().printStackTrace(System.out);
++      srsp.getException().printStackTrace(System.out);
++      
+       return false;
+     }
+ 
+diff --git a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+index a3f4f21e..7b656441 100644
+--- a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
++++ b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+@@ -439,11 +439,11 @@ public static String getShardLeadersPath(String collection, String shardId) {
+     
+     Map<String,ZkNodeProps> shardMap = replicas.getShards();
+     List<ZkCoreNodeProps> nodes = new ArrayList<ZkCoreNodeProps>(shardMap.size());
+-
++    String filterNodeName = thisNodeName + "_" + coreName;
+     for (Entry<String,ZkNodeProps> entry : shardMap.entrySet()) {
+       ZkCoreNodeProps nodeProps = new ZkCoreNodeProps(entry.getValue());
+       String coreNodeName = nodeProps.getNodeName() + "_" + coreName;
+-      if (cloudState.liveNodesContain(thisNodeName) && !coreNodeName.equals(thisNodeName + "_" + coreName)) {
++      if (cloudState.liveNodesContain(nodeProps.getNodeName()) && !coreNodeName.equals(filterNodeName)) {
+         if (stateFilter == null || stateFilter.equals(nodeProps.getState())) {
+           nodes.add(nodeProps);
+         }

@@ -1,0 +1,304 @@
+diff --git a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ColumnReference.java b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ColumnReference.java
+index c469cb40..e171ab93 100644
+--- a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ColumnReference.java
++++ b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ColumnReference.java
+@@ -71,6 +71,10 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	int				origTableNumber = -1;
+ 	int				origColumnNumber = -1;
+ 
++    /* For remembering original (tn,cn) of this CR during join flattening. */
++    private int tableNumberBeforeFlattening = -1;
++    private int columnNumberBeforeFlattening = -1;
++
+ 	/* Reuse generated code where possible */
+ 	//Expression genResult;
+ 
+@@ -850,12 +854,6 @@ public ValueNode remapColumnReferencesToExpressions()
+ 			if (rsn instanceof FromTable)
+ 			{
+ 				FromTable ft = (FromTable)rsn;
+-				tableNumber = ft.getTableNumber();
+-				if (SanityManager.DEBUG)
+-				{
+-					SanityManager.ASSERT(tableNumber != -1,
+-						"tableNumber not expected to be -1");
+-				}
+ 
+ 				/* It's not enough to just set the table number.  Depending
+ 				 * on the original query specified and on whether or not
+@@ -865,15 +863,53 @@ public ValueNode remapColumnReferencesToExpressions()
+ 				 * we got here.  In that case we also need to update the
+ 				 * columnNumber to point to the correct column in "ft".
+ 				 * See DERBY-2526 for details.
++                 * See DERBY-3023 and DERBY-4679 for further improvement
++                 * details.
+ 				 */
+-				ResultColumn ftRC =
+-					ft.getResultColumns().getResultColumn(columnName);
+ 
+-				if (SanityManager.DEBUG)
+-				{
+-					SanityManager.ASSERT(ftRC != null,
+-						"Failed to find column '" + columnName + "' in the " +
+-						"RCL for '" + ft.getTableName() + "'.");
++                ResultColumnList rcl = ft.getResultColumns();
++
++                ResultColumn ftRC = null;
++
++
++                // Need to save original (tn,cn) in case we have several
++                // flattenings so we can relocate the correct column many
++                // times. After the first flattening, the (tn,cn) pair points
++                // to the top RCL which is going away..
++                if (tableNumberBeforeFlattening == -1) {
++                    tableNumberBeforeFlattening = tableNumber;
++                    columnNumberBeforeFlattening = columnNumber;
++                }
++
++                // Covers references to a table not being flattened out, e.g.
++                // inside a join tree, which can have many columns in the rcl
++                // with the same name, so looking up via column name can give
++                // the wrong column. DERBY-4679.
++                ftRC = rcl.getResultColumn(
++                    tableNumberBeforeFlattening,
++                    columnNumberBeforeFlattening,
++                    columnName);
++
++                if (ftRC == null) {
++                    // The above lookup won't work for references to a base
++                    // column, so fall back on column name, which is unique
++                    // then.
++                    ftRC = rcl.getResultColumn(columnName);
++                }
++
++                if (SanityManager.DEBUG) {
++                    SanityManager.ASSERT(
++                        ftRC != null,
++                        "Failed to find column '" + columnName +
++                        "' in the " + "RCL for '" + ft.getTableName() +
++                        "'.");
++                }
++
++                tableNumber = ft.getTableNumber();
++
++				if (SanityManager.DEBUG) {
++					SanityManager.ASSERT(tableNumber != -1,
++						"tableNumber not expected to be -1");
+ 				}
+ 
+ 				/* Use the virtual column id if the ResultColumn's expression
+diff --git a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+index bdf96508..10448e52 100644
+--- a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
++++ b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+@@ -310,6 +310,106 @@ public ResultColumn getResultColumn(String columnName, boolean markIfReferenced
+ 		return null;
+ 	}
+ 
++	/**
++     * Return a result column, if any found, which contains in its
++     * expression/&#123;VCN,CR&#125; chain a result column with the given
++     * columnNumber from a FromTable with the given tableNumber.
++     * <p/>
++     * Used by the optimizer preprocess phase when it is flattening queries,
++     * which has to use the pair &#123;table number, column number&#125; to
++     * uniquely distinguish the column desired in situations where the same
++     * table may appear multiple times in the queries with separate correlation
++     * names, and/or column names from different tables may be the same (hence
++     * looking up by column name will not always work), cf DERBY-4679.
++     * <p/>
++     * {@code columnName} is used to assert that we find the right column.
++     * If we found a match on (tn, cn) but columnName is wrong, return null.
++     * Once we trust table numbers and column numbers to always be correct,
++     * cf. DERBY-4695, we can remove this parameter.
++     *
++     * @param tableNumber the table number to look for
++     * @param columnNumber the column number to look for
++     * @param columnName name of the desired column
++     */
++    public ResultColumn getResultColumn(int tableNumber,
++                                        int columnNumber,
++                                        String columnName)
++    {
++        int size = size();
++
++        for (int index = 0; index < size; index++)
++        {
++            ResultColumn resultColumn = (ResultColumn)elementAt(index);
++            ResultColumn rc = resultColumn;
++
++            while (rc != null) {
++                ValueNode exp = rc.getExpression();
++
++                if (exp instanceof VirtualColumnNode) {
++                    VirtualColumnNode vcn = (VirtualColumnNode)exp;
++                    ResultSetNode rsn = vcn.getSourceResultSet();
++
++                    if (rsn instanceof FromTable) {
++                        FromTable ft = (FromTable)rsn;
++
++                        if (ft.getTableNumber() == tableNumber &&
++                                rc.getColumnPosition() == columnNumber) {
++
++                            // Found matching (t,c) within this top
++                            // resultColumn. Now do sanity check that column
++                            // name is correct. Remove when DERBY-4695 is
++                            // fixed.
++                            if (columnName.equals(
++                                        vcn.getSourceColumn().getName())) {
++                                resultColumn.setReferenced();
++                                return resultColumn;
++                            } else {
++                                if (SanityManager.DEBUG) {
++                                    SanityManager.ASSERT(
++                                        false,
++                                        "wrong (tn,cn) for column " +
++                                        columnName +
++                                        " found: this pair points to " +
++                                        vcn.getSourceColumn().getName());
++                                }
++                                // Fall back on column name based lookup,
++                                // cf. DERBY-4679. See ColumnReference#
++                                // remapColumnReferencesToExpressions
++                                return null;
++                            }
++                        } else {
++                            rc = vcn.getSourceColumn();
++                        }
++                    } else {
++                        rc = null;
++                    }
++                } else if (exp instanceof ColumnReference) {
++                    ColumnReference cr = (ColumnReference)exp;
++
++                    if (cr.getTableNumber() == tableNumber &&
++                            cr.getColumnNumber() == columnNumber) {
++                        // Found matching (t,c) within this top resultColumn
++                        resultColumn.setReferenced();
++                        return resultColumn;
++                    } else {
++                        rc = null;
++                    }
++                } else {
++                    if (SanityManager.DEBUG) {
++                        SanityManager.ASSERT(
++                            exp instanceof BaseColumnNode,
++                            "expected BaseColumnNode, found: " +
++                            exp.getClass());
++                    }
++                    rc = null;
++                }
++            }
++
++        }
++        return null;
++    }
++
++
+ 	/**
+ 	 * Get a ResultColumn that matches the specified columnName and
+ 	 * mark the ResultColumn as being referenced.
+diff --git a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/VirtualColumnNode.java b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/VirtualColumnNode.java
+index e57e8fbc..94e7ad39 100644
+--- a/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/VirtualColumnNode.java
++++ b/db/derby/code/branches/10.6/java/engine/org/apache/derby/impl/sql/compile/VirtualColumnNode.java
+@@ -94,6 +94,8 @@ public void printSubNodes(int depth)
+ 
+ 			printLabel(depth, "sourceColumn: ");
+ 		    sourceColumn.treePrint(depth + 1);
++            printLabel(depth, "sourceResultSet: ");
++            sourceResultSet.treePrint(depth + 1);
+ 		}
+ 	}
+ 
+diff --git a/db/derby/code/branches/10.6/java/testing/org/apache/derbyTesting/functionTests/tests/lang/JoinTest.java b/db/derby/code/branches/10.6/java/testing/org/apache/derbyTesting/functionTests/tests/lang/JoinTest.java
+index 86a33bf5..ddbb76f8 100644
+--- a/db/derby/code/branches/10.6/java/testing/org/apache/derbyTesting/functionTests/tests/lang/JoinTest.java
++++ b/db/derby/code/branches/10.6/java/testing/org/apache/derbyTesting/functionTests/tests/lang/JoinTest.java
+@@ -1828,4 +1828,86 @@ static void insertTourRow(PreparedStatement ps, int a, String b, String c)
+         ps.setString(3, c);
+         ps.execute();
+     }
++
++
++    /**
++     * DERBY-4679. Verify that when transitive closure generates new criteria
++     * into the query, it isn't confused by situations where the same column
++     * name appears in a result column list multiple times due to flattening of
++     * sub-queries.  
++     * <p/>
++     * Flattening requires remapping of (table, column) numbers in column
++     * references. In cases where the same column name appears in a result
++     * column list multiple times, this might earlier lead to remapping
++     * (reassigning) wrong (table, column) numbers to column references in join
++     * predicates transformed to where clauses as a result of the flattening.
++     * <p/>
++     * See also DERBY-2526 and DERBY-3023 whose fixes which were partial
++     * solutions to the problem of wrong column number remappings confusing
++     * the transitive closure of search predicates performed by the
++     * preprocessing step of the optimizer.
++     */
++    public void testDerby_4679() throws SQLException {
++        setAutoCommit(false);
++        Statement s = createStatement();
++
++        s.execute("create table abstract_instance (" +
++                  "    jz_discriminator int, " +
++                  "    item_id char(32), " +
++                  "    family_item_id char(32), " +
++                  "    state_id char(32), " +
++                  "    visibility bigint)");
++
++        s.execute("create table lab_resource_operatingsystem (" +
++                  "    jz_parent_id char(32), " +
++                  "    item_id char(32))");
++
++        s.execute("create table operating_system_software_install (" +
++                  "    jz_parent_id char(32), " +
++                  "    item_id char(32))");
++
++        s.execute("create table family (" +
++                  "    item_id char(32), " +
++                  "    root_item_id char(32))");
++
++        s.execute("insert into abstract_instance (" +
++                  "    jz_discriminator, " +
++                  "    item_id, " +
++                  "    family_item_id, " +
++                  "    visibility) " +
++                  "values (238, 'aaaa', 'bbbb', 0)," +
++                  "       (0, 'cccc', 'dddd', 0)," +
++                  "       (1, 'eeee', '_5VetVWTeEd-Q8aOqWJPEIQ', 0)");
++
++        s.execute("insert into lab_resource_operatingsystem " +
++                  "values ('aaaa', 'cccc')");
++
++
++        s.execute("insert into operating_system_software_install " +
++                  "values ('cccc', 'eeee')");
++
++        s.execute("insert into family " +
++                  "values ('dddd', '_5ZDlwWTeEd-Q8aOqWJPEIQ')," +
++                  "       ('bbbb', '_5nN9mmTeEd-Q8aOqWJPEIQ')");
++
++        ResultSet rs =
++            s.executeQuery(
++                "select distinct t1.ITEM_ID, t1.state_id, t1.JZ_DISCRIMINATOR from " +
++                "((((((select * from ABSTRACT_INSTANCE z1 where z1.JZ_DISCRIMINATOR = 238) t1 " +
++                "      left outer join LAB_RESOURCE_OPERATINGSYSTEM j1 on (t1.ITEM_ID = j1.JZ_PARENT_ID)) " +
++                "     left outer join ABSTRACT_INSTANCE t2 on (j1.ITEM_ID = t2.ITEM_ID)) " +
++                "    left outer join OPERATING_SYSTEM_SOFTWARE_INSTALL j2 on (t2.ITEM_ID = j2.JZ_PARENT_ID))" +
++                "   left outer join ABSTRACT_INSTANCE t3 on (j2.ITEM_ID = t3.ITEM_ID) " +
++                "  inner join FAMILY t5 on (t2.FAMILY_ITEM_ID = t5.ITEM_ID)) " +
++                " inner join FAMILY t7 on (t1.FAMILY_ITEM_ID = t7.ITEM_ID)) " +
++                "where (t3.FAMILY_ITEM_ID IN('_5VetVWTeEd-Q8aOqWJPEIQ') and " +
++                "      (t5.ROOT_ITEM_ID = '_5ZDlwWTeEd-Q8aOqWJPEIQ') and " +
++                "      (t7.ROOT_ITEM_ID ='_5nN9mmTeEd-Q8aOqWJPEIQ') and " +
++                "      (t1.VISIBILITY = 0))");
++        JDBC.assertFullResultSet(
++            rs,
++            new String[][]{{"aaaa", null, "238"}});
++        rollback();
++    }
++
+ }

@@ -1,0 +1,755 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromList.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromList.java
+index 1dfed3d4..5cd74540 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromList.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromList.java
+@@ -63,12 +63,22 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	// will help keep track of such a condition.
+ 	private boolean  referencesSessionSchema;
+ 
++	/* Whether or not this FromList is transparent.  A "transparent" FromList
++	 * is one in which all FromTables are bound based on an outer query's
++	 * FromList.  This means that the FromTables in the transparent list are
++	 * allowed to see and reference FromTables in the outer query's list.
++	 * Or put differently, a FromTable which sits in a transparent FromList
++	 * does not "see" the transparent FromList when binding; rather, it sees
++	 * (and can therefore reference) the FromList of an outer query.
++	 */
++	private boolean isTransparent;
+ 
+ 	/** Initializer for a FromList */
+ 
+ 	public void init(Object optimizeJoinOrder)
+ 	{
+ 		fixedJoinOrder = ! (((Boolean) optimizeJoinOrder).booleanValue());
++		isTransparent = false;
+ 	}
+ 
+ 	/**
+@@ -333,7 +343,12 @@ public void bindExpressions( FromList fromListParam )
+ 		for (int index = 0; index < size; index++)
+ 		{
+ 			fromTable = (FromTable) elementAt(index);
+-			fromTable.bindExpressions(this);
++
++			/* If this FromList is transparent then its FromTables should
++			 * be bound based on the outer query's FROM list.
++			 */
++			fromTable.bindExpressions(
++				isTransparent ? fromListParam : this);
+ 		}
+ 	}
+ 
+@@ -393,9 +408,30 @@ public boolean hasOuterJoins()
+ 	/**
+ 	 * Expand a "*" into the appropriate ResultColumnList. If the "*"
+ 	 * is unqualified it will expand into a list of all columns in all
+-	 * of the base tables in the from list, otherwise it will expand
+-	 * into a list of all of the columns in the base table that matches
+-	 * the qualification.
++	 * of the base tables in the from list at the current nesting level;
++	 * otherwise it will expand into a list of all of the columns in the
++	 * base table that matches the qualification.
++	 *
++	 * NOTE: Callers are responsible for ordering the FromList by nesting
++	 * level, with tables at the deepest (current) nesting level first.  
++	 * We will expand the "*" into a list of all columns from all tables
++	 * having the same nesting level as the first FromTable in this list.
++	 * The check for nesting level exists because it's possible that this
++	 * FromList includes FromTables from an outer query, which can happen
++	 * if there is a "transparent" FromList above this one in the query
++	 * tree.  Ex:
++	 *
++	 *  select j from onerow where exists
++	 *    (select 1 from somerow
++	 *      union select * from diffrow where onerow.j < diffrow.k)
++	 *
++	 * If "this" is the FromList for the right child of the UNION then it will
++	 * contain both "diffrow" and "onerow", the latter of which was passed
++	 * down via a transparent FromList (to allow binding of the WHERE clause).
++	 * In that case the "*" should only expand the result columns of "diffrow";
++	 * it should not expand the result columns of "onerow" because that table
++	 * is from an outer query.  We can achieve this selective expansion by
++	 * looking at nesting levels.
+ 	 *
+ 	 * @param allTableName		The qualification on the "*" as a String.
+ 	 *
+@@ -412,13 +448,44 @@ public ResultColumnList expandAll(TableName allTableName)
+ 		FromTable	 fromTable;
+  
+ 		/* Expand the "*" for the table that matches, if it is qualified 
+-		 * (allTableName is not null) or for all tables in the list if the 
+-		 * "*" is not qualified (allTableName is null).
++		 * (allTableName is not null) or for all tables in the list at the
++		 * current nesting level if the "*" is not qualified (allTableName
++		 * is null).  Current nesting level is determined by the nesting
++		 * level of the first FromTable in the list.
+ 		 */
++		int targetNestingLevel = ((FromTable)elementAt(0)).getLevel();
+ 		int size = size();
++
++		/* Make sure our assumption about nesting-based ordering
++		 * has been satisified.  I.e. that the list is ordered
++		 * with the most deeply nested FromTables first.
++		 */
++		if (SanityManager.DEBUG)
++		{
++			int prevNL = targetNestingLevel;
++			for (int i = 1; i < size; i++)
++			{
++				int currNL = ((FromTable)elementAt(i)).getLevel();
++				SanityManager.ASSERT((prevNL >= currNL),
++					"FROM list should have been ordered by nesting " +
++					"level (deepest level first), but it was not.");
++
++				prevNL = currNL;
++			}
++		}
++
+ 		for (int index = 0; index < size; index++)
+ 		{
+ 			fromTable = (FromTable) elementAt(index);
++			if (targetNestingLevel != fromTable.getLevel())
++			{
++				/* We only expand result columns for tables at the
++				 * target nesting level.  Since the FromTables are
++				 * sorted based on nesting level, we're done if we
++				 * get here.
++				 */
++				break;
++			}
+ 
+ 			/* We let the FromTable decide if there is a match on
+ 			 * the exposed name.  (A JoinNode will not have an
+@@ -1526,6 +1593,17 @@ boolean hashJoinSpecified()
+ 		return false;
+ 	}
+ 
++	/**
++	 * Indicate that this FromList is "transparent", which means that
++	 * its FromTables should be bound to tables from an outer query.
++	 * Generally this is not allowed, but there are exceptions.  See
++	 * SetOperatorNode.setResultToBooleanTrueNode() for more.
++	 */
++	void markAsTransparent()
++	{
++		isTransparent = true;
++	}
++
+ 	/**
+ 	 * Accept a visitor, and call v.visit()
+ 	 * on child nodes as necessary.  
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultSetNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultSetNode.java
+index 76269b21..8242d3cf 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultSetNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultSetNode.java
+@@ -532,10 +532,12 @@ public ResultColumn getMatchingColumn(
+ 	 * already the correct boolean constant.
+ 	 * 
+ 	 * @param onlyConvertAlls	Boolean, whether or not to just convert *'s
++	 * @return ResultSetNode whose resultColumn was transformed; defaults
++	 *  to "this" here, but can be overridden by subclasses.
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+-	public void setResultToBooleanTrueNode(boolean onlyConvertAlls)
++	public ResultSetNode setResultToBooleanTrueNode(boolean onlyConvertAlls)
+ 				throws StandardException
+ 	{
+ 		BooleanConstantNode	booleanNode;
+@@ -554,7 +556,7 @@ public void setResultToBooleanTrueNode(boolean onlyConvertAlls)
+ 		}
+ 		else if (onlyConvertAlls)
+ 		{
+-			return;
++			return this;
+ 		}
+ 		else
+ 		{
+@@ -563,7 +565,7 @@ else if (onlyConvertAlls)
+ 			/* Nothing to do if query is already select TRUE ... */
+ 			if (resultColumn.getExpression().isBooleanTrue())
+ 			{
+-				return;
++				return this;
+ 			}
+ 		}
+ 		
+@@ -577,6 +579,7 @@ else if (onlyConvertAlls)
+ 		/* VirtualColumnIds are 1-based, RCLs are 0-based */
+ 		resultColumn.setVirtualColumnId(1);
+ 		resultColumns.setElementAt(resultColumn, 0);
++		return this;
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SetOperatorNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SetOperatorNode.java
+index 1e4333de..61b88d01 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SetOperatorNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SetOperatorNode.java
+@@ -905,16 +905,116 @@ protected FromTable getFromTableByName(String name, String schemaName, boolean e
+ 	 * NOTE: No transformation is performed if the ResultColumn.expression is
+ 	 * already the correct boolean constant.
+ 	 * 
++	 * This method is used during binding of EXISTS predicates to map
++	 * a subquery's result column list into a single TRUE node.  For
++	 * SELECT and VALUES subqueries this transformation is pretty
++	 * straightforward.  But for set operators (ex. INTERSECT) we have
++	 * to do some extra work.  To see why, assume we have the following
++	 * query:
++	 *
++	 *  select * from ( values 'BAD' ) as T
++	 *    where exists ((values 1) intersect (values 2))
++	 *
++	 * If we treated the INTERSECT in this query the same way that we
++	 * treat SELECT/VALUES subqueries then the above query would get
++	 * transformed into:
++	 *
++	 *  select * from ( values 'BAD' ) as T
++	 *    where ((values TRUE) intersect (values TRUE))
++	 *
++	 * Since both children of the INTERSECT would then have the same value,
++	 * the result of set operation would be a single value (TRUE), which
++	 * means the WHERE clause would evaluate to TRUE and thus the query
++	 * would return one row with value 'BAD'.  That would be wrong.
++	 *
++	 * To avoid this problem, we internally wrap this SetOperatorNode
++	 * inside a "SELECT *" subquery and then we change the new SelectNode's
++	 * result column list (as opposed to *this* nodes' result column list)
++	 * to a singe boolean true node:
++	 *
++	 *  select * from ( values 'BAD' ) as T where
++	 *      SELECT TRUE FROM ((values 1) intersect (values 2))
++	 *
++	 * In this case the left and right children of the INTERSECT retain
++	 * their values, which ensures that the result of the intersect
++	 * operation will be correct.  Since (1 intersect 2) is an empty
++	 * result set, the internally generated SELECT node will return
++	 * zero rows, which in turn means the WHERE predicate will return
++	 * NULL (an empty result set from a SubqueryNode is treated as NULL
++	 * at execution time; see impl/sql/execute/AnyResultSet). Since
++	 * NULL is not the same as TRUE the query will correctly return
++	 * zero rows.  DERBY-2370.
++	 *
+ 	 * @param onlyConvertAlls	Boolean, whether or not to just convert *'s
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+-	public void setResultToBooleanTrueNode(boolean onlyConvertAlls)
++	public ResultSetNode setResultToBooleanTrueNode(boolean onlyConvertAlls)
+ 				throws StandardException
+ 	{
+-		super.setResultToBooleanTrueNode(onlyConvertAlls);
+-		leftResultSet.setResultToBooleanTrueNode(onlyConvertAlls);
+-		rightResultSet.setResultToBooleanTrueNode(onlyConvertAlls);
++		// First create a FromList to hold this node (and only this node).
++
++		FromList fromList =
++			(FromList) getNodeFactory().getNode(
++				C_NodeTypes.FROM_LIST,
++				getContextManager());
++
++		fromList.addFromTable(this);
++
++		/* It's possible that this SetOperatorNode (or more specifically,
++		 * one of its children) references tables from an outer query, ex:
++		 *
++		 *  select j from onerow where exists
++		 *    (select 1 from diffrow where 1 = 0 INTERSECT
++		 *      select * from diffrow where onerow.j < k)
++		 *
++		 * In this case the right child of the INTERSECT node references
++		 * the outer table "onerow".  In order to ensure that the new
++		 * subquery binds correctly we mark the new FromList as "transparent",
++		 * which means that the FromTables it contains (namely, this node
++		 * and its children) will still be able to see (and reference) the
++		 * outer table.
++		 */
++		fromList.markAsTransparent();
++
++		// Now create a ResultColumnList that simply holds the "*".
++
++		ResultColumnList rcl =
++			(ResultColumnList) getNodeFactory().getNode(
++				C_NodeTypes.RESULT_COLUMN_LIST,
++				getContextManager());
++
++		ResultColumn allResultColumn =
++			(ResultColumn) getNodeFactory().getNode(
++				C_NodeTypes.ALL_RESULT_COLUMN,
++				null,
++				getContextManager());
++
++		rcl.addResultColumn(allResultColumn);
++
++		/* Create a new SELECT node of the form:
++		 *  SELECT * FROM <thisSetOperatorNode>
++		 */
++		ResultSetNode result =
++			(ResultSetNode) getNodeFactory().getNode(
++				C_NodeTypes.SELECT_NODE,
++				rcl,      // ResultColumns
++				null,     // AGGREGATE list
++				fromList, // FROM list
++				null,     // WHERE clause
++				null,     // GROUP BY list
++				null,     // having clause
++				getContextManager());
++
++		/* And finally, transform the "*" in the new SELECT node
++		 * into a TRUE constant node.  This ultimately gives us:
++		 *
++		 *  SELECT TRUE FROM <thisSetOperatorNode>
++		 *
++		 * which has a single result column that is a boolean TRUE
++		 * constant.  So we're done.
++		 */
++		return result.setResultToBooleanTrueNode(onlyConvertAlls);
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+index 2e1c1942..cddad7b9 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+@@ -464,7 +464,7 @@ public ValueNode bindExpression(FromList fromList, SubqueryList subqueryList,
+ 		if (subqueryType == EXISTS_SUBQUERY)
+ 		{
+ 			/* Transform the * into true (EXISTS). */
+-			resultSet.setResultToBooleanTrueNode(true);
++			resultSet = resultSet.setResultToBooleanTrueNode(true);
+ 		}
+ 
+ 		/* We need to bind the tables before we can bind the target list
+@@ -500,7 +500,7 @@ public ValueNode bindExpression(FromList fromList, SubqueryList subqueryList,
+ 			 * AllResultColumn above, but we have to also handle
+ 			 * EXISTS (select r from s ...)
+ 			 */
+-			resultSet.setResultToBooleanTrueNode(false);
++			resultSet = resultSet.setResultToBooleanTrueNode(false);
+ 		}
+ 
+ 		/* bind the left operand, if there is one */
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ExistsWithSetOpsTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ExistsWithSetOpsTest.java
+index e69de29b..1edfdacc 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ExistsWithSetOpsTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ExistsWithSetOpsTest.java
+@@ -0,0 +1,385 @@
++/*
++ 
++   Derby - Class org.apache.derbyTesting.functionTests.tests.lang.ExistsWithSetOpsTest
++
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to you under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++ 
++      http://www.apache.org/licenses/LICENSE-2.0
++ 
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ 
++ */
++
++package org.apache.derbyTesting.functionTests.tests.lang;
++
++import junit.framework.*;
++
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++
++/**
++ * This test ensures that an EXISTS predicate which wraps a set operation--
++ * meaning a UNION, INTERSECT, or EXCEPT node--returns the correct results.
++ * For example:
++ *
++ *   select * from ( values 'BAD' ) as T
++ *     where exists ((values 1) intersect (values 2))
++ *
++ * should return zero rows. Prompted by DERBY-2370.
++ */
++public class ExistsWithSetOpsTest extends BaseJDBCTestCase {
++    
++    private static final String EXISTS_PREFIX_1 =
++        "select * from ( values 'GOT_A_ROW' ) as T where exists (";
++
++    private static final String EXISTS_PREFIX_2 =
++        "select j from onerow where exists (";
++
++    /**
++     * Create a test with the given name.
++     * @param name name of the test.
++     *
++     */
++    public ExistsWithSetOpsTest(String name)
++    {
++        super(name);
++    }
++    
++    /**
++     * Return suite with all tests of the class.
++     */
++    public static Test suite()
++    {
++       TestSuite suite = new TestSuite("EXISTS with SET operations");
++
++        /* This is a language/optimization test so behavior will be the
++         * same for embedded and client/server.  Therefore we only need
++         * to run the test against one or the other; we choose embedded.
++         */
++        suite.addTest(
++            TestConfiguration.embeddedSuite(ExistsWithSetOpsTest.class));
++
++        /* Wrap the suite in a CleanDatabaseTestSetup that will create
++         * and populate the test tables.
++         */
++        return new CleanDatabaseTestSetup(suite) 
++        {
++            /**
++            * Create and populate the test table.
++            */
++            protected void decorateSQL(Statement s) throws SQLException
++            {
++                s.executeUpdate("create table empty (i int)"); 
++                s.executeUpdate("create table onerow (j int)");
++                s.executeUpdate("insert into onerow values 2");
++                s.executeUpdate("create table diffrow (k int)");
++                s.executeUpdate("insert into diffrow values 4");
++                s.executeUpdate("create table tworows (p int)");
++                s.executeUpdate("insert into tworows values 2, 4");
++                s.executeUpdate("create table onerow2col (j1 int, j2 int)");
++                s.executeUpdate("insert into onerow2col values (2, 2)");
++            }
++        };
++    }
++
++    /**
++     * Test queries where the set operation just involves VALUES
++     * expressions.
++     */
++    public void testSetOpsWithVALUES() throws Exception
++    {
++        Statement st = createStatement();
++        String [][] expRS = new String [1][1];
++
++        expRS[0][0] = "GOT_A_ROW";
++        checkQuery(st, expRS, EXISTS_PREFIX_1 + "values 1 union values 1)");
++        checkQuery(st, expRS, EXISTS_PREFIX_1 + "values 1 intersect values 1)");
++        checkQuery(st, expRS, EXISTS_PREFIX_1 + "values 1 except values 0)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 + "values 1 intersect values 0)");
++        checkQuery(st, null, EXISTS_PREFIX_1 + "values 1 except values 1)");
++        st.close();
++    }
++
++    /**
++     * Test queries where the set operation has subqueries which are not
++     * correlated to the outer query.  It's important to check for cases
++     * where we have explicit columns _and_ cases where we have "*" because
++     * the binding codepaths differ and we want to verify both.
++     */
++    public void testNonCorrelatedSetOps() throws Exception
++    {
++        Statement st = createStatement();
++        String [][] expRS = new String [1][1];
++
++        expRS[0][0] = "GOT_A_ROW";
++
++        // Expect 1 row for the following.
++
++        // Simple UNION with "*".
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select * from diffrow union select * from onerow)");
++
++        // Simple UNION with explicit columns.
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select k from diffrow union select j from onerow)");
++
++        // Simple INTERSECT with "*".
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select * from diffrow intersect select 4 from onerow)");
++
++        // Simple INTERSECT with explicit columns.
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select k from diffrow intersect select 4 from onerow)");
++
++        // Simple EXCEPT with "*".
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select * from diffrow except select * from onerow)");
++
++        // Simple EXCEPT with explicit columns.
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "select k from diffrow except select j from onerow)");
++
++        // EXCEPT with "*" where left and right children have their
++        // own preds.
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "(select * from tworows where p = 2) except " +
++            "(select * from tworows where p <> 2))");
++
++        // INTERSECT with "*" where left and right children have their
++        // own preds.
++        checkQuery(st, expRS, EXISTS_PREFIX_1 +
++            "(select * from tworows where p = 2) intersect " +
++            "(select * from tworows where p = 2))");
++
++        // Expect 0 rows for the following.  Similar queries to
++        // above except modified to return no rows.
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select i from empty union select * from empty)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select * from onerow intersect select * from empty)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select j from onerow intersect select i from empty)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select * from empty except select * from onerow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select i from empty except select j from onerow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select * from onerow intersect select * from diffrow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select j from onerow intersect select k from diffrow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select * from onerow except select * from onerow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "select j from onerow except select j from onerow)");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "(select * from tworows where p = 2) intersect " +
++            "(select * from tworows where p <> 2))");
++
++        checkQuery(st, null, EXISTS_PREFIX_1 +
++            "(select * from tworows where p = 2) except " +
++            "(select * from tworows where p = 2))");
++
++        // Negative cases.  These should fail because "oops" is not
++        // a valid column in ONEROW.
++
++        assertCompileError("42X04", EXISTS_PREFIX_1 +
++            "(select * from onerow where j = 2) intersect " +
++            "(select oops from onerow where j <> 2))");
++
++        assertCompileError("42X04", EXISTS_PREFIX_1 +
++            "(select * from onerow where j = 2) intersect " +
++            "(select * from onerow where oops <> 2))");
++
++        st.close();
++    }
++
++    /**
++     * Test queries where the set operation has subqueries which are
++     * correlated to the outer query.  Subqueries should still be able
++     * reference the outer query table and execute without error.
++     */
++    public void testCorrelatedSetOps() throws Exception
++    {
++        Statement st = createStatement();
++        String [][] expRS = new String [1][1];
++
++        // "2" here is the value that was inserted into "onerow".
++        expRS[0][0] = "2";
++        
++        // Expect 1 row for the following.
++
++        // Right child of UNION has "*" for RCL and references table
++        // from outer query.
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select * from diffrow where onerow.j < k)");
++
++        // Right child of UNION has qualified "*" for RCL and references
++        // table from outer query.
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select diffrow.* from diffrow where onerow.j < k)");
++
++        // Right child of UNION has explicit RCL and references
++        // table from outer query.
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select k from diffrow where onerow.j < k)");
++
++        /* Right child of UNION is itself another EXISTS query whose
++         * child is another set operator (INTERSECT). The INTERSECT in
++         * turn has a right child which references a table from the
++         * outer-most query.
++         */
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from diffrow intersect " +
++            "     select 2 from diffrow where onerow.j < k))");
++
++        /* Right child of UNION is itself another EXISTS query whose
++         * child is another set operator (INTERSECT). The INTERSECT in
++         * turn has a right child which references a table from the
++         * outer-most query.  In this one the INTERSECT returns zero
++         * rows.
++         */
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from empty intersect " +
++            "    select 3 from empty where onerow.j < i))");
++
++        /* Right child of UNION is itself another EXISTS query whose
++         * child is another set operator (INTERSECT). The INTERSECT in
++         * turn has a right child which references 1) a table from the
++         * outer-most query, and 2) a table from the INTERSECT node's
++         * "parent" subquery (i.e. from the UNION's right subquery).
++         */
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from onerow2col intersect " +
++            "    select 3 from empty where onerow.j < diffrow.k))");
++
++        /* Right child of UNION is itself another EXISTS query whose
++         * child is another set operator (INTERSECT). The INTERSECT in
++         * turn has a right child which references 1) a table from the
++         * outer-most query, and 2) a table from the INTERSECT node's
++         * "parent" query.  In addition, add another predicate to the
++         * UNION's right subquery and make that predicate reference
++         * both 1) a table from the outer-most query, and 2) a table
++         * in the subquery's own FROM list.  All of this to ensure
++         * that binding finds the correct columns at all levels of
++         * the query.
++         */
++        checkQuery(st, expRS, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from onerow2col intersect " +
++            "    select 3 from empty where onerow.j < k) " +
++            "  and (onerow.j < diffrow.k))");
++
++        // Expect 0 rows for the following.  Similar queries to
++        // above except modified to return no rows.
++
++        checkQuery(st, null, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where onerow.j > k)");
++
++        checkQuery(st, null, EXISTS_PREFIX_2 +
++              "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from diffrow intersect " +
++            "     select 3 from diffrow where onerow.j < k))");
++
++        checkQuery(st, null, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from empty intersect " +
++            "    select 3 from empty where onerow.j < i))");
++
++        checkQuery(st, null, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from onerow2col intersect " +
++            "    select 3 from empty where onerow.j < diffrow.k))");
++
++        checkQuery(st, null, EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from diffrow where exists " +
++            "  (select 2 from onerow2col intersect " +
++            "    select 3 from empty where onerow.j < k) " +
++            "  and (onerow.j < diffrow.k))");
++
++        // Negative cases.
++
++        // Should fail because left and right children of the UNION
++        // have different RCL sizes. (NOTE: Would have passed prior
++        // to DERBY-2370, but that was incorrect).
++        assertCompileError("42X58", EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 0 union " +
++            "select * from onerow2col where onerow.j < j)");
++
++        /* Should fail because there is an explicit subquery ("SELECT *")
++         * within the EXISTS query and such a subquery is not allowed to
++         * reference outer tables.  So we will be unable to find the
++         * column "onerow.j" in this case.
++         */
++        assertCompileError("42X04", EXISTS_PREFIX_2 +
++            "select * from (select 1 from diffrow where 1 = 0 " +
++            "union select * from diffrow where onerow.j < k) x)");
++
++        /* Should fail because the UNION's right subquery is trying to
++         * select from an outer table.  While the subquery is allowed
++         * to reference the outer table in expressions, it cannot
++         * include the outer table in its RCL.
++         */
++        assertCompileError("42X10", EXISTS_PREFIX_2 +
++            "select 1 from diffrow where 1 = 1 union " +
++            "select onerow.* from diffrow where onerow.j < k)");
++
++        st.close();
++    }
++
++    /**
++     * Simple helper method to assert the results of the received
++     * query.  If the array representing expected results is null
++     * then we assert that the query returns no rows.
++     */
++    private void checkQuery(Statement st, String [][] expRS,
++        String query) throws Exception
++    {
++        ResultSet rs = st.executeQuery(query);
++        if (expRS == null)
++            JDBC.assertEmpty(rs);
++        else
++            JDBC.assertFullResultSet(rs, expRS);
++        rs.close();
++    }
++}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ResultSetsFromPreparedStatementTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ResultSetsFromPreparedStatementTest.java
+index ad5a8670..c9160016 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ResultSetsFromPreparedStatementTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ResultSetsFromPreparedStatementTest.java
+@@ -2001,15 +2001,11 @@ public void testAnyResultSet() throws Exception {
+             // Make the sets are disjunct (DERBY-2370)
+             tst.setInt(1,i);
+             rs = tst.executeQuery();
+-            assertResultSet("?="+i+" ?="+(i+1),
+-                            /*always empty when DERBY-2370 is fixed*/
+-                            (i==0?empty:existed), rs);
++            assertResultSet("?="+i+" ?="+(i+1), empty, rs);
+ 
+             // Re-execute tst with the same parameters
+             rs = tst.executeQuery();
+-            assertResultSet("R?="+i+" ?="+(i+1),
+-                            /*always empty when DERBY-2370 is fixed*/
+-                            (i==0?empty:existed), rs);
++            assertResultSet("R?="+i+" ?="+(i+1), empty, rs);
+         }
+         tst.close();
+     }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+index e6e1d6b0..6716b86d 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+@@ -62,6 +62,7 @@ public static Test suite() {
+ 
+         suite.addTest(CreateTableFromQueryTest.suite());
+         suite.addTest(DatabaseClassLoadingTest.suite());
++        suite.addTest(ExistsWithSetOpsTest.suite());
+         suite.addTest(GrantRevokeTest.suite());
+         suite.addTest(GroupByExpressionTest.suite());
+ 		suite.addTest(LangScripts.suite());

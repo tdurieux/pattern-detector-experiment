@@ -1,0 +1,2495 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+index 11a03eb2..93b9d389 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+@@ -25,7 +25,7 @@
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.SocketChannel;
+ 
+-import org.apache.cassandra.streaming.PendingFile;
++import org.apache.cassandra.streaming.StreamHeader;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -38,16 +38,15 @@
+ {
+     private static Logger logger = LoggerFactory.getLogger( FileStreamTask.class );
+     
+-    public static final int CHUNK_SIZE = 32*1024*1024;
+     // around 10 minutes at the default rpctimeout
+     public static final int MAX_CONNECT_ATTEMPTS = 8;
+ 
+-    private final PendingFile file;
++    private final StreamHeader header;
+     private final InetAddress to;
+     
+-    FileStreamTask(PendingFile file, InetAddress to)
++    FileStreamTask(StreamHeader header, InetAddress to)
+     {
+-        this.file = file;
++        this.header = header;
+         this.to = to;
+     }
+     
+@@ -74,22 +73,22 @@ public void runMayThrow() throws IOException
+             }
+         }
+         if (logger.isDebugEnabled())
+-          logger.debug("Done streaming " + file);
++          logger.debug("Done streaming " + header.getStreamFile());
+     }
+ 
+     private void stream(SocketChannel channel) throws IOException
+     {
+-        RandomAccessFile raf = new RandomAccessFile(new File(file.getFilename()), "r");
++        RandomAccessFile raf = new RandomAccessFile(new File(header.getStreamFile().getFilename()), "r");
+         try
+         {
+             FileChannel fc = raf.getChannel();
+ 
+-            ByteBuffer buffer = MessagingService.constructStreamHeader(false);
++            ByteBuffer buffer = MessagingService.constructStreamHeader(header, false);
+             channel.write(buffer);
+             assert buffer.remaining() == 0;
+             
+             // stream sections of the file as returned by PendingFile.currentSection
+-            for (Pair<Long, Long> section : file.sections)
++            for (Pair<Long, Long> section : header.getStreamFile().sections)
+             {
+                 long length = section.right - section.left;
+                 long bytesTransferred = 0;
+@@ -137,7 +136,7 @@ private SocketChannel connect() throws IOException
+                     throw e;
+ 
+                 long waitms = DatabaseDescriptor.getRpcTimeout() * (long)Math.pow(2, attempts);
+-                logger.warn("Failed attempt " + attempts + " to connect to " + to + " to stream " + file + ". Retrying in " + waitms + " ms. (" + e + ")");
++                logger.warn("Failed attempt " + attempts + " to connect to " + to + " to stream " + header.getStreamFile() + ". Retrying in " + waitms + " ms. (" + e + ")");
+                 try
+                 {
+                     Thread.sleep(waitms);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/IncomingTcpConnection.java b/cassandra/trunk/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
+index 67905080..ca1fb562 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
+@@ -28,6 +28,7 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.streaming.IncomingStreamReader;
++import org.apache.cassandra.streaming.StreamHeader;
+ 
+ public class IncomingTcpConnection extends Thread
+ {
+@@ -64,7 +65,11 @@ public void run()
+ 
+                 if (isStream)
+                 {
+-                    new IncomingStreamReader(socket.getChannel()).read();
++                    int size = input.readInt();
++                    byte[] headerBytes = new byte[size];
++                    input.readFully(headerBytes);
++                    StreamHeader streamHeader = StreamHeader.serializer().deserialize(new DataInputStream(new ByteArrayInputStream(headerBytes)));
++                    new IncomingStreamReader(streamHeader, socket.getChannel()).read();
+                 }
+                 else
+                 {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index 40e9e73c..b91ad0bc 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -22,12 +22,11 @@
+ import org.apache.cassandra.concurrent.NamedThreadFactory;
+ import org.apache.cassandra.concurrent.StageManager;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.gms.IFailureDetectionEventListener;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.net.io.SerializerType;
+ import org.apache.cassandra.net.sink.SinkManager;
+ import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.streaming.PendingFile;
++import org.apache.cassandra.streaming.StreamHeader;
+ import org.apache.cassandra.utils.ExpiringMap;
+ import org.apache.cassandra.utils.GuidGenerator;
+ import org.apache.cassandra.utils.SimpleCondition;
+@@ -340,14 +339,14 @@ public IAsyncResult sendRR(Message message, InetAddress to)
+     /**
+      * Stream a file from source to destination. This is highly optimized
+      * to not hold any of the contents of the file in memory.
+-     * @param file file to stream.
++     * @param header Header contains file to stream and other metadata.
+      * @param to endpoint to which we need to stream the file.
+     */
+ 
+-    public void stream(PendingFile file, InetAddress to)
++    public void stream(StreamHeader header, InetAddress to)
+     {
+         /* Streaming asynchronously on streamExector_ threads. */
+-        streamExecutor_.execute(new FileStreamTask(file, to));
++        streamExecutor_.execute(new FileStreamTask(header, to));
+     }
+     
+     /** blocks until the processing pools are empty and done. */
+@@ -470,7 +469,7 @@ public static ByteBuffer packIt(byte[] bytes, boolean compress)
+         return buffer;
+     }
+         
+-    public static ByteBuffer constructStreamHeader(boolean compress)
++    public static ByteBuffer constructStreamHeader(StreamHeader streamHeader, boolean compress)
+     {
+         /* 
+         Setting up the protocol header. This is 4 bytes long
+@@ -494,9 +493,29 @@ public static ByteBuffer constructStreamHeader(boolean compress)
+         header |= (version_ << 8);
+         /* Finished the protocol header setup */
+ 
+-        ByteBuffer buffer = ByteBuffer.allocate(4 + 4);
++        /* Adding the StreamHeader which contains the session Id along
++         * with the pendingfile info for the stream.
++         * | Session Id | Pending File Size | Pending File | Bool more files |
++         * | No. of Pending files | Pending Files ... |
++         */
++        byte[] bytes;
++        try
++        {
++            DataOutputBuffer buffer = new DataOutputBuffer();
++            StreamHeader.serializer().serialize(streamHeader, buffer);
++            bytes = buffer.getData();
++        }
++        catch (IOException e)
++        {
++            throw new RuntimeException(e);
++        }
++        assert bytes.length > 0;
++
++        ByteBuffer buffer = ByteBuffer.allocate(4 + 4 + 4 + bytes.length);
+         buffer.putInt(PROTOCOL_MAGIC);
+         buffer.putInt(header);
++        buffer.putInt(bytes.length);
++        buffer.put(bytes);
+         buffer.flip();
+         return buffer;
+     }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+index b49edf0a..6506f269 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+@@ -40,6 +40,7 @@
+ import org.apache.cassandra.io.AbstractCompactedRow;
+ import org.apache.cassandra.io.ICompactSerializer;
+ import org.apache.cassandra.io.sstable.SSTableReader;
++import org.apache.cassandra.streaming.StreamContext;
+ import org.apache.cassandra.streaming.StreamIn;
+ import org.apache.cassandra.streaming.StreamOut;
+ import org.apache.cassandra.net.CompactEndpointSerializationHelper;
+@@ -536,8 +537,9 @@ void performStreamingRepair() throws IOException
+                 {
+                     protected void runMayThrow() throws Exception
+                     {
+-                        StreamOut.transferSSTables(request.endpoint, request.cf.left, sstables, ranges);
+-                        StreamOutManager.remove(request.endpoint);
++                        StreamContext context = new StreamContext(request.endpoint);
++                        StreamOut.transferSSTables(context, request.cf.left, sstables, ranges);
++                        StreamOutManager.remove(context);
+                     }
+                 });
+                 // request ranges from the remote node
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index ee7fe8e0..74000ba1 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -109,9 +109,9 @@
+         READ_REPAIR,
+         READ,
+         READ_RESPONSE,
+-        STREAM_INITIATE,
+-        STREAM_INITIATE_DONE,
+-        STREAM_FINISHED,
++        STREAM_INITIATE, // Deprecated
++        STREAM_INITIATE_DONE, // Deprecated
++        STREAM_STATUS,
+         STREAM_REQUEST,
+         RANGE_SLICE,
+         BOOTSTRAP_TOKEN,
+@@ -236,9 +236,7 @@ public StorageService()
+         // see BootStrapper for a summary of how the bootstrap verbs interact
+         MessagingService.instance.registerVerbHandlers(Verb.BOOTSTRAP_TOKEN, new BootStrapper.BootstrapTokenVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.STREAM_REQUEST, new StreamRequestVerbHandler() );
+-        MessagingService.instance.registerVerbHandlers(Verb.STREAM_INITIATE, new StreamInitiateVerbHandler());
+-        MessagingService.instance.registerVerbHandlers(Verb.STREAM_INITIATE_DONE, new StreamInitiateDoneVerbHandler());
+-        MessagingService.instance.registerVerbHandlers(Verb.STREAM_FINISHED, new StreamFinishedVerbHandler());
++        MessagingService.instance.registerVerbHandlers(Verb.STREAM_STATUS, new StreamStatusVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.READ_RESPONSE, new ResponseVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.TREE_REQUEST, new TreeRequestVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.TREE_RESPONSE, new AntiEntropyService.TreeResponseVerbHandler());
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
+index bfedd3c5..2c2c662d 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatus.java
+@@ -33,51 +33,60 @@
+ 
+ class FileStatus
+ {
+-    private static ICompactSerializer<FileStatus> serializer_;
++    private static ICompactSerializer<FileStatus> serializer;
+ 
+     static enum Action
+     {
+         // was received successfully, and can be deleted from the source node
+         DELETE,
+         // needs to be streamed (or restreamed)
+-        STREAM
++        STREAM,
++        // No matching Ranges, this should not happen in almost all cases
++        EMPTY
+     }
+ 
+     static
+     {
+-        serializer_ = new FileStatusSerializer();
++        serializer = new FileStatusSerializer();
+     }
+ 
+     public static ICompactSerializer<FileStatus> serializer()
+     {
+-        return serializer_;
++        return serializer;
+     }
+ 
+-    private final String file_;
+-    private Action action_;
++    private final long sessionId;
++    private final String file;
++    private Action action;
+ 
+     /**
+      * Create a FileStatus with the default Action: STREAM.
+      */
+-    public FileStatus(String file)
++    public FileStatus(String file, long sessionId)
+     {
+-        file_ = file;
+-        action_ = Action.STREAM;
++        this.file = file;
++        this.action = Action.STREAM;
++        this.sessionId = sessionId;
+     }
+ 
+     public String getFile()
+     {
+-        return file_;
++        return file;
+     }
+ 
+     public void setAction(Action action)
+     {
+-        action_ = action;
++        this.action = action;
+     }
+ 
+     public Action getAction()
+     {
+-        return action_;
++        return action;
++    }
++
++    public long getSessionId()
++    {
++        return sessionId;
+     }
+ 
+     public Message makeStreamStatusMessage() throws IOException
+@@ -85,27 +94,31 @@ public Message makeStreamStatusMessage() throws IOException
+         ByteArrayOutputStream bos = new ByteArrayOutputStream();
+         DataOutputStream dos = new DataOutputStream( bos );
+         FileStatus.serializer().serialize(this, dos);
+-        return new Message(FBUtilities.getLocalAddress(), "", StorageService.Verb.STREAM_FINISHED, bos.toByteArray());
++        return new Message(FBUtilities.getLocalAddress(), "", StorageService.Verb.STREAM_STATUS, bos.toByteArray());
+     }
+ 
+     private static class FileStatusSerializer implements ICompactSerializer<FileStatus>
+     {
+         public void serialize(FileStatus streamStatus, DataOutputStream dos) throws IOException
+         {
++            dos.writeLong(streamStatus.getSessionId());
+             dos.writeUTF(streamStatus.getFile());
+             dos.writeInt(streamStatus.getAction().ordinal());
+         }
+ 
+         public FileStatus deserialize(DataInputStream dis) throws IOException
+         {
++            long sessionId = dis.readLong();
+             String targetFile = dis.readUTF();
+-            FileStatus streamStatus = new FileStatus(targetFile);
++            FileStatus streamStatus = new FileStatus(targetFile, sessionId);
+ 
+             int ordinal = dis.readInt();
+             if (ordinal == Action.DELETE.ordinal())
+                 streamStatus.setAction(Action.DELETE);
+             else if (ordinal == Action.STREAM.ordinal())
+                 streamStatus.setAction(Action.STREAM);
++            else if (ordinal == Action.EMPTY.ordinal())
++                streamStatus.setAction(Action.EMPTY);
+             else
+                 throw new IOException("Bad FileStatus.Action: " + ordinal);
+ 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+index 241041ee..dd0c55c0 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/FileStatusHandler.java
+@@ -20,18 +20,15 @@
+ package org.apache.cassandra.streaming;
+ 
+ import java.io.IOException;
+-import java.net.InetAddress;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.io.sstable.Descriptor;
+-import org.apache.cassandra.io.sstable.SSTable;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.sstable.SSTableWriter;
+ import org.apache.cassandra.net.MessagingService;
+-import org.apache.cassandra.service.StorageService;
+ 
+ /**
+  * This is the callback handler that is invoked on the receiving node when a file changes status from RECEIVE to either
+@@ -41,18 +38,28 @@
+ {
+     private static Logger logger = LoggerFactory.getLogger(FileStatusHandler.class);
+ 
+-    public void onStatusChange(InetAddress host, PendingFile pendingFile, FileStatus streamStatus) throws IOException
++    public static void onStatusChange(StreamContext context, PendingFile pendingFile, FileStatus streamStatus) throws IOException
+     {
+         if (FileStatus.Action.STREAM == streamStatus.getAction())
+         {
+             // file needs to be restreamed
+-            logger.warn("Streaming of file " + pendingFile + " from " + host + " failed: requesting a retry.");
+-            MessagingService.instance.sendOneWay(streamStatus.makeStreamStatusMessage(), host);
++            logger.warn("Streaming of file {} from {} failed: requesting a retry.", pendingFile, context);
++            MessagingService.instance.sendOneWay(streamStatus.makeStreamStatusMessage(), context.host);
+             return;
+         }
+         assert FileStatus.Action.DELETE == streamStatus.getAction() :
+             "Unknown stream action: " + streamStatus.getAction();
+ 
++        addSSTable(pendingFile);
++
++        // send a StreamStatus message telling the source node it can delete this file
++        if (logger.isDebugEnabled())
++            logger.debug("Sending a streaming finished message for {} to {}", pendingFile, context);
++        MessagingService.instance.sendOneWay(streamStatus.makeStreamStatusMessage(), context.host);
++    }
++
++    public static void addSSTable(PendingFile pendingFile)
++    {
+         // file was successfully streamed
+         Descriptor desc = pendingFile.desc;
+         try
+@@ -63,19 +70,8 @@ public void onStatusChange(InetAddress host, PendingFile pendingFile, FileStatus
+         }
+         catch (IOException e)
+         {
+-            logger.error("Failed adding " + pendingFile, e);
++            logger.error("Failed adding {}", pendingFile, e);
+             throw new RuntimeException("Not able to add streamed file " + pendingFile.getFilename(), e);
+         }
+-
+-        // send a StreamStatus message telling the source node it can delete this file
+-        if (logger.isDebugEnabled())
+-            logger.debug("Sending a streaming finished message for " + pendingFile + " to " + host);
+-        MessagingService.instance.sendOneWay(streamStatus.makeStreamStatusMessage(), host);
+-
+-        // if all files have been received from this host, remove from bootstrap sources
+-        if (StreamInManager.isDone(host) && StorageService.instance.isBootstrapMode())
+-        {
+-            StorageService.instance.removeBootstrapSource(host, pendingFile.desc.ksname);
+-        }
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index 15f3dc67..b5e7fd48 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -19,7 +19,6 @@
+ package org.apache.cassandra.streaming;
+ 
+ import java.net.InetSocketAddress;
+-import java.net.InetAddress;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.SocketChannel;
+ import java.io.*;
+@@ -28,35 +27,45 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.io.util.FileUtils;
+-import org.apache.cassandra.net.FileStreamTask;
+ import org.apache.cassandra.utils.Pair;
+ 
+ public class IncomingStreamReader
+ {
+     private static Logger logger = LoggerFactory.getLogger(IncomingStreamReader.class);
+     private PendingFile pendingFile;
++    private PendingFile lastFile;
+     private FileStatus streamStatus;
+     private SocketChannel socketChannel;
++    private StreamContext context;
++    private boolean initiatedTransfer;
+ 
+-    public IncomingStreamReader(SocketChannel socketChannel)
++    public IncomingStreamReader(StreamHeader header, SocketChannel socketChannel) throws IOException
+     {
+         this.socketChannel = socketChannel;
+         InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+-        // this is the part where we are assuming files come in order from a particular host. it is brittle because
+-        // any node could send a stream message to this host and it would just assume it is receiving the next file.
+-        pendingFile = StreamInManager.getNextIncomingFile(remoteAddress.getAddress());
+-        StreamInManager.activeStreams.put(remoteAddress.getAddress(), pendingFile);
++        // pendingFile gets the new context for the local node.
++        pendingFile = StreamIn.getContextMapping(header.getStreamFile());
++        // lastFile has the old context, which was registered in the manager.
++        lastFile = header.getStreamFile();
++        initiatedTransfer = header.initiatedTransfer;
++        context = new StreamContext(remoteAddress.getAddress(), header.getSessionId());
++        StreamInManager.activeStreams.put(context, pendingFile);
+         assert pendingFile != null;
+-        streamStatus = StreamInManager.getStreamStatus(remoteAddress.getAddress());
+-        assert streamStatus != null;
++        // For transfers setup the status and for replies to requests, prepare the list
++        // of available files to request.
++        if (initiatedTransfer)
++            streamStatus = new FileStatus(lastFile.getFilename(), header.getSessionId());
++        else if (header.getPendingFiles() != null)
++            StreamInManager.get(context).addFilesToRequest(header.getPendingFiles());
+     }
+ 
+     public void read() throws IOException
+     {
+-        logger.debug("Receiving stream");
+-        InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+         if (logger.isDebugEnabled())
+-          logger.debug("Creating file for " + pendingFile.getFilename());
++        {
++            logger.debug("Receiving stream");
++            logger.debug("Creating file for {}", pendingFile.getFilename());
++        }
+         FileOutputStream fos = new FileOutputStream(pendingFile.getFilename(), true);
+         FileChannel fc = fos.getChannel();
+ 
+@@ -76,8 +85,11 @@ public void read() throws IOException
+         {
+             logger.debug("Receiving stream: recovering from IO error");
+             /* Ask the source node to re-stream this file. */
+-            streamStatus.setAction(FileStatus.Action.STREAM);
+-            handleFileStatus(remoteAddress.getAddress());
++            if (initiatedTransfer)
++                handleFileStatus(FileStatus.Action.STREAM);
++            else
++                StreamIn.requestFile(context, lastFile);
++
+             /* Delete the orphaned file. */
+             FileUtils.deleteWithConfirm(new File(pendingFile.getFilename()));
+             throw ex;
+@@ -85,23 +97,23 @@ public void read() throws IOException
+         finally
+         {
+             fc.close();
+-            StreamInManager.activeStreams.remove(remoteAddress.getAddress(), pendingFile);
++            StreamInManager.activeStreams.remove(context, pendingFile);
+         }
+ 
+         if (logger.isDebugEnabled())
+-            logger.debug("Removing stream context " + pendingFile);
+-        streamStatus.setAction(FileStatus.Action.DELETE);
+-        handleFileStatus(remoteAddress.getAddress());
++            logger.debug("Removing stream context {}", pendingFile);
++        if (initiatedTransfer)
++            handleFileStatus(FileStatus.Action.DELETE);
++        else
++        {
++            FileStatusHandler.addSSTable(pendingFile);
++            StreamInManager.get(context).finishAndRequestNext(lastFile);
++        }
+     }
+ 
+-    private void handleFileStatus(InetAddress remoteHost) throws IOException
++    private void handleFileStatus(FileStatus.Action action) throws IOException
+     {
+-        /*
+-         * Streaming is complete. If all the data that has to be received inform the sender via
+-         * the stream completion callback so that the source may perform the requisite cleanup.
+-        */
+-        FileStatusHandler handler = StreamInManager.getFileStatusHandler(remoteHost);
+-        if (handler != null)
+-            handler.onStatusChange(remoteHost, pendingFile, streamStatus);
++        streamStatus.setAction(action);
++        FileStatusHandler.onStatusChange(context, pendingFile, streamStatus);
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamContext.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamContext.java
+index e69de29b..a6103799 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamContext.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamContext.java
+@@ -0,0 +1,80 @@
++package org.apache.cassandra.streaming;
++
++/*
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ */
++
++import java.net.InetAddress;
++
++import org.apache.commons.lang.builder.EqualsBuilder;
++import org.apache.commons.lang.builder.HashCodeBuilder;
++
++public class StreamContext
++{
++    public final InetAddress host;
++    public final long sessionId;
++
++    public StreamContext(InetAddress host, long sessionId)
++    {
++        this.host = host;
++        this.sessionId = sessionId;
++    }
++
++    public StreamContext(InetAddress host)
++    {
++        this.host = host;
++        this.sessionId = generateSessionId();
++    }
++
++    private static long generateSessionId()
++    {
++        return System.nanoTime();
++    }
++
++    public String toString()
++    {
++        return new String(host + " - " + sessionId);
++    }
++
++    public boolean equals(Object obj)
++    {
++        if (obj == this)
++        {
++            return true;
++        }
++        else if (obj == null || obj.getClass() != getClass())
++        {
++            return false;
++        }
++        StreamContext context = (StreamContext) obj;
++        return new EqualsBuilder().
++                    append(host, context.host).
++                    append(sessionId, context.sessionId).
++                    isEquals();
++    }
++
++    public int hashCode()
++    {
++        return new HashCodeBuilder(119, 5971).
++                    append(host).
++                    append(sessionId).
++                    toHashCode();
++    }
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
+index 2c3c39b3..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamFinishedVerbHandler.java
+@@ -1,69 +0,0 @@
+-package org.apache.cassandra.streaming;
+-/*
+- * 
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the License is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+- * KIND, either express or implied.  See the License for the
+- * specific language governing permissions and limitations
+- * under the License.
+- * 
+- */
+-
+-
+-import java.io.ByteArrayInputStream;
+-import java.io.DataInputStream;
+-import java.io.IOError;
+-import java.io.IOException;
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import org.apache.cassandra.net.IVerbHandler;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.streaming.StreamOutManager;
+-
+-public class StreamFinishedVerbHandler implements IVerbHandler
+-{
+-    private static Logger logger = LoggerFactory.getLogger(StreamFinishedVerbHandler.class);
+-
+-    public void doVerb(Message message)
+-    {
+-        byte[] body = message.getMessageBody();
+-        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+-
+-        try
+-        {
+-            FileStatus streamStatus = FileStatus.serializer().deserialize(new DataInputStream(bufIn));
+-
+-            switch (streamStatus.getAction())
+-            {
+-                case DELETE:
+-                    StreamOutManager.get(message.getFrom()).finishAndStartNext();
+-                    break;
+-
+-                case STREAM:
+-                    logger.warn("Need to re-stream file " + streamStatus.getFile() + " to " + message.getFrom());
+-                    StreamOutManager.get(message.getFrom()).startNext();
+-                    break;
+-
+-                default:
+-                    throw new RuntimeException("Cannot handle FileStatus.Action: " + streamStatus.getAction());
+-            }
+-        }
+-        catch (IOException ex)
+-        {
+-            throw new IOError(ex);
+-        }
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamHeader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamHeader.java
+index e69de29b..3d94f112 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamHeader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamHeader.java
+@@ -0,0 +1,131 @@
++package org.apache.cassandra.streaming;
++
++/*
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ */
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.cassandra.io.ICompactSerializer;
++
++public class StreamHeader
++{
++    private static ICompactSerializer<StreamHeader> serializer;
++
++    static
++    {
++        serializer = new StreamHeaderSerializer();
++    }
++
++    public static ICompactSerializer<StreamHeader> serializer()
++    {
++        return serializer;
++    }
++
++    private PendingFile file;
++    private long sessionId;
++    
++    // indicates an initiated transfer as opposed to a request
++    protected final boolean initiatedTransfer;
++    
++    // this list will only be non-null when the first of a batch of files are being sent. it avoids having to have
++    // a separate message indicating which files to expect.
++    private final List<PendingFile> pending;
++
++    public StreamHeader(long sessionId, PendingFile file, boolean initiatedTransfer)
++    {
++        this.sessionId = sessionId;
++        this.file = file;
++        this.initiatedTransfer = initiatedTransfer;
++        pending = null;
++    }
++
++    public StreamHeader(long sessionId, PendingFile file, List<PendingFile> pending, boolean initiatedTransfer)
++    {
++        this.sessionId  = sessionId;
++        this.file = file;
++        this.initiatedTransfer = initiatedTransfer;
++        this.pending = pending;
++    }
++
++    public List<PendingFile> getPendingFiles()
++    {
++        return pending;
++    }
++
++    public PendingFile getStreamFile()
++    {
++        return file;
++    }
++
++    public long getSessionId()
++    {
++        return sessionId;
++    }
++
++    private static class StreamHeaderSerializer implements ICompactSerializer<StreamHeader>
++    {
++        public void serialize(StreamHeader sh, DataOutputStream dos) throws IOException
++        {
++            dos.writeLong(sh.getSessionId());
++            PendingFile.serializer().serialize(sh.getStreamFile(), dos);
++            dos.writeBoolean(sh.initiatedTransfer);
++            if (sh.pending != null)
++            {
++                dos.writeInt(sh.getPendingFiles().size());
++                for(PendingFile file : sh.getPendingFiles())
++                {
++                    PendingFile.serializer().serialize(file, dos);
++                }
++            }
++            else
++                dos.writeInt(0);
++        }
++
++        public StreamHeader deserialize(DataInputStream dis) throws IOException
++        {
++           long sessionId = dis.readLong();
++           PendingFile file = PendingFile.serializer().deserialize(dis);
++           boolean initiatedTransfer = dis.readBoolean();
++           int size = dis.readInt();
++           StreamHeader header;
++
++           if (size > 0)
++           {
++               List<PendingFile> pendingFiles = new ArrayList<PendingFile>(size);
++               for (int i=0; i<size; i++)
++               {
++                   pendingFiles.add(PendingFile.serializer().deserialize(dis));
++               }
++               header = new StreamHeader(sessionId, file, pendingFiles, initiatedTransfer);
++           }
++           else
++           {
++               header = new StreamHeader(sessionId, file, initiatedTransfer);
++           }
++
++           return header;
++        }
++    }
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
+index fb371ebc..6825ff12 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
+@@ -21,6 +21,7 @@
+  */
+ 
+ 
++import java.io.IOException;
+ import java.net.InetAddress;
+ import java.util.Collection;
+ 
+@@ -28,7 +29,10 @@
+ import org.slf4j.LoggerFactory;
+ import org.apache.commons.lang.StringUtils;
+ 
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.io.sstable.Descriptor;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -36,18 +40,46 @@
+ /** for streaming data from other nodes in to this one */
+ public class StreamIn
+ {
+-    private static Logger logger = LoggerFactory.getLogger(StreamOut.class);
++    private static Logger logger = LoggerFactory.getLogger(StreamIn.class);
+ 
+     /**
+      * Request ranges to be transferred from source to local node
+      */
+     public static void requestRanges(InetAddress source, String tableName, Collection<Range> ranges)
+     {
++        assert ranges.size() > 0;
++
+         if (logger.isDebugEnabled())
+-            logger.debug("Requesting from " + source + " ranges " + StringUtils.join(ranges, ", "));
+-        StreamInManager.initContect(source);
+-        StreamRequestMetadata streamRequestMetadata = new StreamRequestMetadata(FBUtilities.getLocalAddress(), ranges, tableName);
+-        Message message = StreamRequestMessage.makeStreamRequestMessage(new StreamRequestMessage(streamRequestMetadata));
++            logger.debug("Requesting from {} ranges {}", source, StringUtils.join(ranges, ", "));
++        StreamContext context = new StreamContext(source);
++        StreamInManager.get(context);
++        Message message = new StreamRequestMessage(FBUtilities.getLocalAddress(), ranges, tableName, context.sessionId).makeMessage();
+         MessagingService.instance.sendOneWay(message, source);
+     }
++
++    /**
++     * Request for transferring a single file. This happens subsequent of #requestRanges() being called.
++     * @param file Pending File that needs to be transferred
++     */
++    public static void requestFile(StreamContext context, PendingFile file)
++    {
++        if (logger.isDebugEnabled())
++            logger.debug("Requesting file {} from source {}", file.getFilename(), context.host);
++        Message message = new StreamRequestMessage(FBUtilities.getLocalAddress(), file, context.sessionId).makeMessage();
++        MessagingService.instance.sendOneWay(message, context.host);
++    }
++
++    /** Translates remote files to local files by creating a local sstable per remote sstable. */
++    public static PendingFile getContextMapping(PendingFile remote) throws IOException
++    {
++        /* Create a local sstable for each remote sstable */
++        Descriptor remotedesc = remote.desc;
++
++        // new local sstable
++        Table table = Table.open(remotedesc.ksname);
++        ColumnFamilyStore cfStore = table.getColumnFamilyStore(remotedesc.cfname);
++        Descriptor localdesc = Descriptor.fromFilename(cfStore.getFlushPath());
++
++        return new PendingFile(localdesc, remote);
++     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
+index 5b5462ce..426089b4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
+@@ -19,130 +19,106 @@
+ 
+ package org.apache.cassandra.streaming;
+ 
+-import java.util.*;
+ import java.net.InetAddress;
++import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ 
+ import com.google.common.collect.HashMultimap;
+ import com.google.common.collect.Multimap;
+ import com.google.common.collect.Multimaps;
+-import org.apache.cassandra.streaming.FileStatusHandler;
++
++import org.apache.cassandra.service.StorageService;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-class StreamInManager
++/** each context gets its own StreamInManager. So there may be >1 StreamInManager per host */
++public class StreamInManager
+ {
+     private static final Logger logger = LoggerFactory.getLogger(StreamInManager.class);
+ 
+-    /* Maintain a stream context per host that is the source of the stream */
+-    public static final Map<InetAddress, List<PendingFile>> ctxBag_ = new Hashtable<InetAddress, List<PendingFile>>();
+-    /* Maintain in this map the status of the streams that need to be sent back to the source */
+-    public static final Map<InetAddress, List<FileStatus>> streamStatusBag_ = new Hashtable<InetAddress, List<FileStatus>>();
+-    /* Maintains a callback handler per endpoint to notify the app that a stream from a given endpoint has been handled */
+-    public static final Map<InetAddress, FileStatusHandler> streamNotificationHandlers_ = new HashMap<InetAddress, FileStatusHandler>();
++    private static ConcurrentMap<StreamContext, StreamInManager> streamManagers = new ConcurrentHashMap<StreamContext, StreamInManager>(0);
++    public static final Multimap<StreamContext, PendingFile> activeStreams = Multimaps.synchronizedMultimap(HashMultimap.<StreamContext, PendingFile>create());
++    public static final Multimap<InetAddress, StreamContext> sourceHosts = Multimaps.synchronizedMultimap(HashMultimap.<InetAddress, StreamContext>create());
++    
++    private final List<PendingFile> pendingFiles = new ArrayList<PendingFile>();
++    private final StreamContext context;
+ 
+-    public static final Multimap<InetAddress, PendingFile> activeStreams = Multimaps.synchronizedMultimap(HashMultimap.<InetAddress, PendingFile>create());
++    private StreamInManager(StreamContext context)
++    {
++        this.context = context;
++    }
+ 
+-    public synchronized static void initContect(InetAddress key)
++    public synchronized static StreamInManager get(StreamContext context)
++    {
++        StreamInManager manager = streamManagers.get(context);
++        if (manager == null)
+     {
+-        List<PendingFile> context = ctxBag_.get(key);
+-        if (context == null)
++            StreamInManager possibleNew = new StreamInManager(context);
++            if ((manager = streamManagers.putIfAbsent(context, possibleNew)) == null)
+         {
+-            context = new ArrayList<PendingFile>();
+-            ctxBag_.put(key, context);
++                manager = possibleNew;
++                sourceHosts.put(context.host, context);
+         }
+     }
+-    /**
+-     * gets the next file to be received given a host key.
+-     * @param key
+-     * @return next file to receive.
+-     * @throws IndexOutOfBoundsException if you are unfortunate enough to call this on an empty context. 
+-     */
+-    public synchronized static PendingFile getNextIncomingFile(InetAddress key)
+-    {        
+-        List<PendingFile> context = ctxBag_.get(key);
+-        if ( context == null )
+-            throw new IllegalStateException("Streaming context has not been set for " + key);
+-        // will thrown an IndexOutOfBoundsException if nothing is there.
+-        PendingFile pendingFile = context.remove(0);
+-        if ( context.isEmpty() )
+-            ctxBag_.remove(key);
+-        return pendingFile;
+-    }
+-    
+-    public synchronized static FileStatus getStreamStatus(InetAddress key)
+-    {
+-        List<FileStatus> status = streamStatusBag_.get(key);
+-        if ( status == null )
+-            throw new IllegalStateException("Streaming status has not been set for " + key);
+-        FileStatus streamStatus = status.remove(0);
+-        if ( status.isEmpty() )
+-            streamStatusBag_.remove(key);
+-        return streamStatus;
++        return manager;
+     }
+ 
+-    /** query method to determine which hosts are streaming to this node. */
+-    public static Set<InetAddress> getSources()
++    public void addFilesToRequest(List<PendingFile> pendingFiles)
+     {
+-        HashSet<InetAddress> set = new HashSet<InetAddress>();
+-        set.addAll(ctxBag_.keySet());
+-        set.addAll(activeStreams.keySet());
+-        return set;
+-    }
+-
+-    /** query the status of incoming files. */
+-    public static List<PendingFile> getIncomingFiles(InetAddress host)
++        for(PendingFile file : pendingFiles)
+     {
+-        // avoid returning null.
+-        List<PendingFile> list = new ArrayList<PendingFile>();
+-        if (ctxBag_.containsKey(host))
+-            list.addAll(ctxBag_.get(host));
+-        list.addAll(activeStreams.get(host));
+-        return list;
++            if(logger.isDebugEnabled())
++                logger.debug("Adding file {} to Stream Request queue", file.getFilename());
++            this.pendingFiles.add(file);
++        }
+     }
+ 
+-    /*
+-     * This method helps determine if the FileStatusHandler needs
+-     * to be invoked for the data being streamed from a source. 
++    /**
++     * Complete the transfer process of the existing file and then request
++     * the next file in the list
+     */
+-    public synchronized static boolean isDone(InetAddress key)
++    public void finishAndRequestNext(PendingFile lastFile)
+     {
+-        return (ctxBag_.get(key) == null);
+-    }
+-    
+-    public synchronized static FileStatusHandler getFileStatusHandler(InetAddress key)
++        pendingFiles.remove(lastFile);
++        if (pendingFiles.size() > 0)
++            StreamIn.requestFile(context, pendingFiles.get(0));
++        else
+     {
+-        return streamNotificationHandlers_.get(key);
++            if (StorageService.instance.isBootstrapMode())
++                StorageService.instance.removeBootstrapSource(context.host, lastFile.desc.ksname);
++            remove();
+     }
+-    
+-    public synchronized static void removeFileStatusHandler(InetAddress key)
+-    {
+-        streamNotificationHandlers_.remove(key);
+     }
+     
+-    public synchronized static void registerFileStatusHandler(InetAddress key, FileStatusHandler streamComplete)
++    public void remove()
+     {
+-        streamNotificationHandlers_.put(key, streamComplete);
++        if (streamManagers.containsKey(context))
++            streamManagers.remove(context);
++        sourceHosts.remove(context.host, context);
+     }
+     
+-    public synchronized static void addStreamContext(InetAddress key, PendingFile pendingFile, FileStatus streamStatus)
+-    {
+-        /* Record the stream context */
+-        List<PendingFile> context = ctxBag_.get(key);
+-        if ( context == null )
++    /** query method to determine which hosts are streaming to this node. */
++    public static Set<StreamContext> getSources()
+         {
+-            context = new ArrayList<PendingFile>();
+-            ctxBag_.put(key, context);
++        HashSet<StreamContext> set = new HashSet<StreamContext>();
++        set.addAll(streamManagers.keySet());
++        set.addAll(activeStreams.keySet());
++        return set;
+         }
+-        context.add(pendingFile);
+         
+-        /* Record the stream status for this stream context */
+-        List<FileStatus> status = streamStatusBag_.get(key);
+-        if ( status == null )
++    /** query the status of incoming files. */
++    public static List<PendingFile> getIncomingFiles(InetAddress host)
+         {
+-            status = new ArrayList<FileStatus>();
+-            streamStatusBag_.put(key, status);
++        // avoid returning null.
++        List<PendingFile> list = new ArrayList<PendingFile>();
++        for (StreamContext context : sourceHosts.get(host))
++        {
++            if (streamManagers.containsKey(context))
++                list.addAll(streamManagers.get(context).pendingFiles);
++            list.addAll(activeStreams.get(context));
+         }
+-        status.add( streamStatus );
++        return list;
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateDoneVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateDoneVerbHandler.java
+index f48a2f53..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateDoneVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateDoneVerbHandler.java
+@@ -1,41 +0,0 @@
+-package org.apache.cassandra.streaming;
+-/*
+- * 
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the License is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+- * KIND, either express or implied.  See the License for the
+- * specific language governing permissions and limitations
+- * under the License.
+- * 
+- */
+-
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import org.apache.cassandra.net.IVerbHandler;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.streaming.StreamOutManager;
+-
+-public class StreamInitiateDoneVerbHandler implements IVerbHandler
+-{
+-    private static Logger logger = LoggerFactory.getLogger(StreamInitiateDoneVerbHandler.class);
+-
+-    public void doVerb(Message message)
+-    {
+-        if (logger.isDebugEnabled())
+-          logger.debug("Received a stream initiate done message ...");
+-        StreamOutManager.get(message.getFrom()).startNext();
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateMessage.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateMessage.java
+index 9f7577e2..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateMessage.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateMessage.java
+@@ -1,86 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.streaming;
+-
+-import java.io.ByteArrayOutputStream;
+-import java.io.DataInputStream;
+-import java.io.DataOutputStream;
+-import java.io.IOException;
+-
+-import org.apache.cassandra.io.ICompactSerializer;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.streaming.PendingFile;
+-import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.utils.FBUtilities;
+-
+-class StreamInitiateMessage
+-{
+-    private static ICompactSerializer<StreamInitiateMessage> serializer_;
+-
+-    static
+-    {
+-        serializer_ = new StreamInitiateMessageSerializer();
+-    }
+-    
+-    public static ICompactSerializer<StreamInitiateMessage> serializer()
+-    {
+-        return serializer_;
+-    }
+-    
+-    public static Message makeStreamInitiateMessage(StreamInitiateMessage biMessage) throws IOException
+-    {
+-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+-        DataOutputStream dos = new DataOutputStream( bos );
+-        StreamInitiateMessage.serializer().serialize(biMessage, dos);
+-        return new Message(FBUtilities.getLocalAddress(), "", StorageService.Verb.STREAM_INITIATE, bos.toByteArray() );
+-    }
+-    
+-    protected PendingFile[] streamContexts_ = new PendingFile[0];
+-   
+-    public StreamInitiateMessage(PendingFile[] pendingFiles)
+-    {
+-        streamContexts_ = pendingFiles;
+-    }
+-    
+-    public PendingFile[] getStreamContext()
+-    {
+-        return streamContexts_;
+-    }
+-
+-    private static class StreamInitiateMessageSerializer implements ICompactSerializer<StreamInitiateMessage>
+-    {
+-        public void serialize(StreamInitiateMessage bim, DataOutputStream dos) throws IOException
+-        {
+-            dos.writeInt(bim.streamContexts_.length);
+-            for ( PendingFile pendingFile : bim.streamContexts_ )
+-            {
+-                PendingFile.serializer().serialize(pendingFile, dos);
+-            }
+-        }
+-
+-        public StreamInitiateMessage deserialize(DataInputStream dis) throws IOException
+-        {
+-            int size = dis.readInt();
+-            PendingFile[] pendingFiles = new PendingFile[size];
+-            for (int i = 0; i < size; i++)
+-                pendingFiles[i] = PendingFile.serializer().deserialize(dis);
+-            return new StreamInitiateMessage(pendingFiles);
+-        }
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+index 7a2b26f7..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInitiateVerbHandler.java
+@@ -1,129 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the License is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+- * KIND, either express or implied.  See the License for the
+- * specific language governing permissions and limitations
+- * under the License.
+- */
+-
+-package org.apache.cassandra.streaming;
+-
+-import java.io.*;
+-import java.net.InetAddress;
+-import java.util.*;
+-
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import org.apache.cassandra.db.ColumnFamilyStore;
+-import org.apache.cassandra.db.Table;
+-import org.apache.cassandra.io.sstable.Descriptor;
+-import org.apache.cassandra.net.IVerbHandler;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.net.MessagingService;
+-import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.utils.FBUtilities;
+-
+-public class StreamInitiateVerbHandler implements IVerbHandler
+-{
+-    private static Logger logger = LoggerFactory.getLogger(StreamInitiateVerbHandler.class);
+-
+-    /*
+-     * Here we handle the StreamInitiateMessage. Here we get the
+-     * array of StreamContexts. We get file names for the column
+-     * families associated with the files and replace them with the
+-     * file names as obtained from the column family store on the
+-     * receiving end.
+-    */
+-    public void doVerb(Message message)
+-    {
+-        byte[] body = message.getMessageBody();
+-        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+-        if (logger.isDebugEnabled())
+-            logger.debug(String.format("StreamInitiateVerbeHandler.doVerb %s %s %s", message.getVerb(), message.getMessageId(), message.getMessageType()));
+-
+-        try
+-        {
+-            StreamInitiateMessage biMsg = StreamInitiateMessage.serializer().deserialize(new DataInputStream(bufIn));
+-            PendingFile[] pendingFiles = biMsg.getStreamContext();
+-
+-            if (pendingFiles.length == 0)
+-            {
+-                if (logger.isDebugEnabled())
+-                    logger.debug("no data needed from " + message.getFrom());
+-                if (StorageService.instance.isBootstrapMode())
+-                    StorageService.instance.removeBootstrapSource(message.getFrom(), new String(message.getHeader(StreamOut.TABLE_NAME)));
+-                return;
+-            }
+-
+-            /*
+-             * For each of the remote files in the incoming message
+-             * generate a local pendingFile and store it in the StreamInManager.
+-             */
+-            for (Map.Entry<PendingFile, PendingFile> pendingFile : getContextMapping(pendingFiles).entrySet())
+-            {
+-                PendingFile remoteFile = pendingFile.getKey();
+-                PendingFile localFile = pendingFile.getValue();
+-
+-                FileStatus streamStatus = new FileStatus(remoteFile.getFilename());
+-
+-                if (logger.isDebugEnabled())
+-                  logger.debug("Preparing to receive stream from " + message.getFrom() + ": " + remoteFile + " -> " + localFile);
+-                addStreamContext(message.getFrom(), localFile, streamStatus);
+-            }
+-
+-            StreamInManager.registerFileStatusHandler(message.getFrom(), new FileStatusHandler());
+-            if (logger.isDebugEnabled())
+-              logger.debug("Sending a stream initiate done message ...");
+-            Message doneMessage = new Message(FBUtilities.getLocalAddress(), "", StorageService.Verb.STREAM_INITIATE_DONE, new byte[0] );
+-            MessagingService.instance.sendOneWay(doneMessage, message.getFrom());
+-        }
+-        catch (IOException ex)
+-        {
+-            throw new IOError(ex);
+-        }
+-    }
+-
+-    /**
+-     * Translates remote files to local files by creating a local sstable
+-     * per remote sstable.
+-     */
+-    public LinkedHashMap<PendingFile, PendingFile> getContextMapping(PendingFile[] remoteFiles) throws IOException
+-    {
+-        /* Create a local sstable for each remote sstable */
+-        LinkedHashMap<PendingFile, PendingFile> mapping = new LinkedHashMap<PendingFile, PendingFile>();
+-        for (PendingFile remote : remoteFiles)
+-        {
+-            Descriptor remotedesc = remote.desc;
+-
+-            // new local sstable
+-            Table table = Table.open(remotedesc.ksname);
+-            ColumnFamilyStore cfStore = table.getColumnFamilyStore(remotedesc.cfname);
+-
+-            Descriptor localdesc = Descriptor.fromFilename(cfStore.getFlushPath());
+-
+-            // add a local file for this component
+-            mapping.put(remote, new PendingFile(localdesc, remote));
+-        }
+-
+-        return mapping;
+-    }
+-
+-    private void addStreamContext(InetAddress host, PendingFile pendingFile, FileStatus streamStatus)
+-    {
+-        if (logger.isDebugEnabled())
+-          logger.debug("Adding stream context " + pendingFile + " for " + host + " ...");
+-        StreamInManager.addStreamContext(host, pendingFile, streamStatus);
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+index f9cbe120..969acaaa 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+@@ -22,7 +22,6 @@
+ import java.net.InetAddress;
+ import java.util.*;
+ import java.io.IOException;
+-import java.io.File;
+ import java.io.IOError;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+@@ -43,15 +42,16 @@
+ /**
+  * This class handles streaming data from one node to another.
+  *
+- * For bootstrap,
+- *  1. BOOTSTRAP_TOKEN asks the most-loaded node what Token to use to split its Range in two.
+- *  2. STREAM_REQUEST tells source nodes to send us the necessary Ranges
+- *  3. source nodes send STREAM_INITIATE to us to say "get ready to receive data" [if there is data to send]
+- *  4. when we have everything set up to receive the data, we send STREAM_INITIATE_DONE back to the source nodes and they start streaming
+- *  5. when streaming is complete, we send STREAM_FINISHED to the source so it can clean up on its end
++ * For StreamingRepair and Unbootstrap
++ *  1. The ranges are transferred on a single file basis.
++ *  2. Each transfer has the header information for the sstable being transferred.
++ *  3. List of the pending files are maintained, as this is the source node.
++ *
++ * For StreamRequests
++ *  1. The ranges are compiled and the first file transferred.
++ *  2. The header contains the first file info + all the remaining pending files info.
++ *  3. List of the pending files are not maintained, that will be maintained by the destination node
+  *
+- * For unbootstrap, the leaving node starts with step 3 (1 and 2 are skipped entirely).  This is why
+- * STREAM_INITIATE is a separate verb, rather than just a reply to STREAM_REQUEST; the REQUEST is optional.
+  */
+ public class StreamOut
+ {
+@@ -66,20 +66,39 @@ public static void transferRanges(InetAddress target, String tableName, Collecti
+     {
+         assert ranges.size() > 0;
+         
++        StreamContext context = new StreamContext(target);
+         // this is so that this target shows up as a destination while anticompaction is happening.
+-        StreamOutManager.pendingDestinations.add(target);
++        StreamOutManager.get(context);
++
++        logger.info("Beginning transfer process to {} for ranges {}", context, StringUtils.join(ranges, ", "));
+ 
+-        logger.info("Beginning transfer process to " + target + " for ranges " + StringUtils.join(ranges, ", "));
++        try
++        {
++            Table table = flushSSTable(tableName);
++            // send the matching portion of every sstable in the keyspace
++            transferSSTables(context, tableName, table.getAllSSTables(), ranges);
++        }
++        catch (IOException e)
++        {
++            throw new IOError(e);
++        }
++        finally
++        {
++            StreamOutManager.remove(context);
++        }
++        if (callback != null)
++            callback.run();
++    }
+ 
+-        /*
++    /**
+          * (1) dump all the memtables to disk.
+          * (2) determine the minimal file sections we need to send for the given ranges
+          * (3) transfer the data.
+         */
+-        try
++    private static Table flushSSTable(String tableName) throws IOException
+         {
+             Table table = Table.open(tableName);
+-            logger.info("Flushing memtables for " + tableName + "...");
++        logger.info("Flushing memtables for {}...", tableName);
+             for (Future f : table.flush())
+             {
+                 try
+@@ -95,17 +114,29 @@ public static void transferRanges(InetAddress target, String tableName, Collecti
+                     throw new RuntimeException(e);
+                 }
+             }
++        return table;
++    }
++
++    /**
++     * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
++    */
++    public static void transferRangesForRequest(StreamContext context, String tableName, Collection<Range> ranges, Runnable callback)
++    {
++        assert ranges.size() > 0;
++
++        logger.info("Beginning transfer process to {} for ranges {}", context, StringUtils.join(ranges, ", "));
++
++        try
++        {
++            Table table = flushSSTable(tableName);
+             // send the matching portion of every sstable in the keyspace
+-            transferSSTables(target, tableName, table.getAllSSTables(), ranges);
++            transferSSTablesForRequest(context, tableName, table.getAllSSTables(), ranges);
+         }
+         catch (IOException e)
+         {
+             throw new IOError(e);
+         }
+-        finally
+-        {
+-            StreamOutManager.remove(target);
+-        }
++
+         if (callback != null)
+             callback.run();
+     }
+@@ -113,10 +144,56 @@ public static void transferRanges(InetAddress target, String tableName, Collecti
+     /**
+      * Transfers matching portions of a group of sstables from a single table to the target endpoint.
+      */
+-    public static void transferSSTables(InetAddress target, String table, Collection<SSTableReader> sstables, Collection<Range> ranges) throws IOException
++    public static void transferSSTables(StreamContext context, String table, Collection<SSTableReader> sstables, Collection<Range> ranges) throws IOException
++    {
++        List<PendingFile> pending = createPendingFiles(sstables, ranges);
++
++        if (pending.size() > 0)
++        {
++            StreamHeader header = new StreamHeader(context.sessionId, pending.get(0), true);
++            StreamOutManager.get(context).addFilesToStream(pending);
++
++            logger.info("Streaming file {} to {}", header.getStreamFile(), context.host);
++            MessagingService.instance.stream(header, context.host);
++
++            logger.info("Waiting for transfer to {} to complete", context);
++            StreamOutManager.get(context).waitForStreamCompletion();
++            logger.info("Done with transfer to {}", context);
++        }
++    }
++
++    /**
++     * Transfers the first file for matching portions of a group of sstables and appends a list of other files
++     * to the header for the requesting destination to take control of the rest of the transfers
++     */
++    private static void transferSSTablesForRequest(StreamContext context, String table, Collection<SSTableReader> sstables, Collection<Range> ranges) throws IOException
++    {
++        List<PendingFile> pending = createPendingFiles(sstables, ranges);
++        if (pending.size() > 0)
++        {
++            StreamHeader header = new StreamHeader(context.sessionId, pending.get(0), pending, false);
++            // In case this happens to be a re-request due to some error condition on the destination side
++            if (StreamOutManager.getPendingFiles(context).size() == 0)
++                StreamOutManager.get(context).addFilesToStream(pending);
++
++            logger.info("Streaming file {} to {}", header.getStreamFile(), context.host);
++            MessagingService.instance.stream(header, context.host);
++            StreamOutManager.get(context).removePending(header.getStreamFile());
++        }
++        else
++        {
++            FileStatus status = new FileStatus("", context.sessionId);
++            status.setAction(FileStatus.Action.EMPTY);
++            Message message = status.makeStreamStatusMessage();
++            message.setHeader(StreamOut.TABLE_NAME, table.getBytes());
++            MessagingService.instance.sendOneWay(message, context.host);
++        }
++    }
++
++    // called prior to sending anything.
++    private static List<PendingFile> createPendingFiles(Collection<SSTableReader> sstables, Collection<Range> ranges)
+     {
+         List<PendingFile> pending = new ArrayList<PendingFile>();
+-        int i = 0;
+         for (SSTableReader sstable : sstables)
+         {
+             Descriptor desc = sstable.getDescriptor();
+@@ -125,23 +202,7 @@ public static void transferSSTables(InetAddress target, String table, Collection
+                 continue;
+             pending.add(new PendingFile(desc, SSTable.COMPONENT_DATA, sections));
+         }
+-        logger.info("Stream context metadata " + pending + " " + sstables.size() + " sstables.");
+-
+-        PendingFile[] pendingFiles = pending.toArray(new PendingFile[pending.size()]);
+-        StreamOutManager.get(target).addFilesToStream(pendingFiles);
+-        StreamInitiateMessage biMessage = new StreamInitiateMessage(pendingFiles);
+-        Message message = StreamInitiateMessage.makeStreamInitiateMessage(biMessage);
+-        message.setHeader(StreamOut.TABLE_NAME, table.getBytes());
+-        logger.info("Sending a stream initiate message to " + target + " ...");
+-        MessagingService.instance.sendOneWay(message, target);
+-
+-        if (pendingFiles.length > 0)
+-        {
+-            logger.info("Waiting for transfer to " + target + " to complete");
+-            StreamOutManager.get(target).waitForStreamCompletion();
+-            // todo: it would be good if there were a dafe way to remove the StreamManager for target.
+-            // (StreamManager will delete the streamed file on completion.)
+-            logger.info("Done with transfer to " + target);
+-        }
++        logger.info("Stream context metadata {}, {} sstables.", pending, sstables.size());
++        return pending;
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+index 168bcddb..f1624dd0 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+@@ -18,8 +18,8 @@
+ 
+ package org.apache.cassandra.streaming;
+ 
+-import java.io.File;
+ import java.io.IOException;
++import java.net.InetAddress;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
+@@ -30,17 +30,16 @@
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ 
+-import java.net.InetAddress;
+-
+ import org.apache.cassandra.net.MessagingService;
+-import org.apache.cassandra.utils.FBUtilities;
+-import org.apache.cassandra.io.util.FileUtils;
+-import org.apache.cassandra.utils.Pair;
+ import org.apache.cassandra.utils.SimpleCondition;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import com.google.common.collect.HashMultimap;
++import com.google.common.collect.Multimap;
++import com.google.common.collect.Multimaps;
++
+ /**
+  * This class manages the streaming of multiple files one after the other.
+ */
+@@ -48,34 +47,39 @@
+ {   
+     private static Logger logger = LoggerFactory.getLogger( StreamOutManager.class );
+         
+-    private static ConcurrentMap<InetAddress, StreamOutManager> streamManagers = new ConcurrentHashMap<InetAddress, StreamOutManager>();
+-    public static final Set<InetAddress> pendingDestinations = Collections.synchronizedSet(new HashSet<InetAddress>());
++    // one host may have multiple stream contexts (think of them as sessions). each context gets its own manager.
++    private static ConcurrentMap<StreamContext, StreamOutManager> streamManagers = new ConcurrentHashMap<StreamContext, StreamOutManager>();
++    public static final Multimap<InetAddress, StreamContext> destHosts = Multimaps.synchronizedMultimap(HashMultimap.<InetAddress, StreamContext>create());
+ 
+-    public static StreamOutManager get(InetAddress to)
++    public static StreamOutManager get(StreamContext context)
+     {
+-        StreamOutManager manager = streamManagers.get(to);
++        StreamOutManager manager = streamManagers.get(context);
+         if (manager == null)
+         {
+-            StreamOutManager possibleNew = new StreamOutManager(to);
+-            if ((manager = streamManagers.putIfAbsent(to, possibleNew)) == null)
++            StreamOutManager possibleNew = new StreamOutManager(context);
++            if ((manager = streamManagers.putIfAbsent(context, possibleNew)) == null)
++            {
+                 manager = possibleNew;
++                destHosts.put(context.host, context);
++            }
+         }
+         return manager;
+     }
+     
+-    public static void remove(InetAddress to)
++    public static void remove(StreamContext context)
++    {
++        if (streamManagers.containsKey(context) && streamManagers.get(context).files.size() == 0)
+     {
+-        if (streamManagers.containsKey(to) && streamManagers.get(to).files.size() == 0)
+-            streamManagers.remove(to);
+-        pendingDestinations.remove(to);
++            streamManagers.remove(context);
++            destHosts.remove(context.host, context);
++        }
+     }
+ 
+     public static Set<InetAddress> getDestinations()
+     {
+         // the results of streamManagers.keySet() isn't serializable, so create a new set.
+         Set<InetAddress> hosts = new HashSet<InetAddress>();
+-        hosts.addAll(streamManagers.keySet());
+-        hosts.addAll(pendingDestinations);
++        hosts.addAll(destHosts.keySet());
+         return hosts;
+     }
+     
+@@ -83,65 +87,88 @@ public static void remove(InetAddress to)
+      * this method exists so that we don't have to call StreamOutManager.get() which has a nasty side-effect of 
+      * indicating that we are streaming to a particular host.
+      **/     
+-    public static List<PendingFile> getPendingFiles(InetAddress host)
++    public static List<PendingFile> getPendingFiles(StreamContext context)
+     {
+         List<PendingFile> list = new ArrayList<PendingFile>();
+-        StreamOutManager manager = streamManagers.get(host);
++        StreamOutManager manager = streamManagers.get(context);
+         if (manager != null)
+             list.addAll(manager.getFiles());
+         return list;
+     }    
+ 
++    public static List<PendingFile> getOutgoingFiles(InetAddress host)
++    {
++        List<PendingFile> list = new ArrayList<PendingFile>();
++        for(StreamContext context : destHosts.get(host))
++        {
++            list.addAll(getPendingFiles(context));
++        }
++        return list;
++    }
++
+     // we need sequential and random access to the files. hence, the map and the list.
+     private final List<PendingFile> files = new ArrayList<PendingFile>();
+     private final Map<String, PendingFile> fileMap = new HashMap<String, PendingFile>();
+     
+-    private final InetAddress to;
++    private final StreamContext context;
+     private final SimpleCondition condition = new SimpleCondition();
+     
+-    private StreamOutManager(InetAddress to)
++    private StreamOutManager(StreamContext context)
+     {
+-        this.to = to;
++        this.context = context;
+     }
+     
+-    public void addFilesToStream(PendingFile[] pendingFiles)
++    public void addFilesToStream(List<PendingFile> pendingFiles)
+     {
+         // reset the condition in case this SOM is getting reused before it can be removed.
+         condition.reset();
+         for (PendingFile pendingFile : pendingFiles)
+         {
+             if (logger.isDebugEnabled())
+-              logger.debug("Adding file " + pendingFile.getFilename() + " to be streamed.");
++                logger.debug("Adding file {} to be streamed.", pendingFile.getFilename());
+             files.add(pendingFile);
+             fileMap.put(pendingFile.getFilename(), pendingFile);
+         }
+     }
+     
+-    public void startNext()
++    public void retry(String file)
+     {
+-        if (files.size() > 0)
++        PendingFile pf = fileMap.get(file);
++        if (pf != null)
++            streamFile(pf);
++    }
++
++    private void streamFile(PendingFile pf)
+         {
+-            PendingFile pf = files.get(0);
+             if (logger.isDebugEnabled())
+-              logger.debug("Streaming " + pf + " ...");
+-            MessagingService.instance.stream(pf, to);
+-        }
++            logger.debug("Streaming {} ...", pf);
++        MessagingService.instance.stream(new StreamHeader(context.sessionId, pf, true), context.host);
+     }
+ 
+-    public void finishAndStartNext() throws IOException
++    public void finishAndStartNext(String pfname) throws IOException
+     {
+-        PendingFile pf = files.remove(0);
+-        fileMap.remove(pf.getFilename());
++        PendingFile pf = fileMap.remove(pfname);
++        files.remove(pf);
++
+         if (files.size() > 0)
+-            startNext();
++            streamFile(files.get(0));
+         else
+         {
+             if (logger.isDebugEnabled())
+-              logger.debug("Signalling that streaming is done for " + to);
++                logger.debug("Signalling that streaming is done for {} session {}", context.host, context.sessionId);
++            remove(context);
+             condition.signalAll();
+         }
+     }
+     
++    public void removePending(PendingFile pf)
++    {
++        files.remove(pf);
++        fileMap.remove(pf.getFilename());
++        if (files.size() == 0)
++            remove(context);
++    }
++
+     public void waitForStreamCompletion()
+     {
+         try
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMessage.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMessage.java
+index 81c6ce9b..910ba95d 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMessage.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMessage.java
+@@ -22,9 +22,16 @@
+ 
+ 
+ import java.io.*;
++import java.net.InetAddress;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
+ 
+ import org.apache.cassandra.concurrent.StageManager;
++import org.apache.cassandra.dht.AbstractBounds;
++import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.io.ICompactSerializer;
++import org.apache.cassandra.net.CompactEndpointSerializationHelper;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -33,6 +40,8 @@
+ * This class encapsulates the message that needs to be sent to nodes
+ * that handoff data. The message contains information about ranges
+ * that need to be transferred and the target node.
++* 
++* If a file is specified, ranges and table will not. vice-versa should hold as well.
+ */
+ class StreamRequestMessage
+ {
+@@ -47,13 +56,41 @@
+        return serializer_;
+    }
+ 
+-   protected static Message makeStreamRequestMessage(StreamRequestMessage streamRequestMessage)
++    protected final long sessionId;
++    protected final InetAddress target;
++    
++    // if this is specified, ranges and table should not be.
++    protected final PendingFile file;
++    
++    // if these are specified, file shoud not be.
++    protected final Collection<Range> ranges;
++    protected final String table;
++
++    StreamRequestMessage(InetAddress target, Collection<Range> ranges, String table, long sessionId)
++    {
++        this.target = target;
++        this.ranges = ranges;
++        this.table = table;
++        this.sessionId = sessionId;
++        file = null;
++    }
++
++    StreamRequestMessage(InetAddress target, PendingFile file, long sessionId)
++    {
++        this.target = target;
++        this.file = file;
++        this.sessionId = sessionId;
++        ranges = null;
++        table = null;
++    }
++    
++    Message makeMessage()
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        try
+        {
+-           StreamRequestMessage.serializer().serialize(streamRequestMessage, dos);
++            StreamRequestMessage.serializer().serialize(this, dos);
+        }
+        catch (IOException e)
+        {
+@@ -62,36 +99,72 @@ protected static Message makeStreamRequestMessage(StreamRequestMessage streamReq
+        return new Message(FBUtilities.getLocalAddress(), StageManager.STREAM_STAGE, StorageService.Verb.STREAM_REQUEST, bos.toByteArray() );
+    }
+ 
+-   protected StreamRequestMetadata[] streamRequestMetadata_ = new StreamRequestMetadata[0];
+-
+-   // TODO only actually ever need one BM, not an array
+-   StreamRequestMessage(StreamRequestMetadata... streamRequestMetadata)
++    public String toString()
++    {
++        StringBuilder sb = new StringBuilder("");
++        if (file == null)
++        {
++            sb.append(table);
++            sb.append("@");
++            sb.append(target);
++            sb.append("------->");
++            for ( Range range : ranges )
+    {
+-       assert streamRequestMetadata != null;
+-       streamRequestMetadata_ = streamRequestMetadata;
++                sb.append(range);
++                sb.append(" ");
++            }
++        }
++        else
++        {
++            sb.append(file.toString());
++        }
++        return sb.toString();
+    }
+ 
+     private static class StreamRequestMessageSerializer implements ICompactSerializer<StreamRequestMessage>
+     {
+-        public void serialize(StreamRequestMessage streamRequestMessage, DataOutputStream dos) throws IOException
++        public void serialize(StreamRequestMessage srm, DataOutputStream dos) throws IOException
+         {
+-            StreamRequestMetadata[] streamRequestMetadata = streamRequestMessage.streamRequestMetadata_;
+-            dos.writeInt(streamRequestMetadata.length);
+-            for (StreamRequestMetadata bsmd : streamRequestMetadata)
++            dos.writeLong(srm.sessionId);
++            CompactEndpointSerializationHelper.serialize(srm.target, dos);
++            if (srm.file != null)
+             {
+-                StreamRequestMetadata.serializer().serialize(bsmd, dos);
++                dos.writeBoolean(true);
++                PendingFile.serializer().serialize(srm.file, dos);
++            }
++            else
++        {
++                dos.writeBoolean(false);
++                dos.writeUTF(srm.table);
++                dos.writeInt(srm.ranges.size());
++                for (Range range : srm.ranges)
++            {
++                    AbstractBounds.serializer().serialize(range, dos);
++                }
+             }
+         }
+ 
+         public StreamRequestMessage deserialize(DataInputStream dis) throws IOException
+         {
++            long sessionId = dis.readLong();
++            InetAddress target = CompactEndpointSerializationHelper.deserialize(dis);
++            boolean singleFile = dis.readBoolean();
++            if (singleFile)
++            {
++                PendingFile file = PendingFile.serializer().deserialize(dis);
++                return new StreamRequestMessage(target, file, sessionId);
++            }
++            else
++            {
++                String table = dis.readUTF();
+             int size = dis.readInt();
+-            StreamRequestMetadata[] streamRequestMetadata = new StreamRequestMetadata[size];
+-            for (int i = 0; i < size; ++i)
++                List<Range> ranges = (size == 0) ? null : new ArrayList<Range>();
++                for( int i = 0; i < size; ++i )
+             {
+-                streamRequestMetadata[i] = StreamRequestMetadata.serializer().deserialize(dis);
++                    ranges.add((Range) AbstractBounds.serializer().deserialize(dis));
++                }
++                return new StreamRequestMessage(target, ranges, table, sessionId);
+             }
+-            return new StreamRequestMessage(streamRequestMetadata);
+         }
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
+index 22d5f3d8..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
+@@ -1,108 +0,0 @@
+-package org.apache.cassandra.streaming;
+-/*
+- * 
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the License is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+- * KIND, either express or implied.  See the License for the
+- * specific language governing permissions and limitations
+- * under the License.
+- * 
+- */
+-
+-
+-import java.io.DataInputStream;
+-import java.io.DataOutputStream;
+-import java.io.IOException;
+-import java.net.InetAddress;
+-import java.util.ArrayList;
+-import java.util.Collection;
+-import java.util.List;
+-
+-import org.apache.cassandra.dht.AbstractBounds;
+-import org.apache.cassandra.dht.Range;
+-import org.apache.cassandra.io.ICompactSerializer;
+-import org.apache.cassandra.net.CompactEndpointSerializationHelper;
+-
+-/**
+- * This encapsulates information of the list of ranges that a target
+- * node requires to be transferred. This will be bundled in a
+- * StreamRequestsMessage and sent to nodes that are going to handoff
+- * the data.
+-*/
+-class StreamRequestMetadata
+-{
+-    private static ICompactSerializer<StreamRequestMetadata> serializer_;
+-    static
+-    {
+-        serializer_ = new StreamRequestMetadataSerializer();
+-    }
+-
+-    protected static ICompactSerializer<StreamRequestMetadata> serializer()
+-    {
+-        return serializer_;
+-    }
+-
+-    protected InetAddress target_;
+-    protected Collection<Range> ranges_;
+-    protected String table_;
+-
+-    StreamRequestMetadata(InetAddress target, Collection<Range> ranges, String table)
+-    {
+-        target_ = target;
+-        ranges_ = ranges;
+-        table_ = table;
+-    }
+-
+-    public String toString()
+-    {
+-        StringBuilder sb = new StringBuilder("");
+-        sb.append(table_);
+-        sb.append("@");
+-        sb.append(target_);
+-        sb.append("------->");
+-        for ( Range range : ranges_ )
+-        {
+-            sb.append(range);
+-            sb.append(" ");
+-        }
+-        return sb.toString();
+-    }
+-}
+-
+-class StreamRequestMetadataSerializer implements ICompactSerializer<StreamRequestMetadata>
+-{
+-    public void serialize(StreamRequestMetadata srMetadata, DataOutputStream dos) throws IOException
+-    {
+-        CompactEndpointSerializationHelper.serialize(srMetadata.target_, dos);
+-        dos.writeUTF(srMetadata.table_);
+-        dos.writeInt(srMetadata.ranges_.size());
+-        for (Range range : srMetadata.ranges_)
+-        {
+-            AbstractBounds.serializer().serialize(range, dos);
+-        }
+-    }
+-
+-    public StreamRequestMetadata deserialize(DataInputStream dis) throws IOException
+-    {
+-        InetAddress target = CompactEndpointSerializationHelper.deserialize(dis);
+-        String table = dis.readUTF();
+-        int size = dis.readInt();
+-        List<Range> ranges = (size == 0) ? null : new ArrayList<Range>();
+-        for( int i = 0; i < size; ++i )
+-        {
+-            ranges.add((Range) AbstractBounds.serializer().deserialize(dis));
+-        }
+-        return new StreamRequestMetadata(target, ranges, table);
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
+index e2c8cbf8..fe387097 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
+@@ -25,6 +25,7 @@
+ 
+ import org.apache.cassandra.net.IVerbHandler;
+ import org.apache.cassandra.net.Message;
++import org.apache.cassandra.net.MessagingService;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -35,25 +36,33 @@
+ */
+ public class StreamRequestVerbHandler implements IVerbHandler
+ {
+-    private static Logger logger_ = LoggerFactory.getLogger(StreamRequestVerbHandler.class);
++    private static Logger logger = LoggerFactory.getLogger(StreamRequestVerbHandler.class);
+     
+     public void doVerb(Message message)
+     {
+-        if (logger_.isDebugEnabled())
+-            logger_.debug("Received a StreamRequestMessage from " + message.getFrom());
++        if (logger.isDebugEnabled())
++            logger.debug("Received a StreamRequestMessage from {}", message.getFrom());
+         
+         byte[] body = message.getMessageBody();
+         ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+         try
+         {
+-            StreamRequestMessage streamRequestMessage = StreamRequestMessage.serializer().deserialize(new DataInputStream(bufIn));
+-            StreamRequestMetadata[] streamRequestMetadata = streamRequestMessage.streamRequestMetadata_;
++            StreamRequestMessage srm = StreamRequestMessage.serializer().deserialize(new DataInputStream(bufIn));
+ 
+-            for (StreamRequestMetadata srm : streamRequestMetadata)
++            if (logger.isDebugEnabled())
++                logger.debug(srm.toString());
++
++            if (srm.file != null)
++            {
++                // single file request.
++                StreamHeader header = new StreamHeader(srm.sessionId, srm.file, false);
++                MessagingService.instance.stream(header, message.getFrom());
++                StreamOutManager.get(new StreamContext(message.getFrom(), srm.sessionId)).removePending(srm.file);
++            }
++            else
+             {
+-                if (logger_.isDebugEnabled())
+-                    logger_.debug(srm.toString());
+-                StreamOut.transferRanges(srm.target_, srm.table_, srm.ranges_, null);
++                // range request.
++                StreamOut.transferRangesForRequest(new StreamContext(message.getFrom(), srm.sessionId), srm.table, srm.ranges, null);
+             }
+         }
+         catch (IOException ex)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamStatusVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamStatusVerbHandler.java
+index e69de29b..8967a696 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamStatusVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamStatusVerbHandler.java
+@@ -0,0 +1,74 @@
++package org.apache.cassandra.streaming;
++
++/*
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ */
++
++import java.io.ByteArrayInputStream;
++import java.io.DataInputStream;
++import java.io.IOError;
++import java.io.IOException;
++
++import org.apache.cassandra.net.IVerbHandler;
++import org.apache.cassandra.net.Message;
++import org.apache.cassandra.service.StorageService;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class StreamStatusVerbHandler implements IVerbHandler
++{
++    private static Logger logger = LoggerFactory.getLogger(StreamStatusVerbHandler.class);
++
++    public void doVerb(Message message)
++    {
++        byte[] body = message.getMessageBody();
++        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
++
++        try
++        {
++            FileStatus streamStatus = FileStatus.serializer().deserialize(new DataInputStream(bufIn));
++            StreamContext context = new StreamContext(message.getFrom(), streamStatus.getSessionId());
++
++            switch (streamStatus.getAction())
++            {
++                case DELETE:
++                    StreamOutManager.get(context).finishAndStartNext(streamStatus.getFile());
++                    break;
++                case STREAM:
++                    logger.warn("Need to re-stream file {} to {}", streamStatus.getFile(), message.getFrom());
++                    StreamOutManager.get(context).retry(streamStatus.getFile());
++                    break;
++                case EMPTY:
++                    logger.error("Did not find matching ranges on {}", message.getFrom());
++                    StreamInManager.get(context).remove();
++                    if (StorageService.instance.isBootstrapMode())
++                        StorageService.instance.removeBootstrapSource(message.getFrom(), new String(message.getHeader(StreamOut.TABLE_NAME)));
++                    break;
++                default:
++                    throw new RuntimeException("Cannot handle FileStatus.Action: " + streamStatus.getAction());
++            }
++        }
++        catch (IOException ex)
++        {
++            throw new IOError(ex);
++        }
++    }
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+index afcd7a91..032251dd 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+@@ -27,6 +27,7 @@
+ import java.lang.management.ManagementFactory;
+ import java.net.InetAddress;
+ import java.util.ArrayList;
++import java.util.HashSet;
+ import java.util.List;
+ import java.util.Set;
+ 
+@@ -53,10 +54,10 @@ public String getStatus()
+     {
+         StringBuilder sb = new StringBuilder();
+         sb.append("Receiving from:\n");
+-        for (InetAddress source : StreamInManager.getSources())
++        for (StreamContext source : StreamInManager.getSources())
+         {
+-            sb.append(String.format(" %s:\n", source.getHostAddress()));
+-            for (PendingFile pf : StreamInManager.getIncomingFiles(source))
++            sb.append(String.format(" %s:\n", source.host.getHostAddress()));
++            for (PendingFile pf : StreamInManager.getIncomingFiles(source.host))
+             {
+                 sb.append(String.format("  %s\n", pf.toString()));
+             }
+@@ -65,7 +66,7 @@ public String getStatus()
+         for (InetAddress dest : StreamOutManager.getDestinations())
+         {
+             sb.append(String.format(" %s:\n", dest.getHostAddress()));
+-            for (PendingFile pf : StreamOutManager.getPendingFiles(dest))
++            for (PendingFile pf : StreamOutManager.getOutgoingFiles(dest))
+             {
+                 sb.append(String.format("  %s\n", pf.toString()));
+             }
+@@ -90,8 +91,7 @@ public String getStatus()
+         if (!existingDestinations.contains(dest))
+             return files;
+         
+-        StreamOutManager manager = StreamOutManager.get(dest);
+-        for (PendingFile f : manager.getFiles())
++        for (PendingFile f : StreamOutManager.getOutgoingFiles(dest))
+             files.add(String.format("%s", f.toString()));
+         return files;
+     }
+@@ -99,7 +99,13 @@ public String getStatus()
+     /** hosts sending incoming streams */
+     public Set<InetAddress> getStreamSources()
+     {
+-        return StreamInManager.getSources();
++        Set<InetAddress> sources = new HashSet<InetAddress>();
++
++        for(StreamContext context : StreamInManager.getSources())
++        {
++            sources.add(context.host);
++        }
++        return sources;
+     }
+ 
+     /** details about incoming streams. */
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
+index 2753ce76..e69de29b 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
+@@ -1,81 +0,0 @@
+-/*
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*    http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing,
+-* software distributed under the License is distributed on an
+-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-* KIND, either express or implied.  See the License for the
+-* specific language governing permissions and limitations
+-* under the License.
+-*/
+-package org.apache.cassandra.io;
+-
+-import static junit.framework.Assert.assertEquals;
+-
+-import java.net.InetAddress;
+-import java.util.*;
+-
+-import org.apache.cassandra.CleanupHelper;
+-import org.apache.cassandra.Util;
+-import org.apache.cassandra.db.*;
+-import org.apache.cassandra.db.filter.QueryFilter;
+-import org.apache.cassandra.db.filter.QueryPath;
+-import org.apache.cassandra.dht.IPartitioner;
+-import org.apache.cassandra.dht.Range;
+-import org.apache.cassandra.dht.Token;
+-import org.apache.cassandra.io.sstable.SSTableUtils;
+-import org.apache.cassandra.io.sstable.SSTableReader;
+-import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.streaming.StreamOut;
+-import org.apache.cassandra.utils.FBUtilities;
+-
+-import org.junit.Test;
+-
+-public class StreamingTest extends CleanupHelper
+-{
+-    public static final InetAddress LOCAL = FBUtilities.getLocalAddress();
+-
+-    @Test
+-    public void testTransferTable() throws Exception
+-    {
+-        StorageService.instance.initServer();
+-
+-        // write a temporary SSTable, but don't register it
+-        Set<String> content = new HashSet<String>();
+-        content.add("key");
+-        content.add("key2");
+-        content.add("key3");
+-        SSTableReader sstable = SSTableUtils.writeSSTable(content);
+-        String tablename = sstable.getTableName();
+-        String cfname = sstable.getColumnFamilyName();
+-
+-        // transfer the first and last key
+-        IPartitioner p = StorageService.getPartitioner();
+-        List<Range> ranges = new ArrayList<Range>();
+-        ranges.add(new Range(p.getMinimumToken(), p.getToken("key".getBytes())));
+-        ranges.add(new Range(p.getToken("key2".getBytes()), p.getMinimumToken()));
+-        StreamOut.transferSSTables(LOCAL, tablename, Arrays.asList(sstable), ranges);
+-
+-        // confirm that the SSTable was transferred and registered
+-        ColumnFamilyStore cfstore = Table.open(tablename).getColumnFamilyStore(cfname);
+-        List<Row> rows = Util.getRangeSlice(cfstore);
+-        assertEquals(2, rows.size());
+-        assert Arrays.equals(rows.get(0).key.key, "key".getBytes());
+-        assert Arrays.equals(rows.get(1).key.key, "key3".getBytes());
+-        assert rows.get(0).cf.getColumnsMap().size() == 1;
+-        assert rows.get(1).cf.getColumnsMap().size() == 1;
+-        assert rows.get(1).cf.getColumn("key3".getBytes()) != null;
+-
+-        // and that the index and filter were properly recovered
+-        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("key"), new QueryPath("Standard1")));
+-        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("key3"), new QueryPath("Standard1")));
+-    }
+-}
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+index df9061f6..a067ccd3 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+@@ -22,7 +22,6 @@
+ 
+ import java.io.File;
+ import java.io.IOException;
+-import java.util.Map;
+ 
+ import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.io.sstable.Descriptor;
+@@ -38,15 +37,9 @@
+     public void testGetNewNames() throws IOException
+     {
+         Descriptor desc = Descriptor.fromFilename(new File("Keyspace1", "Standard1-500-Data.db").toString());
+-        PendingFile[] pendingFiles = new PendingFile[]{ new PendingFile(desc, "Data.db", Arrays.asList(new Pair<Long,Long>(0L, 1L))) };
+-        StreamInitiateVerbHandler bivh = new StreamInitiateVerbHandler();
+-
+-        // map the input (remote) contexts to output (local) contexts
+-        Map<PendingFile, PendingFile> mapping = bivh.getContextMapping(pendingFiles);
+-        assertEquals(pendingFiles.length, mapping.size());
+-        for (PendingFile inContext : pendingFiles)
+-        {
+-            PendingFile outContext = mapping.get(inContext);
++        PendingFile inContext = new PendingFile(desc, "Data.db", Arrays.asList(new Pair<Long,Long>(0L, 1L)));
++
++        PendingFile outContext = StreamIn.getContextMapping(inContext);
+             // filename and generation are expected to have changed
+             assert !inContext.getFilename().equals(outContext.getFilename());
+ 
+@@ -55,5 +48,4 @@ public void testGetNewNames() throws IOException
+             assertEquals(inContext.desc.ksname, outContext.desc.ksname);
+             assertEquals(inContext.desc.cfname, outContext.desc.cfname);
+         }
+-    }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
+index e69de29b..93d18fba 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
+@@ -0,0 +1,134 @@
++package org.apache.cassandra.streaming;
++
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++
++import static junit.framework.Assert.assertEquals;
++
++import java.net.InetAddress;
++import java.util.*;
++
++import org.apache.cassandra.CleanupHelper;
++import org.apache.cassandra.Util;
++import org.apache.cassandra.db.*;
++import org.apache.cassandra.db.filter.QueryFilter;
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.dht.IPartitioner;
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.io.sstable.SSTableUtils;
++import org.apache.cassandra.io.sstable.SSTableReader;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.streaming.StreamContext;
++import org.apache.cassandra.streaming.StreamOut;
++import org.apache.cassandra.utils.FBUtilities;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++public class StreamingTransferTest extends CleanupHelper
++{
++    public static final InetAddress LOCAL = FBUtilities.getLocalAddress();
++
++    @BeforeClass
++    public static void setup() throws Exception
++    {
++        StorageService.instance.initServer();
++    }
++
++    @Test
++    public void testTransferTable() throws Exception
++    {
++        // write a temporary SSTable, but don't register it
++        Set<String> content = new HashSet<String>();
++        content.add("key");
++        content.add("key2");
++        content.add("key3");
++        SSTableReader sstable = SSTableUtils.writeSSTable(content);
++        String tablename = sstable.getTableName();
++        String cfname = sstable.getColumnFamilyName();
++
++        // transfer the first and last key
++        IPartitioner p = StorageService.getPartitioner();
++        List<Range> ranges = new ArrayList<Range>();
++        ranges.add(new Range(p.getMinimumToken(), p.getToken("key".getBytes())));
++        ranges.add(new Range(p.getToken("key2".getBytes()), p.getMinimumToken()));
++        StreamOut.transferSSTables(new StreamContext(LOCAL), tablename, Arrays.asList(sstable), ranges);
++
++        // confirm that the SSTable was transferred and registered
++        ColumnFamilyStore cfstore = Table.open(tablename).getColumnFamilyStore(cfname);
++        List<Row> rows = Util.getRangeSlice(cfstore);
++        assertEquals(2, rows.size());
++        assert Arrays.equals(rows.get(0).key.key, "key".getBytes());
++        assert Arrays.equals(rows.get(1).key.key, "key3".getBytes());
++        assert rows.get(0).cf.getColumnsMap().size() == 1;
++        assert rows.get(1).cf.getColumnsMap().size() == 1;
++        assert rows.get(1).cf.getColumn("key3".getBytes()) != null;
++
++        // and that the index and filter were properly recovered
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("key"), new QueryPath("Standard1")));
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("key3"), new QueryPath("Standard1")));
++    }
++
++    @Test
++    public void testTransferTableMultiple() throws Exception
++    {
++        // write a temporary SSTable, but don't register it
++        Set<String> content = new HashSet<String>();
++        content.add("transfer1");
++        content.add("transfer2");
++        content.add("transfer3");
++        SSTableReader sstable = SSTableUtils.writeSSTable(content);
++        String tablename = sstable.getTableName();
++        String cfname = sstable.getColumnFamilyName();
++
++        Set<String> content2 = new HashSet<String>();
++        content2.add("test");
++        content2.add("test2");
++        content2.add("test3");
++        SSTableReader sstable2 = SSTableUtils.writeSSTable(content2);
++
++        // transfer the first and last key
++        IPartitioner p = StorageService.getPartitioner();
++        List<Range> ranges = new ArrayList<Range>();
++        ranges.add(new Range(p.getMinimumToken(), p.getToken("transfer1".getBytes())));
++        ranges.add(new Range(p.getToken("test2".getBytes()), p.getMinimumToken()));
++        StreamOut.transferSSTables(new StreamContext(LOCAL), tablename, Arrays.asList(sstable, sstable2), ranges);
++
++        // confirm that the SSTable was transferred and registered
++        ColumnFamilyStore cfstore = Table.open(tablename).getColumnFamilyStore(cfname);
++        List<Row> rows = Util.getRangeSlice(cfstore);
++        assertEquals(8, rows.size());
++        assert Arrays.equals(rows.get(0).key.key, "key".getBytes());
++        assert Arrays.equals(rows.get(2).key.key, "test".getBytes());
++        assert Arrays.equals(rows.get(5).key.key, "transfer1".getBytes());
++        assert rows.get(0).cf.getColumnsMap().size() == 1;
++        assert rows.get(2).cf.getColumnsMap().size() == 1;
++        assert rows.get(5).cf.getColumnsMap().size() == 1;
++        assert rows.get(0).cf.getColumn("key".getBytes()) != null;
++        
++        // these keys fall outside of the ranges and should not be transferred.
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("transfer2"), new QueryPath("Standard1")));
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("transfer3"), new QueryPath("Standard1")));
++        
++        // and that the index and filter were properly recovered
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("key"), new QueryPath("Standard1")));
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("test"), new QueryPath("Standard1")));
++        assert null != cfstore.getColumnFamily(QueryFilter.getIdentityFilter(Util.dk("transfer1"), new QueryPath("Standard1")));
++    }
++}

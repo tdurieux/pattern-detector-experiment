@@ -1,0 +1,162 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/java/org/apache/solr/handler/dataimport/JdbcDataSource.java b/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/java/org/apache/solr/handler/dataimport/JdbcDataSource.java
+index ccaf3a67..1a25f8ba 100644
+--- a/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/java/org/apache/solr/handler/dataimport/JdbcDataSource.java
++++ b/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/java/org/apache/solr/handler/dataimport/JdbcDataSource.java
+@@ -22,6 +22,8 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import javax.naming.InitialContext;
++import javax.naming.NamingException;
++
+ import java.sql.*;
+ import java.util.*;
+ import java.util.concurrent.Callable;
+@@ -132,26 +134,12 @@ public Connection call() throws Exception {
+                 + url);
+         long start = System.currentTimeMillis();
+         Connection c = null;
++
++        if (jndiName != null) {
++          c = getFromJndi(initProps, jndiName);
++        } else if (url != null) {
+         try {
+-          if(url != null){
+             c = DriverManager.getConnection(url, initProps);
+-          } else if(jndiName != null){
+-            InitialContext ctx =  new InitialContext();
+-            Object jndival =  ctx.lookup(jndiName);
+-            if (jndival instanceof javax.sql.DataSource) {
+-              javax.sql.DataSource dataSource = (javax.sql.DataSource) jndival;
+-              String user = (String) initProps.get("user");
+-              String pass = (String) initProps.get("password");
+-              if(user == null || user.trim().equals("")){
+-                c = dataSource.getConnection();
+-              } else {
+-                c = dataSource.getConnection(user, pass);
+-              }
+-            } else {
+-              throw new DataImportHandlerException(SEVERE,
+-                      "the jndi name : '"+jndiName +"' is not a valid javax.sql.DataSource");
+-            }
+-          }
+         } catch (SQLException e) {
+           // DriverManager does not allow you to use a driver which is not loaded through
+           // the class loader of the class which is trying to make the connection.
+@@ -160,7 +148,27 @@ public Connection call() throws Exception {
+           Driver d = (Driver) DocBuilder.loadClass(driver, context.getSolrCore()).newInstance();
+           c = d.connect(url, initProps);
+         }
++        }
+         if (c != null) {
++          try {
++            initializeConnection(c, initProps);
++          } catch (SQLException e) {
++            try {
++              c.close();
++            } catch (SQLException e2) {
++              LOG.warn("Exception closing connection during cleanup", e2);
++            }
++
++            throw new DataImportHandlerException(SEVERE, "Exception initializing SQL connection", e);
++          }
++        }
++        LOG.info("Time taken for getConnection(): "
++            + (System.currentTimeMillis() - start));
++        return c;
++      }
++
++      private void initializeConnection(Connection c, final Properties initProps)
++          throws SQLException {
+           if (Boolean.parseBoolean(initProps.getProperty("readOnly"))) {
+             c.setReadOnly(true);
+             // Add other sane defaults
+@@ -190,8 +198,26 @@ public Connection call() throws Exception {
+             c.setHoldability(ResultSet.HOLD_CURSORS_OVER_COMMIT);
+           }
+         }
+-        LOG.info("Time taken for getConnection(): "
+-                + (System.currentTimeMillis() - start));
++
++      private Connection getFromJndi(final Properties initProps, final String jndiName) throws NamingException,
++          SQLException {
++
++        Connection c = null;
++        InitialContext ctx =  new InitialContext();
++        Object jndival =  ctx.lookup(jndiName);
++        if (jndival instanceof javax.sql.DataSource) {
++          javax.sql.DataSource dataSource = (javax.sql.DataSource) jndival;
++          String user = (String) initProps.get("user");
++          String pass = (String) initProps.get("password");
++          if(user == null || user.trim().equals("")){
++            c = dataSource.getConnection();
++          } else {
++            c = dataSource.getConnection(user, pass);
++          }
++        } else {
++          throw new DataImportHandlerException(SEVERE,
++                  "the jndi name : '"+jndiName +"' is not a valid javax.sql.DataSource");
++        }
+         return c;
+       }
+     };
+diff --git a/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/test/org/apache/solr/handler/dataimport/TestJdbcDataSource.java b/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/test/org/apache/solr/handler/dataimport/TestJdbcDataSource.java
+index eb8d5ae9..98cac769 100644
+--- a/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/test/org/apache/solr/handler/dataimport/TestJdbcDataSource.java
++++ b/lucene/dev/branches/branch_4x/solr/contrib/dataimporthandler/src/test/org/apache/solr/handler/dataimport/TestJdbcDataSource.java
+@@ -20,6 +20,7 @@
+ import java.sql.Connection;
+ import java.sql.Driver;
+ import java.sql.DriverManager;
++import java.sql.SQLException;
+ import java.util.*;
+ 
+ import javax.sql.DataSource;
+@@ -127,6 +128,48 @@ public void testRetrieveFromJndiWithCredentials() throws Exception {
+     assertSame("connection", conn, connection);
+   }
+ 
++  @Test
++  public void testRetrieveFromJndiFailureNotHidden() throws Exception {
++    MockInitialContextFactory.bind("java:comp/env/jdbc/JndiDB", dataSource);
++
++    props.put(JdbcDataSource.JNDI_NAME, "java:comp/env/jdbc/JndiDB");
++
++    SQLException sqlException = new SQLException("fake");
++    EasyMock.expect(dataSource.getConnection()).andThrow(sqlException);
++
++    mockControl.replay();
++    
++    try {
++      jdbcDataSource.createConnectionFactory(context, props).call();
++    } catch (SQLException ex) {
++      assertSame(sqlException, ex);
++    }
++    
++    mockControl.verify();
++  }
++  
++  @Test
++  public void testClosesConnectionWhenExceptionThrownOnSetAutocommit() throws Exception {
++    MockInitialContextFactory.bind("java:comp/env/jdbc/JndiDB", dataSource);
++
++    props.put(JdbcDataSource.JNDI_NAME, "java:comp/env/jdbc/JndiDB");
++
++    SQLException sqlException = new SQLException("fake");
++    EasyMock.expect(dataSource.getConnection()).andReturn(connection);
++    connection.setAutoCommit(false);
++    EasyMock.expectLastCall().andThrow(sqlException);
++    connection.close();
++    mockControl.replay();
++    
++    try {
++      jdbcDataSource.createConnectionFactory(context, props).call();
++    } catch (DataImportHandlerException ex) {
++      assertSame(sqlException, ex.getCause());
++    }
++    
++    mockControl.verify();
++  }
++  
+   @Test
+   public void testRetrieveFromDriverManager() throws Exception {
+     DriverManager.registerDriver(driver);

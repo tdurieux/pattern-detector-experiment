@@ -1,0 +1,165 @@
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index 32b8ac6b..726607f5 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -1344,10 +1344,16 @@ public Object run() throws StandardException
+                  throw StandardException.newException( SQLState.FILE_CREATE, se, file);
+              }
+ 
++             boolean success = false;
++             int maxTries = MAX_INTERRUPT_RETRIES;
++             while (!success) {
++                 success = true;
++
+              try {
+ 
+-                 // OK not to force WAL here, in fact, this operation preceeds the
+-                 // creation of the log record to ensure sufficient space.
++                     // OK not to force WAL here, in fact, this operation
++                     // preceeds the creation of the log record to ensure
++                     // sufficient space.
+ 
+                  dataFactory.writeInProgress();
+                  try
+@@ -1359,24 +1365,25 @@ public Object run() throws StandardException
+                      dataFactory.writeFinished();
+                  }
+ 
+-                 // This container format specifies that the first page is an
+-                 // allocation page and the container information is stored 
+-                 // within it.  The allocation page needs to be somewhat 
+-                 // formatted because if the system crashed after the create 
+-                 // container log operation is written, it needs to be well 
+-                 // formed enough to get the container information back out of
+-                 // it.
++                     // This container format specifies that the first page is
++                     // an allocation page and the container information is
++                     // stored within it.  The allocation page needs to be
++                     // somewhat formatted because if the system crashed after
++                     // the create container log operation is written, it needs
++                     // to be well formed enough to get the container
++                     // information back out of it.
+                  //
+                  // Don't try to go thru the page cache here because the 
+-                 // container object cannot be found in the container cache at
+-                 // this point yet.  However, if we use the page cache to store
+-                 // the first allocation page, then in order to write itself 
+-                 // out, it needs to ask the container to do so, which is going
+-                 // to create a deadlock.  The allocation page cannot write 
+-                 // itself out without going thru the container because it 
+-                 // doesn't know where its offset is.  Here we effectively 
+-                 // hardwire page 0 at offset 0 of the container file to be 
+-                 // the first allocation page.
++                     // container object cannot be found in the container cache
++                     // at this point yet.  However, if we use the page cache
++                     // to store the first allocation page, then in order to
++                     // write itself out, it needs to ask the container to do
++                     // so, which is going to create a deadlock.  The
++                     // allocation page cannot write itself out without going
++                     // thru the container because it doesn't know where its
++                     // offset is.  Here we effectively hardwire page 0 at
++                     // offset 0 of the container file to be the first
++                     // allocation page.
+ 
+                  // create an embryonic page - if this is not a temporary 
+                  // container, synchronously write out the file header.
+@@ -1385,26 +1392,45 @@ public Object run() throws StandardException
+                      (actionIdentity.getSegmentId() != 
+                           ContainerHandle.TEMPORARY_SEGMENT));
+ 
+-             } catch (SecurityException se) {
++                 } catch (IOException ioe) {
++                     Class clazz = ioe.getClass();
+ 
+-                 // only thrown by the RandomeAccessFile constructor,
+-                 // so the file won't exist
+-                 throw StandardException.newException( SQLState.FILE_CREATE, se, file);
++                     // test with reflection since NIO is not in Foundation 1.1
++                     if (clazz.getName().equals(
++                             "java.nio.channels.ClosedByInterruptException") ||
++                         clazz.getName().equals( // Java NIO Bug 6979009:
++                             "java.nio.channels.AsynchronousCloseException")) {
+ 
+-             } catch (IOException ioe) {
++                         if (--maxTries > 0) {
++                             success = false;
++                             InterruptStatus.setInterrupted();
++                             closeContainer();
++                             continue;
++                         }
++                     }
+ 
+                  boolean fileDeleted;
+                  try {
+                      fileDeleted = privRemoveFile(file);
+                  } catch (SecurityException se) {
+-                     throw StandardException.newException( SQLState.FILE_CREATE_NO_CLEANUP, ioe, file, se.toString());
++                         throw StandardException.newException(
++                             SQLState.FILE_CREATE_NO_CLEANUP,
++                             ioe,
++                             file,
++                             se.toString());
+                  }
+ 
+                  if (!fileDeleted) {
+-                     throw StandardException.newException( SQLState.FILE_CREATE_NO_CLEANUP, ioe, file, ioe.toString());
++                         throw StandardException.newException(
++                             SQLState.FILE_CREATE_NO_CLEANUP,
++                             ioe,
++                             file,
++                             ioe.toString());
+                  }
+ 
+-                 throw StandardException.newException( SQLState.FILE_CREATE, ioe, file);
++                     throw StandardException.newException(
++                         SQLState.FILE_CREATE, ioe, file);
++                 }
+              }
+ 
+              canUpdate = true;
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
+index 446f51a1..a0ca3109 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
+@@ -662,9 +662,39 @@ public void testInterruptShutdown() throws SQLException {
+ 
+             TestConfiguration.getCurrent().shutdownDatabase();
+ 
+-            // Assert and clear thread's flag:
++            // Assert thread's flag:
+             // DERBY-5152: Fails before fix due to lcc going away.
+-            assertTrue(Thread.interrupted());
++            assertTrue(Thread.currentThread().isInterrupted());
++
++        } finally {
++            Thread.interrupted(); // clear flag
++        }
++    }
++
++    /**
++     * DERBY-5233: verify that CREATE TABLE (i.e. container creation) survives
++     * interrupts with NIO.
++     */
++    public void testCreateDropInterrupted() throws SQLException {
++
++        if (!usingEmbedded()) {
++            // Only meaningful for embedded.
++            return;
++        }
++
++        setAutoCommit(false);
++
++        Statement s = createStatement();
++
++        try {
++            Thread.currentThread().interrupt();
++
++            s.executeUpdate("create table foo (i int)");
++            s.executeUpdate("insert into foo values 1");
++            s.executeUpdate("drop table foo");
++
++            // Assert thread's flag:
++            assertTrue(Thread.currentThread().isInterrupted());
+ 
+         } finally {
+             Thread.interrupted(); // clear flag

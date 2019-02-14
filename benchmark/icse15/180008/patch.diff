@@ -1,0 +1,1339 @@
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/RegisteredFormatIds.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/RegisteredFormatIds.java
+index e3a09666..9e0ed5a6 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/RegisteredFormatIds.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/RegisteredFormatIds.java
+@@ -514,6 +514,7 @@ The offset from the base format number (0 based) gives the offset in the array.
+  
+         /* 451 */   "org.apache.derby.catalog.types.RoutineAliasInfo",
+ 		/* 452 */   null,
+-		/* 453 */   "org.apache.derby.impl.store.raw.log.ChecksumOperation"
++		/* 453 */   "org.apache.derby.impl.store.raw.log.ChecksumOperation",
++		/* 454 */   "org.apache.derby.impl.store.raw.data.CompressSpacePageOperation"
+ };
+ }
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/StoredFormatIds.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/StoredFormatIds.java
+index 2b342832..eaab337b 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/StoredFormatIds.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/services/io/StoredFormatIds.java
+@@ -1686,6 +1686,10 @@ and another may restore (read) the object. The implication of this
+         public static final int LOGOP_CHECKSUM =
+                 (MIN_ID_2 + 453);
+ 
++		/* org.apache.derby.impl.store.raw.data.CompressSpacePageOperation */
++        public static final int LOGOP_COMPRESS_SPACE =
++                (MIN_ID_2 + 454);
++
+ 
+         /*******************************************************************
+         **
+@@ -1806,7 +1810,7 @@ and another may restore (read) the object. The implication of this
+          * Make sure this is updated when a new module is added
+          */
+         public static final int MAX_ID_2 =
+-                (MIN_ID_2 + 453);
++                (MIN_ID_2 + 454);
+ 
+         // DO NOT USE 4 BYTE IDS ANYMORE
+         static public final int MAX_ID_4 =
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
+index 8bae67ce..df127f6e 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
+@@ -852,9 +852,9 @@ public void compressConglomerate(
+                     rawtran,
+                     false,
+                     TransactionController.OPENMODE_FORUPDATE,
+-                    TransactionController.MODE_RECORD,
++                    TransactionController.MODE_TABLE,
+                     rawtran.newLockingPolicy(
+-                        LockingPolicy.MODE_RECORD,
++                        LockingPolicy.MODE_CONTAINER,
+                         TransactionController.ISOLATION_REPEATABLE_READ, true),
+                     null) == null)
+             {
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocExtent.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocExtent.java
+index c309f32a..6e43bcf9 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocExtent.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocExtent.java
+@@ -23,6 +23,7 @@
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.store.raw.ContainerHandle;
++import org.apache.derby.iapi.store.raw.xact.RawTransaction; 
+ 
+ import org.apache.derby.iapi.services.io.FormatableBitSet;
+ 
+@@ -431,21 +432,24 @@ protected void deallocPage(long pagenum) throws StandardException
+      * page that can be returned to the OS.
+      * <p>
+      *
+-	 * @return Return bit of page where page and all those that follow can
++	 * @return Return bit of page where all pages that follow can
+      *         be returned to the OS.
+      **/
+-    protected long compressPages()
++    protected int compress(
++    BaseContainerHandle owner,
++    RawTransaction      ntt,
++    AllocPage           alloc_page)
++        throws StandardException
+     {
+         int compress_bitnum = -1;
++        int num_pages_compressed = 0;
+ 
+-        for (int i = extentLength - 1; i >= 0; i--)
++        for (int i = (extentLength - 1); i >= 0; i--)
+         {
+             if (freePages.isSet(i))
+             {
+-                freePages.clear(i);
+-                unFilledPages.clear(i);
+-
+                 compress_bitnum = i;
++                num_pages_compressed++;
+             }
+             else
+             {
+@@ -453,15 +457,134 @@ protected long compressPages()
+             }
+         }
+ 
+-        if (compress_bitnum >= 0)
++        // new_highest_page is the last page to remain in the file after 
++        // the truncate, the above loop set compress_bitnum to lowest 
++        // free page in the set of contiguous free pages at end of extent.
++        int new_highest_page = compress_bitnum - 1;
++
++        if (num_pages_compressed > 0)
+         {
+-            extentLength = compress_bitnum;
+-            return(extentStart + extentLength - 1);
++            if (SanityManager.DEBUG)
++            {
++                for (int i = new_highest_page + 1; i < extentLength; i++)
++                {
++                    if (!freePages.isSet(i))
++                    {
++
++                        SanityManager.THROWASSERT(
++                            "compressPages with nonfree pg to truncate," +
++                            "new_highest_page = " + new_highest_page +
++                            "num_pages_truncated = " + num_pages_compressed +
++                            ";extentLength = " + extentLength +
++                            ";extentStart = " + extentStart +
++                            ";freePages.isSet(" + i + ") = " + 
++                                freePages.isSet(i) +
++                            "\nextent:\n" + toDebugString());
++                    }
++                }
++
++                SanityManager.ASSERT(
++                    (new_highest_page + num_pages_compressed + 1) == 
++                        extentLength,
++                    "truncate page count did not match: " +
++                    ";new_highest_page = " + new_highest_page +
++                    ";num_pages_truncated = " + num_pages_compressed +
++                    ";extentLength = " + extentLength);
++
++                // the following assert could be made invalid by a new type of
++                // access method, but currently page 1 of btree and heap contain
++                // control rows, so will never become free and thus should never
++                // be compressed.
++                if (extentStart == 1)
++                {
++                    SanityManager.ASSERT(new_highest_page >= 0);
++
++                    if (num_pages_compressed >= extentLength)
++        {
++                        SanityManager.THROWASSERT(
++                            "new_highest_page = "     + new_highest_page +
++                            "num_pages_compressed = " + num_pages_compressed +
++                            "; extentLength = "       + extentLength +
++                            "extent:\n"               + toDebugString());
++                    }
++                }
++            }
++
++            /*
++            SanityManager.DEBUG_PRINT("AllocExtent", 
++                "calling actionCompressSpaceOperation:" +
++                ";new_highest_page = " + new_highest_page +
++                ";num_pages_compressed = " +  num_pages_compressed +
++                ";extentLength = " +  extentLength +
++                ";extent: \n" + toDebugString());
++            */
++
++
++            owner.getAllocationActionSet().actionCompressSpaceOperation(
++                ntt, alloc_page, new_highest_page, num_pages_compressed); 
++            return(compress_bitnum);
+         }
+         else
+         {
+             return(-1);
+         }
++
++    }
++
++    protected void compressPages(
++    int        new_highest_page,
++    int        num_pages_truncated)
++    {
++        if (SanityManager.DEBUG)
++        {
++            if (new_highest_page >= 0)
++            {
++                for (int i = new_highest_page + 1; i < extentLength; i++)
++                {
++                    if (!freePages.isSet(i))
++                    {
++                        SanityManager.THROWASSERT(
++                            "compressPages with non free page to truncate," +
++                            "new_highest_page = " + new_highest_page +
++                            "num_pages_truncated = " + num_pages_truncated +
++                            ";extentLength = " + extentLength +
++                            ";extentStart = " + extentStart +
++                            ";freePages.isSet(" + i + ") = " + 
++                                freePages.isSet(i) +
++                            "\nextent:\n" + toDebugString());
++                    }
++                }
++            }
++
++            SanityManager.ASSERT(
++                (new_highest_page + num_pages_truncated + 1) == extentLength,
++                "truncate page count did not match: " +
++                ";new_highest_page = " + new_highest_page +
++                ";num_pages_truncated = " + num_pages_truncated +
++                ";extentLength = " + extentLength);
++
++            // the following assert could be made invalid by a new type of
++            // access method, but currently page 1 of btree and heap contain
++            // control rows, so will never become free and thus should never
++            // be compressed.
++            if (extentStart == 1)
++            {
++                SanityManager.ASSERT(new_highest_page >= 0);
++                SanityManager.ASSERT(num_pages_truncated < extentLength);
++            }
++        }
++
++        if (new_highest_page >= 0)
++        {
++            freePages.shrink(new_highest_page + 1);
++            unFilledPages.shrink(new_highest_page + 1);
++
++            // This routine assumes the caller
++            // will be doing the truncate, and just updates the data structures.
++            preAllocLength = extentLength = (new_highest_page + 1);
++        }
++
++        return;
+     }
+ 
+ 	protected long getExtentEnd()
+@@ -606,6 +729,20 @@ protected long getLastPagenum()
+ 		return extentStart+extentLength-1;
+ 	}
+ 
++    /**
++     * translate bit position in map to page number.
++     * <p>
++     *
++	 * @return The page number of this "bit" in the extent map.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    protected long getPagenum(int bit_pos)
++    {
++        return(extentStart + bit_pos);
++    }
++        
++
+ 
+ 	/*
+ 	 * page preallocation 
+@@ -813,10 +950,12 @@ protected int getAllocatedPageCount()
+ 
+ 		if (SanityManager.DEBUG)
+         {
+-			SanityManager.ASSERT(
+-                allocatedPageCount >= 0,
++            if (allocatedPageCount < 0)
++            {
++                SanityManager.THROWASSERT(
+                 "number of allocated page < 0, val =" + allocatedPageCount +
+                 "\nextent = " + toDebugString());
++        }
+         }
+ 
+ 		return allocatedPageCount;
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocPage.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocPage.java
+index dfe03437..c594bca1 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocPage.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocPage.java
+@@ -874,16 +874,70 @@ protected void chainNextAllocPage(LogInstant instant,
+ 		nextAllocPageOffset = newAllocPageOffset;
+ 	}
+ 
++    /**
++     * Compress free pages.
++     * <p>
++     * Compress the free pages at the end of the range maintained by
++     * this allocation page.  All pages being compressed should be FREE.
++     * Only pages in the last allocation page can be compressed.
++     * <p>
++     *
++     * @param instant               log address for this operation.
++     * @param new_highest_page      The new highest page on this allocation 
++     *                              page.  The number is the offset of the page
++     *                              in the array of pages maintained by this 
++     *                              allocation page, for instance a value of 0 
++     *                              indicates all page except the first one are
++     *                              to be truncated.  If all pages are 
++     *                              truncated then the offset is set to -1.
++     * @param num_pages_truncated   The number of allocated pages in this 
++     *                              allocation page prior to the truncate.  
++     *                              Note that all pages from NewHighestPage+1 
++     *                              through newHighestPage+num_pages_truncated 
++     *                              should be FREE.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++	protected void compressSpace(
++    LogInstant  instant,
++    int         new_highest_page,
++    int         num_pages_truncated)
++		 throws StandardException
++	{
++		if (SanityManager.DEBUG)
++        {
++			SanityManager.ASSERT(isLatched(), "page is not latched");
++            SanityManager.ASSERT(isLast(), "compress on non last alloc page.");
++            SanityManager.ASSERT(new_highest_page >= 0, "negative new high page.");
++        }
++
++		logAction(instant);
++
++        extent.compressPages(new_highest_page, num_pages_truncated);
++	}
++
+ 	public String toString()
+ 	{
+ 		if (SanityManager.DEBUG)
+ 		{
+-			String str = "*** Alloc page ***\n" + super.toString();
++			String str = 
++                "*** Alloc page ***\n"      + 
++                "nextAllocPageNumber = "    + nextAllocPageNumber   +
++                "\nnextAllocPageOffset = "  + nextAllocPageOffset   +
++                "\nreserved1 = "            + reserved1             +
++                "\nreserved2 = "            + reserved2             +
++                "\nreserved3 = "            + reserved3             +
++                "\nreserved4 = "            + reserved4             +
++	            "\nborrowedSpace = "        + borrowedSpace         +
++                "\nextent = "               + extent.toDebugString() + "\n" +
++                super.toString();
+ 			return str;
+ 		}
+ 		else
++        {
+ 			return null;
+ 	}
++	}
+ 
+ 
+ 	/**
+@@ -959,25 +1013,51 @@ protected void preAllocatePage(FileContainer myContainer,
+ 	}
+ 
+ 	/**
+-		compress
+-
+-		@param myContainer the container object
+-	*/
++     * compress out empty pages at end of container.
++     * <p>
++     * Call the extent to update the data structure make the bit map look
++     * like contiguous free pages at the end of the extent no longer exist.
++     * Similar to preallocate do the operation unlogged, need to force the
++     * change to the extent before actually removing the space from the
++     * file.
++     * <p>
++     * The sequence is:
++     *     1) update extent data structure
++     *     2) force extent changes to disk
++     *     3) truncate pages
++     *
++     * If the system crashes between 1 and 2 then no changes are on disk.
++     * If the system crashes between 2 and 3 then there are extra pages in
++     *     the file that extent does not know about, this is the same case
++     *     as preallocation which the code already handes.  It will handle
++     *     any set of pages from 0 to all of the intended pages being 
++     *     truncated.  The next allocate looks at actual size of file as
++     *     does the right thing.
++     *
++     * <p)
++     * MT - expect Container level X lock
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
+ 	protected boolean compress(
++    RawTransaction  ntt,
+     FileContainer myContainer)
+         throws StandardException
+ 	{
+         boolean all_pages_compressed = false;
+ 
+ 		if (SanityManager.DEBUG)
++        {
+ 			SanityManager.ASSERT(isLatched(), "page is not latched");
++        }
++
++        int last_valid_page = extent.compress(owner, ntt, this);
+ 
+-        long last_valid_page = extent.compressPages();
+         if (last_valid_page >= 0)
+         {
+             // a non-negative return means that pages can be returned to
+             // the operating system.
+-            myContainer.truncatePages(last_valid_page);
++            myContainer.truncatePages(extent.getPagenum(last_valid_page));
+ 
+             if (last_valid_page == this.getPageNumber())
+             {
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocationActions.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocationActions.java
+index 819b8dd4..25093048 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocationActions.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/AllocationActions.java
+@@ -65,5 +65,37 @@ public void actionChainAllocPage(RawTransaction t, BasePage allocPage,
+ 								long pageNumber, long pageOffset)
+ 		 throws StandardException;
+ 
++    /**
++     * Compress free pages.
++     * <p>
++     * Compress the free pages at the end of the range maintained by
++     * this allocation page.  All pages being compressed should be FREE.
++     * Only pages in the last allocation page can be compressed.
++     * <p>
++     *
++     * @param t				        The transaction
++     * @param allocPage		        the allocation page to do compress on.
++     * @param instant               log address for this operation.
++     * @param new_highest_page      The new highest page on this allocation 
++     *                              page.  The number is the offset of the page
++     *                              in the array of pages maintained by this 
++     *                              allocation page, for instance a value of 0 
++     *                              indicates all page except the first one are
++     *                              to be truncated.  If all pages are 
++     *                              truncated then the offset is set to -1.
++     * @param num_pages_truncated   The number of allocated pages in this 
++     *                              allocation page prior to the truncate.  
++     *                              Note that all pages from NewHighestPage+1 
++     *                              through newHighestPage+num_pages_truncated 
++     *                              should be FREE.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public void actionCompressSpaceOperation(
++	RawTransaction  t,
++    BasePage        allocPage, 
++    int             new_highest_page, 
++    int             num_pages_truncated)
++        throws StandardException;
+ 
+ }
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/CompressSpacePageOperation.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/CompressSpacePageOperation.java
+index e69de29b..4285bd63 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/CompressSpacePageOperation.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/CompressSpacePageOperation.java
+@@ -0,0 +1,222 @@
++/*
++
++   Derby - Class org.apache.derby.impl.store.raw.data.ChainAllocPageOperation
++
++   Copyright 2005 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derby.impl.store.raw.data;
++
++import org.apache.derby.impl.store.raw.data.PhysicalPageOperation;
++import org.apache.derby.impl.store.raw.data.BasePage;
++
++import org.apache.derby.iapi.services.io.FormatIdUtil;
++import org.apache.derby.iapi.services.io.StoredFormatIds;
++import org.apache.derby.iapi.services.sanity.SanityManager;
++
++import org.apache.derby.iapi.error.StandardException;
++import org.apache.derby.iapi.store.raw.ContainerHandle;
++import org.apache.derby.iapi.store.raw.data.RawContainerHandle;
++import org.apache.derby.iapi.store.raw.Transaction;
++import org.apache.derby.iapi.store.raw.log.LogInstant;
++
++import org.apache.derby.iapi.services.io.CompressedNumber;
++
++import java.io.OutputStream;
++import java.io.ObjectOutput;
++import java.io.IOException;
++import org.apache.derby.iapi.services.io.LimitObjectInput;
++import java.io.ObjectInput;
++
++
++/**
++
++Log operation to implement compressing space from a container and returning
++it to the operating system.
++
++**/
++
++public final class CompressSpacePageOperation extends PhysicalPageOperation
++{
++    /**************************************************************************
++     * Fields of the class
++     **************************************************************************
++     */
++
++    /**
++     * The new highest page on this allocation page.  The number is the
++     * offset of the page in the array of pages maintained by this 
++     * allocation page, for instance a value of 0 indicates all page except
++     * the first one are to be truncated.  If all pages are truncated then 
++     * the offset is set to -1.
++     **/
++	protected int newHighestPage;	    
++
++    /**
++     * The number of allocated pages in this allocation page prior to 
++     * the truncate.  Note that all pages from NewHighestPage+1 through
++     * newHighestPage+num_pages_truncated should be FREE.
++     **/
++	protected int num_pages_truncated; 
++
++    /**************************************************************************
++     * Constructors for This class:
++     **************************************************************************
++     */
++	public CompressSpacePageOperation(
++    AllocPage   allocPage, 
++    int         highest_page, 
++    int         num_truncated)
++		 throws StandardException
++	{
++		super(allocPage);
++
++        newHighestPage      = highest_page;
++        num_pages_truncated = num_truncated;
++	}
++	
++    /**************************************************************************
++     * Public Methods of Formatable interface.
++     **************************************************************************
++     */
++
++	// no-arg constructor, required by Formatable 
++	public CompressSpacePageOperation() { super(); }
++
++	public void writeExternal(ObjectOutput out) throws IOException 
++	{
++		super.writeExternal(out);
++		CompressedNumber.writeInt(out, newHighestPage);
++		CompressedNumber.writeInt(out, num_pages_truncated);
++	}
++
++	/**
++		@exception IOException error reading from log stream
++		@exception ClassNotFoundException cannot read object from input
++	*/
++	public void readExternal(ObjectInput in)
++		 throws IOException, ClassNotFoundException
++	{
++		super.readExternal(in);
++		newHighestPage      = CompressedNumber.readInt(in);
++		num_pages_truncated = CompressedNumber.readInt(in);
++	}
++
++	/**
++		Return my format identifier.
++	*/
++	public int getTypeFormatId() {
++		return StoredFormatIds.LOGOP_COMPRESS_SPACE;
++	}
++
++    /**************************************************************************
++     * Public Methods of Loggable interface.
++     **************************************************************************
++     */
++
++    /**
++     * Compress space from container.
++     * <p>
++     * Compress the indicate space from the container, returning the free
++     * pages to the OS.  Update the allocation page to reflect the file
++     * change.
++     *
++     * @param tran      transaction doing the operation.
++     * @param instant   log instant for this operation.
++     * @param in        unused by this log operation.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++	public final void doMe(
++    Transaction         tran, 
++    LogInstant          instant, 
++    LimitObjectInput    in) 
++		 throws StandardException
++	{
++		if (SanityManager.DEBUG) 
++        {
++			SanityManager.ASSERT(this.page instanceof AllocPage);
++		}
++
++		((AllocPage)page).compressSpace(
++             instant, newHighestPage, num_pages_truncated);
++	}
++
++    /**************************************************************************
++     * Public Methods of Undoable interface.
++     **************************************************************************
++     */
++
++    /**
++     * Compress space undo.
++     * <p>
++     *
++	 * @exception StandardException Thrown by methods I call 
++     * @see PhysicalPageOperation#undoMe
++     **/
++	public void undoMe(
++    Transaction         xact, 
++    BasePage            undoPage, 
++    LogInstant          CLRInstant, 
++    LimitObjectInput    in)
++		 throws StandardException
++	{
++		if (SanityManager.DEBUG) 
++        {
++			SanityManager.ASSERT(undoPage != null, "undo Page null");
++			SanityManager.ASSERT(
++                undoPage instanceof AllocPage, 
++				"undo Page is not an allocPage");
++		}
++
++		((AllocPage)undoPage).compressSpace(
++             CLRInstant, newHighestPage, num_pages_truncated);
++	}
++
++	/*
++	 * method to support BeforeImageLogging
++	 */
++	public void restoreMe(
++    Transaction         xact, 
++    BasePage            undoPage, 
++    LogInstant          CLRinstant, 
++    LimitObjectInput    in)
++	{
++		// nobody should be calling this since there is no corresponding 
++        // BI operation.
++		if (SanityManager.DEBUG)
++			SanityManager.THROWASSERT(
++                "cannot call restoreMe on CompressSpaceOperation.");
++	}
++
++
++	/** debug */
++	public String toString()
++	{
++		if (SanityManager.DEBUG)
++		{
++			String str = super.toString();
++			str += " CompressSpaceOperation: " + 
++                "newHighestPage = " + newHighestPage +
++                ";num_pages_truncated = " + num_pages_truncated +
++				" to " + getPageId();
++
++			return str;
++		}
++		else
++			return null;
++	}
++}
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/DirectAllocActions.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/DirectAllocActions.java
+index 4672cb98..ca821c22 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/DirectAllocActions.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/DirectAllocActions.java
+@@ -76,4 +76,39 @@ public void actionChainAllocPage(RawTransaction t, BasePage allocPage,
+ 												  pageOffset);
+ 	}
+ 
++    /**
++     * Compress free pages.
++     * <p>
++     * Compress the free pages at the end of the range maintained by
++     * this allocation page.  All pages being compressed should be FREE.
++     * Only pages in the last allocation page can be compressed.
++     * <p>
++     *
++     * @param t				        The transaction
++     * @param allocPage		        the allocation page to do compress on.
++     * @param new_highest_page      The new highest page on this allocation 
++     *                              page.  The number is the offset of the page
++     *                              in the array of pages maintained by this 
++     *                              allocation page, for instance a value of 0 
++     *                              indicates all page except the first one are
++     *                              to be truncated.  If all pages are 
++     *                              truncated then the offset is set to -1.
++     * @param num_pages_truncated   The number of allocated pages in this 
++     *                              allocation page prior to the truncate.  
++     *                              Note that all pages from NewHighestPage+1 
++     *                              through newHighestPage+num_pages_truncated 
++     *                              should be FREE.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public void actionCompressSpaceOperation(
++	RawTransaction  t,
++    BasePage        allocPage, 
++    int             new_highest_page, 
++    int             num_pages_truncated)
++        throws StandardException
++    {
++		((AllocPage)allocPage).compressSpace(
++             (LogInstant)null, new_highest_page, num_pages_truncated);
++    }
+ }
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+index 40801e5f..cdb65b82 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+@@ -1379,10 +1379,17 @@ protected void compressContainer(
+                         allocHandle.getAllocPage(nextAllocPageNumber);
+                 }
+ 
+-                alloc_page.compress(this);
+-
++                // invalidate cache before compress changes cached information,
++                // while holding synchronization on cache and latch on 
++                // allocation page.  This should guarantee that only new info
++                // is seen after this operation completes.
+ 				allocCache.invalidate(); 
+ 
++                // reset, as pages may not exist after compress
++                lastUnfilledPage    = ContainerHandle.INVALID_PAGE_NUMBER;
++                lastAllocatedPage   = ContainerHandle.INVALID_PAGE_NUMBER;
++
++                alloc_page.compress(ntt, this);
+             }
+ 
+ 		}
+@@ -1464,7 +1471,7 @@ protected BasePage newPage(BaseContainerHandle userHandle,
+ 							   boolean isOverflow) 
+ 		 throws StandardException 
+ 	{
+-		// NOTE: right now, we are single threaded thru this method, see MT comment
++		// NOTE: we are single threaded thru this method, see MT comment
+ 
+ 		boolean useNTT = (ntt != null);
+ 
+@@ -1497,45 +1504,59 @@ protected BasePage newPage(BaseContainerHandle userHandle,
+ 				{
+ 					if (SanityManager.DEBUG)
+ 					{
+-						SanityManager.ASSERT(ntt.getId().equals(allocHandle.getTransaction().getId()));
++						SanityManager.ASSERT(
++                            ntt.getId().equals(
++                                allocHandle.getTransaction().getId()));
++
+ 						if (useNTT)
+-							SanityManager.ASSERT(!ntt.getId().equals(userHandle.getTransaction().getId()));
++							SanityManager.ASSERT(
++                                !ntt.getId().equals(
++                                    userHandle.getTransaction().getId()));
+ 					}
+ 
+-					/* find an allocation page that can handle adding a new page
+-					   allocPage is unlatched when the ntt commits
+-					   The new page is initialized by the ntt but the latch is
+-					   transfered to the user transaction before the allocPage is
+-					   unlatched.  The allocPage latch prevents almost any other reader or
+-					   writer from finding the new page until the ntt is committed and
+-					   the new page latched by the user transaction.
+-                       (If the page is being reused, it is possible for another xact
+-                       which kept a handle on the reused page to find the page during the
+-                       transfer UT -> NTT. If this unlikely even occurs and the transfer
+-                       fails [see code relating to transfer below], we retry from
+-                       the beginning.)
+-
+-
+-					   After the NTT commits a reader (getNextPageNumber) may get the page
+-					   number of the newly allocated page and it will wait for the new page
+-					   and latch it when the user transaction commits, aborts or unlatches
+-					   the new page. Whether the user transaction commits or aborts,
+-					   the new page stay allocated.
+-
+-					   RESOLVE: before NTT rolls back (or commits) the latch is released.
+-					   To repopulate the allocation cache, need to get either the container
+-					   lock on add page, or get a per allocation page lock.
+-
+-					   This blocks all page read (getPage) from accessing this alloc page in
+-					   this this container until the alloc page is unlatched.  Those who
+-					   already have a page handle into this container is unaffected.
+-
+-					   In other words, allocation blocks out reader (of any page that is
+-					   managed by this alloc page) by the latch on the allocation page.
+-
+-					   Note that write page can proceed as usual.
++                    /* find an allocation page that can handle adding a new 
++                     * page.
++                     *
++                     * allocPage is unlatched when the ntt commits. The new 
++                     * page is initialized by the ntt but the latch is 
++                     * transfered to the user transaction before the allocPage 
++                     * is unlatched.  The allocPage latch prevents almost any 
++                     * other reader or writer from finding the new page until 
++                     * the ntt is committed and the new page is latched by the
++                     * user transaction.
++                     *
++                     * (If the page is being reused, it is possible for another
++                     * xact which kept a handle on the reused page to find the 
++                     * page during the transfer UT -> NTT. If this unlikely 
++                     * even occurs and the transfer fails [see code relating 
++                     * to transfer below], we retry from the beginning.)
++                     *
++                     * After the NTT commits a reader (getNextPageNumber) may 
++                     * get the page number of the newly allocated page and it 
++                     * will wait for the new page and latch it when the user 
++                     * transaction commits, aborts or unlatches the new page. 
++                     * Whether the user transaction commits or aborts, the new 
++                     * page stay allocated.
++                     *
++                     * RESOLVE: before NTT rolls back (or commits) the latch is
++                     * released.  To repopulate the allocation cache, need to 
++                     * get either the container lock on add page, or get a per 
++                     * allocation page lock.
++                     *
++                     * This blocks all page read (getPage) from accessing this 
++                     * alloc page in this container until the alloc page is 
++                     * unlatched.  Those who already have a page handle into 
++                     * this container are unaffected.
++                     *
++                     * In other words, allocation blocks out reader (of any 
++                     * page that is managed by this alloc page) by the latch 
++                     * on the allocation page.
++                     *
++                     * Note that write page can proceed as usual.
+ 				    */
+-					allocPage = findAllocPageForAdd(allocHandle, ntt, startSearch);
++					allocPage = 
++                        findAllocPageForAdd(allocHandle, ntt, startSearch);
++
+ 					allocCache.invalidate(allocPage, allocPage.getPageNumber());
+ 				}
+ 
+@@ -1642,37 +1663,44 @@ This blocks all page read (getPage) from accessing this alloc page in
+                     SanityManager.ASSERT(retry == false);
+                 }
+ 
+-			    // Now we have verified that the allocPage is latched and we can get
+-			    // the zeroDuration deallocLock nowait.  This means the transaction
+-			    // which freed the page has committed.  Had that transaction aborted,
+-			    // we would have retried.
++			    // Now we have verified that the allocPage is latched and we 
++                // can get the zeroDuration deallocLock nowait.  This means the
++                // transaction which freed the page has committed.  Had that 
++                // transaction aborted, we would have retried.
+ 
+ 			    if (SanityManager.DEBUG)
+ 			    {
+ 				    // ASSERT lastPage <= lastPreallocPage
+ 				    if (lastPage > lastPreallocPage)
++                    {
+ 					    SanityManager.THROWASSERT("last page " +
+-						    lastPage + " > lastPreallocPage " + lastPreallocPage);
++						    lastPage + " > lastPreallocPage " + 
++                            lastPreallocPage);
++                    }
+ 			    }
+ 
+-			    // No I/O at all if this new page is requested as part of a create
+-			    // and load statement or this new page is in a temporary container.
+-			    // In the former case, BaseContainer will allow the MODE_UNLOGGED
+-			    // bit to go thru to the nested top transaction alloc handle.
+-			    // In the later case, there is no nested top transaction and the
+-			    // alloc handle is the user handle, which is UNLOGGED.
+-			    boolean noIO = (allocHandle.getMode() & ContainerHandle.MODE_UNLOGGED) ==
++			    // No I/O at all if this new page is requested as part of a 
++                // create and load statement or this new page is in a temporary
++                // container.
++                //
++			    // In the former case, BaseContainer will allow the 
++                // MODE_UNLOGGED bit to go thru to the nested top transaction 
++                // alloc handle.  In the later case, there is no nested top 
++                // transaction and the alloc handle is the user handle, which 
++                // is UNLOGGED.
++			    boolean noIO = 
++                    (allocHandle.getMode() & ContainerHandle.MODE_UNLOGGED) ==
+ 				    ContainerHandle.MODE_UNLOGGED;
+ 
+ 			    // If we do not need the I/O (either because we are in a
+-			    // create_unlogged mode or we are dealing with a temp table), don't
+-			    // do any preallocation.  Otherwise, see if we should be
++			    // create_unlogged mode or we are dealing with a temp table), 
++                // don't do any preallocation.  Otherwise, see if we should be
+ 			    // pre-Allocating page by now.  We don't call it before
+ 			    // nextFreePageNumber because finding a reusable page may be
+-			    // expensive and we don't want to start preAllocation unless there
+-			    // is no more reusable page.  Unless we are called explicitly to
+-			    // bulk increase the container size in a preload or in a create
+-			    // container.
++			    // expensive and we don't want to start preAllocation unless 
++                // there is no more reusable page.  Unless we are called 
++                // explicitly to bulk increase the container size in a preload 
++                // or in a create container.
+ 			    if (!noIO && (bulkIncreaseContainerSize ||
+ 						  (pageNumber > lastPreallocPage &&
+ 						   pageNumber > PreAllocThreshold)))
+@@ -1681,15 +1709,15 @@ This blocks all page read (getPage) from accessing this alloc page in
+ 				    						  PreAllocSize);
+ 			    }
+ 
+-			    // update last preAllocated Page, it may have been changed by the
+-			    // preAllocatePage call.  We don't want to do the sync if it
++			    // update last preAllocated Page, it may have been changed by 
++                // the preAllocatePage call.  We don't want to do the sync if 
+ 			    // preAllocatePage already took care of it.
+ 			    lastPreallocPage = allocPage.getLastPreallocPagenum();
+ 			    boolean prealloced = pageNumber <= lastPreallocPage;
+ 
+ 			    // Argument to the create is an array of ints.
+-			    // The array is only used for new page creation or for creating a
+-			    // preallocated page, not for reuse.
++			    // The array is only used for new page creation or for creating
++                // a preallocated page, not for reuse.
+ 			    // 0'th element is the page format
+ 			    // 1'st element is whether or not to sync the page to disk
+ 			    // 2'nd element is pagesize
+@@ -1697,7 +1725,8 @@ This blocks all page read (getPage) from accessing this alloc page in
+ 
+ 			    int[] createPageArgs = new int[STORED_PAGE_ARG_NUM];
+ 			    createPageArgs[0] = StoredPage.FORMAT_NUMBER;
+-			    createPageArgs[1] = prealloced ? 0 : (noIO ? 0 : CachedPage.WRITE_SYNC);
++			    createPageArgs[1] = prealloced ? 
++                                        0 : (noIO ? 0 : CachedPage.WRITE_SYNC);
+ 			    createPageArgs[2] = pageSize;
+ 			    createPageArgs[3] = spareSpace;
+ 			    createPageArgs[4] = minimumRecordSize;
+@@ -1711,12 +1740,31 @@ This blocks all page read (getPage) from accessing this alloc page in
+ 			    // allocation failed, it is rolled back with the NTT.
+ 			    // Later, we transfer the latch to the userHandle so it won't be
+ 			    // released when the ntt commits
++
++                try
++                {
+ 			    page = initPage(allocHandle, pkey, createPageArgs, pageOffset,
+ 				    			reuse, isOverflow);
++                }
++                catch (StandardException se)
++                {
++                    SanityManager.DEBUG_PRINT("FileContainer",
++                        "got exception from initPage:"  +
++                        "\nreuse = " + reuse +
++                        "\ncreatePageArgs[1] = " + createPageArgs[1] +
++                        "\nallocPage = " + allocPage
++                        );
++                    allocCache.dumpAllocationCache();
++
++                    throw se;
++                }
++
+ 			    if (SanityManager.DEBUG)
+ 			    {
+-				    SanityManager.ASSERT(page != null, "initPage returns null page");
+-				    SanityManager.ASSERT(page.isLatched(), "initPage returns unlatched page");
++				    SanityManager.ASSERT(
++                        page != null, "initPage returns null page");
++				    SanityManager.ASSERT(
++                        page.isLatched(), "initPage returns unlatched page");
+ 			    }
+ 
+ 			    // allocate the page in the allocation page bit map
+@@ -1725,36 +1773,48 @@ This blocks all page read (getPage) from accessing this alloc page in
+ 			    if (useNTT)
+ 			    {
+ 				    // transfer the page latch from NTT to UT.
+-				    // after the page is unlatched by NTT, it is still protected from being
+-				    // found by almost everybody else because the alloc page is still latched and
+-				    // the alloc cache is invalidated.
+-                    // However (beetle 3942) it is possible for the page to be found by threads
+-                    // who specifically ask for this pagenumber (e.g. HeapPostCommit).
+-                    // We may find that such a thread has latched the page. We shouldn't wait
+-                    // for it because we have the alloc page latch, and this could cause
+-                    // deadlock (e.g. HeapPostCommit might call removePage and this would
+-                    // wait on the alloc page).
+-                    // We may instead find that we can latch the page, but that another thread
+-                    // has managed to get hold of it during the transfer and either deallocate
+-                    // it or otherwise change it (add rows, delete rows etc.)
+-                    // Since this doesn't happen very often, we retry in these 2 cases
+-                    // (we give up the alloc page and page and we start this method from scratch).
+-
+-                    // If the lock manager were changed to allow latches to be transferred between
+-                    // transactions, wouldn't need to unlatch to do the transfer, and would avoid
+-                    // having to retry in these cases (beetle 4011).
++                    //
++				    // after the page is unlatched by NTT, it is still 
++                    // protected from being found by almost everybody else 
++                    // because the alloc page is still latched and the alloc 
++                    // cache is invalidated.
++                    //
++                    // However (beetle 3942) it is possible for the page to be 
++                    // found by threads who specifically ask for this 
++                    // pagenumber (e.g. HeapPostCommit).
++                    // We may find that such a thread has latched the page. 
++                    // We shouldn't wait for it because we have the alloc page 
++                    // latch, and this could cause deadlock (e.g. 
++                    // HeapPostCommit might call removePage and this would wait
++                    // on the alloc page).
++                    //
++                    // We may instead find that we can latch the page, but that
++                    // another thread has managed to get hold of it during the 
++                    // transfer and either deallocate it or otherwise change it
++                    // (add rows, delete rows etc.)
++                    //
++                    // Since this doesn't happen very often, we retry in these 
++                    // 2 cases (we give up the alloc page and page and we start
++                    // this method from scratch).
++                    //
++                    // If the lock manager were changed to allow latches to be 
++                    // transferred between transactions, wouldn't need to 
++                    // unlatch to do the transfer, and would avoid having to 
++                    // retry in these cases (beetle 4011).
+ 
+ 				    page.unlatch();
+ 				    page = null;
+ 
+-				    // need to find it in the cache again since unlatch also unkept the
+-				    // page from the cache
++				    // need to find it in the cache again since unlatch also 
++                    // unkept the page from the cache
+ 				    page = (BasePage)pageCache.find(pkey);
+-				    page = latchPage(userHandle, page, false /* don't wait, it might deadlock */);
++				    page = latchPage(
++                                userHandle, page, 
++                                false /* don't wait, it might deadlock */);
+ 
+                     if (page == null ||
+-                        // recordCount will only return true if there are no rows
+-                        // (including deleted rows)
++                        // recordCount will only return true if there are no 
++                        // rows (including deleted rows)
+                         page.recordCount() != 0 ||
+                         page.getPageStatus() != BasePage.VALID_PAGE)
+                     {
+@@ -1825,9 +1885,11 @@ This blocks all page read (getPage) from accessing this alloc page in
+ 		if (!this.identity.equals(page.getPageId().getContainerId())) {
+ 
+ 			if (SanityManager.DEBUG) {
+-				SanityManager.THROWASSERT("just created a new page from a different container"
++				SanityManager.THROWASSERT(
++                    "just created a new page from a different container"
+ 					+ "\n this.identity = " + this.identity
+-					+ "\n page.getPageId().getContainerId() = " + page.getPageId().getContainerId()
++					+ "\n page.getPageId().getContainerId() = " + 
++                        page.getPageId().getContainerId()
+ 					+ "\n userHandle is: " + userHandle
+ 					+ "\n allocHandle is: " + allocHandle
+ 					+ "\n this container is: " + this);
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/LoggableAllocActions.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/LoggableAllocActions.java
+index 3fcf3ff3..9ee6f18b 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/LoggableAllocActions.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/LoggableAllocActions.java
+@@ -86,4 +86,43 @@ public void actionChainAllocPage(RawTransaction t, BasePage allocPage,
+ 		t.logAndDo(lop);
+ 	}
+ 
++    /**
++     * Compress free pages.
++     * <p>
++     * Compress the free pages at the end of the range maintained by
++     * this allocation page.  All pages being compressed should be FREE.
++     * Only pages in the last allocation page can be compressed.
++     * <p>
++     *
++     * @param t				        The transaction
++     * @param allocPage		        the allocation page to do compress on.
++     * @param new_highest_page      The new highest page on this allocation 
++     *                              page.  The number is the offset of the page
++     *                              in the array of pages maintained by this 
++     *                              allocation page, for instance a value of 0 
++     *                              indicates all page except the first one are
++     *                              to be truncated.  If all pages are 
++     *                              truncated then the offset is set to -1.
++     * @param num_pages_truncated   The number of allocated pages in this 
++     *                              allocation page prior to the truncate.  
++     *                              Note that all pages from NewHighestPage+1 
++     *                              through newHighestPage+num_pages_truncated 
++     *                              should be FREE.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public void actionCompressSpaceOperation(
++	RawTransaction  t,
++    BasePage        allocPage, 
++    int             new_highest_page, 
++    int             num_pages_truncated)
++        throws StandardException
++    {
++		Loggable lop = 
++            new CompressSpacePageOperation(
++                (AllocPage)allocPage, new_highest_page, num_pages_truncated);
++        allocPage.preDirty();
++
++        t.logAndDo(lop);
++    }
+ }
+diff --git a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
+index 3cf5f5a9..cca2f368 100644
+--- a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
++++ b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
+@@ -206,17 +206,27 @@ private void createAndLoadTable(
+         String  data1_str = new String(data1_data);
+         String  data2_str = new String(data2_data);
+ 
+-        for (int i = 0; i < num_rows; i++)
++        int row_count = 0;
++        try
+         {
+-            insert_stmt.setInt(1, i);               // keycol
+-            insert_stmt.setInt(2, i * 10);          // indcol1
+-            insert_stmt.setInt(3, i * 100);         // indcol2
+-            insert_stmt.setInt(4, -i);              // indcol3
++            for (;row_count < num_rows; row_count++)
++            {
++                insert_stmt.setInt(1, row_count);               // keycol
++                insert_stmt.setInt(2, row_count * 10);          // indcol1
++                insert_stmt.setInt(3, row_count * 100);         // indcol2
++                insert_stmt.setInt(4, -row_count);              // indcol3
+             insert_stmt.setString(5, data1_str);   // data1_data
+             insert_stmt.setString(6, data2_str);   // data2_data
+ 
+             insert_stmt.execute();
+         }
++        }
++        catch (SQLException sqle)
++        {
++            System.out.println(
++                "Exception while trying to insert row number: " + row_count);
++            throw sqle;
++        }
+ 
+         if (create_table)
+         {
+@@ -498,6 +508,73 @@ private void deleteAllRows(
+         testProgress("end deleteAllRows," + num_rows + " row test.");
+     }
+ 
++    private void simpleDeleteAllRows(
++    Connection  conn,
++    boolean     create_table,
++    boolean     long_table,
++    String      schemaName,
++    String      table_name,
++    int         num_rows) 
++        throws SQLException 
++    {
++        testProgress(
++            "begin simpleDeleteAllRows," + num_rows + " row test, create = " + 
++                create_table + ".");
++
++
++        if (long_table)
++            createAndLoadLongTable(conn, create_table, table_name, num_rows);
++        else
++            createAndLoadTable(conn, create_table, table_name, num_rows);
++
++        if (verbose)
++            testProgress("Calling compress.");
++
++        // compress with no deletes should not affect size
++        int[] ret_before = getSpaceInfo(conn, "APP", table_name, true);
++        callCompress(conn, "APP", table_name, true, true, true, true);
++        int[] ret_after  = getSpaceInfo(conn, "APP", table_name, true);
++
++        if (ret_after[SPACE_INFO_NUM_ALLOC] != ret_before[SPACE_INFO_NUM_ALLOC])
++        {
++            log_wrong_count(
++                "Expected no alloc page change.", 
++                table_name, num_rows, 
++                ret_before[SPACE_INFO_NUM_ALLOC], 
++                ret_after[SPACE_INFO_NUM_ALLOC],
++                ret_before, ret_after);
++        }
++
++        testProgress("no delete case complete.");
++
++        // delete all the rows.
++        ret_before = getSpaceInfo(conn, "APP", table_name, true);
++        executeQuery(conn, "delete from " + table_name, true);
++
++        if (verbose)
++            testProgress("deleted all rows, now calling compress.");
++
++        callCompress(conn, "APP", table_name, true, true, true, true);
++        ret_after  = getSpaceInfo(conn, "APP", table_name, true);
++
++        // An empty table has 2 pages, one allocation page and the 1st page
++        // which will have a system row in it.  The space vti only reports
++        // a count of the user pages so the count is 1.
++        if (ret_after[SPACE_INFO_NUM_ALLOC] != 1)
++        {
++            log_wrong_count(
++                "Expected all pages to be truncated.",
++                table_name, num_rows, 1, ret_after[SPACE_INFO_NUM_ALLOC],
++                ret_before, ret_after);
++        }
++
++        testProgress("delete all rows case succeeded.");
++
++        conn.commit();
++
++        testProgress("end simple deleteAllRows," + num_rows + " row test.");
++    }
++
+     /**
+      * Check/exercise purge pass phase.
+      * <p>
+@@ -640,13 +717,21 @@ private void checkPurgePhase(
+ 
+         // make sure table is back to all deleted row state.  lock timeout
+         // will abort transaction.
++
++        // delete all rows and commit.
+         executeQuery(conn, "delete from " + table_name, true);
++
++        // compress all space and commit.
+         callCompress(conn, "APP", table_name, true, true, true, true);
++
++        // add back all rows and commit.
+         if (long_table)
+             createAndLoadLongTable(conn, create_table, table_name, num_rows);
+         else
+             createAndLoadTable(conn, create_table, table_name, num_rows);
+         conn.commit();
++
++        // delete all rows, and NO commit.
+         executeQuery(conn, "delete from " + table_name, false);
+ 
+ 
+@@ -789,8 +874,11 @@ private void test1(
+     }
+ 
+     /**
+-     * Test 2 - check transaction roll backs
++     * Test 2 - check repeated delete tests.
+      * <p>
++     * There was a timing error where test1 would usually pass, but 
++     * repeated execution of this test found a timing problem with
++     * allocation using an "unallocated" page and getting an I/O error.
+      *
+      **/
+     private void test2(
+@@ -799,6 +887,29 @@ private void test2(
+     String      table_name)
+         throws SQLException 
+     {
++        beginTest(conn, test_name);
++
++        int[] test_cases = {4000};
++
++        for (int i = 0; i < test_cases.length; i++)
++        {
++            // first create new table and run the tests.
++            simpleDeleteAllRows(
++                conn, true, false, "APP", table_name, test_cases[i]);
++
++            for (int j = 0; j < 100; j++)
++            {
++
++                // now rerun tests on existing table, which had all rows deleted
++                // and truncated.
++                deleteAllRows(
++                    conn, false, false, "APP", table_name, test_cases[i]);
++            }
++
++            executeQuery(conn, "drop table " + table_name, true);
++        }
++
++        endTest(conn, test_name);
+     }
+ 
+ 
+@@ -855,14 +966,55 @@ private void test3(
+         endTest(conn, test_name);
+     }
+ 
++    /**
++     * Test 4 - check repeated delete tests.
++     * <p>
++     * There was a timing error where test1 would usually pass, but 
++     * repeated execution of this test found a timing problem with
++     * allocation using an "unallocated" page and getting an I/O error.
++     *
++     **/
++    private void test4(
++    Connection  conn,
++    String      test_name,
++    String      table_name)
++        throws SQLException 
++    {
++        beginTest(conn, test_name);
++
++        int[] test_cases = {4000};
++
++        for (int i = 0; i < test_cases.length; i++)
++        {
++
++            for (int j = 0; j < 100; j++)
++            {
++                // first create new table and run the tests.
++                simpleDeleteAllRows(
++                    conn, true, false, "APP", table_name, test_cases[i]);
++
++                // now rerun tests on existing table, which had all rows deleted
++                // and truncated.
++                deleteAllRows(
++                    conn, false, false, "APP", table_name, test_cases[i]);
++
++                executeQuery(conn, "drop table " + table_name, true);
++            }
++
++        }
++
++        endTest(conn, test_name);
++    }
++
+ 
+ 
+     public void testList(Connection conn)
+         throws SQLException
+     {
+         test1(conn, "test1", "TEST1");
+-        // test2(conn, "test2", "TEST2", 10000);
++        // test2(conn, "test2", "TEST2");
+         test3(conn, "test3", "TEST3");
++        // test4(conn, "test2", "TEST2");
+     }
+ 
+     public static void main(String[] argv) 

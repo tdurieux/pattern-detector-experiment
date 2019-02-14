@@ -1,0 +1,748 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
+index 9f796f9a..e1dc07d9 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
+@@ -130,6 +130,12 @@ public ColumnFamily deserialize(DataInput dis, boolean intern, boolean fromRemot
+     public void deserializeColumns(DataInput dis, ColumnFamily cf, boolean intern, boolean fromRemote) throws IOException
+     {
+         int size = dis.readInt();
++        deserializeColumns(dis, cf, size, intern, fromRemote);
++    }
++
++    /* column count is already read from DataInput */
++    public void deserializeColumns(DataInput dis, ColumnFamily cf, int size, boolean intern, boolean fromRemote) throws IOException
++    {
+         ColumnFamilyStore interner = intern ? Table.open(CFMetaData.getCF(cf.id()).left).getColumnFamilyStore(cf.id()) : null;
+         for (int i = 0; i < size; ++i)
+         {
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Table.java
+index 71bfbc61..54fa7fa2 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Table.java
+@@ -631,8 +631,8 @@ public CompactionInfo getCompactionInfo()
+             return new CompactionInfo(cfs.table.name,
+                                       cfs.columnFamily,
+                                       CompactionType.INDEX_BUILD,
+-                                      iter.getTotalBytes(),
+-                                      iter.getBytesRead());
++                                      iter.getBytesRead(),
++                                      iter.getTotalBytes());
+         }
+ 
+         public void build()
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
+index 64158782..e26f5309 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
+@@ -35,10 +35,9 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.db.IColumn;
+-import org.apache.cassandra.thrift.Cassandra;
+-import org.apache.cassandra.thrift.InvalidRequestException;
+-import org.apache.cassandra.thrift.TokenRange;
+-import org.apache.cassandra.thrift.TBinaryProtocol;
++import org.apache.cassandra.dht.IPartitioner;
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.thrift.*;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.mapreduce.*;
+ import org.apache.thrift.TException;
+@@ -101,12 +100,44 @@ private static void validateConfiguration(Configuration conf)
+ 
+         try
+         {
++            KeyRange jobKeyRange = ConfigHelper.getInputKeyRange(conf);
++            IPartitioner partitioner = null;
++            Range jobRange = null;
++            if (jobKeyRange != null)
++            {
++                partitioner = ConfigHelper.getPartitioner(context.getConfiguration());
++                assert partitioner.preservesOrder() : "ConfigHelper.setInputKeyRange(..) can only be used with a order preserving paritioner";
++                jobRange = new Range(partitioner.getToken(jobKeyRange.start_key),
++                                     partitioner.getToken(jobKeyRange.end_key),
++                                     partitioner);
++            }
++
+             List<Future<List<InputSplit>>> splitfutures = new ArrayList<Future<List<InputSplit>>>();
+             for (TokenRange range : masterRangeNodes)
+             {
++                if (jobRange == null)
++                {
+                     // for each range, pick a live owner and ask it to compute bite-sized splits
+                     splitfutures.add(executor.submit(new SplitCallable(range, conf)));
+             }
++                else
++                {
++                    Range dhtRange = new Range(partitioner.getTokenFactory().fromString(range.start_token),
++                                               partitioner.getTokenFactory().fromString(range.end_token),
++                                               partitioner);
++
++                    if (dhtRange.intersects(jobRange))
++                    {
++                        Set<Range> intersections = dhtRange.intersectionWith(jobRange);
++                        assert intersections.size() == 1 : "wrapping ranges not supported";
++                        Range intersection = intersections.iterator().next();
++                        range.start_token = partitioner.getTokenFactory().toString(intersection.left);
++                        range.end_token = partitioner.getTokenFactory().toString(intersection.right);
++                        // for each range, pick a live owner and ask it to compute bite-sized splits
++                        splitfutures.add(executor.submit(new SplitCallable(range, conf)));
++                    }
++                }
++            }
+ 
+             // wait until we have all the results back
+             for (Future<List<InputSplit>> futureInputSplits : splitfutures)
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ConfigHelper.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
+index 0478ac7c..70e1d6a1 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
+@@ -22,6 +22,7 @@
+ 
+ import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.dht.IPartitioner;
++import org.apache.cassandra.thrift.KeyRange;
+ import org.apache.cassandra.thrift.SlicePredicate;
+ import org.apache.cassandra.thrift.TBinaryProtocol;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -42,6 +43,7 @@
+     private static final String INPUT_COLUMNFAMILY_CONFIG = "cassandra.input.columnfamily";
+     private static final String OUTPUT_COLUMNFAMILY_CONFIG = "cassandra.output.columnfamily";
+     private static final String INPUT_PREDICATE_CONFIG = "cassandra.input.predicate";
++    private static final String INPUT_KEYRANGE_CONFIG = "cassandra.input.keyRange";
+     private static final String OUTPUT_PREDICATE_CONFIG = "cassandra.output.predicate";
+     private static final String INPUT_SPLIT_SIZE_CONFIG = "cassandra.input.split.size";
+     private static final int DEFAULT_SPLIT_SIZE = 64 * 1024;
+@@ -195,6 +197,51 @@ private static SlicePredicate predicateFromString(String st)
+         return predicate;
+     }
+ 
++    /**
++     * Set the KeyRange to limit the rows.
++     * @param conf Job configuration you are about to run
++     * @param keyRange
++     */
++    public static void setInputKeyRange(Configuration conf, KeyRange keyRange){
++        conf.set(INPUT_KEYRANGE_CONFIG, keyRangeToString(keyRange));
++    }
++
++    /** may be null if unset */
++    public static KeyRange getInputKeyRange(Configuration conf){
++        String str = conf.get(INPUT_KEYRANGE_CONFIG);
++        return null != str ? keyRangeFromString(str) : null;
++    }
++
++    private static String keyRangeToString(KeyRange keyRange)
++    {
++        assert keyRange != null;
++        TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
++        try
++        {
++            return FBUtilities.bytesToHex(serializer.serialize(keyRange));
++        }
++        catch (TException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    private static KeyRange keyRangeFromString(String st)
++    {
++        assert st != null;
++        TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
++        KeyRange keyRange = new KeyRange();
++        try
++        {
++            deserializer.deserialize(keyRange, FBUtilities.hexToBytes(st));
++        }
++        catch (TException e)
++        {
++            throw new RuntimeException(e);
++        }
++        return keyRange;
++    }
++
+     public static String getInputKeyspace(Configuration conf)
+     {
+         return conf.get(INPUT_KEYSPACE_CONFIG);
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/IndexHelper.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
+index 3144a681..d8b550ee 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
+@@ -42,25 +42,43 @@
+      * @param in the data input from which the bloom filter should be skipped
+      * @throws IOException
+      */
+-    public static void skipBloomFilter(FileDataInput in) throws IOException
++    public static void skipBloomFilter(DataInput in) throws IOException
+     {
+         /* size of the bloom filter */
+         int size = in.readInt();
+         /* skip the serialized bloom filter */
++        if (in instanceof FileDataInput)
++        {
+         FileUtils.skipBytesFully(in, size);
+     }
++        else
++        {
++            // skip bytes
++            byte[] skip = new byte[size];
++            in.readFully(skip);
++        }
++    }
+ 
+ 	/**
+ 	 * Skip the index
+-	 * @param file the data input from which the index should be skipped
++     * @param in the data input from which the index should be skipped
+ 	 * @throws IOException if an I/O error occurs.
+ 	 */
+-	public static void skipIndex(FileDataInput file) throws IOException
++    public static void skipIndex(DataInput in) throws IOException
+ 	{
+         /* read only the column index list */
+-        int columnIndexSize = file.readInt();
++        int columnIndexSize = in.readInt();
+         /* skip the column index data */
+-        FileUtils.skipBytesFully(file, columnIndexSize);
++        if (in instanceof FileDataInput)
++        {
++            FileUtils.skipBytesFully(in, columnIndexSize);
++        }
++        else
++        {
++            // skip bytes
++            byte[] skip = new byte[columnIndexSize];
++            in.readFully(skip);
++        }
+ 	}
+     
+     /**
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
+index fbeb8227..3bb69a18 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
+@@ -21,11 +21,11 @@
+  */
+ 
+ 
++import java.io.DataInput;
+ import java.io.DataOutput;
+ import java.io.EOFException;
+ import java.io.IOError;
+ import java.io.IOException;
+-import java.util.ArrayList;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -37,7 +37,7 @@
+ import org.apache.cassandra.db.columniterator.IColumnIterator;
+ import org.apache.cassandra.db.marshal.MarshalException;
+ import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+-import org.apache.cassandra.utils.Filter;
++import org.apache.cassandra.utils.BytesReadTracker;
+ 
+ public class SSTableIdentityIterator implements Comparable<SSTableIdentityIterator>, IColumnIterator
+ {
+@@ -45,14 +45,16 @@
+ 
+     private final DecoratedKey key;
+     private final long finishedAt;
+-    private final BufferedRandomAccessFile file;
++    private final DataInput input;
+     private final long dataStart;
+     public final long dataSize;
+     public final boolean fromRemote;
+ 
+     private final ColumnFamily columnFamily;
+     public final int columnCount;
+-    private final long columnPosition;
++    private long columnPosition;
++
++    private BytesReadTracker inputWithTracker; // tracks bytes read
+ 
+     // Used by lazilyCompactedRow, so that we see the same things when deserializing the first and second time
+     private final int expireBefore;
+@@ -90,17 +92,18 @@ public SSTableIdentityIterator(SSTableReader sstable, BufferedRandomAccessFile f
+         this(sstable.metadata, file, key, dataStart, dataSize, checkData, sstable, false);
+     }
+ 
+-    public SSTableIdentityIterator(CFMetaData metadata, BufferedRandomAccessFile file, DecoratedKey key, long dataStart, long dataSize, boolean fromRemote)
++    public SSTableIdentityIterator(CFMetaData metadata, DataInput file, DecoratedKey key, long dataStart, long dataSize, boolean fromRemote)
+     throws IOException
+     {
+         this(metadata, file, key, dataStart, dataSize, false, null, fromRemote);
+     }
+ 
+     // sstable may be null *if* deserializeRowHeader is false
+-    private SSTableIdentityIterator(CFMetaData metadata, BufferedRandomAccessFile file, DecoratedKey key, long dataStart, long dataSize, boolean checkData, SSTableReader sstable, boolean fromRemote)
++    private SSTableIdentityIterator(CFMetaData metadata, DataInput input, DecoratedKey key, long dataStart, long dataSize, boolean checkData, SSTableReader sstable, boolean fromRemote)
+     throws IOException
+     {
+-        this.file = file;
++        this.input = input;
++        this.inputWithTracker = new BytesReadTracker(input);
+         this.key = key;
+         this.dataStart = dataStart;
+         this.dataSize = dataSize;
+@@ -111,6 +114,9 @@ private SSTableIdentityIterator(CFMetaData metadata, BufferedRandomAccessFile fi
+ 
+         try
+         {
++            if (input instanceof BufferedRandomAccessFile)
++            {
++                BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+             file.seek(this.dataStart);
+             if (checkData)
+             {
+@@ -136,14 +142,20 @@ private SSTableIdentityIterator(CFMetaData metadata, BufferedRandomAccessFile fi
+                 }
+                 file.seek(this.dataStart);
+             }
++            }
+ 
+-            IndexHelper.skipBloomFilter(file);
+-            IndexHelper.skipIndex(file);
++            IndexHelper.skipBloomFilter(inputWithTracker);
++            IndexHelper.skipIndex(inputWithTracker);
+             columnFamily = ColumnFamily.create(metadata);
+-            ColumnFamily.serializer().deserializeFromSSTableNoColumns(columnFamily, file);
+-            columnCount = file.readInt();
++            ColumnFamily.serializer().deserializeFromSSTableNoColumns(columnFamily, inputWithTracker);
++            columnCount = inputWithTracker.readInt();
++
++            if (input instanceof BufferedRandomAccessFile)
++            {
++                BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+             columnPosition = file.getFilePointer();
+         }
++        }
+         catch (IOException e)
+         {
+             throw new IOError(e);
+@@ -162,14 +174,22 @@ public ColumnFamily getColumnFamily()
+ 
+     public boolean hasNext()
+     {
++        if (input instanceof BufferedRandomAccessFile)
++        {
++            BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+         return file.getFilePointer() < finishedAt;
+     }
++        else
++        {
++            return inputWithTracker.getBytesRead() < dataSize;
++        }
++    }
+ 
+     public IColumn next()
+     {
+         try
+         {
+-            IColumn column = columnFamily.getColumnSerializer().deserialize(file, null, fromRemote, expireBefore);
++            IColumn column = columnFamily.getColumnSerializer().deserialize(inputWithTracker, null, fromRemote, expireBefore);
+             if (validateColumns)
+                 column.validateFields(columnFamily.metadata());
+             return column;
+@@ -196,23 +216,50 @@ public void close() throws IOException
+ 
+     public String getPath()
+     {
++        // if input is from file, then return that path, otherwise it's from streaming
++        if (input instanceof BufferedRandomAccessFile)
++        {
++            BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+         return file.getPath();
+     }
++        else
++        {
++            throw new UnsupportedOperationException();
++        }
++    }
+ 
+     public void echoData(DataOutput out) throws IOException
+     {
++        // only effective when input is from file
++        if (input instanceof BufferedRandomAccessFile)
++        {
++            BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+         file.seek(dataStart);
+         while (file.getFilePointer() < finishedAt)
+         {
+             out.write(file.readByte());
+         }
+     }
++        else
++        {
++            throw new UnsupportedOperationException();
++        }
++    }
+ 
+     public ColumnFamily getColumnFamilyWithColumns() throws IOException
+     {
+-        file.seek(columnPosition - 4); // seek to before column count int
+         ColumnFamily cf = columnFamily.cloneMeShallow();
+-        ColumnFamily.serializer().deserializeColumns(file, cf, false, fromRemote);
++        if (input instanceof BufferedRandomAccessFile)
++        {
++            BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
++            file.seek(columnPosition - 4); // seek to before column count int
++            ColumnFamily.serializer().deserializeColumns(inputWithTracker, cf, false, fromRemote);
++        }
++        else
++        {
++            // since we already read column count, just pass that value and continue deserialization
++            ColumnFamily.serializer().deserializeColumns(inputWithTracker, cf, columnCount, false, fromRemote);
++        }
+         if (validateColumns)
+         {
+             try
+@@ -234,6 +281,10 @@ public int compareTo(SSTableIdentityIterator o)
+ 
+     public void reset()
+     {
++        // only effective when input is from file
++        if (input instanceof BufferedRandomAccessFile)
++        {
++            BufferedRandomAccessFile file = (BufferedRandomAccessFile) input;
+         try
+         {
+             file.seek(columnPosition);
+@@ -242,5 +293,11 @@ public void reset()
+         {
+             throw new IOError(e);
+         }
++            inputWithTracker.reset();
++        }
++        else
++        {
++            throw new UnsupportedOperationException();
++        }
+     }
+ }
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index cc2c7cdb..d0eb9403 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -18,6 +18,8 @@
+ 
+ package org.apache.cassandra.streaming;
+ 
++import java.io.DataInput;
++import java.io.DataInputStream;
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+@@ -25,11 +27,27 @@
+ import java.net.Socket;
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.SocketChannel;
++import java.util.Collections;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.db.Table;
++import org.apache.cassandra.db.compaction.AbstractCompactedRow;
++import org.apache.cassandra.db.compaction.CompactionController;
++import org.apache.cassandra.db.compaction.PrecompactedRow;
++import org.apache.cassandra.io.sstable.IndexHelper;
++import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
++import org.apache.cassandra.io.sstable.SSTableReader;
++import org.apache.cassandra.io.sstable.SSTableWriter;
+ import org.apache.cassandra.io.util.FileUtils;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.ByteBufferUtil;
++import org.apache.cassandra.utils.BytesReadTracker;
+ import org.apache.cassandra.utils.Pair;
+ 
+ public class IncomingStreamReader
+@@ -70,6 +88,28 @@ protected void readFile() throws IOException
+             logger.debug("Receiving stream");
+             logger.debug("Creating file for {}", localFile.getFilename());
+         }
++
++        SSTableReader reader = null;
++        if (remoteFile.estimatedKeys > 0)
++        {
++            logger.debug("Estimated keys {}", remoteFile.estimatedKeys);
++            DataInputStream dis = new DataInputStream(socketChannel.socket().getInputStream());
++            try
++            {
++                reader = streamIn(dis, localFile, remoteFile);
++            }
++            catch (IOException ex)
++            {
++                retry();
++                throw ex;
++            }
++            finally
++            {
++                dis.close();
++            }
++        }
++        else
++        {
+         FileOutputStream fos = new FileOutputStream(localFile.getFilename(), true);
+         FileChannel fc = fos.getChannel();
+ 
+@@ -89,19 +129,16 @@ protected void readFile() throws IOException
+         }
+         catch (IOException ex)
+         {
+-            /* Ask the source node to re-stream this file. */
+-            session.retry(remoteFile);
+-
+-            /* Delete the orphaned file. */
+-            FileUtils.deleteWithConfirm(new File(localFile.getFilename()));
++                retry();
+             throw ex;
+         }
+         finally
+         {
+             fc.close();
+         }
++        }
+ 
+-        session.finished(remoteFile, localFile);
++        session.finished(remoteFile, localFile, reader);
+     }
+ 
+     protected long readnwrite(long length, long bytesRead, long offset, FileChannel fc) throws IOException
+@@ -117,4 +154,96 @@ protected long readnwrite(long length, long bytesRead, long offset, FileChannel
+         remoteFile.progress += lastRead;
+         return bytesRead;
+     }
++
++    private SSTableReader streamIn(DataInput input, PendingFile localFile, PendingFile remoteFile) throws IOException
++    {
++        ColumnFamilyStore cfs = Table.open(localFile.desc.ksname).getColumnFamilyStore(localFile.desc.cfname);
++        DecoratedKey key;
++        SSTableWriter writer = new SSTableWriter(localFile.getFilename(), remoteFile.estimatedKeys);
++        CompactionController controller = null;
++
++        BytesReadTracker in = new BytesReadTracker(input);
++
++        for (Pair<Long, Long> section : localFile.sections)
++        {
++            long length = section.right - section.left;
++            long bytesRead = 0;
++            while (bytesRead < length)
++            {
++                key = SSTableReader.decodeKey(StorageService.getPartitioner(), localFile.desc, ByteBufferUtil.readWithShortLength(in));
++                long dataSize = SSTableReader.readRowSize(in, localFile.desc);
++                ColumnFamily cf = null;
++                if (cfs.metadata.getDefaultValidator().isCommutative())
++                {
++                    // take care of counter column family
++                    if (controller == null)
++                        controller = new CompactionController(cfs, Collections.<SSTableReader>emptyList(), Integer.MAX_VALUE, true);
++                    SSTableIdentityIterator iter = new SSTableIdentityIterator(cfs.metadata, in, key, 0, dataSize, true);
++                    AbstractCompactedRow row = controller.getCompactedRow(iter);
++                    writer.append(row);
++
++                    if (row instanceof PrecompactedRow)
++                    {
++                        // we do not purge so we should not get a null here
++                        cf = ((PrecompactedRow)row).getFullColumnFamily();
++                    }
++                }
++                else
++                {
++                    // skip BloomFilter
++                    IndexHelper.skipBloomFilter(in);
++                    // skip Index
++                    IndexHelper.skipIndex(in);
++
++                    // restore ColumnFamily
++                    cf = ColumnFamily.create(cfs.metadata);
++                    ColumnFamily.serializer().deserializeFromSSTableNoColumns(cf, in);
++                    ColumnFamily.serializer().deserializeColumns(in, cf, true, true);
++
++                    // write key and cf
++                    writer.append(key, cf);
++                }
++
++                // update cache
++                ColumnFamily cached = cfs.getRawCachedRow(key);
++                if (cached != null)
++                {
++                    switch (remoteFile.type)
++                    {
++                        case AES:
++                            if (dataSize > DatabaseDescriptor.getInMemoryCompactionLimit())
++                            {
++                                // We have a key in cache for a very big row, that is fishy. We don't fail here however because that would prevent the sstable
++                                // from being build (and there is no real point anyway), so we just invalidate the row for correction and log a warning.
++                                logger.warn("Found a cached row over the in memory compaction limit during post-streaming rebuilt; it is highly recommended to avoid huge row on column family with row cache enabled.");
++                                cfs.invalidateCachedRow(key);
++                            }
++                            else
++                            {
++                                assert cf != null;
++                                cfs.updateRowCache(key, cf);
++                            }
++                            break;
++                        default:
++                            cfs.invalidateCachedRow(key);
++                            break;
++                    }
++                }
++
++                bytesRead += in.getBytesRead();
++                remoteFile.progress += in.getBytesRead();
++            }
++        }
++
++        return writer.closeAndOpenReader();
++    }
++
++    private void retry() throws IOException
++    {
++        /* Ask the source node to re-stream this file. */
++        session.retry(remoteFile);
++
++        /* Delete the orphaned file. */
++        FileUtils.deleteWithConfirm(new File(localFile.getFilename()));
++    }
+ }
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/PendingFile.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/PendingFile.java
+index 580e8c20..b7d8ccb3 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/PendingFile.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/PendingFile.java
+@@ -53,14 +53,20 @@ public static PendingFileSerializer serializer()
+     public final List<Pair<Long,Long>> sections;
+     public final OperationType type;
+     public final long size;
++    public final long estimatedKeys;
+     public long progress;
+ 
+     public PendingFile(Descriptor desc, PendingFile pf)
+     {
+-        this(null, desc, pf.component, pf.sections, pf.type);
++        this(null, desc, pf.component, pf.sections, pf.type, pf.estimatedKeys);
+     }
+ 
+     public PendingFile(SSTable sstable, Descriptor desc, String component, List<Pair<Long,Long>> sections, OperationType type)
++    {
++        this(sstable, desc, component, sections, type, 0);
++    }
++    
++    public PendingFile(SSTable sstable, Descriptor desc, String component, List<Pair<Long,Long>> sections, OperationType type, long estimatedKeys)
+     {
+         this.sstable = sstable;
+         this.desc = desc;
+@@ -74,6 +80,8 @@ public PendingFile(SSTable sstable, Descriptor desc, String component, List<Pair
+             tempSize += section.right - section.left;
+         }
+         size = tempSize;
++
++        this.estimatedKeys = estimatedKeys;
+     }
+ 
+     public String getFilename()
+@@ -119,6 +127,7 @@ public void serialize(PendingFile sc, DataOutputStream dos, int version) throws
+             }
+             if (version > MessagingService.VERSION_07)
+                 dos.writeUTF(sc.type.name());
++            dos.writeLong(sc.estimatedKeys);
+         }
+ 
+         public PendingFile deserialize(DataInputStream dis, int version) throws IOException
+@@ -137,7 +146,8 @@ public PendingFile deserialize(DataInputStream dis, int version) throws IOExcept
+             OperationType type = OperationType.RESTORE_REPLICA_COUNT;
+             if (version > MessagingService.VERSION_07)
+                 type = OperationType.valueOf(dis.readUTF());
+-            return new PendingFile(null, desc, component, sections, type);
++            long estimatedKeys = dis.readLong();
++            return new PendingFile(null, desc, component, sections, type, estimatedKeys);
+         }
+     }
+ }
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamInSession.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamInSession.java
+index 4c32a40b..dc5ea20e 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamInSession.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamInSession.java
+@@ -51,6 +51,7 @@
+     private final Runnable callback;
+     private String table;
+     private final Collection<Future<SSTableReader>> buildFutures = new LinkedBlockingQueue<Future<SSTableReader>>();
++    private final List<SSTableReader> readers = new ArrayList<SSTableReader>();
+     private PendingFile current;
+ 
+     private StreamInSession(Pair<InetAddress, Long> context, Runnable callback)
+@@ -102,13 +103,21 @@ public void addFiles(Collection<PendingFile> files)
+         }
+     }
+ 
+-    public void finished(PendingFile remoteFile, PendingFile localFile) throws IOException
++    public void finished(PendingFile remoteFile, PendingFile localFile, SSTableReader reader) throws IOException
+     {
+         if (logger.isDebugEnabled())
+             logger.debug("Finished {}. Sending ack to {}", remoteFile, this);
+ 
++        if (reader != null)
++        {
++            // SSTR was already built during streaming
++            readers.add(reader);
++        }
++        else
++        {
+         Future<SSTableReader> future = CompactionManager.instance.submitSSTableBuild(localFile.desc, remoteFile.type);
+         buildFutures.add(future);
++        }
+ 
+         files.remove(remoteFile);
+         if (remoteFile.equals(current))
+@@ -136,14 +145,7 @@ public void closeIfFinished() throws IOException
+                 try
+                 {
+                     SSTableReader sstable = future.get();
+-                    assert sstable.getTableName().equals(table);
+-                    if (sstable == null)
+-                        continue;
+-                    ColumnFamilyStore cfs = Table.open(sstable.getTableName()).getColumnFamilyStore(sstable.getColumnFamilyName());
+-                    cfs.addSSTable(sstable);
+-                    if (!cfstores.containsKey(cfs))
+-                        cfstores.put(cfs, new ArrayList<SSTableReader>());
+-                    cfstores.get(cfs).add(sstable);
++                    readers.add(sstable);
+                 }
+                 catch (InterruptedException e)
+                 {
+@@ -155,6 +157,18 @@ public void closeIfFinished() throws IOException
+                 }
+             }
+ 
++            for (SSTableReader sstable : readers)
++            {
++                assert sstable.getTableName().equals(table);
++                if (sstable == null)
++                    continue;
++                ColumnFamilyStore cfs = Table.open(sstable.getTableName()).getColumnFamilyStore(sstable.getColumnFamilyName());
++                cfs.addSSTable(sstable);
++                if (!cfstores.containsKey(cfs))
++                    cfstores.put(cfs, new ArrayList<SSTableReader>());
++                cfstores.get(cfs).add(sstable);
++            }
++
+             // build secondary indexes
+             for (Map.Entry<ColumnFamilyStore, List<SSTableReader>> entry : cfstores.entrySet())
+             {
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamOut.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamOut.java
+index 4fc9ccb1..0a1fd706 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamOut.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/streaming/StreamOut.java
+@@ -176,7 +176,7 @@ public static void transferSSTables(StreamOutSession session, Collection<SSTable
+             List<Pair<Long,Long>> sections = sstable.getPositionsForRanges(ranges);
+             if (sections.isEmpty())
+                 continue;
+-            pending.add(new PendingFile(sstable, desc, SSTable.COMPONENT_DATA, sections, type));
++            pending.add(new PendingFile(sstable, desc, SSTable.COMPONENT_DATA, sections, type, sstable.estimatedKeys()));
+         }
+         logger.info("Stream context metadata {}, {} sstables.", pending, sstables.size());
+         return pending;

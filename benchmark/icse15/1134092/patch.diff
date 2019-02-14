@@ -1,0 +1,149 @@
+diff --git a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/access/btree/BTreePostCommit.java b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/access/btree/BTreePostCommit.java
+index 0d4d99b5..beafd0ab 100644
+--- a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/access/btree/BTreePostCommit.java
++++ b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/access/btree/BTreePostCommit.java
+@@ -244,11 +244,8 @@ public int performWork(ContextManager contextMgr)
+             DataValueDescriptor[] shrink_key = 
+                 purgeCommittedDeletes(open_btree, this.page_number);
+ 
+-            // RESOLVE (mikem) - move this call when doing row level locking.
+             if (shrink_key != null)
+                 doShrink(open_btree, shrink_key);
+-
+-            open_btree.close();
+         }
+         catch (StandardException se)
+         {
+@@ -277,8 +274,6 @@ public int performWork(ContextManager contextMgr)
+ 
+                     purgeRowLevelCommittedDeletes(open_btree);
+ 
+-                    open_btree.close();
+-
+                 }
+                 catch (StandardException se2)
+                 {
+@@ -295,6 +290,15 @@ public int performWork(ContextManager contextMgr)
+         }
+         finally
+         {
++            if (open_btree != null)
++                open_btree.close();
++
++            // counting on this commit to release latches associated with
++            // row level purge, that have been left to prevent others from
++            // getting to purged pages before the commit.  If latch is released
++            // early, other transactions could insert on the page which could
++            // prevent undo of the purges in case of a crash before the commit
++            // gets to the disk.
+             internal_xact.commit();
+             internal_xact.destroy();
+         }
+@@ -330,8 +334,9 @@ public int performWork(ContextManager contextMgr)
+      * committed transactions (otherwise we could not have gotten the exclusive
+      * table lock).
+      * <p>
+-     * RESOLVE (mikem) - under row locking this routine must do more work to
+-     * determine a deleted row is a committed deleted row.
++     * This routine handles purging committed deletes while holding a table
++     * level exclusive lock.  See purgeRowLevelCommittedDeletes() for row level
++     * purging.
+      *
+      * @param open_btree The btree already opened.
+      * @param pageno The page number of the page to look for committed deletes.
+@@ -448,6 +453,12 @@ public int performWork(ContextManager contextMgr)
+      * If it succeeds, and since this transaction did not delete the row then 
+      * the row must have been deleted by a transaction which has committed, so
+      * it is safe to purge the row.  It then purges the row from the page.
++     * <p>
++     * The latch on the leaf page containing the purged rows must be kept until
++     * after the transaction has been committed or aborted in order to insure
++     * proper undo of the purges can take place.  Otherwise another transaction
++     * could use the space freed by the purge and then prevent the purge from
++     * being able to undo.
+      *
+      * @param open_btree The already open btree, which has been locked with IX
+      *                   table lock, to use to get latch on page.
+@@ -460,8 +471,6 @@ private final void purgeRowLevelCommittedDeletes(
+     {
+         LeafControlRow leaf = null;
+ 
+-        try
+-        {
+             // The following can fail, returning null, either if it can't get
+             // the latch or somehow the page requested no longer exists.  In 
+             // either case the post commit work will just skip it.
+@@ -519,11 +528,11 @@ private final void purgeRowLevelCommittedDeletes(
+                 }
+ 
+             }
+-        }
+-        finally
+-        {
+-            if (leaf != null)
+-                leaf.release();
+-        }
++
++        // need to maintain latch on leaf until xact is committed.  The
++        // commit will clear the latch as part of releasing all 
++        // locks/latches associated with a transaction.
++
++        return;
+     }
+ }
+diff --git a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/BasePage.java b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/BasePage.java
+index 6cdd231c..e3f84b44 100644
+--- a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/BasePage.java
++++ b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/BasePage.java
+@@ -1362,7 +1362,8 @@ public void copyAndPurge(Page destPage, int src_slot, int num_rows, int dest_slo
+ 	*/
+ 	public void unlatch() {
+ 		if (SanityManager.DEBUG) {
+-			SanityManager.ASSERT(isLatched());
++			SanityManager.ASSERT(isLatched(), 
++                "unlatch() attempted on page that is not latched.");
+ 		}
+ 
+ 	   releaseExclusive();
+@@ -1386,7 +1387,8 @@ public final synchronized boolean isLatched() {
+ 	/** @see Page#recordCount */
+ 	public final int recordCount() {
+ 		if (SanityManager.DEBUG) {
+-			SanityManager.ASSERT(isLatched());
++			SanityManager.ASSERT(
++                isLatched(), "page not latched on call to recordCount()");
+ 		}
+ 
+ 		return recordCount;
+@@ -1427,9 +1429,14 @@ protected int internalNonDeletedRecordCount()
+ 						delCount++;
+ 				}
+ 				if (delCount != deletedCount)
+-					SanityManager.THROWASSERT("incorrect deleted row count.  Should be: "
+-						+ delCount + ", instead got: " + deletedCount
+-						+ ", maxSlot = " + maxSlot + ", recordCount = " + recordCount);
++                {
++					SanityManager.THROWASSERT(
++                        "incorrect deleted row count.  Should be: " + delCount +
++                        ", instead got: " + deletedCount + 
++                        ", maxSlot = " + maxSlot + 
++                        ", recordCount = " + recordCount +
++                        "\npage = " + this);
++                }
+ 			}
+ 
+ 			return (recordCount - deletedCount);
+diff --git a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
+index d5778894..175818e0 100644
+--- a/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
++++ b/db/derby/code/branches/10.7/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
+@@ -7034,7 +7034,8 @@ public int moveRecordForCompressAtSlot(
+     public void logAction(LogInstant instant) throws StandardException
+     {
+         if (SanityManager.DEBUG) {
+-            SanityManager.ASSERT(isLatched());
++            SanityManager.ASSERT(isLatched(), 
++                "logAction() executed on an unlatched page.");
+         }
+ 
+         if (rawDataOut == null)

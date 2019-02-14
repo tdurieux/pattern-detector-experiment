@@ -1,0 +1,187 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+index d315882c..456eca55 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+@@ -539,6 +539,26 @@ public void	dropAllColumnDescriptors(UUID tableID, TransactionController tc)
+ 	public void	dropAllTableAndColPermDescriptors(UUID tableID, TransactionController tc)
+ 						throws StandardException;
+ 
++
++	/**
++	 * Need to update SYSCOLPERMS for a given table because a new column has 
++	 * been added to that table. SYSCOLPERMS has a column called "COLUMNS"
++	 * which is a bit map for all the columns in a given user table. Since
++	 * ALTER TABLE .. ADD COLUMN .. has added one more column, we need to
++	 * expand "COLUMNS" for that new column
++	 *
++	 * Currently, this code gets called during execution phase of
++	 * ALTER TABLE .. ADD COLUMN .. 
++	 *
++	 * @param tableID	The UUID of the table to which a column has been added
++	 * @param tc		TransactionController for the transaction
++	 *
++	 * @exception StandardException		Thrown on error
++	 */
++	public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionController tc)
++	throws StandardException;
++	
++	
+ 	/**
+ 	 * Drops all routine permission descriptors for the given routine.
+ 	 *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index debd6dfc..0e31222f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -2439,6 +2439,84 @@ public void	dropAllTableAndColPermDescriptors(UUID tableID, TransactionControlle
+ 		dropColumnPermDescriptor(tc, keyRow);
+ 	}
+ 
++	/**
++	 * Need to update SYSCOLPERMS for a given table because a new column has 
++	 * been added to that table. SYSCOLPERMS has a column called "COLUMNS"
++	 * which is a bit map for all the columns in a given user table. Since
++	 * ALTER TABLE .. ADD COLUMN .. has added one more column, we need to
++	 * expand "COLUMNS" for that new column
++	 *
++	 * Currently, this code gets called during execution phase of
++	 * ALTER TABLE .. ADD COLUMN .. 
++	 *
++	 * @param tableID	The UUID of the table to which a column has been added
++	 * @param tc		TransactionController for the transaction
++	 *
++	 * @exception StandardException		Thrown on error
++	 */
++	public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionController tc)
++	throws StandardException
++	{
++		// In Derby authorization mode, permission catalogs may not be present
++		if (!usesSqlAuthorization)
++			return;
++
++		/* This method has 2 steps to it. First get all the ColPermsDescriptor   
++		for given tableid. And next step is to go back to SYSCOLPERMS to find
++		unique row corresponding to each of ColPermsDescriptor and update the
++		"COLUMNS" column in SYSCOLPERMS. The reason for this 2 step process is
++		that SYSCOLPERMS has a non-unique row on "TABLEID" column and hence   
++		we can't get a unique handle on each of the affected row in SYSCOLPERMS
++		using just the "TABLEID" column */
++
++		// First get all the ColPermsDescriptor for the given tableid from   
++		//SYSCOLPERMS using getDescriptorViaIndex(). 
++		List permissionDescriptorsList;//all ColPermsDescriptor for given tableid
++		DataValueDescriptor		tableIDOrderable = getValueAsDVD(tableID);
++		TabInfoImpl	ti = getNonCoreTI(SYSCOLPERMS_CATALOG_NUM);
++		SYSCOLPERMSRowFactory rf = (SYSCOLPERMSRowFactory) ti.getCatalogRowFactory();
++		ExecIndexRow keyRow = exFactory.getIndexableRow(1);
++		keyRow.setColumn(1, tableIDOrderable);
++		permissionDescriptorsList = newSList();
++		getDescriptorViaIndex(
++			SYSCOLPERMSRowFactory.TABLEID_INDEX_NUM,
++			keyRow,
++			(ScanQualifier [][]) null,
++			ti,
++			(TupleDescriptor) null,
++			permissionDescriptorsList,
++			false);
++
++		/* Next, using each of the ColPermDescriptor's uuid, get the unique row 
++		in SYSCOLPERMS and expand the "COLUMNS" column in SYSCOLPERMS to 
++		accomodate the newly added column to the tableid*/
++		ColPermsDescriptor colPermsDescriptor;
++		ExecRow curRow;
++		ExecIndexRow uuidKey;
++		// Not updating any indexes on SYSCOLPERMS
++		boolean[] bArray = new boolean[SYSCOLPERMSRowFactory.TOTAL_NUM_OF_INDEXES];
++		int[] colsToUpdate = {SYSCOLPERMSRowFactory.COLUMNS_COL_NUM};
++		for (Iterator iterator = permissionDescriptorsList.iterator(); iterator.hasNext(); )
++		{
++			colPermsDescriptor = (ColPermsDescriptor) iterator.next();
++			removePermEntryInCache(colPermsDescriptor);
++			uuidKey = rf.buildIndexKeyRow(rf.COLPERMSID_INDEX_NUM, colPermsDescriptor);
++			curRow=ti.getRow(tc, uuidKey, rf.COLPERMSID_INDEX_NUM);
++	        FormatableBitSet columns = (FormatableBitSet) curRow.getColumn( 
++					  SYSCOLPERMSRowFactory.COLUMNS_COL_NUM).getObject();
++	        int currentLength = columns.getLength();
++	        columns.grow(currentLength+1);
++	        curRow.setColumn(SYSCOLPERMSRowFactory.COLUMNS_COL_NUM,
++					  dvf.getDataValue((Object) columns));
++			ti.updateRow(keyRow, curRow,
++					SYSCOLPERMSRowFactory.TABLEID_INDEX_NUM,
++					 bArray, 
++					 colsToUpdate,
++					 tc);
++		}
++	}
++
++	
+ 	/**
+ 	 * Remove PermissionsDescriptor from permissions cache if present
+ 	 */
+@@ -2528,7 +2606,6 @@ private void dropTablePermDescriptor(
+ 	{
+ 		ExecRow curRow;
+ 		PermissionsDescriptor perm;
+-		ExecIndexRow newKey;
+ 		TabInfoImpl	ti = getNonCoreTI(SYSTABLEPERMS_CATALOG_NUM);
+ 		SYSTABLEPERMSRowFactory rf = (SYSTABLEPERMSRowFactory) ti.getCatalogRowFactory();
+ 
+@@ -2560,7 +2637,6 @@ private void dropColumnPermDescriptor(
+ 	{
+ 		ExecRow curRow;
+ 		PermissionsDescriptor perm;
+-		ExecIndexRow newKey;
+ 		TabInfoImpl	ti = getNonCoreTI(SYSCOLPERMS_CATALOG_NUM);
+ 		SYSCOLPERMSRowFactory rf = (SYSCOLPERMSRowFactory) ti.getCatalogRowFactory();
+ 
+@@ -10223,9 +10299,7 @@ else if( changedColCount > 0)
+         // Remove cached permissions data. The cache may hold permissions data for this key even if
+         // the row in the permissions table is new. In that case the cache may have an entry indicating no
+         // permissions
+-        Cacheable cacheEntry = getPermissionsCache().findCached( perm);
+-        if( cacheEntry != null)
+-            getPermissionsCache().remove( cacheEntry);
++		removePermEntryInCache(perm);
+ 
+         //If we are dealing with grant, then the caller does not need to send 
+         //any invalidation actions to anyone and hence return false
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SYSCOLPERMSRowFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SYSCOLPERMSRowFactory.java
+index a2350c67..714e470a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SYSCOLPERMSRowFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SYSCOLPERMSRowFactory.java
+@@ -64,12 +64,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private static final int GRANTOR_COL_NUM = 3;
+     private static final int TABLEID_COL_NUM = 4;
+     private static final int TYPE_COL_NUM = 5;
+-    private static final int COLUMNS_COL_NUM = 6;
++    protected static final int COLUMNS_COL_NUM = 6;
+     private static final int COLUMN_COUNT = 6;
+ 
+     static final int GRANTEE_TABLE_TYPE_GRANTOR_INDEX_NUM = 0;
+     static final int COLPERMSID_INDEX_NUM = 1;
+     static final int TABLEID_INDEX_NUM = 2;
++    protected static final int TOTAL_NUM_OF_INDEXES = 3;
+ 	private static final int[][] indexColumnPositions = 
+ 	{ 
+ 		{ GRANTEE_COL_NUM, TABLEID_COL_NUM, TYPE_COL_NUM, GRANTOR_COL_NUM},
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+index 729aa0b5..8cd4f531 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+@@ -648,6 +648,16 @@ private void addNewColumnToTable(Activation activation,
+ 								columnInfo[ix].defaultInfo.getDefaultText(),
+ 								lcc);
+ 		}	
++
++		// Update SYSCOLPERMS table which tracks the permissions granted
++		// at columns level. The sytem table has a bit map of all the columns
++		// in the user table to help determine which columns have the 
++		// permission granted on them. Since we are adding a new column,
++		// that bit map needs to be expanded and initialize the bit for it
++		// to 0 since at the time of ADD COLUMN, no permissions have been
++		// granted on that new column.
++		//
++		dd.updateSYSCOLPERMSforAddColumnToUserTable(td.getUUID(), tc);
+ 	}
+ 
+ 	/**

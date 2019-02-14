@@ -1,0 +1,1448 @@
+diff --git a/db/derby/code/branches/10.4/java/engine/org/apache/derby/iapi/types/SQLChar.java b/db/derby/code/branches/10.4/java/engine/org/apache/derby/iapi/types/SQLChar.java
+index b272a90a..105dfb3a 100644
+--- a/db/derby/code/branches/10.4/java/engine/org/apache/derby/iapi/types/SQLChar.java
++++ b/db/derby/code/branches/10.4/java/engine/org/apache/derby/iapi/types/SQLChar.java
+@@ -44,6 +44,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.cache.ClassSize;
+ import org.apache.derby.iapi.services.io.ArrayInputStream;
+ import org.apache.derby.iapi.util.StringUtil;
++import org.apache.derby.iapi.util.UTF8Util;
+ import org.apache.derby.iapi.services.i18n.LocaleFinder;
+ 
+ import org.apache.derby.iapi.db.DatabaseContext;
+@@ -72,14 +73,44 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.util.Locale;
+ import java.util.Calendar;
+ 
++
++
++
+ /**
+- * SQLChar represents a CHAR value with UCS_BASIC collation.
+- * SQLChar may be used directly by any code when it is guaranteed
+- * that the required collation is UCS_BASIC, e.g. system columns.
+- */
++
++The SQLChar represents a CHAR value with UCS_BASIC collation.
++SQLChar may be used directly by any code when it is guaranteed
++that the required collation is UCS_BASIC, e.g. system columns.
++<p>
++The state may be in char[], a String, or an unread stream, depending
++on how the datatype was created.  
++<p>
++Stream notes:
++<p>
++When the datatype comes from the database layer and the length of the bytes
++necessary to store the datatype on disk exceeds the size of a page of the
++container holding the data then the store returns a stream rather than reading
++all the bytes into a char[] or String.  The hope is that the usual usage case
++is that data never need be expanded in the derby layer, and that client can
++just be given a stream that can be read a char at a time through the jdbc
++layer.  Even though SQLchar's can't ever be this big, this code is shared
++by all the various character datatypes including SQLClob which is expected
++to usually larger than a page.
++<p>
++The state can also be a stream in the case of insert/update where the client
++has used a jdbc interface to set the value as a stream rather than char[].  
++In this case the hope is that the usual usage case is that stream never need
++be read until it is passed to store, read once, and inserted into the database.
++
++**/
++
+ public class SQLChar
+ 	extends DataType implements StringDataValue, StreamStorable
+ {
++    /**************************************************************************
++     * static fields of the class
++     **************************************************************************
++     */
+ 
+     /**
+      * threshold, that decides when we return space back to the VM
+@@ -93,6 +124,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      * instead this amount is used to provide a reasonable growby size.
+      */
+     private final static int GROWBY_FOR_CHAR = 64;
++
++
++    private static final int BASE_MEMORY_USAGE = 
++        ClassSize.estimateBaseFromCatalog( SQLChar.class);
++
+ 	/**
+ 		Static array that can be used for blank padding.
+ 	*/
+@@ -103,9 +139,66 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		}
+ 	}
+ 
+-	private static void appendBlanks(char[] ca, int offset, int howMany) {
+-		while (howMany > 0) {
++    /**************************************************************************
++     * Fields of the class
++     **************************************************************************
++     */
++
++    /*
++     * object state
++     */
++
++    // Don't use value directly in most situations. Use getString()
++    // OR use the rawData array if rawLength != -1.
++    private     String  value;
++
++    // rawData holds the reusable array for reading in SQLChars. It contains a
++    // valid value if rawLength is greater than or equal to 0. See getString() 
++    // to see how it is converted to a String. Even when converted to a String
++    // object the rawData array remains for potential future use, unless 
++    // rawLength is > 4096. In this case the rawData is set to null to avoid
++    // huge memory use.
++    private     char[]  rawData;
++    private     int     rawLength = -1;
++
++    // For null strings, cKey = null.
++    private CollationKey cKey; 
++
++    /**
++     * The value as a stream in the on-disk format.
++     */
++    InputStream stream;
++
++    /* Locale info (for International support) */
++    private LocaleFinder localeFinder;
++
++
++    /**************************************************************************
++     * Constructors for This class:
++     **************************************************************************
++     */
++
++    /**
++     * no-arg constructor, required by Formattable.
++     **/
++    public SQLChar()
++    {
++    }
++
++    public SQLChar(String val)
++    {
++        value = val;
++    }
++
++    /**************************************************************************
++     * Private/Protected methods of This class:
++     **************************************************************************
++     */
+ 
++    private static void appendBlanks(char[] ca, int offset, int howMany) 
++    {
++        while (howMany > 0) 
++        {
+ 			int count = howMany > BLANKS.length ? BLANKS.length : howMany;
+ 
+ 			System.arraycopy(BLANKS, 0, ca, offset, count);
+@@ -113,25 +206,40 @@ private static void appendBlanks(char[] ca, int offset, int howMany) {
+ 			offset += count;
+ 		}
+ 	}
+-	/*
+-	 * DataValueDescriptor interface
+-	 * (mostly implemented in DataType)
+-	 * casts to the
+-	 * numeric and date/time types as well, "for valid strings"
++
++    /**************************************************************************
++     * Public Methods of This class:
++     **************************************************************************
++     */
++
++    /**************************************************************************
++     * Public Methods of DataValueDescriptor interface:
++     *     Mostly implemented in Datatype.
++     **************************************************************************
+ 	 */
+ 
+ 	/**
++     * Get Boolean from a SQLChar.
++     *
++     * <p>
++     * Return false for only "0" or "false" for false. No case insensitivity. 
++     * Everything else is true.
++     * <p>
++     * The above matches JCC.
++     *
++     *
+ 	 * @see DataValueDescriptor#getBoolean
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+-	 */
++     **/
+ 	public boolean getBoolean()
+ 		throws StandardException
+ 	{
+-		if (isNull()) return false;
++        if (isNull()) 
++            return false;
+ 
+-		// match JCC, match only "0" or "false" for false. No case insensitivity.
+-		// everything else is true.
++        // match JCC, match only "0" or "false" for false. No case 
++        // insensitivity. everything else is true.
+ 
+ 		String cleanedValue = getString().trim();
+ 
+@@ -139,126 +247,221 @@ public boolean getBoolean()
+ 	}
+ 
+ 	/**
++     * Get Byte from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Byte.parseByte() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getByte
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public byte	getByte() throws StandardException
+ 	{
+-		if (isNull()) return (byte)0;
+-		try {
++        if (isNull()) 
++            return (byte)0;
++
++        try 
++        {
+ 			return Byte.parseByte(getString().trim());
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "byte");
++        } 
++        catch (NumberFormatException nfe) 
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "byte");
+ 		}
+ 	}
+ 
+ 	/**
++     * Get Short from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Short.parseShort() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getShort
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public short	getShort() throws StandardException
+ 	{
+-		if (isNull()) return (short)0;
+-		try {
++        if (isNull()) 
++            return (short)0;
++
++        try 
++        {
+ 			return Short.parseShort(getString().trim());
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "short");
++
++        } 
++        catch (NumberFormatException nfe) 
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "short");
+ 		}
+ 	}
+ 
+ 	/**
++     * Get int from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Short.parseInt() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getInt
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public int	getInt() throws StandardException
+ 	{
+-		if (isNull()) return 0;
+-		try {
++        if (isNull()) 
++            return 0;
++
++        try 
++        {
+ 			return Integer.parseInt(getString().trim());
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "int");
++        } 
++        catch (NumberFormatException nfe) 
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "int");
+ 		}
+ 	}
+ 
+ 	/**
++     * Get long from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Short.parseLong() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getLong
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public long	getLong() throws StandardException
+ 	{
+-		if (isNull()) return 0;
+-		try {
++        if (isNull()) 
++            return 0;
++
++        try 
++        {
+ 			return Long.parseLong(getString().trim());
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "long");
++
++        } 
++        catch (NumberFormatException nfe) 
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "long");
+ 		}
+ 	}
+ 
+ 	/**
++     * Get float from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Float.floatValue() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getFloat
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public float	getFloat() throws StandardException
+ 	{
+-		if (isNull()) return 0;
+-		try {
++        if (isNull()) 
++            return 0;
++
++        try 
++        {
+ 			return new Float(getString().trim()).floatValue();
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "float");
++        } 
++        catch (NumberFormatException nfe) 
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "float");
+ 		}
+ 	}
+ 
+ 	/**
++     * Get double from a SQLChar.
++     *
++     * <p>
++     * Uses java standard Double.doubleValue() to perform coercion.
++     *
+ 	 * @see DataValueDescriptor#getDouble
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public double	getDouble() throws StandardException
+ 	{
+-		if (isNull()) return 0;
+-		try {
++        if (isNull()) 
++            return 0;
++
++        try 
++        {
+ 			return new Double(getString().trim()).doubleValue();
+-		} catch (NumberFormatException nfe) {
+-			throw StandardException.newException(SQLState.LANG_FORMAT_EXCEPTION, "double");
+-		}
+ 	}
+-
+-	/**
+-	 * CHAR/VARCHAR/LONG VARCHAR implementation. Convert to a BigDecimal using getString.
+-	 */
+-	public int typeToBigDecimal()  throws StandardException
++        catch (NumberFormatException nfe) 
+ 	{
+-		return java.sql.Types.CHAR;
++            throw StandardException.newException(
++                    SQLState.LANG_FORMAT_EXCEPTION, "double");
++        }
+ 	}
++
+ 	/**
++     * Get date from a SQLChar.
++     *
+ 	 * @see DataValueDescriptor#getDate
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
+-	public Date	getDate( Calendar cal) throws StandardException
++     **/
++    public Date getDate(Calendar cal) 
++        throws StandardException
+ 	{
+-        return getDate( cal, getString(), getLocaleFinder());
++        return getDate(cal, getString(), getLocaleFinder());
+ 	}
+ 
+-    public static Date getDate(java.util.Calendar cal, String str, LocaleFinder localeFinder) throws StandardException
++    /**
++     * Static function to Get date from a string.
++     *
++     * @see DataValueDescriptor#getDate
++     *
++     * @exception StandardException thrown on failure to convert
++     **/
++    public static Date getDate(
++    java.util.Calendar  cal, 
++    String              str, 
++    LocaleFinder        localeFinder) 
++        throws StandardException
+     {
+         if( str == null)
+             return null;
+-        SQLDate internalDate = new SQLDate( str, false, localeFinder);
+-        return internalDate.getDate( cal);
++
++        SQLDate internalDate = new SQLDate(str, false, localeFinder);
++
++        return internalDate.getDate(cal);
+     }
+ 
+ 	/**
++     * Get time from a SQLChar.
++     *
+ 	 * @see DataValueDescriptor#getTime
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public Time	getTime(Calendar cal) throws StandardException
+ 	{
+ 		return getTime( cal, getString(), getLocaleFinder());
+ 	}
+ 
+ 	/**
++     * Static function to Get Time from a string.
++     *
++     * @see DataValueDescriptor#getTime
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
+-	public static Time getTime( Calendar cal, String str, LocaleFinder localeFinder) throws StandardException
++     **/
++    public static Time getTime(
++    Calendar        cal, 
++    String          str, 
++    LocaleFinder    localeFinder) 
++        throws StandardException
+ 	{
+         if( str == null)
+             return null;
+@@ -267,27 +470,65 @@ public static Time getTime( Calendar cal, String str, LocaleFinder localeFinder)
+ 	}
+ 
+ 	/**
++     * Get Timestamp from a SQLChar.
++     *
+ 	 * @see DataValueDescriptor#getTimestamp
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
++     **/
+ 	public Timestamp getTimestamp( Calendar cal) throws StandardException
+ 	{
+ 		return getTimestamp( cal, getString(), getLocaleFinder());
+ 	}
+ 
+ 	/**
++     * Static function to Get Timestamp from a string.
++     *
+ 	 * @see DataValueDescriptor#getTimestamp
++     *
+ 	 * @exception StandardException thrown on failure to convert
+-	 */
+-	public static Timestamp	getTimestamp(java.util.Calendar cal, String str, LocaleFinder localeFinder)
++     **/
++    public static Timestamp getTimestamp(
++    java.util.Calendar  cal, 
++    String              str, 
++    LocaleFinder        localeFinder)
+         throws StandardException
+ 	{
+         if( str == null)
+             return null;
+-        SQLTimestamp internalTimestamp = new SQLTimestamp( str, false, localeFinder, cal);
++
++        SQLTimestamp internalTimestamp = 
++            new SQLTimestamp( str, false, localeFinder, cal);
++
+         return internalTimestamp.getTimestamp( cal);
+ 	}
+ 
++    /**************************************************************************
++     * Public Methods of StreamStorable interface:
++     **************************************************************************
++     */
++    public InputStream returnStream()
++    {
++        return stream;
++    }
++
++    /**
++     * Set this value to the on-disk format stream.
++     */
++    public final void setStream(InputStream newStream)
++    {
++        this.value = null;
++        this.rawLength = -1;
++        this.stream = newStream;
++        cKey = null;
++    }
++
++    public void loadStream() throws StandardException
++    {
++        getString();
++    }
++
++
+ 	/**
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+@@ -303,18 +544,65 @@ public InputStream	getStream() throws StandardException
+ 	{
+ 		return stream;
+ 	}
++    /**
++     * CHAR/VARCHAR/LONG VARCHAR implementation. 
++     * Convert to a BigDecimal using getString.
++     */
++    public int typeToBigDecimal()  throws StandardException
++    {
++        return java.sql.Types.CHAR;
++    }
+ 
+ 	/**
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+-	public int	getLength() throws StandardException
+-	{
++    public int getLength() throws StandardException {
+ 		if (rawLength != -1)
+ 			return rawLength;
+-
++        if (stream != null) {
++            if (stream instanceof Resetable && stream instanceof ObjectInput) {
++                try {
++                    int clobLength = 0;
++                    // If we have the stream length encoded.
++                    // just read that.
++                    int utf8len = readCharacterLength((ObjectInput) stream);
++                    if (utf8len != 0) {
++                        clobLength = utf8len;
++                        return clobLength;
++                    }
++                    // Otherwise we will have to read the whole stream.
++                    int skippedCharSize = (int) UTF8Util.skipUntilEOF(stream);
++                    clobLength = skippedCharSize;
++                    return clobLength;
++                } catch (IOException ioe) {
++                    throwStreamingIOException(ioe);
++                } finally {
++                    try {
++                        ((Resetable) stream).resetStream();
++                    } catch (IOException ioe) {
++                        throwStreamingIOException(ioe);
++                    }
++                }
++            }
++        }
+ 		String tmpString = getString();
+-		return (tmpString == null) ?
+-			0 : tmpString.length();
++        if (tmpString == null) {
++            return 0;
++        } else {
++            int clobLength = tmpString.length();
++            return clobLength;
++        }
++    }
++
++    private int readCharacterLength(ObjectInput in) throws IOException {
++         int utflen = in.readUnsignedShort();
++        return utflen;
++    }
++
++    private void throwStreamingIOException(IOException ioe) throws StandardException {
++		throw StandardException.
++			newException(SQLState.LANG_STREAMING_COLUMN_I_O_EXCEPTION,
++						 ioe, getTypeName());
+ 	}
+ 
+ 	public String getTypeName()
+@@ -414,29 +702,6 @@ else if (rawLength != -1)
+ 		}
+ 	}
+ 
+-	/*
+-	 * StreamStorable interface : 
+-	 */
+-	public InputStream returnStream()
+-	{
+-		return stream;
+-	}
+-
+-    /**
+-     * Set this value to the on-disk format stream.
+-     */
+-	public final void setStream(InputStream newStream)
+-	{
+-		this.value = null;
+-		this.rawLength = -1;
+-		this.stream = newStream;
+-		cKey = null;
+-	}
+-
+-	public void loadStream() throws StandardException
+-	{
+-		getString();
+-	}
+ 
+ 	/*
+ 	 * Storable interface, implies Externalizable, TypedFormat
+@@ -889,9 +1154,10 @@ public int compare(DataValueDescriptor other) throws StandardException
+ 	 */
+ 
+ 	/** From CloneableObject
+-	 *	Shallow clone a StreamStorable without objectifying.  This is used to avoid
+-	 *	unnecessary objectifying of a stream object.  The only difference of this method
+-	 *  from getClone is this method does not objectify a stream.  beetle 4896
++     *  Shallow clone a StreamStorable without objectifying.  This is used to 
++     *  avoid unnecessary objectifying of a stream object.  The only 
++     *  difference of this method from getClone is this method does not 
++     *  objectify a stream.
+ 	 */
+ 	public Object cloneObject()
+ 	{
+@@ -960,31 +1226,15 @@ public final void setValueFromResultSet(ResultSet resultSet, int colNumber,
+ 	/**
+ 		Set the value into a PreparedStatement.
+ 	*/
+-	public final void setInto(PreparedStatement ps, int position) throws SQLException, StandardException {
+-
++    public final void setInto(
++    PreparedStatement   ps, 
++    int                 position) 
++        throws SQLException, StandardException 
++    {
+ 		ps.setString(position, getString());
+ 	}
+ 
+ 
+-	/*
+-	 * class interface
+-	 */
+-
+-	/*
+-	 * constructors
+-	 */
+-
+-	/**
+-		no-arg constructor, required by Formattable.
+-	*/
+-	public SQLChar()
+-	{
+-	}
+-
+-	public SQLChar(String val)
+-	{
+-		value = val;
+-	}
+ 
+ 	public void setValue(String theValue)
+ 	{
+@@ -1123,7 +1373,10 @@ public void setValue(Time theValue, Calendar cal) throws StandardException
+ 	}
+ 
+ 	/** @exception StandardException		Thrown on error */
+-	public void setValue(Timestamp theValue, Calendar cal) throws StandardException
++    public void setValue(
++    Timestamp   theValue, 
++    Calendar    cal) 
++        throws StandardException
+ 	{
+         String strValue = null;
+         if( theValue != null)
+@@ -1137,17 +1390,28 @@ public void setValue(Timestamp theValue, Calendar cal) throws StandardException
+                 formatJDBCDate( cal, sb);
+                 sb.append( ' ');
+                 formatJDBCTime( cal, sb);
+-                int micros = (theValue.getNanos() + SQLTimestamp.FRACTION_TO_NANO/2)/SQLTimestamp.FRACTION_TO_NANO;
++                int micros = 
++                    (theValue.getNanos() + SQLTimestamp.FRACTION_TO_NANO/2) / 
++                        SQLTimestamp.FRACTION_TO_NANO;
++
+                 if( micros > 0)
+                 {
+                     sb.append( '.');
+                     String microsStr = Integer.toString( micros);
+-                    if( microsStr.length() > SQLTimestamp.MAX_FRACTION_DIGITS)
+-                        sb.append( microsStr.substring( 0, SQLTimestamp.MAX_FRACTION_DIGITS));
++                    if(microsStr.length() > SQLTimestamp.MAX_FRACTION_DIGITS)
++                    {
++                        sb.append(
++                            microsStr.substring(
++                                0, SQLTimestamp.MAX_FRACTION_DIGITS));
++                    }
+                     else
+                     {
+-                        for( int i = microsStr.length(); i < SQLTimestamp.MAX_FRACTION_DIGITS ; i++)
++                        for(int i = microsStr.length(); 
++                            i < SQLTimestamp.MAX_FRACTION_DIGITS ; i++)
++                        {
+                             sb.append( '0');
++                        }
++
+                         sb.append( microsStr);
+                     }
+                 }
+@@ -1167,7 +1431,11 @@ private void formatJDBCDate( Calendar cal, StringBuffer sb)
+ 
+     private void formatJDBCTime( Calendar cal, StringBuffer sb)
+     {
+-        SQLTime.timeToString( cal.get( Calendar.HOUR), cal.get( Calendar.MINUTE), cal.get( Calendar.SECOND), sb);
++        SQLTime.timeToString(
++            cal.get(Calendar.HOUR), 
++            cal.get(Calendar.MINUTE), 
++            cal.get(Calendar.SECOND), 
++            sb);
+     }
+ 
+     /**
+@@ -1188,9 +1456,12 @@ public final void setValue(InputStream theStream, int valueLength)
+ 	 * @exception StandardException
+ 	 *                thrown on failure
+ 	 */
+-	public void setObjectForCast(Object theValue, boolean instanceOfResultType,
+-			String resultTypeClassName) throws StandardException {
+-		
++    public void setObjectForCast(
++    Object  theValue, 
++    boolean instanceOfResultType,
++    String  resultTypeClassName) 
++        throws StandardException 
++    {
+ 		if (theValue == null)
+ 		{
+ 			setToNull();
+@@ -1200,11 +1471,13 @@ public void setObjectForCast(Object theValue, boolean instanceOfResultType,
+ 		if ("java.lang.String".equals(resultTypeClassName))
+ 		    setValue(theValue.toString());
+ 		else
+-			super.setObjectForCast(theValue, instanceOfResultType, resultTypeClassName);
++            super.setObjectForCast(
++                theValue, instanceOfResultType, resultTypeClassName);
+ 	}
+ 	
+-	protected void setFrom(DataValueDescriptor theValue) throws StandardException {
+-
++    protected void setFrom(DataValueDescriptor theValue) 
++        throws StandardException 
++    {
+ 		setValue(theValue.getString());
+ 	}
+ 
+@@ -1300,7 +1573,11 @@ protected final void hasNonBlankChars(String source, int start, int end)
+ 		{
+ 			if (source.charAt(posn) != ' ')
+ 			{
+-				throw StandardException.newException(SQLState.LANG_STRING_TRUNCATION, getTypeName(), StringUtil.formatForPrint(source), String.valueOf(start));
++                throw StandardException.newException(
++                    SQLState.LANG_STRING_TRUNCATION, 
++                    getTypeName(), 
++                    StringUtil.formatForPrint(source), 
++                    String.valueOf(start));
+ 			}
+ 		}
+ 	}
+@@ -1639,7 +1916,9 @@ public StringDataValue concatenate(
+ 			return result;
+ 		}
+ 
+-		result.setValue(leftOperand.getString().concat(rightOperand.getString()));
++        result.setValue(
++                leftOperand.getString().concat(rightOperand.getString()));
++
+ 		return result;
+ 	}
+ 
+@@ -1721,7 +2000,8 @@ public BooleanDataValue like(
+ 
+ 		if (escapeCharArray != null && escapeLength != 1 )
+ 		{
+-			throw StandardException.newException(SQLState.LANG_INVALID_ESCAPE_CHARACTER,
++            throw StandardException.newException(
++                    SQLState.LANG_INVALID_ESCAPE_CHARACTER,
+ 					new String(escapeCharArray));
+ 		}
+ 		likeResult = Like.like(evalCharArray, 
+@@ -1829,11 +2109,13 @@ public ConcatableDataValue substring(
+ 
+ 		stringResult = (StringDataValue) result;
+ 
+-		/* The result is null if the receiver (this) is null or if the length is negative.
++        /* The result is null if the receiver (this) is null or if the length 
++         * is negative.
+ 		 * We will return null, which is the only sensible thing to do.
+-		 * (If the user did not specify a length then length is not a user null.)
++         * (If user did not specify a length then length is not a user null.)
+ 		 */
+-		if (this.isNull() || start.isNull() || (length != null && length.isNull()))
++        if (this.isNull() || start.isNull() || 
++                (length != null && length.isNull()))
+ 		{
+ 			stringResult.setToNull();
+ 			return stringResult;
+@@ -1848,13 +2130,17 @@ public ConcatableDataValue substring(
+ 		}
+ 		else lengthInt = maxLen - startInt + 1;
+ 
+-		/* DB2 Compatibility: Added these checks to match DB2. We currently enforce these
+-		 * limits in both modes. We could do these checks in DB2 mode only, if needed, so
+-		 * leaving earlier code for out of range in for now, though will not be exercised
++        /* DB2 Compatibility: Added these checks to match DB2. We currently 
++         * enforce these limits in both modes. We could do these checks in DB2 
++         * mode only, if needed, so leaving earlier code for out of range in 
++         * for now, though will not be exercised
+ 		 */
+ 		if ((startInt <= 0 || lengthInt < 0 || startInt > maxLen ||
+ 				lengthInt > maxLen - startInt + 1))
+-			throw StandardException.newException(SQLState.LANG_SUBSTR_START_OR_LEN_OUT_OF_RANGE);
++        {
++            throw StandardException.newException(
++                    SQLState.LANG_SUBSTR_START_OR_LEN_OUT_OF_RANGE);
++        }
+ 			
+ 		// Return null if length is non-positive
+ 		if (lengthInt < 0)
+@@ -1907,7 +2193,8 @@ else if (startInt > 0)
+ 		}
+ 		else
+ 		{
+-			stringResult.setValue(getString().substring(startInt, startInt + lengthInt));
++            stringResult.setValue(
++                getString().substring(startInt, startInt + lengthInt));
+ 		}
+ 
+ 		return stringResult;
+@@ -1961,8 +2248,12 @@ private String trimInternal(int trimType, char trimChar, String source)
+ 	 *
+ 	 * @return A StringDataValue containing the result of the trim.
+ 	 */
+-	public StringDataValue ansiTrim(int trimType, StringDataValue trimChar, StringDataValue result)
+-			throws StandardException {
++    public StringDataValue ansiTrim(
++    int             trimType, 
++    StringDataValue trimChar, 
++    StringDataValue result)
++            throws StandardException 
++    {
+ 
+ 		if (result == null)
+ 		{
+@@ -1978,7 +2269,8 @@ public StringDataValue ansiTrim(int trimType, StringDataValue trimChar, StringDa
+ 
+ 		if (trimChar.getString().length() != 1)
+ 		{
+-			throw StandardException.newException(SQLState.LANG_INVALID_TRIM_CHARACTER, trimChar.getString());			
++            throw StandardException.newException(
++                    SQLState.LANG_INVALID_TRIM_CHARACTER, trimChar.getString());           
+ 		}
+ 
+ 		char trimCharacter = trimChar.getString().charAt(0);
+@@ -2121,7 +2413,8 @@ protected static int stringCompare(String op1, String op2)
+ 			** Remaining characters are on the left.
+ 			*/
+ 
+-			/* If a remaining character is less than a space, return -1 (op1 < op2) */
++            /* If a remaining character is less than a space, 
++             * return -1 (op1 < op2) */
+ 			retvalIfLTSpace = -1;
+ 			remainingString = op1;
+ 			posn = rightlen;
+@@ -2133,7 +2426,8 @@ protected static int stringCompare(String op1, String op2)
+ 			** Remaining characters are on the right.
+ 			*/
+ 
+-			/* If a remaining character is less than a space, return 1 (op1 > op2) */
++            /* If a remaining character is less than a space, 
++             * return 1 (op1 > op2) */
+ 			retvalIfLTSpace = 1;
+ 			remainingString = op2;
+ 			posn = leftlen;
+@@ -2186,7 +2480,11 @@ protected int stringCompare(SQLChar char1, SQLChar char2)
+ 	 * 			 0 - op1 == op2
+ 	 *			 1 - op1 > op2
+ 	 */
+-	protected static int stringCompare(char[] op1, int leftlen, char[] op2, int rightlen)
++    protected static int stringCompare(
++    char[]  op1, 
++    int     leftlen, 
++    char[]  op2, 
++    int     rightlen)
+ 	{
+ 		int			posn;
+ 		char		leftchar;
+@@ -2244,7 +2542,8 @@ protected static int stringCompare(char[] op1, int leftlen, char[] op2, int righ
+ 			** Remaining characters are on the left.
+ 			*/
+ 
+-			/* If a remaining character is less than a space, return -1 (op1 < op2) */
++            /* If a remaining character is less than a space, 
++             * return -1 (op1 < op2) */
+ 			retvalIfLTSpace = -1;
+ 			remainingString = op1;
+ 			posn = rightlen;
+@@ -2256,7 +2555,8 @@ protected static int stringCompare(char[] op1, int leftlen, char[] op2, int righ
+ 			** Remaining characters are on the right.
+ 			*/
+ 
+-			/* If a remaining character is less than a space, return 1 (op1 > op2) */
++            /* If a remaining character is less than a space, 
++             * return 1 (op1 > op2) */
+ 			retvalIfLTSpace = 1;
+ 			remainingString = op2;
+ 			posn = leftlen;
+@@ -2369,7 +2669,8 @@ public int hashCode()
+ 		}
+ 
+ 
+-		/* value.hashCode() doesn't work because of the SQL blank padding behavior
++        /* value.hashCode() doesn't work because of the SQL blank padding 
++         * behavior.
+ 		 * We want the hash code to be based on the value after the 
+ 		 * trailing blanks have been trimmed.  Calling trim() is too expensive
+ 		 * since it will create a new object, so here's what we do:
+@@ -2424,7 +2725,8 @@ private Locale getLocale() throws StandardException
+ 		return getLocaleFinder().getCurrentLocale();
+ 	}
+ 
+-	protected RuleBasedCollator getCollatorForCollation() throws StandardException
++    protected RuleBasedCollator getCollatorForCollation() 
++        throws StandardException
+ 	{
+ 		return getLocaleFinder().getCollator();
+ 	}
+@@ -2436,7 +2738,8 @@ protected LocaleFinder getLocaleFinder()
+ 		// though.  -  Jeff
+ 		if (localeFinder == null)
+ 		{
+-			DatabaseContext dc = (DatabaseContext) ContextService.getContext(DatabaseContext.CONTEXT_ID);
++            DatabaseContext dc = (DatabaseContext) 
++                ContextService.getContext(DatabaseContext.CONTEXT_ID);
+             if( dc != null)
+                 localeFinder = dc.getDatabase();
+ 		}
+@@ -2454,66 +2757,41 @@ protected DateFormat getTimestampFormat() throws StandardException {
+ 		return getLocaleFinder().getTimestampFormat();
+ 	}
+ 
+-	protected DateFormat getDateFormat( Calendar cal) throws StandardException {
++    protected DateFormat getDateFormat( Calendar cal) 
++        throws StandardException {
+ 		return setDateFormatCalendar( getLocaleFinder().getDateFormat(), cal);
+ 	}
+-	protected DateFormat getTimeFormat( Calendar cal) throws StandardException {
++    protected DateFormat getTimeFormat( Calendar cal) 
++        throws StandardException {
+ 		return setDateFormatCalendar( getLocaleFinder().getTimeFormat(), cal);
+ 	}
+-	protected DateFormat getTimestampFormat( Calendar cal) throws StandardException {
+-		return setDateFormatCalendar( getLocaleFinder().getTimestampFormat(), cal);
++    protected DateFormat getTimestampFormat( Calendar cal) 
++        throws StandardException {
++        return setDateFormatCalendar(
++                getLocaleFinder().getTimestampFormat(), cal);
+ 	}
+ 
+     private DateFormat setDateFormatCalendar( DateFormat df, Calendar cal)
+     {
+         if( cal != null && df.getTimeZone() != cal.getTimeZone())
+         {
+-            // The DateFormat returned by getDateFormat may be cached and used by other threads.
+-            // Therefore we cannot change its calendar.
++            // The DateFormat returned by getDateFormat may be cached and used
++            // by other threads.  Therefore we cannot change its calendar.
+             df = (DateFormat) df.clone();
+             df.setCalendar( cal);
+         }
+         return df;
+     }
+ 
+-	/*
+-	 * object state
+-	 */
+-
+-	// Don't use value directly in most situations. Use getString()
+-	// OR use the rawData array if rawLength != -1.
+-	private		String	value;
+-
+-	// rawData holds the reusable array for reading in
+-	// SQLChars. It contains a valid value if rawLength
+-	// is greater than or equal to 0. See getString() to see how it is
+-	// converted to a String. Even when converted to a String
+-	// object the rawData array remains for potential future
+-	// use, unless  rawLength is > 4096. In this case the
+-	// rawData is set to null to avoid huge memory use.
+-	private		char[]	rawData;
+-	private		int		rawLength = -1;
+-
+-	// For null strings, cKey = null.
+-	private CollationKey cKey; 
+-
+-    /**
+-	 * The value as a stream in the on-disk format.
+-	 */
+-	InputStream stream;
+-
+-	/* Locale info (for International support) */
+-	private LocaleFinder localeFinder;
+-
+-    private static final int BASE_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( SQLChar.class);
+-
+     public int estimateMemoryUsage()
+     {
+         int sz = BASE_MEMORY_USAGE + ClassSize.estimateMemoryUsage( value);
+         if( null != rawData)
+             sz += 2*rawData.length;
+-        // Assume that cKey, stream, and localFinder are shared, so do not count their memory usage
++        // Assume that cKey, stream, and localFinder are shared, 
++        // so do not count their memory usage
+         return sz;
++
+     } // end of estimateMemoryUsage
+ 
+ 	protected void copyState(SQLChar other) {
+@@ -2539,5 +2817,4 @@ public String getTraceString() throws StandardException {
+ 
+         return (toString());
+     }
+-
+ }
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/ClobMemTest.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/ClobMemTest.java
+index e69de29b..7217bf19 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/ClobMemTest.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/ClobMemTest.java
+@@ -0,0 +1,200 @@
++/**
++ * Derby - Class org.apache.derbyTesting.functionTests.tests.memory.ClobMemTest
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.derbyTesting.functionTests.tests.memory;
++
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.Reader;
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++
++import java.util.Arrays;
++import java.util.Properties;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++
++import junit.framework.Test;
++
++import org.apache.derbyTesting.functionTests.util.streams.LoopingAlphabetReader;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.SystemPropertyTestSetup;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++public class ClobMemTest extends BaseJDBCTestCase {
++
++    private static final int LONG_CLOB_LENGTH = 18000000;
++    private static final String LONG_CLOB_LENGTH_STRING= "18000000";
++    private static final char[] SHORT_CLOB_CHARS = new char[] {'\uc911','\uc5d0','a', '\uc608', '\uae30',
++            '\uce58'};
++
++    public ClobMemTest(String name) {
++        super(name);
++    }
++
++    public void tearDown() throws SQLException {
++        rollback();
++    }
++
++
++
++    /**
++     * Insert a clob and test length.
++     *
++     * @param lengthless  if true use the lengthless setCharacterStream api
++     *
++     * @throws SQLException
++     * @throws IOException
++     * @throws InvocationTargetException
++     * @throws IllegalAccessException
++     * @throws IllegalArgumentException
++     */
++    private void testClobLength(boolean lengthless) throws SQLException, IOException, IllegalArgumentException,
++            IllegalAccessException, InvocationTargetException {
++        getConnection().setAutoCommit(false);
++        Statement s = createStatement();
++        s.executeUpdate("CREATE TABLE CLOBTABLE (K INT CONSTRAINT PK PRIMARY KEY, C CLOB(" + LONG_CLOB_LENGTH + "))");
++
++        PreparedStatement ps = prepareStatement("INSERT INTO CLOBTABLE VALUES(?,?)");
++        // We allocate 16MB for the test so use something bigger than that.
++        ps.setInt(1,1);
++        LoopingAlphabetReader reader = new LoopingAlphabetReader(LONG_CLOB_LENGTH);
++        if (lengthless) {
++            Method m = null;
++            try {
++                Class c = ps.getClass();
++                m = c.getMethod("setCharacterStream",new Class[] {Integer.TYPE,
++                            InputStream.class});
++            } catch (NoSuchMethodException e) {
++                // ignore method not found as method may not be present for
++                // jdk's lower than 1.6.
++                println("Skipping lengthless insert because method is not available");
++                return;
++            }
++            m.invoke(ps, new Object[] {new Integer(2), reader});
++        }
++        else
++            ps.setCharacterStream(2, reader, LONG_CLOB_LENGTH);
++        ps.executeUpdate();
++        // insert a zero length clob.
++        ps.setInt(1, 2);
++        ps.setString(2, "");
++        ps.executeUpdate();
++        // insert a null clob.
++        ps.setInt(1, 3);
++        ps.setString(2,null);
++        ps.executeUpdate();
++        // insert a short clob
++        ps.setInt(1, 4);
++        ps.setString(2, new String(SHORT_CLOB_CHARS));
++        ps.executeUpdate();
++        // Currently need to use optimizer override to force use of the index.
++        // Derby should use sort avoidance and do it automatically, but there
++        // appears to be a bug.
++        ResultSet rs = s.executeQuery("SELECT K, LENGTH(C), C FROM CLOBTABLE" +
++                "-- DERBY-PROPERTIES constraint=pk\n ORDER BY K");
++        rs.next();
++        assertEquals(LONG_CLOB_LENGTH_STRING,rs.getString(2));
++        // make sure we can still access the clob after getting length.
++        // It should be ok because we reset the stream
++        Reader rsReader = rs.getCharacterStream(3);
++        int len= 0;
++        char[] buf = new char[32672];
++        for (;;)  {
++                int size = rsReader.read(buf);
++                if (size == -1)
++                        break;
++                len += size;
++                int expectedValue = ((len -1) % 26) + 'a';
++                if (size != 0)
++                    assertEquals(expectedValue,buf[size -1]);
++        }
++
++        assertEquals(LONG_CLOB_LENGTH,len);
++        // empty clob
++        rs.next();
++        assertEquals("0",rs.getString(2));
++        String chars = rs.getString(3);
++        assertEquals(0, chars.length());
++        // null clob
++        rs.next();
++        assertEquals(null, rs.getString(2));
++        chars = rs.getString(3);
++        assertEquals(null, chars);
++        // short clob
++        rs.next();
++        assertEquals("" + SHORT_CLOB_CHARS.length , rs.getString(2));
++        chars = rs.getString(3);
++        assertTrue(Arrays.equals(chars.toCharArray(), SHORT_CLOB_CHARS));
++        rs.close();
++
++        // Select just length without selecting the clob.
++        rs = s.executeQuery("SELECT K, LENGTH(C)  FROM CLOBTABLE " +
++                "ORDER BY K");
++        JDBC.assertFullResultSet(rs, new String [][] {{"1",LONG_CLOB_LENGTH_STRING},{"2","0"},
++                {"3",null},{"4","6"}});
++    }
++
++    /**
++     * Test the length after inserting with the setCharacterStream api
++     * that takes length.  In this case the length will be encoded at the
++     * begining of the stream and the call should be fairly low overhead.
++     *
++     * @throws SQLException
++     * @throws IOException
++     * @throws InvocationTargetException
++     * @throws IllegalAccessException
++     * @throws IllegalArgumentException
++     */
++    public void testClobLength() throws SQLException, IOException, IllegalArgumentException, IllegalAccessException,
++            InvocationTargetException {
++        testClobLength(false);
++    }
++
++    /**
++     * Test the length after inserting the clob value with the lengthless
++     * setCharacterStream api. In this case we will have to read the whole
++     * stream to get the length.
++     *
++     * @throws SQLException
++     * @throws IOException
++     * @throws InvocationTargetException
++     * @throws IllegalAccessException
++     * @throws IllegalArgumentException
++     */
++    public void testClobLengthWithLengthlessInsert() throws SQLException, IOException, IllegalArgumentException,
++            IllegalAccessException, InvocationTargetException {
++        testClobLength(true);
++    }
++
++    public static Test suite() {
++        Test suite =  TestConfiguration.defaultSuite(ClobMemTest.class);
++        Properties p = new Properties();
++        // use small pageCacheSize so we don't run out of memory on the insert.
++        p.setProperty("derby.storage.pageCacheSize", "100");
++        return new SystemPropertyTestSetup(suite,p);
++    }
++
++
++
++}
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/MultiByteClobTest.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/MultiByteClobTest.java
+index 3f24d583..65b85f3f 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/MultiByteClobTest.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/MultiByteClobTest.java
+@@ -1 +1,175 @@
+   + native
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.tests.memory.MultiByteClobTest
++   Licensed to the Apache Software Foundation (ASF) under one
++   or more contributor license agreements.  See the NOTICE file
++   distributed with this work for additional information
++   regarding copyright ownership.  The ASF licenses this file
++   to you under the Apache License, Version 2.0 (the
++   "License"); you may not use this file except in compliance
++   with the License.  You may obtain a copy of the License at
++
++     http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing,
++   software distributed under the License is distributed on an
++   "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++   KIND, either express or implied.  See the License for the
++   specific language governing permissions and limitations
++   under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.memory;
++
++import org.apache.derbyTesting.junit.*;
++import org.apache.derbyTesting.functionTests.util.streams.LoopingAlphabetReader;
++import org.apache.derbyTesting.functionTests.util.streams.CharAlphabet;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++
++import java.sql.Statement;
++import java.sql.SQLException;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.util.Properties;
++import java.io.Reader;
++import java.io.IOException;
++
++/**
++ * Test for small and larg clobs with multibyte characters.
++ */
++public class MultiByteClobTest extends BaseJDBCTestCase {
++
++    private static final int LONG_CLOB_LENGTH = 9000000;
++    private static final int SHORT_CLOB_LENGTH = 100;
++    private static final String LONG_CLOB_LENGTH_STRING = "9000000";
++    private static final String SHORT_CLOB_LENGTH_STRING = "100";
++
++    /**
++     * Create a test case with the given name.
++     *
++     * @param name of the test case.
++     */
++    public MultiByteClobTest(String name) {
++        super(name);
++    }
++
++    public void testSmallMultiByteCharLob() throws SQLException, IOException {
++        getConnection().setAutoCommit(false);
++        Statement s = createStatement();
++        
++        PreparedStatement ps = prepareStatement("INSERT INTO MB_CLOBTABLE VALUES(?,?)");
++        // We allocate 16MB for the test so use something bigger than that.
++        ps.setInt(1,1);
++        LoopingAlphabetReader reader = new LoopingAlphabetReader(SHORT_CLOB_LENGTH, CharAlphabet.cjkSubset());
++
++        ps.setCharacterStream(2, reader, SHORT_CLOB_LENGTH);
++        ps.executeUpdate();
++
++        ResultSet rs = s.executeQuery("SELECT K, LENGTH(C), C FROM MB_CLOBTABLE" +
++                "-- DERBY-PROPERTIES constraint=pk\n ORDER BY K");
++        rs.next();
++        assertEquals(SHORT_CLOB_LENGTH_STRING, rs.getString(2));
++        // make sure we can still access the clob after getting length.
++        // It should be ok because we reset the stream
++        Reader rsReader = rs.getCharacterStream(3);
++        int len= 0;
++        char[] buf = new char[32672];
++        for (;;)  {
++                int size = rsReader.read(buf);
++                if (size == -1)
++                        break;
++                len += size;
++                int expectedValue = ((len -1) % 12) + '\u4E00';
++                if (size != 0)
++                    assertEquals(expectedValue,buf[size -1]);
++        }
++        assertEquals(SHORT_CLOB_LENGTH, len);
++        rs.close();
++        // Select just length without selecting the clob.
++        rs = s.executeQuery("SELECT K, LENGTH(C)  FROM MB_CLOBTABLE " +
++                "ORDER BY K");
++        JDBC.assertFullResultSet(rs, new String [][] {{"1",SHORT_CLOB_LENGTH_STRING}});
++    }
++
++    public void testLargeMultiByteCharLob() throws SQLException, IOException {
++        getConnection().setAutoCommit(false);
++        Statement s = createStatement();
++
++        PreparedStatement ps = prepareStatement("INSERT INTO MB_CLOBTABLE VALUES(?,?)");
++        // We allocate 16MB for the test so use something bigger than that.
++        ps.setInt(1,1);
++        LoopingAlphabetReader reader = new LoopingAlphabetReader(LONG_CLOB_LENGTH, CharAlphabet.cjkSubset());
++
++        ps.setCharacterStream(2, reader, LONG_CLOB_LENGTH);
++        ps.executeUpdate();
++
++        ResultSet rs = s.executeQuery("SELECT K, LENGTH(C), C FROM MB_CLOBTABLE" +
++                "-- DERBY-PROPERTIES constraint=pk\n ORDER BY K");
++        rs.next();
++        assertEquals(LONG_CLOB_LENGTH_STRING, rs.getString(2));
++        // make sure we can still access the clob after getting length.
++        // It should be ok because we reset the stream
++        Reader rsReader = rs.getCharacterStream(3);
++        int len= 0;
++        char[] buf = new char[32672];
++        for (;;)  {
++                int size = rsReader.read(buf);
++                if (size == -1)
++                        break;
++                len += size;
++                int expectedValue = ((len -1) % 12) + '\u4E00';
++                if (size != 0)
++                    assertEquals(expectedValue,buf[size -1]);
++        }
++        assertEquals(LONG_CLOB_LENGTH, len);
++        rs.close();
++        // Select just length without selecting the clob.
++        rs = s.executeQuery("SELECT K, LENGTH(C)  FROM MB_CLOBTABLE " +
++                "ORDER BY K");
++        JDBC.assertFullResultSet(rs, new String [][] {{"1",LONG_CLOB_LENGTH_STRING}});
++    }
++
++    /**
++	 * Runs the test fixtures in embedded and client.
++	 *
++	 * @return test suite
++	 */
++	public static Test suite() {
++		TestSuite suite = new TestSuite("MultiByteClobTest");
++		suite.addTest(baseSuite("MultiByteClobTest:embedded"));
++                // Disable for client for now. Client clob is inordinately slow.
++		//suite.addTest(TestConfiguration
++		//		.clientServerDecorator(baseSuite("MultiByteClobTest:client")));
++                Properties p = new Properties();
++                // use small pageCacheSize so we don't run out of memory on the insert.
++                p.setProperty("derby.storage.pageCacheSize", "100");
++                return new SystemPropertyTestSetup(suite,p);	
++	}
++
++	/**
++	 * Base suite of tests that will run in both embedded and client.
++	 *
++	 * @param name
++	 *            Name for the suite.
++	 */
++	private static Test baseSuite(String name) {
++		TestSuite suite = new TestSuite(name);
++		suite.addTestSuite(MultiByteClobTest.class);
++		return new CleanDatabaseTestSetup(DatabasePropertyTestSetup
++				.setLockTimeouts(suite, 2, 4)) {
++
++			/**
++			 * Creates the tables used in the test cases.
++			 *
++			 * @exception java.sql.SQLException
++			 *                if a database error occurs
++			 */
++			protected void decorateSQL(Statement stmt) throws SQLException {
++				stmt.execute("CREATE TABLE MB_CLOBTABLE (K INT CONSTRAINT PK PRIMARY KEY, C CLOB(" + LONG_CLOB_LENGTH + "))");
++			}
++		};
++	}
++}
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/_Suite.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/_Suite.java
+index 0b5e94f3..8ee87282 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/_Suite.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/memory/_Suite.java
+@@ -37,6 +37,8 @@ public _Suite(String name) {
+     public static Test suite() throws Exception{
+         TestSuite suite = new TestSuite("Memory Suite");
+         suite.addTest(BlobMemTest.suite());
++        suite.addTest(ClobMemTest.suite());
++        suite.addTest(MultiByteClobTest.suite());
+                 return suite;
+     }
+ }

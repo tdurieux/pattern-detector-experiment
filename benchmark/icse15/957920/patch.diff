@@ -1,0 +1,215 @@
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
+index 99130b39..c8635f27 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
+@@ -66,6 +66,11 @@
+   private int numDocs = -1;
+   private boolean hasDeletions = false;
+ 
++  // Max version in index as of when we opened; this can be
++  // > our current segmentInfos version in case we were
++  // opened on a past IndexCommit:
++  private long maxIndexVersion;
++
+   static IndexReader open(final Directory directory, final IndexDeletionPolicy deletionPolicy, final IndexCommit commit, final boolean readOnly,
+                           final int termInfosIndexDivisor) throws CorruptIndexException, IOException {
+     return (IndexReader) new SegmentInfos.FindSegmentsFile(directory) {
+@@ -295,7 +300,7 @@ public String toString() {
+     return buffer.toString();
+   }
+ 
+-  private void initialize(SegmentReader[] subReaders) {
++  private void initialize(SegmentReader[] subReaders) throws IOException {
+     this.subReaders = subReaders;
+     starts = new int[subReaders.length + 1];    // build starts array
+     for (int i = 0; i < subReaders.length; i++) {
+@@ -306,6 +311,10 @@ private void initialize(SegmentReader[] subReaders) {
+         hasDeletions = true;
+     }
+     starts[subReaders.length] = maxDoc;
++
++    if (!readOnly) {
++      maxIndexVersion = SegmentInfos.readCurrentVersion(directory);
++    }
+   }
+ 
+   @Override
+@@ -724,8 +733,9 @@ protected void acquireWriteLock() throws StaleReaderException, CorruptIndexExcep
+         this.writeLock = writeLock;
+ 
+         // we have to check whether index has changed since this reader was opened.
+-        // if so, this reader is no longer valid for deletion
+-        if (SegmentInfos.readCurrentVersion(directory) > segmentInfos.getVersion()) {
++        // if so, this reader is no longer valid for
++        // deletion
++        if (SegmentInfos.readCurrentVersion(directory) > maxIndexVersion) {
+           stale = true;
+           this.writeLock.release();
+           this.writeLock = null;
+@@ -752,6 +762,7 @@ protected void doCommit(Map<String,String> commitUserData) throws IOException {
+       IndexFileDeleter deleter = new IndexFileDeleter(directory,
+                                                       deletionPolicy == null ? new KeepOnlyLastCommitDeletionPolicy() : deletionPolicy,
+                                                       segmentInfos, null, null);
++      segmentInfos.updateGeneration(deleter.getLastSegmentInfos());
+ 
+       // Checkpoint the state we are about to change, in
+       // case we have to roll back:
+@@ -790,6 +801,8 @@ protected void doCommit(Map<String,String> commitUserData) throws IOException {
+       deleter.checkpoint(segmentInfos, true);
+       deleter.close();
+ 
++      maxIndexVersion = segmentInfos.getVersion();
++
+       if (writeLock != null) {
+         writeLock.release();  // release write lock
+         writeLock = null;
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
+index 5984c80f..498c75ed 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
+@@ -101,6 +101,7 @@
+   private DocumentsWriter docWriter;
+ 
+   final boolean startingCommitDeleted;
++  private SegmentInfos lastSegmentInfos;
+ 
+   /** Change to true to see details of reference counts when
+    *  infoStream != null */
+@@ -164,7 +165,6 @@ public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, Segment
+           // This is a commit (segments or segments_N), and
+           // it's valid (<= the max gen).  Load it, then
+           // incref all files it refers to:
+-          if (SegmentInfos.generationFromSegmentsFileName(fileName) <= currentGen) {
+             if (infoStream != null) {
+               message("init: load commit \"" + fileName + "\"");
+             }
+@@ -183,6 +183,15 @@ public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, Segment
+                 message("init: hit FileNotFoundException when loading commit \"" + fileName + "\"; skipping this commit point");
+               }
+               sis = null;
++          } catch (IOException e) {
++            if (SegmentInfos.generationFromSegmentsFileName(fileName) <= currentGen) {
++              throw e;
++            } else {
++              // Most likely we are opening an index that
++              // has an aborted "future" commit, so suppress
++              // exc in this case
++              sis = null;
++            }
+             }
+             if (sis != null) {
+               CommitPoint commitPoint = new CommitPoint(commitsToDelete, directory, sis);
+@@ -191,6 +200,9 @@ public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, Segment
+               }
+               commits.add(commitPoint);
+               incRef(sis, true);
++
++            if (lastSegmentInfos == null || sis.getGeneration() > lastSegmentInfos.getGeneration()) {
++              lastSegmentInfos = sis;
+             }
+           }
+         }
+@@ -250,6 +262,10 @@ public IndexFileDeleter(Directory directory, IndexDeletionPolicy policy, Segment
+     deleteCommits();
+   }
+ 
++  public SegmentInfos getLastSegmentInfos() {
++    return lastSegmentInfos;
++  }
++
+   /**
+    * Remove the CommitPoints in the commitsToDelete List by
+    * DecRef'ing all files from each SegmentInfos.
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
+index 899b5f1c..a256cfe4 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -811,6 +811,7 @@ public void testSimulatedCrashedWriter() throws IOException {
+         try {
+           writer  = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)).setOpenMode(OpenMode.CREATE));
+         } catch (Exception e) {
++          e.printStackTrace(System.out);
+           fail("writer failed to open on a crashed index");
+         }
+ 
+@@ -4915,4 +4916,80 @@ public void testNoSegmentFile() throws IOException {
+       _TestUtil.rmDir(tempDir);
+     }
+   }
++
++  public void testFutureCommit() throws Exception {
++    Directory dir = new MockRAMDirectory();
++
++    IndexWriter w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer()).setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE));
++    Document doc = new Document();
++    w.addDocument(doc);
++
++    // commit to "first"
++    Map<String,String> commitData = new HashMap<String,String>();
++    commitData.put("tag", "first");
++    w.commit(commitData);
++
++    // commit to "second"
++    w.addDocument(doc);
++    commitData.put("tag", "second");
++    w.commit(commitData);
++    w.close();
++
++    // open "first" with IndexWriter
++    IndexCommit commit = null;
++    for(IndexCommit c : IndexReader.listCommits(dir)) {
++      if (c.getUserData().get("tag").equals("first")) {
++        commit = c;
++        break;
++      }
++    }
++
++    assertNotNull(commit);
++
++    w = new IndexWriter(dir, new IndexWriterConfig(TEST_VERSION_CURRENT, new WhitespaceAnalyzer()).setIndexDeletionPolicy(NoDeletionPolicy.INSTANCE).setIndexCommit(commit));
++
++    assertEquals(1, w.numDocs());
++    
++    // commit IndexWriter to "third"
++    w.addDocument(doc);
++    commitData.put("tag", "third");
++    w.commit(commitData);
++    w.close();
++
++    // make sure "second" commit is still there
++    commit = null;
++    for(IndexCommit c : IndexReader.listCommits(dir)) {
++      if (c.getUserData().get("tag").equals("second")) {
++        commit = c;
++        break;
++      }
++    }
++
++    assertNotNull(commit);
++
++    IndexReader r = IndexReader.open(commit, true);
++    assertEquals(2, r.numDocs());
++    r.close();
++
++    // open "second", w/ writeable IndexReader & commit
++    r = IndexReader.open(commit, NoDeletionPolicy.INSTANCE, false);
++    assertEquals(2, r.numDocs());
++    r.deleteDocument(0);
++    r.deleteDocument(1);
++    commitData.put("tag", "fourth");
++    r.commit(commitData);
++    r.close();
++
++    // make sure "third" commit is still there
++    commit = null;
++    for(IndexCommit c : IndexReader.listCommits(dir)) {
++      if (c.getUserData().get("tag").equals("third")) {
++        commit = c;
++        break;
++      }
++    }
++    assertNotNull(commit);
++
++    dir.close();
++  }
+ }

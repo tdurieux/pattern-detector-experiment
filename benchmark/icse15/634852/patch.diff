@@ -1,0 +1,389 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
+index a77e714e..bbb327de 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
+@@ -456,7 +456,9 @@ public ConglomerateDescriptor drop(LanguageConnectionContext lcc,
+ 			 * has a uniqueness requirement.
+ 			 */
+ 			needNewConglomerate =
+-				indexRowGenerator.isUnique() && !othersIRG.isUnique();
++				(indexRowGenerator.isUnique() && !othersIRG.isUnique()) ||
++					(indexRowGenerator.isUniqueWithDuplicateNulls() && 
++						!othersIRG.isUniqueWithDuplicateNulls());
+ 
+ 			if (needNewConglomerate)
+ 			{
+@@ -561,10 +563,15 @@ public ConglomerateDescriptor describeSharedConglomerate(
+ 		 *  1. If any of the sharing descriptors is unique, then
+ 		 *     the physical conglomerate must also be unique.
+ 		 *
+-		 *  2. If none of the sharing descriptors are unique, the
+-		 *     physical conglomerate must not be unique.
++		 *  2. If none of sharing descriptors are unique and any of 
++		 *     the descriptors are UniqueWithDuplicateNulls the physical
++		 *     conglomerate must also be UniqueWithDuplicateNulls
+ 		 *
+-		 *  3. If the physical conglomerate has n columns, then all
++		 *  3. If none of the sharing descriptors are unique or 
++		 *     UniqueWithDuplicateNulls, the physical conglomerate 
++		 *     must not be unique.
++		 *
++		 *  4. If the physical conglomerate has n columns, then all
+ 		 *     sharing descriptors must have n columns, as well.
+ 		 *
+ 		 * These criteria follow from the "share conglom" detection logic
+@@ -597,15 +604,31 @@ public ConglomerateDescriptor describeSharedConglomerate(
+ 				continue;
+ 			}
+ 
+-			returnDesc = descriptors[i];
+-			if (returnDesc.getIndexDescriptor().isUnique())
++			if (descriptors[i].getIndexDescriptor().isUnique())
+ 			{
+-				/* Given criteria #1 and #3 described above, if we
++				/* Given criteria #1 and #4 described above, if we
+ 				 * have a unique conglomerate descriptor then we've
+ 				 * found what we need, so we're done.
+ 				 */
++				returnDesc = descriptors[i];
+ 				break;
+ 			}
++
++			if (descriptors[i].getIndexDescriptor()
++					.isUniqueWithDuplicateNulls())
++			{
++				/* Criteria #2. Remember this descriptor. If we don't find
++				 * any unique descriptor we will use this.
++				 */
++				returnDesc = descriptors[i];
++			}
++			else if (returnDesc == null)
++			{
++				/* Criteria #3 If no other descriptor found satifying
++				 * #1 or #2 this descriptor will be used.
++				 */
++				 returnDesc = descriptors[i];
++			}
+ 		}
+ 
+ 		if (SanityManager.DEBUG)
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateIndexConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateIndexConstantAction.java
+index dc657177..aa7cdc96 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateIndexConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateIndexConstantAction.java
+@@ -205,6 +205,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		 */
+ 		IndexRowGenerator irg = srcCD.getIndexDescriptor();
+ 		this.unique = irg.isUnique();
++		this.uniqueWithDuplicateNulls = irg.isUniqueWithDuplicateNulls();
+ 		this.indexType = irg.indexType();
+ 		this.columnNames = srcCD.getColumnNames();
+ 		this.isAscending = irg.isAscending();
+@@ -440,13 +441,34 @@ public void	executeConstantAction( Activation activation )
+ 			 *
+ 			 * 1. the set of columns (both key and include columns) and their 
+ 			 *  order in the index is the same as that of an existing index AND 
++			 *
+ 			 * 2. the ordering attributes are the same AND 
+-			 * 3. both the previously existing index and the one being created 
+-			 *  are non-unique OR the previously existing index is unique
++			 *
++			 * 3. one of the following is true:
++			 *    a) the existing index is unique, OR
++			 *    b) the existing index is non-unique with uniqueWhenNotNulls
++			 *       set to TRUE and the index being created is non-unique, OR
++			 *    c) both the existing index and the one being created are
++			 *       non-unique and have uniqueWithDuplicateNulls set to FALSE.
+ 			 */ 
+ 			boolean possibleShare = (irg.isUnique() || !unique) &&
+ 			    (bcps.length == baseColumnPositions.length);
+ 
++			//check if existing index is non unique and uniqueWithDuplicateNulls
++			//is set to true (backing index for unique constraint)
++			if (possibleShare && !irg.isUnique ())
++			{
++				/* If the existing index has uniqueWithDuplicateNulls set to
++				 * TRUE it can be shared by other non-unique indexes; otherwise
++				 * the existing non-unique index has uniqueWithDuplicateNulls
++				 * set to FALSE, which means the new non-unique conglomerate
++				 * can only share if it has uniqueWithDuplicateNulls set to
++				 * FALSE, as well.
++				 */
++				possibleShare = (irg.isUniqueWithDuplicateNulls() ||
++								! uniqueWithDuplicateNulls);
++			}
++
+ 			if (possibleShare && indexType.equals(irg.indexType()))
+ 			{
+ 				for (; j < bcps.length; j++)
+@@ -491,7 +513,7 @@ public void	executeConstantAction( Activation activation )
+ 				 */
+ 				indexRowGenerator =
+ 					new IndexRowGenerator(
+-						indexType, unique,
++						indexType, unique, uniqueWithDuplicateNulls,
+ 						baseColumnPositions,
+ 						isAscending,
+ 						baseColumnPositions.length);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ConglomerateSharingTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ConglomerateSharingTest.java
+index 335cc959..4dfaa4f4 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ConglomerateSharingTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ConglomerateSharingTest.java
+@@ -467,6 +467,257 @@ public void testConstraintDrops() throws SQLException
+         st.close();
+     }
+ 
++    /**
++     * Test conglomerate sharing when a unique constraint having one or
++     * more nullable columns is in play (possible as of DERBY-3330).
++     * @throws SQLException
++     */
++    public void testUniqueConstraintWithNullsBackingIndex ()
++        throws SQLException
++    {
++        PreparedStatement countCongloms =
++            prepareStatement(COUNT_TABLE_CONGLOMS);
++        
++        Statement stmt = createStatement();
++        stmt.execute("create table t1 (i int, j int not null, k int)");
++        stmt.executeUpdate("insert into t1 values (1, -1, 1), (2, -2, 4), " +
++                "(4, -4, 16), (3, -3, 9)");
++        //create a non unique index
++        stmt.executeUpdate("create index nuix on t1(i,j)");
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. nuix
++         */
++        countConglomerates("T1", countCongloms, 2);
++        
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++        stmt.executeUpdate("alter table t1 add constraint uc unique(i,j)"); 
++        /* Should have 3 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. unix
++         *  3. uc
++         */
++        countConglomerates("T1", countCongloms, 3);
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++
++        assertStatementError("23505", stmt, 
++                "insert into t1 values (1, -1, 1)");
++        //clean the table to try unique index
++        stmt.executeUpdate("delete from t1");
++        stmt.executeUpdate("drop index nuix");
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uc
++         */
++        countConglomerates("T1", countCongloms, 2);
++        stmt.executeUpdate("alter table t1 drop constraint uc");
++        /* Should have 1 conglomerates on T1:
++         *
++         *  1. Heap
++         */
++        countConglomerates("T1", countCongloms, 1);
++        stmt.executeUpdate("insert into t1 values (1, -1, 1), (2, -2, 4), " +
++                "(4, -4, 16), (3, -3, 9)");
++        stmt.executeUpdate("create unique index uix on t1(i,j)");
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uix
++         */
++        countConglomerates("T1", countCongloms, 2);
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++        stmt.executeUpdate("alter table t1 add constraint uc unique(i,j)");
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uix
++         * Unique Constraint uc should use uix
++         */
++        countConglomerates("T1", countCongloms, 2);
++        //make sure that unique index is effective
++        assertStatementError("23505", stmt, 
++                "insert into t1 values (null, 1, -1)");
++        //drop unique index
++        stmt.executeUpdate("drop index uix");
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uc
++         */
++        countConglomerates("T1", countCongloms, 2);  
++        //make sure that its a new index and not a unique index
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++        //drop constraint
++        stmt.executeUpdate("alter table t1 drop constraint uc");
++        //clean table
++        stmt.executeUpdate("delete from t1");
++        /* Should have 1 conglomerates on T1:
++         *
++         *  1. Heap
++         */
++        countConglomerates("T1", countCongloms, 1);
++
++        stmt.executeUpdate("insert into t1 values (1, -1, 1), (2, -2, 4), " +
++                "(4, -4, 16), (3, -3, 9)");
++        stmt.executeUpdate("insert into t1 values (null, 1, -1)");
++        stmt.executeUpdate("alter table t1 add constraint uc unique(i,j)"); 
++        
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uc
++         */
++        countConglomerates("T1", countCongloms, 2);  
++        
++        stmt.executeUpdate("create table t2 (a int not null, b int not null)");
++        stmt.executeUpdate("alter table t2 add constraint pkt2 primary key(a,b)");
++        
++        /* Should have 2 conglomerates on T2:
++         *
++         *  1. Heap
++         *  2. pkt2
++         */
++        countConglomerates("T2", countCongloms, 2);
++        stmt.executeUpdate("insert into t2 values (1, -1), (2, -2), " +
++                "(4, -4), (3, -3)"); 
++        
++        stmt.executeUpdate("alter table t1 add constraint fkt1 " +
++                "foreign key (i,j) references t2");
++        
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uc
++         * fkt1 should share index with uc
++         */
++        countConglomerates("T1", countCongloms, 2);  
++        
++        //ensure there is no change in backing index
++        assertStatementError("23505", stmt, "insert into " +
++                "t1(i,j) values (1, -1)");
++        stmt.executeUpdate("alter table t1 drop constraint uc");
++        
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. fkt1
++         */
++       countConglomerates("T1", countCongloms, 2);  
++       
++       //ensure that it allows duplicate keys
++       stmt.executeUpdate("insert into t1(i,j) values (1, -1)");
++        
++       //clean tables
++       stmt.executeUpdate("alter table t1 drop constraint fkt1");
++       stmt.executeUpdate("alter table t2 drop constraint pkt2");
++       stmt.executeUpdate("delete from t1");
++       stmt.executeUpdate("delete from t2");
++       
++        /* Should have 1 conglomerates on T1:
++         *
++         *  1. Heap
++         */
++       countConglomerates("T1", countCongloms, 1);
++        /* Should have 1 conglomerates on T2:
++         *
++         *  1. Heap
++         */
++       countConglomerates("T2", countCongloms, 1);  
++
++       stmt.executeUpdate("insert into t1 values (1, -1, 1), (2, -2, 4), " +
++               "(4, -4, 16), (3, -3, 9)");
++
++       stmt.executeUpdate("alter table t2 add constraint " +
++                                                "pkt2 primary key(a,b)");
++        /* Should have 2 conglomerates on T2:
++         *
++         *  1. Heap
++         *  2. pkt2
++         */
++       countConglomerates("T2", countCongloms, 2);  
++       
++       stmt.executeUpdate("insert into t2 values (1, -1), (2, -2)," +
++                                                        "(4, -4), (3, -3)");
++
++       stmt.executeUpdate("create unique index uix on t1(i,j)");
++       
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uix
++         */
++       countConglomerates("T1", countCongloms, 2);  
++
++       stmt.executeUpdate("alter table t1 add constraint uc unique(i,j)");
++
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uix
++         *  uc should share uix's index
++         */
++       countConglomerates("T1", countCongloms, 2);  
++
++       //create a foreign key shouldn;t create any new index
++       stmt.executeUpdate("alter table t1 add constraint fkt1 " +
++               "foreign key (i,j) references t2");
++       
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uix
++         *  uc and fkt1 should share uix's index
++         */
++       countConglomerates("T1", countCongloms, 2);  
++
++        //Should fail due to UIX
++        assertStatementError("23505", stmt, "insert into t1(i,j) values (1, -1)");
++
++        //Drop the unique index UIX. The conglomerate for UC and FKT1 should
++        //be re-created as non-unique with uniqueWithDuplicateNulls set to true.
++        stmt.executeUpdate("drop index uix");
++        
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. uc
++         *  fkt1 should share uc's index
++         */
++       countConglomerates("T1", countCongloms, 2);  
++
++       //Should work.
++       stmt.executeUpdate("insert into t1(i,j) values (null, 2)");
++
++       //Should also work since UIX is no longer around.
++       stmt.executeUpdate("insert into t1(i,j) values (null, 2)");
++
++       //Should fail due to UC
++       assertStatementError("23505", stmt,"insert into t1 values (1, -1, 1)");
++        
++       //drop uc a new non unique should be created
++       stmt.executeUpdate("alter table t1 drop constraint uc");
++       
++        /* Should have 2 conglomerates on T1:
++         *
++         *  1. Heap
++         *  2. fkt1
++         */
++       countConglomerates("T1", countCongloms, 2);  
++       
++       //should work because there is no uc
++       stmt.executeUpdate("insert into t1 values (1, -1, 1)");
++       
++       //cleanup
++       stmt.executeUpdate("drop table t1");
++       stmt.executeUpdate("drop table t2");
++       stmt.close();
++       countCongloms.close();
++    }
++
+     /**
+      * Count the number of physical conglomerates that exist for
+      * the received table, and assert that the number found matches

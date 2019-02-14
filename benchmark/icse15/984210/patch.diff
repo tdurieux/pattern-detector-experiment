@@ -1,0 +1,438 @@
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
+index add6957e..13d8bc17 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/DirectoryReader.java
+@@ -54,7 +54,6 @@
+   private final int termInfosIndexDivisor;
+ 
+   private boolean rollbackHasChanges;
+-  private SegmentInfos rollbackSegmentInfos;
+ 
+   private SegmentReader[] subReaders;
+   private int[] starts;                           // 1st docno for each segment
+@@ -810,7 +809,6 @@ protected void doCommit(Map<String,String> commitUserData) throws IOException {
+ 
+   void startCommit() {
+     rollbackHasChanges = hasChanges;
+-    rollbackSegmentInfos = (SegmentInfos) segmentInfos.clone();
+     for (int i = 0; i < subReaders.length; i++) {
+       subReaders[i].startCommit();
+     }
+@@ -818,14 +816,6 @@ void startCommit() {
+ 
+   void rollbackCommit() {
+     hasChanges = rollbackHasChanges;
+-    for (int i = 0; i < segmentInfos.size(); i++) {
+-      // Rollback each segmentInfo.  Because the
+-      // SegmentReader holds a reference to the
+-      // SegmentInfo we can't [easily] just replace
+-      // segmentInfos, so we reset it in place instead:
+-      segmentInfos.info(i).reset(rollbackSegmentInfos.info(i));
+-    }
+-    rollbackSegmentInfos = null;
+     for (int i = 0; i < subReaders.length; i++) {
+       subReaders[i].rollbackCommit();
+     }
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
+index 743c5936..108ab8c7 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexFileDeleter.java
+@@ -514,6 +514,14 @@ void decRef(SegmentInfos segmentInfos) throws IOException {
+     }
+   }
+ 
++  public boolean exists(String fileName) {
++    if (!refCounts.containsKey(fileName)) {
++      return false;
++    } else {
++      return getRefCount(fileName).count > 0;
++    }
++  }
++
+   private RefCount getRefCount(String fileName) {
+     RefCount rc;
+     if (!refCounts.containsKey(fileName)) {
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+index 07ed9e15..a2fe685f 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -494,7 +494,7 @@ public synchronized void release(SegmentReader sr, boolean drop) throws IOExcept
+ 
+       final boolean pooled = readerMap.containsKey(sr.getSegmentInfo());
+ 
+-      assert !pooled | readerMap.get(sr.getSegmentInfo()) == sr;
++      assert !pooled || readerMap.get(sr.getSegmentInfo()) == sr;
+ 
+       // Drop caller's ref; for an external reader (not
+       // pooled), this decRef will close it
+@@ -502,28 +502,30 @@ public synchronized void release(SegmentReader sr, boolean drop) throws IOExcept
+ 
+       if (pooled && (drop || (!poolReaders && sr.getRefCount() == 1))) {
+ 
+-        // We are the last ref to this reader; since we're
+-        // not pooling readers, we release it:
+-        readerMap.remove(sr.getSegmentInfo());
+-
++        // We invoke deleter.checkpoint below, so we must be
++        // sync'd on IW if there are changes:
+         assert !sr.hasChanges || Thread.holdsLock(IndexWriter.this);
+ 
++        // Discard (don't save) changes when we are dropping
++        // the reader; this is used only on the sub-readers
++        // after a successful merge.
++        sr.hasChanges &= !drop;
++
++        final boolean hasChanges = sr.hasChanges;
++
+         // Drop our ref -- this will commit any pending
+         // changes to the dir
+-        boolean success = false;
+-        try {
+-          sr.close();
+-          success = true;
+-        } finally {
+-          if (!success && sr.hasChanges) {
+-            // Abandon the changes & retry closing:
+-            sr.hasChanges = false;
+-            try {
+               sr.close();
+-            } catch (Throwable ignore) {
+-              // Keep throwing original exception
+-            }
+-          }
++
++        // We are the last ref to this reader; since we're
++        // not pooling readers, we release it:
++        readerMap.remove(sr.getSegmentInfo());
++
++        if (hasChanges) {
++          // Must checkpoint w/ deleter, because this
++          // segment reader will have created new _X_N.del
++          // file.
++          deleter.checkpoint(segmentInfos, false);
+         }
+       }
+     }
+@@ -531,6 +533,10 @@ public synchronized void release(SegmentReader sr, boolean drop) throws IOExcept
+     /** Remove all our references to readers, and commits
+      *  any pending changes. */
+     synchronized void close() throws IOException {
++      // We invoke deleter.checkpoint below, so we must be
++      // sync'd on IW:
++      assert Thread.holdsLock(IndexWriter.this);
++
+       Iterator<Map.Entry<SegmentInfo,SegmentReader>> iter = readerMap.entrySet().iterator();
+       while (iter.hasNext()) {
+         
+@@ -539,16 +545,12 @@ synchronized void close() throws IOException {
+         SegmentReader sr = ent.getValue();
+         if (sr.hasChanges) {
+           assert infoIsLive(sr.getSegmentInfo());
+-          sr.startCommit();
+-          boolean success = false;
+-          try {
+             sr.doCommit(null);
+-            success = true;
+-          } finally {
+-            if (!success) {
+-              sr.rollbackCommit();
+-            }
+-          }
++
++          // Must checkpoint w/ deleter, because this
++          // segment reader will have created new _X_N.del
++          // file.
++          deleter.checkpoint(segmentInfos, false);
+         }
+ 
+         iter.remove();
+@@ -566,21 +568,22 @@ synchronized void close() throws IOException {
+      * @throws IOException
+      */
+     synchronized void commit() throws IOException {
++
++      // We invoke deleter.checkpoint below, so we must be
++      // sync'd on IW:
++      assert Thread.holdsLock(IndexWriter.this);
++
+       for (Map.Entry<SegmentInfo,SegmentReader> ent : readerMap.entrySet()) {
+ 
+         SegmentReader sr = ent.getValue();
+         if (sr.hasChanges) {
+           assert infoIsLive(sr.getSegmentInfo());
+-          sr.startCommit();
+-          boolean success = false;
+-          try {
+             sr.doCommit(null);
+-            success = true;
+-          } finally {
+-            if (!success) {
+-              sr.rollbackCommit();
+-            }
+-          }
++
++          // Must checkpoint w/ deleter, because this
++          // segment reader will have created new _X_N.del
++          // file.
++          deleter.checkpoint(segmentInfos, false);
+         }
+       }
+     }
+@@ -4115,7 +4118,7 @@ final private int mergeMiddle(MergePolicy.OneMerge merge)
+           for (int i=0;i<numSegments;i++) {
+             if (merge.readers[i] != null) {
+               try {
+-                readerPool.release(merge.readers[i], true);
++                readerPool.release(merge.readers[i], false);
+               } catch (Throwable t) {
+               }
+             }
+@@ -4219,32 +4222,14 @@ private final synchronized boolean applyDeletes() throws CorruptIndexException,
+       message("applyDeletes");
+     }
+     flushDeletesCount++;
+-    SegmentInfos rollback = (SegmentInfos) segmentInfos.clone();
+     boolean success = false;
+     boolean changed;
+     try {
+       changed = docWriter.applyDeletes(segmentInfos);
+       success = true;
+     } finally {
+-      if (!success) {
+-        if (infoStream != null)
++      if (!success && infoStream != null) {
+           message("hit exception flushing deletes");
+-
+-        // Carefully remove any partially written .del
+-        // files
+-        final int size = rollback.size();
+-        for(int i=0;i<size;i++) {
+-          final String newDelFileName = segmentInfos.info(i).getDelFileName();
+-          final String delFileName = rollback.info(i).getDelFileName();
+-          if (newDelFileName != null && !newDelFileName.equals(delFileName))
+-            deleter.deleteFile(newDelFileName);
+-        }
+-
+-        // Fully replace the segmentInfos since flushed
+-        // deletes could have changed any of the
+-        // SegmentInfo instances:
+-        segmentInfos.clear();
+-        segmentInfos.addAll(rollback);
+       }
+     }
+ 
+@@ -4357,6 +4342,13 @@ private void startCommit(long sizeInBytes, Map<String,String> commitUserData) th
+         Collection<String> files = toSync.files(directory, false);
+         for(final String fileName: files) {
+           assert directory.fileExists(fileName): "file " + fileName + " does not exist";
++
++          // If this trips it means we are missing a call to
++          // .checkpoint somewhere, because by the time we
++          // are called, deleter should know about every
++          // file referenced by the current head
++          // segmentInfos:
++          assert deleter.exists(fileName);
+         }
+       }
+ 
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/SegmentReader.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/SegmentReader.java
+index 3b0dcfdf..54458d41 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/SegmentReader.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/index/SegmentReader.java
+@@ -61,6 +61,7 @@
+   private boolean rollbackHasChanges = false;
+   private boolean rollbackDeletedDocsDirty = false;
+   private boolean rollbackNormsDirty = false;
++  private SegmentInfo rollbackSegmentInfo;
+   private int rollbackPendingDeleteCount;
+ 
+   // optionally used for the .nrm file shared by multiple norms
+@@ -526,11 +527,25 @@ public void reWrite(SegmentInfo si) throws IOException {
+ 
+       // NOTE: norms are re-written in regular directory, not cfs
+       si.advanceNormGen(this.number);
+-      IndexOutput out = directory().createOutput(si.getNormFileName(this.number));
++      final String normFileName = si.getNormFileName(this.number);
++      IndexOutput out = directory().createOutput(normFileName);
++      boolean success = false;
++      try {
+       try {
+         out.writeBytes(bytes, maxDoc());
+       } finally {
+         out.close();
++      }
++        success = true;
++      } finally {
++        if (!success) {
++          try {
++            directory().deleteFile(normFileName);
++          } catch (Throwable t) {
++            // suppress this so we keep throwing the
++            // original exception
++          }
++        }
+       }
+       this.dirty = false;
+     }
+@@ -760,13 +775,41 @@ synchronized SegmentReader reopenSegment(SegmentInfo si, boolean doClone, boolea
+   @Override
+   protected void doCommit(Map<String,String> commitUserData) throws IOException {
+     if (hasChanges) {
++      startCommit();
++      boolean success = false;
++      try {
++        commitChanges(commitUserData);
++        success = true;
++      } finally {
++        if (!success) {
++          rollbackCommit();
++        }
++      }
++    }
++  }
++
++  private void commitChanges(Map<String,String> commitUserData) throws IOException {
+       if (deletedDocsDirty) {               // re-write deleted
+         si.advanceDelGen();
+ 
+         // We can write directly to the actual name (vs to a
+         // .tmp & renaming it) because the file is not live
+         // until segments file is written:
+-        deletedDocs.write(directory(), si.getDelFileName());
++      final String delFileName = si.getDelFileName();
++      boolean success = false;
++      try {
++        deletedDocs.write(directory(), delFileName);
++        success = true;
++      } finally {
++        if (!success) {
++          try {
++            directory().deleteFile(delFileName);
++          } catch (Throwable t) {
++            // suppress this so we keep throwing the
++            // original exception
++          }
++        }
++      }
+ 
+         si.setDelCount(si.getDelCount()+pendingDeleteCount);
+         pendingDeleteCount = 0;
+@@ -787,7 +830,6 @@ protected void doCommit(Map<String,String> commitUserData) throws IOException {
+       normsDirty = false;
+       hasChanges = false;
+     }
+-  }
+ 
+   FieldsReader getFieldsReader() {
+     return fieldsReaderLocal.get();
+@@ -1245,6 +1287,7 @@ void setSegmentInfo(SegmentInfo info) {
+   }
+ 
+   void startCommit() {
++    rollbackSegmentInfo = (SegmentInfo) si.clone();
+     rollbackHasChanges = hasChanges;
+     rollbackDeletedDocsDirty = deletedDocsDirty;
+     rollbackNormsDirty = normsDirty;
+@@ -1255,6 +1298,7 @@ void startCommit() {
+   }
+ 
+   void rollbackCommit() {
++    si.reset(rollbackSegmentInfo);
+     hasChanges = rollbackHasChanges;
+     deletedDocsDirty = rollbackDeletedDocsDirty;
+     normsDirty = rollbackNormsDirty;
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
+index db0fbb98..e7b2c300 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -5072,4 +5072,66 @@ public void testRandomStoredFields() throws IOException {
+     dir.close();
+     _TestUtil.rmDir(index);
+   }
++
++  private static class FailTwiceDuringMerge extends MockRAMDirectory.Failure {
++    public boolean didFail1;
++    public boolean didFail2;
++
++    @Override
++    public void eval(MockRAMDirectory dir)  throws IOException {
++      if (!doFail) {
++        return;
++      }
++      StackTraceElement[] trace = new Exception().getStackTrace();
++      for (int i = 0; i < trace.length; i++) {
++        if ("org.apache.lucene.index.SegmentMerger".equals(trace[i].getClassName()) && "mergeTerms".equals(trace[i].getMethodName()) && !didFail1) {
++          didFail1 = true;
++          throw new IOException("fake disk full during mergeTerms");
++        }
++        if ("org.apache.lucene.util.BitVector".equals(trace[i].getClassName()) && "write".equals(trace[i].getMethodName()) && !didFail2) {
++          didFail2 = true;
++          throw new IOException("fake disk full while writing BitVector");
++        }
++      }
++    }
++  }
++  
++  // LUCENE-2593
++  public void testCorruptionAfterDiskFullDuringMerge() throws IOException {
++    MockRAMDirectory dir = new MockRAMDirectory();
++    final Random rand = newRandom();
++    //IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(rand, TEST_VERSION_CURRENT, new MockAnalyzer()).setReaderPooling(true));
++    IndexWriter w = new IndexWriter(dir, newIndexWriterConfig(rand, TEST_VERSION_CURRENT, new WhitespaceAnalyzer(TEST_VERSION_CURRENT)).setMergeScheduler(new SerialMergeScheduler()).setReaderPooling(true));
++
++    ((LogMergePolicy) w.getMergePolicy()).setMergeFactor(2);
++
++    Document doc = new Document();
++    doc.add(new Field("f", "doctor who", Field.Store.YES, Field.Index.ANALYZED));
++    w.addDocument(doc);
++
++    w.commit();
++
++    w.deleteDocuments(new Term("f", "who"));
++    w.addDocument(doc);
++    
++    // disk fills up!
++    FailTwiceDuringMerge ftdm = new FailTwiceDuringMerge();
++    ftdm.setDoFail();
++    dir.failOn(ftdm);
++
++    try {
++      w.commit();
++      fail("fake disk full IOExceptions not hit");
++    } catch (IOException ioe) {
++      // expected
++      assertTrue(ftdm.didFail1);
++    }
++    _TestUtil.checkIndex(dir);
++    ftdm.clearDoFail();
++    w.addDocument(doc);
++    w.close();
++
++    _TestUtil.checkIndex(dir);
++    dir.close();
++  }
+ }
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriterDelete.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+index dcfe4399..dea4563b 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestIndexWriterDelete.java
+@@ -30,6 +30,7 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.MockRAMDirectory;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
+ 
+ public class TestIndexWriterDelete extends LuceneTestCase {
+ 
+@@ -519,8 +520,10 @@ private void doTestOperationsOnDiskFull(boolean updates) throws IOException {
+ 
+         // If the close() succeeded, make sure there are
+         // no unreferenced files.
+-        if (success)
++        if (success) {
++          _TestUtil.checkIndex(dir);
+           TestIndexWriter.assertNoUnreferencedFiles(dir, "after writer.close");
++        }
+ 
+         // Finally, verify index is not corrupt, and, if
+         // we succeeded, we see all docs changed, and if

@@ -1,0 +1,133 @@
+diff --git a/db/derby/code/branches/10.4/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java b/db/derby/code/branches/10.4/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+index 4bc208a2..8e712166 100644
+--- a/db/derby/code/branches/10.4/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
++++ b/db/derby/code/branches/10.4/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+@@ -28,6 +28,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.reference.Limits;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.types.DataValueDescriptor;
++import org.apache.derby.iapi.types.RawToBinaryFormatStream;
+ import org.apache.derby.iapi.types.Resetable;
+ import org.apache.derby.iapi.services.io.InputStreamUtil;
+ 
+@@ -160,9 +161,20 @@ protected EmbedBlob(DataValueDescriptor dvd, EmbedConnection con)
+         if (SanityManager.DEBUG)
+             SanityManager.ASSERT(!dvd.isNull(), "blob is created on top of a null column");
+ 
++        /*
++           We support three scenarios at this point:
++            a) The Blob value is already represented as bytes in memory.
++               This is the case for small Blobs (less than 32 KB).
++            b) The Blob value is represented as a resetable stream.
++               This is the case for Blobs coming from the store
++               (note the comment about SQLBit below).
++            c) The Blob value is represented as a wrapped user stream.
++               This stream cannot be reset, which means we have to drain the
++               stream and store it temporarily until it is either discarded or
++               inserted into the database.
++         */
+         InputStream dvdStream = dvd.getStream();
+-        if (dvdStream == null)
+-        {
++        if (dvdStream == null) { // a) Blob already materialized in memory
+             materialized = true;
+             streamPositionOffset = Integer.MIN_VALUE;
+             // copy bytes into memory so that blob can live after result set
+@@ -178,9 +190,7 @@ protected EmbedBlob(DataValueDescriptor dvd, EmbedConnection con)
+                 throw StandardException.newException (
+                                         SQLState.SET_STREAM_FAILURE, e);
+             }
+-        }
+-        else
+-        {
++        } else if (dvdStream instanceof Resetable) { // b) Resetable stream
+             materialized = false;
+ 
+             /*
+@@ -216,6 +226,39 @@ implementing the getStream() method for dvd.getStream(), does not
+                 throw StandardException.newException(
+                      SQLState.LANG_STREAMING_COLUMN_I_O_EXCEPTION, ioe, "BLOB");
+             }
++        } else { // c) Non-resetable stream
++            // The code below will only work for RawToBinaryFormatStream.
++            if (SanityManager.DEBUG) {
++                SanityManager.ASSERT(
++                        dvdStream instanceof RawToBinaryFormatStream,
++                        "Invalid stream type: " + dvdStream.getClass());
++            }
++            // The source stream isn't resetable, so we have to write it to a
++            // temporary location to be able to support the Blob operations.
++            materialized = true;
++            streamPositionOffset = Integer.MIN_VALUE;
++            try {
++                control = new LOBStreamControl(getEmbedConnection());
++                BinaryToRawStream tmpStream =
++                        new BinaryToRawStream(dvdStream, con);
++                // Transfer the data.
++                byte[] bytes = new byte[4096]; // 4 KB buffer
++                long pos = 0;
++                while (true) {
++                    int read = tmpStream.read(bytes, 0, bytes.length);
++                    if (read < 1) {
++                        // Reached EOF, or stream is behaving badly.
++                        break;
++                    }
++                    // If the stream is larger than the maximum allowed by
++                    // Derby, the call below will thrown an exception.
++                    pos = control.write(bytes, 0, read, pos);
++                }
++                tmpStream.close();
++            } catch (IOException ioe) {
++                throw StandardException.newException (
++                                        SQLState.SET_STREAM_FAILURE, ioe);
++            }
+         }
+         //add entry in connection so it can be cleared 
+         //when transaction is not valid
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+index bc8ff388..6e675d48 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+@@ -31,6 +31,7 @@
+ import java.sql.SQLException;
+ import java.io.IOException;
+ import java.io.InputStream;
++import org.apache.derbyTesting.functionTests.util.streams.LoopingAlphabetStream;
+ 
+ /**
+  * Tests reading and updating binary large objects (BLOBs).
+@@ -349,6 +350,34 @@ private void testUpdateBlobWithPositionedUpdate(final ResultSet rs,
+         verifyNewValueInTable(newVal, newSize);
+     }
+     
++    /**
++     * Tests that a stream value in a values clause can be cast to a BLOB.
++     * <p>
++     * See DERBY-4102 (test case resulted in a ClassCastException earlier).
++     *
++     * @throws IOException if something goes wrong
++     * @throws SQLException if something goes wrong
++     */
++    public void testBlobCastInValuesClause()
++            throws IOException, SQLException {
++        // The length must be at least 32 KB.
++        final int length = 38*1024;
++        PreparedStatement ps = prepareStatement("values cast(? as blob)");
++        ps.setBinaryStream(1, new LoopingAlphabetStream(length), length);
++        ResultSet rs = ps.executeQuery();
++        assertTrue(rs.next());
++        Blob b = rs.getBlob(1);
++        assertEquals(length, b.length());
++        // Select some parts of the Blob, moving backwards.
++        assertEquals(100, b.getBytes(32*1024-27, 100).length);
++        assertEquals(1029, b.getBytes(19*1024, 1029).length);
++        // Compare a fresh stream with the one from the Blob.
++        assertEquals(new LoopingAlphabetStream(length), b.getBinaryStream());
++        assertEquals(-1, b.position(new byte[] {(byte)'a', (byte)'A'}, 1));
++        assertEquals(length, b.length());
++        assertFalse(rs.next());
++        rs.close();
++    }
+     
+     /**
+      * Verifies that the table has row with column val=newVal

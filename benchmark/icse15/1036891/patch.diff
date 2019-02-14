@@ -1,0 +1,132 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 1685dd2d..778ea5fa 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -103,6 +103,7 @@
+     public final String columnFamily;
+     public final IPartitioner partitioner;
+     private final String mbeanName;
++    private boolean invalid = false;
+ 
+     private volatile int memtableSwitchCount = 0;
+ 
+@@ -309,12 +310,12 @@ public void buildSecondaryIndexes(Collection<SSTableReader> sstables, SortedSet<
+         }
+     }
+ 
+-    // called when dropping or renaming a CF. Performs mbean housekeeping.
++    // called when dropping or renaming a CF. Performs mbean housekeeping and invalidates CFS to other operations.
+     void unregisterMBean()
+     {
+         try
+         {
+-            
++            invalid = true;   
+             MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+             ObjectName nameObj = new ObjectName(mbeanName);
+             if (mbs.isRegistered(nameObj))
+@@ -856,6 +857,11 @@ void replaceCompactedSSTables(Collection<SSTableReader> sstables, Iterable<SSTab
+         ssTables.replace(sstables, replacements);
+     }
+ 
++    public boolean isInvalid()
++    {
++        return invalid;
++    }
++
+     public void removeAllSSTables()
+     {
+         ssTables.replace(ssTables.getSSTables(), Collections.<SSTableReader>emptyList());
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index 492c0298..f3bb0294 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -100,6 +100,8 @@ public Integer call() throws IOException
+                 compactionLock.lock();
+                 try
+                 {
++                    if (cfs.isInvalid())
++                        return 0;
+                     Integer minThreshold = cfs.getMinimumCompactionThreshold();
+                     Integer maxThreshold = cfs.getMaximumCompactionThreshold();
+     
+@@ -165,6 +167,7 @@ public Object call() throws IOException
+                 compactionLock.lock();
+                 try 
+                 {
++                    if (!cfStore.isInvalid())
+                     doCleanupCompaction(cfStore);
+                     return this;
+                 }
+@@ -191,6 +194,8 @@ public Object call() throws IOException
+                 compactionLock.lock();
+                 try
+                 {
++                    if (cfStore.isInvalid())
++                        return this;
+                     Collection<SSTableReader> sstables;
+                     if (skip > 0)
+                     {
+@@ -229,6 +234,7 @@ public Object call() throws IOException
+                 compactionLock.lock();
+                 try
+                 {
++                    if (!cfStore.isInvalid())
+                     doValidationCompaction(cfStore, validator);
+                     return this;
+                 }
+@@ -541,6 +547,8 @@ public void run()
+                 compactionLock.lock();
+                 try
+                 {
++                    if (cfs.isInvalid())
++                        return;
+                     executor.beginCompaction(cfs, builder);
+                     builder.build();
+                 }
+@@ -563,6 +571,7 @@ public void run()
+     
+     public Future<SSTableReader> submitSSTableBuild(Descriptor desc)
+     {
++        // invalid descriptions due to missing or dropped CFS are handled by SSTW and StreamInSession.
+         final SSTableWriter.Builder builder = SSTableWriter.createBuilder(desc);
+         Callable<SSTableReader> callable = new Callable<SSTableReader>()
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+index 6a18d433..6b557c6b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+@@ -259,6 +259,8 @@ public Builder(Descriptor desc)
+ 
+         public SSTableReader build() throws IOException
+         {
++            if (cfs.isInvalid())
++                return null;
+             File ifile = new File(desc.filenameFor(SSTable.COMPONENT_INDEX));
+             File ffile = new File(desc.filenameFor(SSTable.COMPONENT_FILTER));
+             assert !ifile.exists();
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
+index 898de850..5243a9a8 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
+@@ -136,6 +136,8 @@ public void closeIfFinished() throws IOException
+                 try
+                 {
+                     SSTableReader sstable = future.get();
++                    if (sstable == null)
++                        continue;
+                     cfs.addSSTable(sstable);
+                     sstables.add(sstable);
+                 }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/io/sstable/SSTableWriterTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/io/sstable/SSTableWriterTest.java
+index d5242c6a..5878c362 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/io/sstable/SSTableWriterTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/io/sstable/SSTableWriterTest.java
+@@ -81,6 +81,7 @@ public void testRecoverAndOpen() throws IOException, ExecutionException, Interru
+         FileUtils.deleteWithConfirm(orig.descriptor.filenameFor(Component.FILTER));
+ 
+         SSTableReader sstr = CompactionManager.instance.submitSSTableBuild(orig.descriptor).get();
++        assert sstr != null;
+         ColumnFamilyStore cfs = Table.open("Keyspace1").getColumnFamilyStore("Indexed1");
+         cfs.addSSTable(sstr);
+         cfs.buildSecondaryIndexes(cfs.getSSTables(), cfs.getIndexedColumns());

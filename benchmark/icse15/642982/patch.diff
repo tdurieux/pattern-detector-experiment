@@ -1,0 +1,632 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/AsynchronousLogShipper.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/AsynchronousLogShipper.java
+index 7fbb66ba..2eaf6a89 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/AsynchronousLogShipper.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/AsynchronousLogShipper.java
+@@ -417,7 +417,7 @@ private void getLogShipperProperties() {
+         // To guarantee a maximum log shipping delay,
+         // minShippingInterval cannot be higher than
+         // maxShippingInterval / #logbuffers. See javadoc for MAX
+-        int buffers = logBuffer.DEFAULT_NUMBER_LOG_BUFFERS;
++        int buffers = ReplicationLogBuffer.DEFAULT_NUMBER_LOG_BUFFERS;
+         if (minShippingInterval > maxShippingInterval / buffers) {
+             minShippingInterval = maxShippingInterval / buffers;
+             if (SanityManager.DEBUG) {
+@@ -431,4 +431,5 @@ private void getLogShipperProperties() {
+             }
+         }
+     }
++
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
+index c5cb1522..5c882a56 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/master/MasterController.java
+@@ -308,14 +308,11 @@ public void startFailover() throws StandardException {
+             //acknowledgement.
+             ReplicationMessage mesg = new ReplicationMessage(
+                         ReplicationMessage.TYPE_FAILOVER, null);
+-            transmitter.sendMessage(mesg);
+-            ack = transmitter.readMessage();
++            ack = transmitter.sendMessageWaitForReply(mesg);
+         } catch (IOException ioe) {
+             handleFailoverFailure(ioe);
+         } catch (StandardException se) {
+             handleFailoverFailure(se);
+-        } catch (ClassNotFoundException cnfe) {
+-            handleFailoverFailure(cnfe);
+         }
+         
+         //check the contents of the acknowledgement received from the slave
+@@ -462,7 +459,12 @@ public void flushedTo(long instant) {
+      */
+     private void setupConnection() throws StandardException {
+         try {
+-            transmitter = new ReplicationMessageTransmit(slavehost, slaveport);
++            if (transmitter != null) {
++                transmitter.tearDown();
++            }
++            transmitter = new ReplicationMessageTransmit(slavehost,
++                                                         slaveport,
++                                                         dbname);
+             // getHighestShippedInstant is -1 until the first log
+             // chunk has been shipped to the slave. If a log chunk has
+             // been shipped, use the instant of the latest shipped log
+@@ -510,8 +512,12 @@ void handleExceptions(Exception exception) {
+             
+             while (active) {
+                 try {
+-                    transmitter = new ReplicationMessageTransmit
+-                            (slavehost, slaveport);
++                    if (transmitter != null) {
++                        transmitter.tearDown();
++                    }
++                    transmitter = new ReplicationMessageTransmit(slavehost,
++                                                                 slaveport,
++                                                                 dbname);
+ 
+                     // see comment in setupConnection
+                     if (logShipper != null &&
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessage.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessage.java
+index 7bb2fd2a..867a6098 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessage.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessage.java
+@@ -103,6 +103,16 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     public static final int TYPE_ERROR = 12;
+     
++    /** A message used to check if the replication network is working. This
++     * message type has no object
++     */
++    public static final int TYPE_PING = 13;
++
++    /** A message sent as a response to a TYPE_PING message. This
++     * message type has no object
++     */
++    public static final int TYPE_PONG = 14;
++    
+     /**
+      * Used to send a stop replication signal to the slave. Since this
+      * is a control signal the object this message contains will be null.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
+index 10c89d16..c26c70df 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageReceive.java
+@@ -59,6 +59,35 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     private SocketConnection socketConn;
+     
++    /* -- Ping-thread related fields start -- */
++
++    /** The maximum number of millis to wait before giving up waiting for
++     * a ping response*/
++    private static final int DEFAULT_PING_TIMEOUT = 5000; // 5 seconds
++
++    /** Thread used to send ping messages to master to check if the connection
++     * is working. The ping message must be sent from a separate thread
++     * because failed message shipping over TCP does not timeout for two
++     * minutes (not configurable). */
++    private Thread pingThread = null;
++
++    /** Used to terminate the ping thread. */
++    private boolean killPingThread = false;
++
++    /** Whether or not the connection with the master is confirmed to be
++     * working. Set to false by isConnectedToMaster, set to true when
++     * a pong (i.e., a response to a ping) is received. Field protected by
++     * receivePongSemephore */
++    private boolean connectionConfirmed = false;
++
++    /** Used for synchronization of the ping thread */
++    private final Object sendPingSemaphore = new Object();
++
++    /** Used for synchronization when waiting for a ping reply message */
++    private final Object receivePongSemaphore = new Object();
++
++    /* -- Ping-thread related fields stop -- */
++
+     /**
+      * Constructor initializes the slave address used in replication. Accepts
+      * the host name and port number that constitute the slave address as
+@@ -157,6 +186,12 @@ public Object run() throws IOException {
+         parseAndAckVersion(readMessage(), dbname);
+         // ...and have equal log files
+         parseAndAckInstant(readMessage(), synchOnInstant, dbname);
++
++        killPingThread = false;
++        pingThread = new SlavePingThread(dbname);
++        pingThread.setDaemon(true);
++        pingThread.start();
++
+     }
+     
+     /**
+@@ -189,6 +224,11 @@ public Object run() throws IOException, StandardException {
+      *                     close the socket or the associated resources.
+      */
+     public void tearDown() throws IOException {
++        synchronized (sendPingSemaphore) {
++            killPingThread = true;
++            sendPingSemaphore.notify();
++        }
++
+         if (socketConn != null) {
+             socketConn.tearDown();
+         }
+@@ -369,7 +409,9 @@ public void sendMessage(ReplicationMessage message) throws IOException {
+     /**
+      * Used to read a replication message sent by the master. This method
+      * would wait on the connection from the master until a message is received
+-     * or a connection failure occurs.
++     * or a connection failure occurs. Replication network layer specific
++     * messages (i.e. ping/pong messages) are handled internally and are not
++     * returned.
+      *
+      * @return a <code>ReplicationMessage</code> object that contains
+      *         the reply that is sent.
+@@ -384,7 +426,19 @@ public void sendMessage(ReplicationMessage message) throws IOException {
+     public ReplicationMessage readMessage() throws
+         ClassNotFoundException, IOException {
+         checkSocketConnection();
+-        return (ReplicationMessage)socketConn.readMessage();
++        ReplicationMessage msg = (ReplicationMessage)socketConn.readMessage();
++
++        if (msg.getType() == ReplicationMessage.TYPE_PONG) {
++            // If a pong is received, connection is confirmed to be working.
++            synchronized (receivePongSemaphore) {
++                connectionConfirmed = true;
++                receivePongSemaphore.notify();
++            }
++            // Pong messages are network layer specific. Do not return these
++            return readMessage();
++        } else {
++            return msg;
++        }
+     }
+ 
+     /**
+@@ -419,4 +473,71 @@ private void checkSocketConnection() throws IOException {
+                     (MessageId.REPLICATION_INVALID_CONNECTION_HANDLE);
+         }
+     }
++
++    /**
++     * Check if the repliation network is working. Tries to send a ping
++     * message to the master and returns the network status based on the
++     * success or failure of sending this message and receiving a pong reply.
++     * MT: Currently, only one thread is allowed to check the network status at
++     * any time to keep the code complexity down.
++     * @return true if the pong message was received before timing out after
++     * DEFAULT_PING_TIMEOUT millis, false otherwise
++     * @see #DEFAULT_PING_TIMEOUT
++     */
++    public synchronized boolean isConnectedToMaster() {
++        // synchronize on receivePongSemaphore so that this thread is
++        // guaraneed to get to receivePongSemaphore.wait before the pong
++        // message is processed in readMessage
++        synchronized (receivePongSemaphore) {
++            connectionConfirmed = false;
++            synchronized (sendPingSemaphore) {
++                // Make ping thread send a ping message to the master
++                sendPingSemaphore.notify();
++            }
++
++            try {
++                // Wait for the pong response message
++                receivePongSemaphore.wait(DEFAULT_PING_TIMEOUT);
++            } catch (InterruptedException ex) {
++            }
++        }
++        return connectionConfirmed;
++    }
++
++    /////////////////
++    // Inner Class //
++    /////////////////
++    /**
++     * Thread that sends ping messages to the master on request to check if the
++     * replication network is working
++     */
++    private class SlavePingThread extends Thread {
++
++        private final ReplicationMessage pingMsg =
++            new ReplicationMessage(ReplicationMessage.TYPE_PING, null);
++
++        SlavePingThread(String dbname) {
++            super("derby.slave.ping-" + dbname);
++        }
++
++        public void run() {
++            try {
++                while (!killPingThread) {
++                    synchronized (sendPingSemaphore) {
++                        sendPingSemaphore.wait();
++                    }
++                    if (killPingThread) {
++                        // The thread was notified to terminate
++                        break;
++                    }
++
++                    sendMessage(pingMsg);
++                }
++            } catch (InterruptedException ie) {
++            } catch (IOException ioe) {
++            // For both exceptions: Do nothing. isConnectedToMaster will return
++            // 'false' and appropriate action will be taken.
++            }
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
+index 41bf7c7f..b68ecde5 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/net/ReplicationMessageTransmit.java
+@@ -23,6 +23,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.io.IOException;
+ import java.net.InetSocketAddress;
+ import java.net.Socket;
++import java.net.SocketTimeoutException;
+ import java.net.UnknownHostException;
+ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+@@ -41,6 +42,25 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  */
+ public class ReplicationMessageTransmit {
+     
++    /** Number of millis to wait for a response message before timing out
++     */
++    private final int DEFAULT_MESSAGE_RESPONSE_TIMEOUT = 5000;
++
++    /** The thread that listens for messages from the slave */
++    private Thread msgReceiver = null;
++
++    /** Used to synchronize when waiting for a response message from the slave
++     */
++    private final Object receiveSemaphore = new Object();
++
++    /** The message received from the slave as a response to sending a
++     * message. */
++    private ReplicationMessage receivedMsg = null;
++
++    /** Whether or not to keep the message receiver thread alive. Set to true
++     * to terminate the thread */
++    private volatile boolean stopMessageReceiver = false;
++
+     /**
+      * Contains the address (hostname and port number) of the slave
+      * to replicate to.
+@@ -52,6 +72,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     private SocketConnection socketConn;
+     
++    /**
++     * The name of the replicated database
++     */
++    private String dbname;
++    
+     /**
+      * Constructor initializes the slave address used in replication.
+      *
+@@ -59,12 +84,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      *                 the slave to replicate to.
+      * @param portNumber an integer that contains the port number of the
+      *                   slave to replicate to.
++     * @param dbname The name of the replicated database
+      *
+      * @throws UnknownHostException If an exception occurs while trying to
+      *                              resolve the host name.
+      */
+-    public ReplicationMessageTransmit(String hostName, int portNumber) 
++    public ReplicationMessageTransmit(String hostName, int portNumber,
++                                      String dbname)
+     throws UnknownHostException {
++        this.dbname = dbname;
+         slaveAddress = new SlaveAddress(hostName, portNumber);
+     }
+     
+@@ -120,17 +148,17 @@ public Object run() throws IOException {
+             }
+         });
+         
+-        //The reads on the InputStreams obtained from the socket on the
+-        //transmitter should not hang indefinitely. Use the timeout
+-        //used for the connection establishment here to ensure that the
+-        //reads timeout after the timeout period mentioned for the
+-        //connection.
+-        s.setSoTimeout(timeout_);
++        // keep socket alive even if no log is shipped for a long time
++        s.setKeepAlive(true);
+         
+         socketConn = new SocketConnection(s);
+         
+-        //send the initiate message and receive acknowledgment
+-        sendInitiatorAndReceiveAck(synchOnInstant);
++        // Start the thread that will listen for incoming messages.
++        startMessageReceiverThread(dbname);
++        
++        // Verify that the master and slave have the same software version
++        // and exactly equal log files.
++        brokerConnection(synchOnInstant);
+     }
+     
+     /**
+@@ -141,8 +169,11 @@ public Object run() throws IOException {
+      *                     down the network connection
+      */
+     public void tearDown() throws IOException {
++        stopMessageReceiver = true;
++        msgReceiver = null;
+         if(socketConn != null) {
+             socketConn.tearDown();
++            socketConn = null;
+         }
+     }
+ 
+@@ -162,23 +193,41 @@ public void sendMessage(ReplicationMessage message) throws IOException {
+     }
+     
+     /**
+-     * Used to read a replication message sent by the slave. This method
+-     * would wait on the connection from the slave until a message is received
+-     * or a connection failure occurs.
+-     *
+-     * @return the reply message.
++     * Send a replication message to the slave and return the
++     * message received as a response. Will only wait
++     * DEFAULT_MESSAGE_RESPONSE_TIMEOUT millis for the response
++     * message. If not received when the wait times out, no message is
++     * returned. The method is synchronized to guarantee that only one
++     * thread will be waiting for a response message at any time.
+      *
+-     * @throws ClassNotFoundException Class of a serialized object cannot
+-     *                                be found.
++     * @param message a ReplicationMessage object that contains the message to
++     * be transmitted.
+      *
+-     * @throws IOException 1) if an exception occurs while reading from the
+-     *                        stream.
++     * @return the response message
++     * @throws IOException 1) if an exception occurs while sending or receiving
++     *                        a message.
+      *                     2) if the connection handle is invalid.
++     * @throws StandardException if the response message has not been received
++     * after DEFAULT_MESSAGE_RESPONSE_TIMEOUT millis
+      */
+-    public ReplicationMessage readMessage() throws
+-        ClassNotFoundException, IOException {
++    public synchronized ReplicationMessage
++        sendMessageWaitForReply(ReplicationMessage message)
++        throws IOException, StandardException {
++        receivedMsg = null;
+         checkSocketConnection();
+-        return (ReplicationMessage)socketConn.readMessage();
++        socketConn.writeMessage(message);
++        synchronized (receiveSemaphore) {
++            try {
++                receiveSemaphore.wait(DEFAULT_MESSAGE_RESPONSE_TIMEOUT);
++            } catch (InterruptedException ie) {
++            }
++        }
++        if (receivedMsg == null) {
++            throw StandardException.
++                newException(SQLState.REPLICATION_CONNECTION_LOST, dbname);
++
++        }
++        return receivedMsg;
+     }
+     
+     /**
+@@ -205,22 +254,22 @@ public ReplicationMessage readMessage() throws
+      * @throws ClassNotFoundException Class of a serialized object cannot
+      *                                be found.
+      */
+-    private void sendInitiatorAndReceiveAck(long synchOnInstant)
++    private void brokerConnection(long synchOnInstant)
+         throws IOException, StandardException, ClassNotFoundException {
+         // Check that master and slave have the same serialVersionUID
+         ReplicationMessage initiatorMsg = 
+             new ReplicationMessage(ReplicationMessage.TYPE_INITIATE_VERSION, 
+                                    new Long(ReplicationMessage.
+                                             serialVersionUID));
+-        sendMessage(initiatorMsg);
+-        verifyMessageAck(readMessage());
++        verifyMessageType(sendMessageWaitForReply(initiatorMsg),
++                          ReplicationMessage.TYPE_ACK);
+ 
+         // Check that master and slave log files are in synch
+         initiatorMsg =
+             new ReplicationMessage(ReplicationMessage.TYPE_INITIATE_INSTANT,
+                                    new Long(synchOnInstant));
+-        sendMessage(initiatorMsg);
+-        verifyMessageAck(readMessage());
++        verifyMessageType(sendMessageWaitForReply(initiatorMsg),
++                          ReplicationMessage.TYPE_ACK);
+     }
+ 
+     /**
+@@ -236,15 +285,16 @@ private void sendInitiatorAndReceiveAck(long synchOnInstant)
+      * @throws ClassNotFoundException Class of a serialized object cannot
+      *                                be found.
+      */
+-    private void verifyMessageAck(ReplicationMessage ack) 
++    private boolean verifyMessageType(ReplicationMessage message,
++                                      int expectedType)
+         throws StandardException {
+         //If the message is a TYPE_ACK the slave is capable
+         //of handling the messages and is at a compatible database version.
+-        if (ack.getType() == ReplicationMessage.TYPE_ACK) {
+-            return;
+-        } else if (ack.getType() == ReplicationMessage.TYPE_ERROR) {
++        if (message.getType() == expectedType) {
++            return true;
++        } else if (message.getType() == ReplicationMessage.TYPE_ERROR) {
+             // See ReplicationMessage#TYPE_ERROR
+-            String exception[] = (String[])ack.getMessage();
++            String exception[] = (String[])message.getMessage();
+             throw StandardException.
+                 newException(exception[exception.length - 1], exception);
+         } else {
+@@ -267,4 +317,85 @@ private void checkSocketConnection() throws IOException {
+                     (MessageId.REPLICATION_INVALID_CONNECTION_HANDLE);
+         }
+     }
++
++    private void startMessageReceiverThread(String dbname) {
++        msgReceiver = new MasterReceiverThread(dbname);
++        msgReceiver.setDaemon(true);
++        msgReceiver.start();
++    }
++
++    /////////////////
++    // Inner Class //
++    /////////////////
++
++    /**
++     * Thread that listens for messages from the slave. A separate thread
++     * listening for messages from the slave is needed because the slave
++     * may send messages to the master at any time, and these messages require
++     * immediate action.
++     */
++    private class MasterReceiverThread extends Thread {
++
++        private final ReplicationMessage pongMsg =
++            new ReplicationMessage(ReplicationMessage.TYPE_PONG, null);
++
++        MasterReceiverThread(String dbname) {
++            super("derby.master.receiver-" + dbname);
++        }
++
++        public void run() {
++            ReplicationMessage message;
++            while (!stopMessageReceiver) {
++                try {
++                    message = readMessage();
++
++                    switch (message.getType()) {
++                    case ReplicationMessage.TYPE_PING:
++                        sendMessage(pongMsg);
++                        break;
++                    case ReplicationMessage.TYPE_ACK:
++                    case ReplicationMessage.TYPE_ERROR:
++                        synchronized (receiveSemaphore) {
++                            receivedMsg = message;
++                            receiveSemaphore.notify();
++                        }
++                        break;
++                    default:
++                        // Handling of other messages (i.e., stop and failover)
++                        // not implemented yet
++                        break;
++                    }
++                } catch (SocketTimeoutException ste) {
++                    // ignore socket timeout on reads
++                } catch (ClassNotFoundException cnfe) {
++                    // TODO: print problem to log
++                } catch (IOException ex) {
++                    // TODO: print problem to log
++                    // If we get an exception for this socket, the log shipper
++                    // will clean up. Stop this thread.
++                    stopMessageReceiver = true;
++                    msgReceiver = null;
++                }
++            }
++        }
++
++        /**
++         * Used to read a replication message sent by the slave. Hangs until a
++         * message is received from the slave
++         *
++         * @return the reply message.
++         *
++         * @throws ClassNotFoundException Class of a serialized object cannot
++         *                                be found.
++         *
++         * @throws IOException 1) if an exception occurs while reading from the
++         *                        stream.
++         *                     2) if the connection handle is invalid.
++         */
++        private ReplicationMessage readMessage() throws
++            ClassNotFoundException, IOException {
++            checkSocketConnection();
++            return (ReplicationMessage)socketConn.readMessage();
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
+index 89d571a5..ce64af73 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/replication/slave/SlaveController.java
+@@ -76,7 +76,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private ReplicationMessageReceive receiver;
+     private ReplicationLogger repLogger;
+ 
+-    private volatile boolean connectedToMaster = false;
+     private String slavehost;
+     private int slaveport;
+     private String dbname; // The name of the replicated database
+@@ -266,7 +265,7 @@ private void stopSlave() throws StandardException {
+      */
+     public void stopSlave(boolean forcedStop) 
+             throws StandardException {
+-        if (!forcedStop && connectedToMaster){
++        if (!forcedStop && isConnectedToMaster()){
+             throw StandardException.newException(
+                     SQLState.SLAVE_OPERATION_DENIED_WHILE_CONNECTED);
+         }
+@@ -274,7 +273,7 @@ public void stopSlave(boolean forcedStop)
+     }
+ 
+     public void failover() throws StandardException {
+-        if (connectedToMaster){
++        if (isConnectedToMaster()){
+             throw StandardException.newException(
+                 SQLState.SLAVE_OPERATION_DENIED_WHILE_CONNECTED);
+         }
+@@ -339,7 +338,6 @@ private boolean setupConnection() throws StandardException {
+                                         getFirstUnflushedInstantAsLong(),
+                                         dbname);
+             }
+-            connectedToMaster = true;
+             return true; // will not reach this if timeout
+         } catch (StandardException se) {
+             throw se;
+@@ -369,7 +367,6 @@ private boolean setupConnection() throws StandardException {
+      */
+ 
+     private void handleDisconnect(Exception e) {
+-        connectedToMaster = false;
+         if (!inReplicationSlaveMode) {
+             return;
+         }
+@@ -393,6 +390,18 @@ private void handleDisconnect(Exception e) {
+         }
+     }
+ 
++    /**
++     * Check if the repliation network connection to the master is working
++     * @return true if the network connection is working, false otherwise
++     */
++    private boolean isConnectedToMaster() {
++        if (receiver == null) {
++            return false;
++        } else {
++            return receiver.isConnectedToMaster();
++        }
++    }
++
+     /**
+      * Starts the LogReceiverThread that will listen for chunks of log
+      * records from the master and apply the log records to the local
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index 5ee29c6d..2d70ed01 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -1777,7 +1777,8 @@ The message identifier (ie. the value that matches a field in this class)
+     String REPLICATION_LOG_CORRUPTED                               = "XRE01";
+     String REPLICATION_MASTER_SLAVE_VERSION_MISMATCH               = "XRE02";
+     String REPLICATION_UNEXPECTED_EXCEPTION                        = "XRE03";
+-    String REPLICATION_CONNECTION_EXCEPTION                        = "XRE04";
++    String REPLICATION_CONNECTION_EXCEPTION                        = "XRE04.U.1";
++    String REPLICATION_CONNECTION_LOST                             = "XRE04.U.2";
+     String REPLICATION_LOG_OUT_OF_SYNCH                            = "XRE05";
+     String REPLICATION_MASTER_TIMED_OUT                            = "XRE06";
+     String REPLICATION_NOT_IN_MASTER_MODE                          = "XRE07";

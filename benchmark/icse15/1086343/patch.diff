@@ -1,0 +1,409 @@
+diff --git a/cassandra/branches/cassandra-0.7/interface/thrift/gen-java/org/apache/cassandra/thrift/ConsistencyLevel.java b/cassandra/branches/cassandra-0.7/interface/thrift/gen-java/org/apache/cassandra/thrift/ConsistencyLevel.java
+index 7a0fc55c..ee09ae8b 100644
+--- a/cassandra/branches/cassandra-0.7/interface/thrift/gen-java/org/apache/cassandra/thrift/ConsistencyLevel.java
++++ b/cassandra/branches/cassandra-0.7/interface/thrift/gen-java/org/apache/cassandra/thrift/ConsistencyLevel.java
+@@ -32,13 +32,26 @@
+ import org.apache.thrift.TEnum;
+ 
+ /**
+- * The ConsistencyLevel is an enum that controls both read and write behavior based on the ReplicationFactor of the keyspace.
+- * The different consistency levels have different meanings, depending on if you're doing a write or read
+- * operation. Note that if W + R > ReplicationFactor, where W is the number of nodes to block for on write, and R
+- * the number to block for on reads, you will have strongly consistent behavior; that is, readers will always see the most
+- * recent write. Of these, the most interesting is to do QUORUM reads and writes, which gives you consistency while still
+- * allowing availability in the face of node failures up to half of <ReplicationFactor>. Of course if latency is more
+- * important than consistency then you can use lower values for either or both.
++ * The ConsistencyLevel is an enum that controls both read and write
++ * behavior based on the ReplicationFactor of the keyspace.  The
++ * different consistency levels have different meanings, depending on
++ * if you're doing a write or read operation.
++ * 
++ * If W + R > ReplicationFactor, where W is the number of nodes to
++ * block for on write, and R the number to block for on reads, you
++ * will have strongly consistent behavior; that is, readers will
++ * always see the most recent write. Of these, the most interesting is
++ * to do QUORUM reads and writes, which gives you consistency while
++ * still allowing availability in the face of node failures up to half
++ * of <ReplicationFactor>. Of course if latency is more important than
++ * consistency then you can use lower values for either or both.
++ * 
++ * Some ConsistencyLevels (ONE, TWO, THREE) refer to a specific number
++ * of replicas rather than a logical concept that adjusts
++ * automatically with the replication factor.  Of these, only ONE is
++ * commonly used; TWO and (even more rarely) THREE are only useful
++ * when you care more about guaranteeing a certain level of
++ * durability, than consistency.
+  * 
+  * Write consistency levels make the following guarantees before reporting success to the client:
+  *   ANY          Ensure that the write has been written once somewhere, including possibly being hinted in a non-target node.
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 43b03385..047ef472 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -25,6 +25,8 @@
+ import java.util.concurrent.*;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReentrantLock;
+ import java.util.regex.Pattern;
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+@@ -136,6 +138,9 @@
+     private volatile DefaultInteger rowCacheSaveInSeconds;
+     private volatile DefaultInteger keyCacheSaveInSeconds;
+ 
++    /** Lock to allow migrations to block all flushing, so we can be sure not to write orphaned data files */
++    public final Lock flushLock = new ReentrantLock();
++    
+     // Locally held row/key cache scheduled tasks
+     private volatile ScheduledFuture<?> saveRowCacheTask;
+     private volatile ScheduledFuture<?> saveKeyCacheTask;
+@@ -695,7 +700,7 @@ public String getTempSSTablePath(String directory)
+          * contexts (commitlog position) were read, even though the flush executor
+          * is multithreaded.
+          */
+-        Table.flusherLock.writeLock().lock();
++        Table.switchLock.writeLock().lock();
+         try
+         {
+             if (oldMemtable.isFrozen())
+@@ -759,7 +764,7 @@ public void runMayThrow() throws InterruptedException, IOException
+         }
+         finally
+         {
+-            Table.flusherLock.writeLock().unlock();
++            Table.switchLock.writeLock().unlock();
+         }
+     }
+ 
+@@ -1084,14 +1089,14 @@ public int getMemtableSwitchCount()
+      */
+     private Memtable getMemtableThreadSafe()
+     {
+-        Table.flusherLock.readLock().lock();
++        Table.switchLock.readLock().lock();
+         try
+         {
+             return memtable;
+         }
+         finally
+         {
+-            Table.flusherLock.readLock().unlock();
++            Table.switchLock.readLock().unlock();
+         }
+     }
+ 
+@@ -1138,7 +1143,7 @@ public long getTotalReadLatencyMicros()
+ // TODO this actually isn't a good meature of pending tasks
+     public int getPendingTasks()
+     {
+-        return Table.flusherLock.getQueueLength();
++        return Table.switchLock.getQueueLength();
+     }
+ 
+     public long getWriteCount()
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Memtable.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Memtable.java
+index c52e8de6..d99a66f2 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Memtable.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Memtable.java
+@@ -37,7 +37,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.db.columniterator.IColumnIterator;
+ import org.apache.cassandra.db.columniterator.SimpleAbstractColumnIterator;
+ import org.apache.cassandra.db.filter.AbstractColumnIterator;
+@@ -173,8 +172,16 @@ public void flushAndSignal(final CountDownLatch latch, ExecutorService sorter, f
+         {
+             public void runMayThrow() throws IOException
+             {
++                cfs.flushLock.lock();
++                try
++                {
+                 cfs.addSSTable(writeSortedContents());
+                 cfs.getMemtablesPendingFlush().remove(Memtable.this);
++                }
++                finally
++                {
++                    cfs.flushLock.unlock();
++                }
+                 latch.countDown();
+             }
+         });
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/RowIteratorFactory.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/RowIteratorFactory.java
+index 3d31ff0e..8e2d1bc2 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/RowIteratorFactory.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/RowIteratorFactory.java
+@@ -169,14 +169,14 @@ else if (colCollated.hasNext())
+      */
+     private static Iterator<Map.Entry<DecoratedKey, ColumnFamily>> memtableEntryIterator(Memtable memtable, DecoratedKey startWith)
+     {
+-        Table.flusherLock.readLock().lock();
++        Table.switchLock.readLock().lock();
+         try
+         {
+             return memtable.getEntryIterator(startWith);
+         }
+         finally
+         {
+-            Table.flusherLock.readLock().unlock();
++            Table.switchLock.readLock().unlock();
+         }
+     }
+ 
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+index 531ce84f..6da658ff 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+@@ -24,7 +24,6 @@
+ import java.nio.ByteBuffer;
+ import java.util.*;
+ import java.util.concurrent.*;
+-import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import com.google.common.base.Function;
+@@ -61,7 +60,7 @@
+      * accesses to CFS.memtable should acquire this for thread safety.
+      * Table.maybeSwitchMemtable should aquire the writeLock; see that method for the full explanation.
+      */
+-    static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock();
++    static final ReentrantReadWriteLock switchLock = new ReentrantReadWriteLock();
+ 
+     // It is possible to call Table.open without a running daemon, so it makes sense to ensure
+     // proper directories here as well as in CassandraDaemon.
+@@ -116,11 +115,6 @@ public static Table open(String table)
+         return tableInstance;
+     }
+     
+-    public static Lock getFlushLock()
+-    {
+-        return flusherLock.writeLock();
+-    }
+-
+     public static Table clear(String table) throws IOException
+     {
+         synchronized (Table.class)
+@@ -343,7 +337,7 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+             logger.debug("applying mutation of row {}", ByteBufferUtil.bytesToHex(mutation.key()));
+ 
+         // write the mutation to the commitlog and memtables
+-        flusherLock.readLock().lock();
++        switchLock.readLock().lock();
+         try
+         {
+             if (writeCommitLog)
+@@ -407,7 +401,7 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+         }
+         finally
+         {
+-            flusherLock.readLock().unlock();
++            switchLock.readLock().unlock();
+         }
+ 
+         // flush memtables that got filled up outside the readlock (maybeSwitchMemtable acquires writeLock).
+@@ -562,7 +556,7 @@ public void build()
+                 DecoratedKey key = iter.next();
+                 logger.debug("Indexing row {} ", key);
+                 List<Memtable> memtablesToFlush = Collections.emptyList();
+-                flusherLock.readLock().lock();
++                switchLock.readLock().lock();
+                 try
+                 {
+                     synchronized (indexLockFor(key.key))
+@@ -574,7 +568,7 @@ public void build()
+                 }
+                 finally
+                 {
+-                    flusherLock.readLock().unlock();
++                    switchLock.readLock().unlock();
+                 }
+ 
+                 // during index build, we do flush index memtables separately from master; otherwise we could OOM
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+index 6ac1c779..49c50cf7 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+@@ -9,6 +9,7 @@
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.KSMetaData;
+ import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.UUIDGen;
+@@ -66,21 +67,10 @@ private KSMetaData makeNewKeyspaceDefinition(KSMetaData ksm)
+         return new KSMetaData(ksm.name, ksm.strategyClass, ksm.strategyOptions, ksm.replicationFactor, newCfs.toArray(new CFMetaData[newCfs.size()]));
+     }
+ 
+-    @Override
+-    public void beforeApplyModels()
++    public void applyModels() throws IOException
+     {
+-        if (clientMode)
+-            return;
+         ColumnFamilyStore cfs = Table.open(tableName).getColumnFamilyStore(cfName);
+-        cfs.snapshot(Table.getTimestampedSnapshotName(null));
+-    }
+ 
+-    @Override
+-    public void applyModels() throws IOException
+-    {
+-        acquireLocks();
+-        try
+-        {
+             // reinitialize the table.
+             KSMetaData existing = DatabaseDescriptor.getTableDefinition(tableName);
+             CFMetaData cfm = existing.cfMetaData().get(cfName);
+@@ -90,12 +80,18 @@ public void applyModels() throws IOException
+             
+             if (!clientMode)
+             {
++            CompactionManager.instance.getCompactionLock().lock();
++            cfs.flushLock.lock();
++            try
++            {
++                cfs.snapshot(Table.getTimestampedSnapshotName(null));
+                 Table.open(ksm.name).dropCf(cfm.cfId);
+             }
+-        }
+         finally
+         {
+-            releaseLocks();
++                cfs.flushLock.unlock();
++                CompactionManager.instance.getCompactionLock().unlock();
++            }
+         }
+     }
+     
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropKeyspace.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+index 0e69a5ae..2c996d04 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+@@ -24,6 +24,8 @@
+ import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.KSMetaData;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.db.HintedHandOffManager;
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -46,35 +48,37 @@ public DropKeyspace(String name) throws ConfigurationException, IOException
+         rm = makeDefinitionMutation(null, ksm, newVersion);
+     }
+ 
+-    @Override
+-    public void beforeApplyModels()
+-    {
+-        if (!clientMode)
+-            Table.open(name).snapshot(null);
+-    }
+-
+-    @Override
+     public void applyModels() throws IOException
+     {
+-        acquireLocks();
++        String snapshotName = Table.getTimestampedSnapshotName(null);
++        CompactionManager.instance.getCompactionLock().lock();
+         try
+         {
+             KSMetaData ksm = DatabaseDescriptor.getTableDefinition(name);
+-            // remove the table from the static instances.
+-            Table table = Table.clear(ksm.name);
+-            if (table == null)
+-                throw new IOException("Table is not active. " + ksm.name);
+             
+             // remove all cfs from the table instance.
+             for (CFMetaData cfm : ksm.cfMetaData().values())
+             {
++                ColumnFamilyStore cfs = Table.open(ksm.name).getColumnFamilyStore(cfm.cfName);
+                 CFMetaData.purge(cfm);
+                 if (!clientMode)
+                 {
+-                    table.dropCf(cfm.cfId);
++                    cfs.flushLock.lock();
++                    try
++                    {
++                        cfs.snapshot(snapshotName);
++                        Table.open(ksm.name).dropCf(cfm.cfId);
++                    }
++                    finally
++                    {
++                        cfs.flushLock.unlock();
++                    }
+                 }
+             }
+                             
++            // remove the table from the static instances.
++            Table table = Table.clear(ksm.name);
++            assert table != null;
+             // reset defs.
+             DatabaseDescriptor.clearTableDefinition(ksm, newVersion);
+             
+@@ -86,7 +90,7 @@ public void applyModels() throws IOException
+         }
+         finally
+         {
+-            releaseLocks();
++            CompactionManager.instance.getCompactionLock().unlock();
+         }
+     }
+     
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+index fe3ff958..ef55b8cb 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+@@ -92,22 +92,6 @@ protected Migration()
+         this.lastVersion = lastVersion;
+     }
+     
+-    // block compactions and flushing.
+-    protected final void acquireLocks()
+-    {
+-        CompactionManager.instance.getCompactionLock().lock();
+-        Table.getFlushLock().lock();
+-    }
+-    
+-    protected final void releaseLocks()
+-    {
+-        Table.getFlushLock().unlock();
+-        CompactionManager.instance.getCompactionLock().unlock();
+-    }
+-
+-    /** override this to perform logic before writing the migration or applying it.  defaults to nothing. */
+-    public void beforeApplyModels() {}
+-    
+     /** apply changes */
+     public final void apply() throws IOException, ConfigurationException
+     {
+@@ -119,8 +103,6 @@ public final void apply() throws IOException, ConfigurationException
+         if (!clientMode)
+             rm.apply();
+ 
+-        beforeApplyModels();
+-        
+         // write migration.
+         if (!clientMode)
+         {
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
+index 472cf8b7..bf80190c 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
+@@ -66,14 +66,6 @@ public UpdateColumnFamily(org.apache.cassandra.avro.CfDef cf_def) throws Configu
+         rm = Migration.makeDefinitionMutation(newKsMeta, null, newVersion);
+     }
+     
+-    public void beforeApplyModels()
+-    {
+-        if (clientMode)
+-            return;
+-        ColumnFamilyStore cfs = Table.open(metadata.tableName).getColumnFamilyStore(metadata.cfName);
+-        cfs.snapshot(Table.getTimestampedSnapshotName(null));
+-    }
+-
+     void applyModels() throws IOException
+     {
+         logger.debug("Updating " + DatabaseDescriptor.getCFMetaData(metadata.cfId) + " to " + metadata);

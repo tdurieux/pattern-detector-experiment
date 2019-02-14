@@ -1,0 +1,612 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+index e366aeaf..b23b869c 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+@@ -520,10 +520,12 @@ public void flowCommit() throws SqlException {
+     }
+ 
+     // precondition: autoCommit_ is true
+-    public void flowAutoCommit() throws SqlException {
++    public boolean flowAutoCommit() throws SqlException {
+         if (willAutoCommitGenerateFlow()) {
+             flowCommit();
++            return true;
+         }
++        return false;
+     }
+ 
+     public boolean willAutoCommitGenerateFlow() throws org.apache.derby.client.am.SqlException {
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ResultSet.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ResultSet.java
+index c67b25e3..72bf779e 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ResultSet.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ResultSet.java
+@@ -281,6 +281,9 @@ boolean nextX() throws SqlException {
+             //   In these cases, the commit occurs when all results and output parameter values have been retrieved.
+             // we will check to see if the forward only result set has gone past the end,
+             // we will close the result set, the autocommit logic is in the closeX() method
++            //
++            //Aug 24, 2005: Auto-commit logic is no longer in the closeX() method. Insted it has been 
++            //moved to Statement and is handled in a manner similar to the embedded driver.
+ //    if (!isValidCursorPosition_ && // We've gone past the end (+100)
+ //        cursor_ != null) {
+             if ((!isValidCursorPosition_ && cursor_ != null) ||
+@@ -291,10 +294,6 @@ boolean nextX() throws SqlException {
+                 // check for an error which may have caused the cursor to terminate.
+                 // if there were no more rows because of an error, then this method
+                 // should throw an SqlException rather than just returning false.
+-                // note: closeX is still called and this will cause the
+-                // result set to be closed on the client. any additional calls to
+-                // next() will fail checkForClosedResultSet(), the query terminating exception is
+-                // only thrown once.
+                 // depending on how this works with scrollable cursors, there may be
+                 // a better way/more common place for this logic.
+                 SqlException sqlException = null;
+@@ -306,16 +305,17 @@ boolean nextX() throws SqlException {
+                         sqlException = new SqlException(agent_.logWriter_, queryTerminatingSqlca_);
+                     }
+                 }
++            
+                 try {
+-                    closeX(); // the auto commit logic is in closeX()
++                    statement_.resultSetCommitting(this);
+                 } catch (SqlException sqle) {
+                     sqlException = Utils.accumulateSQLException(sqle, sqlException);
+                 }
+-                if (sqlException != null) {
++                
++                if (sqlException != null)
+                     throw sqlException;
+                 }
+             }
+-        }
+ 
+         // for scrollable ResultSet's,
+         // if the "next" request is still fetching within the current rowset,
+@@ -385,14 +385,13 @@ public final void closeX() throws SqlException {
+             if (openOnServer_) {
+                 flowCloseAndAutoCommitIfNotAutoCommitted();
+             } else {
+-                flowAutoCommitIfNotAutoCommitted(); // in case of early close
++                statement_.resultSetCommitting(this);
+             }
+         } finally {
+             markClosed();
+             connection_.CommitAndRollbackListeners_.remove(this);
+         }
+ 
+-        flowAutoCommitIfLastOpenMultipleResultSetWasJustClosed();
+         if (statement_.openOnClient_ && statement_.isCatalogQuery_) {
+             statement_.closeX();
+         }
+@@ -413,31 +412,28 @@ public void nullDataForGC() {
+ 
+     void flowCloseAndAutoCommitIfNotAutoCommitted() throws SqlException {
+         agent_.beginWriteChain(statement_);
+-        writeCloseAndAutoCommitIfNotAutoCommitted();
++        boolean performedAutoCommit = writeCloseAndAutoCommit();
+         agent_.flow(statement_);
+-        readCloseAndAutoCommitIfNotAutoCommitted();
++        readCloseAndAutoCommit(performedAutoCommit);
+         agent_.endReadChain();
+     }
+ 
+-    private void writeCloseAndAutoCommitIfNotAutoCommitted() throws SqlException {
++    private boolean writeCloseAndAutoCommit() throws SqlException {
+         // set autoCommitted_ to false so commit will flow following
+         // close cursor if autoCommit is true.
+         autoCommitted_ = false;
+         if (generatedSection_ == null) { // none call statement result set case
+             writeCursorClose_(statement_.section_);
+-            writeAutoCommitIfNotAutoCommitted();
+         } else { // call statement result set(s) case
+             writeCursorClose_(generatedSection_);
+         }
++        return statement_.resultSetCommitting(this, true);
+     }
+ 
+-    private void readCloseAndAutoCommitIfNotAutoCommitted() throws SqlException {
+-        if (generatedSection_ == null) { // none call statement result set case
++    private void readCloseAndAutoCommit(boolean readAutoCommit) throws SqlException {
+             readCursorClose_();
++        if (readAutoCommit) 
+             readAutoCommitIfNotAutoCommitted();
+-        } else { // call statement result set(s) case
+-            readCursorClose_();
+-        }
+     }
+ 
+     void writeClose() throws SqlException {
+@@ -463,13 +459,6 @@ void readClose() throws SqlException {
+         }
+     }
+ 
+-    void flowAutoCommitIfNotAutoCommitted() throws SqlException {
+-        if (generatedSection_ == null && connection_.autoCommit_ && !autoCommitted_) {
+-            connection_.flowAutoCommit();
+-            markAutoCommitted();
+-        }
+-    }
+-
+     // precondition: transaction state allows for auto commit to generate flow
+     private void writeAutoCommitIfNotAutoCommitted() throws SqlException {
+         if (connection_.autoCommit_ && !autoCommitted_) {
+@@ -484,25 +473,6 @@ private void readAutoCommitIfNotAutoCommitted() throws SqlException {
+         }
+     }
+ 
+-    private void flowAutoCommitIfLastOpenMultipleResultSetWasJustClosed() throws SqlException {
+-        // After this call, the generatedSection_ is reset to null to avoid repeating the commit.
+-        if (generatedSection_ != null && statement_ != null && statement_.resultSetList_ != null) {
+-            int count = 0;
+-            for (int i = 0; i < statement_.resultSetList_.length; i++) {
+-                if (statement_.resultSetList_[i] == null) {
+-                    count++;
+-                }
+-            }
+-            if (count == statement_.resultSetList_.length) {
+-                if (connection_.autoCommit_ && !autoCommitted_) {
+-                    connection_.flowAutoCommit();
+-                    markAutoCommitted();
+-                }
+-            }
+-        }
+-        generatedSection_ = null; // this is prevent a subsequent close() call from doing another autocommit.
+-    }
+-
+     public boolean wasNull() throws SqlException {
+ 
+         if (agent_.loggingEnabled()) {
+@@ -3005,6 +2975,11 @@ private void nullOutReferenceInStatement() {
+         if (statement_.resultSet_ == this) {
+             statement_.resultSet_ = null;
+         }
++        /*
++         * Aug 10, 2005: Do we really only want to only null out the one resultSet? 
++         * The only time this method is called is from completeLocalCommit or 
++         * completeLocalRollback, both of which affect *all* ResultSets  
++         */
+         if (statement_.resultSetList_ != null) {
+             for (int i = 0; i < statement_.resultSetList_.length; i++) {
+                 if (statement_.resultSetList_[i] == this) {
+@@ -3890,17 +3865,3 @@ private void resetRowsetSqlca() {
+         }
+     }
+ }
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+-
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Statement.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Statement.java
+index bbae95d7..d7daa5b5 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Statement.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Statement.java
+@@ -2108,4 +2108,74 @@ protected void removeClientCursorNameFromCache() {
+             cursorName_ = null;
+         }
+     }
++    
++    /**
++     * Convenience method for resultSetCommitting(ResultSet, boolean)
++     * 
++     * @see Statement#resultSetCommitting(ResultSet, boolean)
++     * @param closingRS The ResultSet to be closed
++     * @throws SqlException
++     */
++    public void resultSetCommitting(ResultSet closingRS) throws SqlException {
++        resultSetCommitting(closingRS, false);
++    }
++    
++    /**
++     * Method that checks to see if any other ResultSets are open. If not
++     * proceeds with the autocommit.
++     * 
++     * @param closingRS The ResultSet to be closed
++     * @param writeChain A Boolean indicating whether this method
++     * is part of a chain of write from client to Server
++     * @throws SqlException
++     */
++    public boolean resultSetCommitting(ResultSet closingRS, boolean writeChain) throws SqlException {
++
++        // If the Connection is not in auto commit then this statement completion
++        // cannot cause a commit.
++        if (!connection_.autoCommit_ || closingRS.autoCommitted_)
++            return false;
++
++        // If we have multiple results, see if there is another result set open.
++        // If so, then no commit. The last result set to close will close the statement.
++        if (resultSetList_ != null) {
++            for (int i = 0; i < resultSetList_.length; i++) {
++                ResultSet crs = resultSetList_[i];
++                if (crs == null)
++                    continue;
++                if (!crs.openOnClient_)
++                    continue;
++                if (crs == closingRS)
++                    continue;
++
++                // at least one still open so no commit now.
++                return false;
++            }
++        }
++        
++        if (writeChain) {
++            connection_.writeAutoCommit();
++            return true;
++        } else {
++            if (connection_.flowAutoCommit()) {
++                markAutoCommitted();
++                return true;
++            }
++            return false;
++        }
++    }
++    
++    /**
++     * Mark all ResultSets associated with this statement as auto-committed.   
++     */
++    public void markAutoCommitted() {
++        if (resultSetList_ != null) {
++            for (int i = 0; i < resultSetList_.length; i++)
++                if (resultSetList_[i] != null) {
++                    resultSetList_[i].markAutoCommitted();
++                }
++        } else if (resultSet_ != null) {
++            resultSet_.markAutoCommitted();
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/SpecialFlags.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/SpecialFlags.java
+index 2216ca34..7ed190c0 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/SpecialFlags.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/SpecialFlags.java
+@@ -105,6 +105,8 @@ public static void parse(String flags,
+ 	{
+ 	    // flags is a list of key-value pairs separated by a ^;
+ 	    // to be parsed and added to either ijProps or srvProps
++        if (flags == null)
++            flags = "";
+ 	    StringTokenizer st = new StringTokenizer(flags, "^");
+ 	    String str = "";
+ 	    String key = "";
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/resultset.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/resultset.java
+index 236a371b..28c9835b 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/resultset.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/resultset.java
+@@ -20,6 +20,7 @@
+ 
+ package org.apache.derbyTesting.functionTests.tests.jdbcapi;
+ 
++import java.sql.CallableStatement;
+ import java.sql.Connection;
+ import java.sql.Date;
+ import java.sql.DriverManager;
+@@ -32,12 +33,14 @@
+ import java.sql.Timestamp;
+ import java.sql.Types;
+ 
++
+ import java.lang.reflect.*;
+ 
+ import org.apache.derby.tools.ij;
+ import org.apache.derbyTesting.functionTests.util.TestUtil;
+ import org.apache.derbyTesting.functionTests.util.JDBCTestDisplayUtil;
+ import org.apache.derby.iapi.reference.JDBC30Translation;
++import org.apache.derby.iapi.reference.SQLState;
+ 
+ /**
+  * Test of JDBC result set and result set meta-data.
+@@ -599,6 +602,11 @@ public static void main(String[] args) throws Throwable {
+ 			testMutableValues(con);
+ 			testCorrelationNamesAndMetaDataCalls(con);
+ 			testNullIfAndMetaDataCalls(con);
++            //We know that JCC behavior does not match 
++            //DerbyNetClient or embedded
++            if (!TestUtil.isJCCFramework()) {
++                runAutoCommitTests(con);
++            }
+ 			con.close();
+ 
+ 		}
+@@ -1041,5 +1049,291 @@ private static void checkMutableValue(java.util.ArrayList list, int col, Object
+ 
+ 		list.add(value);
+ 	}
+-}
+ 
++    /**
++     * Helper method to set up and run the auto-commit tests.
++     * 
++     * @param conn The Connection
++     * @throws SQLException
++     */
++    private static void runAutoCommitTests(Connection conn) throws SQLException {
++        Statement s = conn.createStatement();
++        ResultSet rs = s.executeQuery("select tablename from sys.systables " +
++                "where tablename = 'AUTOCOMMITTABLE'");
++        if (rs.next()) {
++            rs.close();
++            s.executeUpdate("delete from AutoCommitTable");
++        } else {
++            rs.close();
++            s.executeUpdate("create table AutoCommitTable (num int)");
++        }
++        s.executeUpdate("insert into AutoCommitTable values (1)");
++        s.executeUpdate("insert into AutoCommitTable values (2)");
++        int isolation = conn.getTransactionIsolation();
++        conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
++        testSingleRSAutoCommit(conn);
++        testSingleRSCloseCursorsAtCommit(conn);
++        multipleRSTests(conn);
++        conn.setTransactionIsolation(isolation);
++        s.executeUpdate("drop table AutoCommitTable");
++        s.close();
++    }
++    
++    /**
++     * Tests for two things:
++     * 
++     * 1) The ResultSet does not close implicitly when the ResultSet completes 
++     * and holdability == HOLD_CURSORS_OVER_COMMIT
++     * 
++     * 2) The ResultSet auto-commits when it completes and auto-commit is on. 
++     * 
++     * @param conn The Connection
++     * @param tableName
++     * @throws SQLException
++     */
++    private static void testSingleRSAutoCommit(Connection conn) throws SQLException {
++        setHoldability(conn, JDBC30Translation.HOLD_CURSORS_OVER_COMMIT);
++        System.out.print("Single RS auto-commit test: ");
++        Statement s = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
++        ResultSet rs = s.executeQuery("select * from AutoCommitTable");
++        while (rs.next());
++        if (!checkLocks()) {
++            System.out.println("FAIL. Auto-commit unsuccessful.");
++            rs.close();
++            return;
++        }
++        try {
++            if (!rs.next()) {
++                System.out.println("PASS.");
++            } else {
++                System.out.println("FAIL. Final call of the ResultSet should return false");
++            }
++            rs.close();
++        } catch (SQLException e) {
++            System.out.println("FAIL. Final call to ResultSet.next() threw an Exception: ");
++            e.printStackTrace();
++        }
++    }
++    
++    /**
++     * Check to see that ResultSet closes implicitly when holdability is set to
++     * CLOSE_CURORS_AT_COMMIT.
++     * 
++     * @param conn The Connection
++     * @throws SQLException
++     */
++    private static void testSingleRSCloseCursorsAtCommit(Connection conn) throws SQLException {
++        setHoldability(conn, JDBC30Translation.CLOSE_CURSORS_AT_COMMIT);
++        conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
++        System.out.print("SingleRSCloseCursorsAtCommit: ");
++        Statement s = conn.createStatement(ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
++        ResultSet rs = s.executeQuery("select * from AutoCommitTable");
++        while (rs.next());
++        if (!checkLocks()) {
++            System.out.println("FAIL. Auto-commit unsuccessful.");
++            rs.close();
++            return;
++        }
++        try {
++            rs.next();
++            System.out.println("FAIL. ResultSet not closed implicitly");
++            rs.close();
++        } catch (SQLException e) {
++            System.out.println("PASS.");
++        }
++    }
++    
++    /**
++     * Sets up and runs two tests with multiple ResultSets
++     * 
++     * @param conn The Connection
++     * @throws SQLException
++     */
++    private static void multipleRSTests(Connection conn) throws SQLException {
++        setHoldability(conn, JDBC30Translation.HOLD_CURSORS_OVER_COMMIT);
++        
++        //Installing Procedure
++        Statement stmt = conn.createStatement();
++        ResultSet mdrs = conn.getMetaData().getProcedures(
++                null, null, "MULTIRESULT");
++        if (mdrs != null || !mdrs.next()) {
++            stmt.executeUpdate("create procedure multiResult(p1 int, " +
++                    "p2 int) parameter style JAVA READS SQL DATA dynamic " +
++                    "result sets 2 language java external name " +
++                    "'org.apache.derbyTesting.functionTests." +
++                    "tests.jdbcapi.resultset.multiResult'");
++        }
++        mdrs.close();
++        multipleRSAutoCommit(conn);
++        multipleRSNoCommit(conn);
++        stmt.executeUpdate("drop procedure multiResult");
++        stmt.close();
++    }
++    
++    /**
++     * Test to see that an auto commit occurs for multiple ResultSets if all 
++     * ResultSets but one are closed and the final ResultSet has completed.
++     * 
++     * @param conn The Connection
++     * @throws SQLException
++     */
++    private static void multipleRSAutoCommit(Connection conn) throws SQLException {
++        System.out.print("MultipleRSAutoCommit: ");
++        CallableStatement cs = conn.prepareCall("call multiResult(?, ?)");
++        cs.setInt(1, 1);
++        cs.setInt(2, 2);
++        cs.execute();
++        ResultSet rs = null;
++        do {
++            if (rs != null)
++                rs.close();
++            rs = cs.getResultSet();
++            while (rs.next());
++            
++            if (rs.next()) {
++                System.out.println("FAIL. Final call to ResultSet should return false.");
++            }
++        } while (getMoreResults(cs));
++        
++        if (!checkLocks()) {
++            return;
++        }
++        
++        System.out.println("PASS. ");
++        
++        if (rs != null)
++            rs.close();
++        cs.close();
++    }
++    
++    /**
++     * Used to insure that there is no auto-commit in the event that there is
++     * more then one ResultSet open.
++     * 
++     * @param conn The Connection
++     * @throws SQLException
++     */
++    private static void multipleRSNoCommit(Connection conn) throws SQLException {
++        System.out.print("MultipleRSNoCommit: ");
++        CallableStatement cs = conn.prepareCall("call multiResult(?, ?)");
++        cs.setInt(1, 1);
++        cs.setInt(2, 2);
++        cs.execute();
++        ResultSet rs = null;
++        do {
++            rs = cs.getResultSet();
++            while (rs.next());
++            
++            if (rs.next()) {
++                System.out.println("FAIL. Final call to ResultSet should return false.");
++            }
++        } while (getMoreResults(cs));
++        
++        if (checkLocks()) {
++            System.out.println("FAIL. Connection incorrectly auto-committed.");
++        }
++        
++        System.out.println("PASS. ");
++        
++        if (rs != null)
++            rs.close();
++        cs.close();
++    }
++
++    
++    
++    /**
++     * Checks to see if there is a lock on a table by attempting to modify the
++     * same table. If the first connection was serializable then it will 
++     * continue to hold a lock and the second Connection will time out.
++     * 
++     * @return false if the a lock could not be established, true if a lock
++     * can be established.
++     * @throws SQLException
++     */
++    private static boolean checkLocks() throws SQLException {
++        Connection conn = null;
++        try {
++            conn = ij.startJBMS();
++        } catch (Exception e) {
++            System.out.println("FAIL. Unable to establish connection in checkLocks");
++            return false;
++        }
++        Statement stmt = conn.createStatement();
++        try {
++            stmt.executeUpdate("update AutoCommitTable " 
++                    + "set num = 3 where num = 2");
++            stmt.executeUpdate("update AutoCommitTable " 
++                    + "set num = 2 where num = 3");
++        } catch (SQLException e) {
++            if (e.getSQLState().equals(SQLState.LOCK_TIMEOUT)) {
++                return false;
++            } else {
++                throw e;
++            }
++        }
++        stmt.close();
++        conn.close();
++        return true;
++    }
++    
++    /**
++     * Sets the holdability of a Connection using reflection so it is
++     * JDBC2.0 compatible.
++     * 
++     * @param conn The Connection
++     * @param hold The new holdability.
++     * @throws SQLException
++     */
++    public static void setHoldability(Connection conn, int hold) throws SQLException {
++        try {
++            Object[] holdArray = {new Integer(hold)};
++            Method sh = conn.getClass().getMethod("setHoldability", CONN_PARAM);
++            sh.invoke(conn, holdArray);
++        } catch (Exception e) {System.out.println("shouldn't get that error " + e.getMessage());}//for jdks prior to jdk14
++    }
++    
++    /**
++     * Uses reflection to call CallableStatement.getMoreResults(KEEP_CURRENT_RESULT)
++     * for JDBC2.0 compatibilty
++     * @param cs The Callable statement
++     * @return boolean value indicating if there are more results 
++     * @throws SQLException
++     */
++    public static boolean getMoreResults(CallableStatement cs) throws SQLException {
++        try {
++            Object[] holdArray = {new Integer(JDBC30Translation.KEEP_CURRENT_RESULT)};
++            Method sh = cs.getClass().getMethod("getMoreResults", CONN_PARAM);
++            Boolean temp = (Boolean)sh.invoke(cs, holdArray);
++            return temp.booleanValue();
++        } catch (Exception e) {return cs.getMoreResults();}//for jdks prior to jdk14 
++    }
++    
++    
++    
++    /**
++     * Procedure installed by the multipleResultSet method and used by the 
++     * multiRSHelper. Designed to return two ResultSets from a specified table
++     * where the num column equals p1 and p2 respectively.  
++     *  
++     * @param p1 Number parameter for the first ResultSet
++     * @param p2 Number parameter for the second ResultSet 
++     * @param data1 The first ResultSet to be returned.
++     * @param data2 The Second ResultSet to be returned
++     * @throws SQLException
++     */
++     public static void multiResult(int p1, int p2, ResultSet[] data1, ResultSet[] data2) 
++        throws SQLException {
++
++        Connection conn = DriverManager.getConnection("jdbc:default:connection");
++        PreparedStatement ps = conn.prepareStatement("select * from AutoCommitTable where num = ?");
++        ps.setInt(1, p1);
++        data1[0] = ps.executeQuery();
++
++        ps = conn.prepareStatement("select * from AutoCommitTable where num = ?");
++        ps.setInt(1, p2);
++        data2[0] = ps.executeQuery();
++
++        conn.close();
++     }
++}

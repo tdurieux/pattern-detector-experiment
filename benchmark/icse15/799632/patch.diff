@@ -1,0 +1,116 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 5148bd79..b56d8714 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -278,7 +278,16 @@ public ColumnIterator getSliceIterator(SliceQueryFilter filter, AbstractType typ
+         // can't use a ColumnComparatorFactory comparator since those compare on both name and time (and thus will fail to match
+         // our dummy column, since the time there is arbitrary).
+         Comparator<IColumn> comparator = filter.getColumnComparator(typeComparator);
+-        int index = Arrays.binarySearch(columns, startIColumn, comparator);
++        int index;
++        if (filter.start.length == 0 && !filter.isAscending)
++        {
++            /* assuming the we scan from the largest column in descending order*/
++            index = 0;
++        }
++        else
++        {
++            index = Arrays.binarySearch(columns, startIColumn, comparator);
++        }
+         final int startIndex = index < 0 ? -(index + 1) : index;
+ 
+         return new AbstractColumnIterator()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+index 5f99091c..674a1de5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+@@ -41,10 +41,22 @@ public SSTableSliceIterator(String filename, String key, String cfName, Abstract
+     private boolean isColumnNeeded(IColumn column)
+     {
+         if (isAscending)
++        {
+             return comparator.compare(column.name(), startColumn) >= 0;
++        }
+         else
++        {
++            if (startColumn.length == 0)
++            {
++                /* assuming scanning from the largest column in descending order */
++                return true;
++            }
++            else
++            {
+             return comparator.compare(column.name(), startColumn) <= 0;
+     }
++        }
++    }
+ 
+     private void getColumnsFromBuffer() throws IOException
+     {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+index 3579cce6..af2ef0c3 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+@@ -42,8 +42,12 @@ public void filterSuperColumn(SuperColumn superColumn, int gcBefore)
+ 
+         for (IColumn column : superColumn.getSubColumns())
+         {
+-            if ((start.length > 0 && superColumn.getComparator().compare(column.name(), start) < 0)
++            final boolean outOfRange = isAscending
++                                     ? (start.length > 0 && superColumn.getComparator().compare(column.name(), start) < 0)
+                 || (finish.length > 0 && superColumn.getComparator().compare(column.name(), finish) > 0)
++                                     : (start.length > 0 && superColumn.getComparator().compare(column.name(), start) > 0)
++                                        || (finish.length > 0 && superColumn.getComparator().compare(column.name(), finish) < 0);
++            if (outOfRange
+                 || (column.isMarkedForDelete() && column.getLocalDeletionTime() <= gcBefore)
+                 || liveColumns > count)
+             {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SequenceFile.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SequenceFile.java
+index 86347153..e63b076c 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SequenceFile.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SequenceFile.java
+@@ -141,9 +141,17 @@ private void init(byte[] startColumn, long position) throws IOException
+                 columnStartPosition_ = file_.getFilePointer();
+                 columnIndexList_ = getFullColumnIndexList(colIndexList, totalNumCols);
+ 
++                if (startColumn.length == 0 && !isAscending_)
++                {
++                    /* in this case, we assume that we want to scan from the largest column in descending order. */
++                    curRangeIndex_ = columnIndexList_.size() - 1;
++                }
++                else
++                {
+                 int index = Collections.binarySearch(columnIndexList_, new IndexHelper.ColumnIndexInfo(startColumn, 0, 0, comparator_));
+                 curRangeIndex_ = index < 0 ? (++index) * (-1) - 1 : index;
+             }
++            }
+             else
+             {
+                 /* no keys found in this file because of a false positive in BF */
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+index 284c35d4..80020155 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+@@ -210,6 +210,9 @@ public void run() throws Exception
+                 cf = cfStore.getColumnFamily(ROW, new QueryPath("Standard1"), "col6".getBytes(), ArrayUtils.EMPTY_BYTE_ARRAY, false, 2);
+                 assertColumns(cf, "col3", "col4", "col5");
+ 
++                cf = cfStore.getColumnFamily(ROW, new QueryPath("Standard1"), ArrayUtils.EMPTY_BYTE_ARRAY, ArrayUtils.EMPTY_BYTE_ARRAY, false, 2);
++                assertColumns(cf, "col7", "col9");
++
+                 cf = cfStore.getColumnFamily(ROW, new QueryPath("Standard1"), "col95".getBytes(), ArrayUtils.EMPTY_BYTE_ARRAY, true, 2);
+                 assertColumns(cf);
+ 
+@@ -309,6 +312,12 @@ public void testGetSliceFromLarge() throws Throwable
+         assertEquals(new String(cf.getColumn("col1990".getBytes()).value()), "vvvvvvvvvvvvvvvv1990");
+         assertEquals(new String(cf.getColumn("col1991".getBytes()).value()), "vvvvvvvvvvvvvvvv1991");
+         assertEquals(new String(cf.getColumn("col1992".getBytes()).value()), "vvvvvvvvvvvvvvvv1992");
++
++        cf = cfStore.getColumnFamily(ROW, new QueryPath("Standard1"), ArrayUtils.EMPTY_BYTE_ARRAY, ArrayUtils.EMPTY_BYTE_ARRAY, false, 3);
++        assertColumns(cf, "col1997", "col1998", "col1999");
++        assertEquals(new String(cf.getColumn("col1999".getBytes()).value()), "vvvvvvvvvvvvvvvv1999");
++        assertEquals(new String(cf.getColumn("col1998".getBytes()).value()), "vvvvvvvvvvvvvvvv1998");
++        assertEquals(new String(cf.getColumn("col1997".getBytes()).value()), "vvvvvvvvvvvvvvvv1997");
+     }
+ 
+     @Test

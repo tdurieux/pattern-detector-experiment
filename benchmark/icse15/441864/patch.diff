@@ -1,0 +1,386 @@
+diff --git a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/SqlXmlUtil.java b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/SqlXmlUtil.java
+index 93f79cbe..7fc5bdef 100644
+--- a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/SqlXmlUtil.java
++++ b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/SqlXmlUtil.java
+@@ -32,6 +32,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ // -- JDBC 3.0 JAXP API classes.
+ 
++import org.w3c.dom.Attr;
+ import org.w3c.dom.Document;
+ import org.w3c.dom.Element;
+ import org.w3c.dom.Node;
+@@ -297,23 +298,43 @@ protected String serializeToString(String xmlAsText)
+         ArrayList aList = new ArrayList();
+         aList.add(dBuilder.parse(
+             new InputSource(new StringReader(xmlAsText))));
+-        return serializeToString(aList);
++
++        /* The second argument in the following call is for
++         * catching cases where we have a top-level (parentless)
++         * attribute node--but since we just created the list
++         * with a single Document node, we already we know we
++         * don't have a top-level attribute node in the list,
++         * so we don't have to worry.  Hence the "null" here.
++         */
++        return serializeToString(aList, null);
+     }
+ 
+     /**
+      * Take an array list (sequence) of XML nodes and/or string values
+      * and serialize that entire list according to SQL/XML serialization
+-     * rules.  We do that by going through each item in the array
+-     * list and either serializing it (if it's a Node) or else
+-     * just echoing the value to the serializer (if it's a Text
+-     * node or an atomic value).
++     * rules, which ultimately point to XML serialization rules as
++     * defined by w3c.  As part of that serialization process we have
++     * to first "normalize" the sequence.  We do that by iterating through
++     * the list and performing the steps for "sequence normalization" as
++     * defined here:
++     *
++     * http://www.w3.org/TR/xslt-xquery-serialization/#serdm
++     *
++     * This method primarily focuses on taking the steps for normalization;
++     * for the rest of the serialization work, we just make calls on the
++     * DOMSerializer class provided by Xalan.
+      *
+      * @param items List of items to serialize
+-     * @return Single string holding the concatenation of the serialized
+-     *  form of all items in the list
++     * @param xmlVal XMLDataValue into which the serialized string
++     *  returned by this method is ultimately going to be stored.
++     *  This is used for keeping track of XML values that represent
++     *  sequences having top-level (parentless) attribute nodes.
++     * @return Single string holding the serialized version of the
++     *  normalized sequence created from the items in the received
++     *  list.
+      */
+-    protected String serializeToString(ArrayList items)
+-        throws java.io.IOException
++    protected String serializeToString(ArrayList items,
++        XMLDataValue xmlVal) throws java.io.IOException
+     {
+         if ((items == null) || (items.size() == 0))
+         // nothing to do; return empty sequence.
+@@ -334,26 +355,121 @@ protected String serializeToString(ArrayList items)
+         int sz = items.size();
+         Object obj = null;
+ 
++        /* Step 1: Empty sequence.  If we have an empty sequence then we
++         * won't ever enter the for loop and the call to sWriter.toString()
++         * at the end of this method will return an empty string, as
++         * required.  Otherwise, for a non-empty sequence our "items"
++         * list already corresponds to "S1".
++         */
++
+         // Iterate through the list and serialize each item.
++        boolean lastItemWasString = false;
+         for (int i = 0; i < sz; i++)
+         {
+             obj = items.get(i);
+-            if (obj instanceof String)
+             // if it's a string, then this corresponds to some atomic
+             // value, so just echo the string as it is.
++            if (obj instanceof String)
++            {
++                /* Step 2: Atomic values.  If "obj" is a string then it
++                 * corresponds to some atomic value whose "lexical
++                 * representation" is obj.  So we just take that.
++                 */
++
++                if (lastItemWasString)
++                {
++                    /* Step 3: Adjacent strings.  If we have multiple adjacent
++                     * strings then concatenate them with a single space
++                     * between them.
++                     */
++                    sWriter.write(" ");
++                }
++
++                /* Step 4: Create a Text node from the adjacent strings.
++                 * Since we're just going to serialize the Text node back
++                 * into a string, we short-cut this step by skipping the
++                 * creation of the Text node and just writing the string
++                 * out directly to our serialized stream.
++                 */
+                 sWriter.write((String)obj);
++                lastItemWasString = true;
++            }
++            else if (obj instanceof Attr)
++            {
++                /* Step 7a: Attribute nodes.  If there is an Attribute node
++                 * node in the sequence then we have to throw a serialization
++                 * error.  NOTE: The rules say we also have to throw an error
++                 * for Namespace nodes, but JAXP doesn't define a "Namespace"
++                 * object per se; it just defines namespace prefixes and URIs
++                 * on other Nodes.  So we just check for attributes.  If we
++                 * find one then we take note of the fact that the result has
++                 * a parentless attribute node and later, if the user calls
++                 * XMLSERIALIZE on the received XMLDataValue we'll throw the
++                 * error as required.  Note that we currently only get here
++                 * for the XMLQUERY operator, which means we're serializing
++                 * a result sequence returned from Xalan and we're going to
++                 * store the serialized version into a Derby XML value.  In
++                 * that case the serialization is an internal operation--and
++                 * since the user didn't ask for it, we don't want to throw
++                 * the serialization error here.  If we did, then whenever an
++                 * XMLQUERY operation returned a result sequence with a top-
++                 * level attribute in it, the user would see a serialization
++                 * error. That's not correct since it is technically okay for
++                 * the XMLQUERY operation to return a sequence with an attribute
++                 * node; it's just not okay for a user to explicitly try to
++                 * serialize that sequence. So instead of throwing the error
++                 * here, we just take note of the fact that the sequence has
++                 * a top-level attribute.  Then later, IF the user makes an
++                 * explicit call to serialize the sequence, we'll throw the
++                 * appropriate error (see XML.XMLSerialize()).
++                 */
++                if (xmlVal != null)
++                    xmlVal.markAsHavingTopLevelAttr();
++                dSer.serialize((Node)obj);
++                lastItemWasString = false;
++            }
+             else
+             { // We have a Node, so try to serialize it.
+                 Node n = (Node)obj;
+                 if (n instanceof Text)
+-                // Xalan doesn't allow a "serialize" call on Text nodes,
+-                // so we just go ahead and echo the value of the text.
++                {
++                    /* Step 6: Combine adjacent text nodes into a single
++                     * text node.  Since we're just going to serialize the
++                     * Text node back into a string, we short-cut this step
++                     * by skipping the creation of a new Text node and just
++                     * writing the text value out directly to our serialized
++                     * stream.  Step 6 also says that empty text nodes should
++                     * be dropped--but if the text node is empty, the call
++                     * to getNodeValue() will return an empty string and
++                     * thus we've effectively "dropped" the text node from
++                     * the serialized result.  Note: it'd be cleaner to just
++                     * call "serialize()" on the Text node like we do for
++                     * all other Nodes, but Xalan doesn't allow that.  So
++                     * use the getNodeValue() method instead.
++                     */
+                     sWriter.write(n.getNodeValue());
++                }
+                 else
++                {
++                    /* Steps 5 and 7b: Copy all non-attribute, non-text
++                     * nodes to the "normalized sequence" and then serialize
++                     * that normalized sequence.  We short-cut this by
++                     * just letting Xalan do the serialization for every
++                     * Node in the current list of items that wasn't
++                     * "serialized" as an atomic value, attribute, or
++                     * text node.
++                     */
+                     dSer.serialize(n);
+             }
++
++                lastItemWasString = false;
++            }
+         }
+ 
++        /* At this point sWriter holds the serialized version of the
++         * normalized sequence that corresponds to the received list
++         * of items.  So that's what we return.
++         */
+         sWriter.flush();
+         return sWriter.toString();
+     }
+diff --git a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XML.java b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XML.java
+index ee6db46a..57d5c7c6 100644
+--- a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XML.java
++++ b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XML.java
+@@ -130,6 +130,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     private static String xmlReqCheck = null;
+ 
++    /*
++     * Whether or not this XML value corresponds to a sequence
++     * that has one or more top-level ("parentless") attribute
++     * nodes.  If so then we have to throw an error if the user
++     * attempts to serialize this value, per XML serialization
++     * rules.
++     */
++    private boolean containsTopLevelAttr;
++
+     /**
+      * Default constructor.
+      */
+@@ -137,32 +146,26 @@ public XML()
+     {
+         xmlStringValue = null;
+         xType = -1;
++        containsTopLevelAttr = false;
+     }
+ 
+     /**
+      * Private constructor used for the getClone() method.
+-     * Takes a SQLChar and clones it.
+-     * @param val A SQLChar instance to clone and use for
+-     *  this XML value.
+-     */
+-    private XML(SQLChar val)
+-    {
+-        xmlStringValue = (val == null ? null : (SQLChar)val.getClone());
+-        xType = -1;
+-    }
+-
+-    /**
+-     * Private constructor used for the getClone() method.
+-     * Takes a SQLChar and clones it and also takes a
+-     * qualified XML type and stores that as this XML
+-     * object's qualified type.
++     *
+      * @param val A SQLChar instance to clone and use for
+      *  this XML value.
++     * @param xmlType Qualified XML type for "val"
++     * @param seqWithAttr Whether or not "val" corresponds to
++     *  sequence with one or more top-level attribute nodes.
++     * @return A new instance of XML whose fields are clones
++     *  of the values received.
+      */
+-    private XML(SQLChar val, int xmlType)
++    private XML(SQLChar val, int xmlType, boolean seqWithAttr)
+     {
+         xmlStringValue = (val == null ? null : (SQLChar)val.getClone());
+         setXType(xmlType);
++        if (seqWithAttr)
++            markAsHavingTopLevelAttr();
+     }
+ 
+     /* ****
+@@ -174,7 +177,7 @@ private XML(SQLChar val, int xmlType)
+      */
+     public DataValueDescriptor getClone()
+     {
+-        return new XML(xmlStringValue, getXType());
++        return new XML(xmlStringValue, getXType(), hasTopLevelAttr());
+     }
+ 
+     /**
+@@ -284,7 +287,11 @@ protected void setFrom(DataValueDescriptor theValue)
+          * brings us to this method).
+          */
+         if (theValue instanceof XMLDataValue)
++        {
+             setXType(((XMLDataValue)theValue).getXType());
++            if (((XMLDataValue)theValue).hasTopLevelAttr())
++                markAsHavingTopLevelAttr();
++        }
+     }
+ 
+     /** 
+@@ -636,6 +643,22 @@ public StringDataValue XMLSerialize(StringDataValue result,
+             return result;
+         }
+ 
++        /* XML serialization rules say that sequence "normalization"
++         * must occur before serialization, and normalization dictates
++         * that a serialization error must be thrown if the XML value
++         * is a sequence with a top-level attribute.  We normalized
++         * (and serialized) this XML value when it was first created,
++         * and at that time we took note of whether or not there is
++         * a top-level attribute.  So throw the error here if needed.
++         * See SqlXmlUtil.serializeToString() for more on sequence
++         * normalization.
++         */
++        if (this.hasTopLevelAttr())
++        {
++            throw StandardException.newException(
++                SQLState.LANG_XQUERY_SERIALIZATION_ERROR);
++        }
++
+         // Get the XML value as a string.  For this UTF-8 impl,
+         // we already have it as a UTF-8 string, so just use
+         // that.
+@@ -749,10 +772,9 @@ public XMLDataValue XMLQuery(XMLDataValue result,
+             ArrayList itemRefs = sqlxUtil.evalXQExpression(
+                 this, true, xType);
+ 
+-            String strResult = sqlxUtil.serializeToString(itemRefs);
+             if (result == null)
+-                result = new XML(new SQLChar(strResult));
+-            else
++                result = new XML();
++            String strResult = sqlxUtil.serializeToString(itemRefs, result);
+                 result.setValue(new SQLChar(strResult));
+ 
+             // Now that we've set the result value, make sure
+@@ -795,6 +817,17 @@ public XMLDataValue XMLQuery(XMLDataValue result,
+     public void setXType(int xtype)
+     {
+         this.xType = xtype;
++
++        /* If the target type is XML_DOC_ANY then this XML value
++         * holds a single well-formed Document.  So we know that
++         * we do NOT have any top-level attribute nodes.  Note: if
++         * xtype is SEQUENCE we don't set "containsTopLevelAttr"
++         * here; assumption is that the caller of this method will
++         * then set the field as appropriate.  Ex. see "setFrom()"
++         * in this class.
++         */
++        if (xtype == XML_DOC_ANY)
++            containsTopLevelAttr = false;
+     }
+ 
+     /**
+@@ -805,6 +838,24 @@ public int getXType()
+         return xType;
+     }
+ 
++    /**
++     * Take note of the fact this XML value represents an XML
++     * sequence that has one or more top-level attribute nodes.
++     */
++    public void markAsHavingTopLevelAttr()
++    {
++        this.containsTopLevelAttr = true;
++    }
++
++    /**
++     * Return whether or not this XML value represents a sequence
++     * that has one or more top-level attribute nodes.
++     */
++    public boolean hasTopLevelAttr()
++    {
++        return containsTopLevelAttr;
++    }
++
+     /**
+      * See if the required JAXP and Xalan classes are in the
+      * user's classpath.  Assumption is that we will always
+diff --git a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XMLDataValue.java b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
+index 9653856c..47d7255a 100644
+--- a/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
++++ b/db/derby/code/branches/10.2/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
+@@ -115,4 +115,16 @@ public XMLDataValue XMLQuery(XMLDataValue result, SqlXmlUtil sqlxUtil)
+      * Retrieve this XML value's qualified type.
+      */
+     public int getXType();
++
++    /**
++     * Take note of the fact this XML value represents an XML
++     * sequence that has one or more top-level attribute nodes.
++     */
++    public void markAsHavingTopLevelAttr();
++
++    /**
++     * Return whether or not this XML value represents a sequence
++     * that has one or more top-level attribute nodes.
++     */
++    public boolean hasTopLevelAttr();
+ }
+diff --git a/db/derby/code/branches/10.2/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/branches/10.2/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index 10523e06..52e1833f 100644
+--- a/db/derby/code/branches/10.2/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/branches/10.2/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -706,6 +706,7 @@ The message identifier (ie. the value that matches a field in this class)
+ 	String LANG_NOT_AN_XML_DOCUMENT                                    = "2200L";
+ 	String LANG_INVALID_XML_DOCUMENT                                   = "2200M";
+ 	String LANG_INVALID_XML_CONTEXT_ITEM                               = "2200V";
++	String LANG_XQUERY_SERIALIZATION_ERROR                             = "2200W";
+ 
+ 	String LANG_INVALID_TRANSACTION_STATE                              = "25000";
+     String CANNOT_CLOSE_ACTIVE_CONNECTION                              = "25001";

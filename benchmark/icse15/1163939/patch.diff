@@ -1,0 +1,1127 @@
+diff --git a/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/ManagedPersistenceUnitInfo.java b/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/ManagedPersistenceUnitInfo.java
+index 364b81e3..c4d4d337 100644
+--- a/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/ManagedPersistenceUnitInfo.java
++++ b/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/ManagedPersistenceUnitInfo.java
+@@ -51,4 +51,17 @@
+    */
+   public Map<String, Object> getContainerProperties();
+   
++  /**
++   * Called to indicate that this persistence unit has been registered in the OSGi
++   * service registry. Note that because this method is called after the service
++   * is registered other threads and listeners may have already accessed the 
++   * persistence unit service.
++   */
++  public void registered();
++  
++  /**
++   * Called to indicate that this persistence unit has been unregistered from the OSGi
++   * service registry. 
++   */
++  public void unregistered();
+ }
+diff --git a/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/PersistenceUnitConstants.java b/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/PersistenceUnitConstants.java
+index a010c71a..09ed47e1 100644
+--- a/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/PersistenceUnitConstants.java
++++ b/aries/trunk/jpa/jpa-api/src/main/java/org/apache/aries/jpa/container/PersistenceUnitConstants.java
+@@ -36,4 +36,15 @@
+    *  This allows clients to filter for empty string persistence unit names.
+    */
+   public static final String EMPTY_PERSISTENCE_UNIT_NAME = "org.apache.aries.jpa.default.unit.name";
++  
++  /**
++   * This property determines whether the Aries JPA container should monitor for DataSourceFactories and only
++   * register the EMF when the DataSource is available
++   */
++  public static final String USE_DATA_SOURCE_FACTORY = "org.apache.aries.jpa.use.data.source.factory";
++  
++  /**
++   * This property name is used to store the JDBC driver class name when using DataSourceFactory integration
++   */
++  public static final String DATA_SOURCE_FACTORY_CLASS_NAME = "org.apache.aries.jpa.data.source.factory.class";
+ }
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
+index 4fe80000..f874694a 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
+@@ -20,6 +20,7 @@
+ 
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.Hashtable;
+@@ -41,13 +42,15 @@
+ import org.osgi.framework.BundleContext;
+ import org.osgi.framework.ServiceReference;
+ import org.osgi.framework.ServiceRegistration;
++import org.osgi.util.tracker.ServiceTracker;
++import org.osgi.util.tracker.ServiceTrackerCustomizer;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ /**
+  * This class manages the lifecycle of Persistence Units and their associated
+  * {@link EntityManagerFactory} objects.
+  */
+-public class EntityManagerFactoryManager {
++public class EntityManagerFactoryManager implements ServiceTrackerCustomizer {
+ 
+   /**
+    * A callback for a named persistence units
+@@ -76,8 +79,8 @@ public void callback(String name) {
+   private final Bundle bundle;
+   /** The {@link PersistenceProvider} to use */
+   private ServiceReference provider;
+-  /** The persistence units to manage */
+-  private Collection<? extends ManagedPersistenceUnitInfo> persistenceUnits;
++  /** The named persistence units to manage */
++  private Map<String, ? extends ManagedPersistenceUnitInfo> persistenceUnits;
+   /** The original parsed data */
+   private Collection<ParsedPersistenceUnit> parsedData;
+   /** A Map of created {@link EntityManagerFactory}s */
+@@ -87,6 +90,12 @@ public void callback(String name) {
+   /** Quiesce this Manager */
+   private boolean quiesce = false;
+ 
++  private volatile ServiceTracker tracker; 
++  
++  /** DataSourceFactories in use by persistence units in this bundle - class name key to collection of unit values */
++  private final ConcurrentMap<String, Collection<String>> dataSourceFactories = 
++         new ConcurrentHashMap<String, Collection<String>>();
++
+   /** Logger */
+   private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
+   
+@@ -108,10 +117,22 @@ public EntityManagerFactoryManager(BundleContext containerCtx, Bundle b, Collect
+     containerContext = containerCtx;
+     bundle = b;
+     provider = ref;
+-    persistenceUnits = infos;
++    persistenceUnits = getInfoMap(infos);
+     parsedData = parsedUnits;
+   }
+ 
++  private Map<String, ? extends ManagedPersistenceUnitInfo> getInfoMap(
++      Collection<? extends ManagedPersistenceUnitInfo> infos) {
++    Map<String, ManagedPersistenceUnitInfo> map = Collections.synchronizedMap(
++        new HashMap<String, ManagedPersistenceUnitInfo>());
++    if (infos != null) {
++      for(ManagedPersistenceUnitInfo info : infos) {
++        map.put(info.getPersistenceUnitInfo().getPersistenceUnitName(), info);
++      }
++    }
++    return map;
++  }
++
+   /**
+    * Notify the {@link EntityManagerFactoryManager} that a provider is being
+    * removed from the service registry.
+@@ -156,14 +177,22 @@ public synchronized void bundleStateChange() throws InvalidPersistenceUnitExcept
+         //Starting and active both require EMFs to be registered
+       case Bundle.STARTING :
+       case Bundle.ACTIVE :
++        if(tracker == null) {
++          tracker = new ServiceTracker(bundle.getBundleContext(), 
++              "org.osgi.service.jdbc.DataSourceFactory", this);
++          tracker.open();
++        }
+         registerEntityManagerFactories();
+         break;
+         //Stopping means the EMFs should
+       case Bundle.STOPPING :
+         //If we're stopping we no longer need to be quiescing
+         quiesce = false;
++        if(tracker != null) {
++          tracker.close();
++          tracker = null;
++        }
+         unregisterEntityManagerFactories();
+-        
+         break;
+       case Bundle.INSTALLED :
+         //Destroy everything
+@@ -180,12 +209,21 @@ private void unregisterEntityManagerFactories() {
+       for(Entry<String, ServiceRegistration> entry : registrations.entrySet()) {
+         AriesFrameworkUtil.safeUnregisterService(entry.getValue());
+         emfs.get(entry.getKey()).clearQuiesce();
++        persistenceUnits.get(entry.getKey()).unregistered();
+       }
+       // remember to set registrations to be null
+       registrations = null;
+     }
+   }
+ 
++  private void unregisterEntityManagerFactory(String unit) {
++    if(registrations != null) {
++      AriesFrameworkUtil.safeUnregisterService(registrations.remove(unit));
++      emfs.get(unit).clearQuiesce();
++      persistenceUnits.get(unit).unregistered();
++    }
++  }
++
+   /**
+    * Register {@link EntityManagerFactory} services
+    * 
+@@ -194,12 +232,15 @@ private void unregisterEntityManagerFactories() {
+    */
+   private void registerEntityManagerFactories() throws InvalidPersistenceUnitException {
+     //Only register if there is a provider and we are not
+-    //already registered
+-    if(provider != null && registrations == null && !quiesce) {
++    //quiescing
++    if(registrations == null) {
++      registrations = new ConcurrentHashMap<String, ServiceRegistration>();
++    }
++    
++    if(provider != null && !quiesce) {
+       //Make sure the EntityManagerFactories are instantiated
+       createEntityManagerFactories();
+       
+-      registrations = new ConcurrentHashMap<String, ServiceRegistration>();
+       String providerName = (String) provider.getProperty("javax.persistence.provider");
+       if(providerName == null) {
+         _logger.warn( NLS.MESSAGES.getMessage("no.provider.specified", 
+@@ -209,17 +250,23 @@ private void registerEntityManagerFactories() throws InvalidPersistenceUnitExcep
+       //Register each EMF
+       for(Entry<String, ? extends EntityManagerFactory> entry : emfs.entrySet())
+       {
++        
+         Hashtable<String,Object> props = new Hashtable<String, Object>();
+         String unitName = entry.getKey();
+           
++        if(registrations.containsKey(unitName) || !!!availableDataSourceFactory(unitName))
++          continue;
++        
+         props.put(PersistenceUnitConstants.OSGI_UNIT_NAME, unitName);
+         if(providerName != null)
+           props.put(PersistenceUnitConstants.OSGI_UNIT_PROVIDER, providerName);
+-          props.put(PersistenceUnitConstants.OSGI_UNIT_VERSION, provider.getBundle().getVersion());
++        
++        props.put(PersistenceUnitConstants.OSGI_UNIT_VERSION, bundle.getVersion());
+           props.put(PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT, Boolean.TRUE);
+           props.put(PersistenceUnitConstants.EMPTY_PERSISTENCE_UNIT_NAME, "".equals(unitName));
+         try {
+           registrations.put(unitName, bundle.getBundleContext().registerService(EntityManagerFactory.class.getCanonicalName(), entry.getValue(), props));
++          persistenceUnits.get(unitName).registered();
+         } catch (Exception e) {
+           _logger.error(NLS.MESSAGES.getMessage("cannot.register.persistence.unit", unitName, bundle.getSymbolicName() + '/' + bundle.getVersion()));
+           throw new InvalidPersistenceUnitException(e);
+@@ -228,6 +275,34 @@ private void registerEntityManagerFactories() throws InvalidPersistenceUnitExcep
+     }
+   }
+ 
++  private boolean availableDataSourceFactory(String unitName) {
++    ManagedPersistenceUnitInfo mpui = persistenceUnits.get(unitName);
++        
++    String driver = (String) mpui.getPersistenceUnitInfo().getProperties().
++    get(PersistenceUnitConstants.DATA_SOURCE_FACTORY_CLASS_NAME);
++    
++    //True if the property is not "true" and the jdbc driver is set
++    if(Boolean.parseBoolean((String)mpui.getContainerProperties().
++        get(PersistenceUnitConstants.USE_DATA_SOURCE_FACTORY)) &&
++        driver != null) {
++      
++      if(dataSourceFactories.containsKey(driver)) {
++        dataSourceFactories.get(driver).add(unitName);
++        if(_logger.isDebugEnabled())
++          _logger.debug(NLS.MESSAGES.getMessage("datasourcefactory.found", unitName, bundle.getSymbolicName(),
++              bundle.getVersion(), driver));
++        return true;
++      }
++      if(_logger.isDebugEnabled())
++        _logger.debug(NLS.MESSAGES.getMessage("datasourcefactory.not.found", unitName, bundle.getSymbolicName(),
++            bundle.getVersion(), driver));
++      return false;
++    } else {
++      //We aren't checking (thanks to the property or a null jdbc driver name)
++      return true;
++    }
++  }
++
+   /**
+    * Create {@link EntityManagerFactory} services for this peristence unit
+    * throws InvalidPersistenceUnitException if this {@link EntityManagerFactory} is no longer
+@@ -248,12 +323,12 @@ private void createEntityManagerFactories() throws InvalidPersistenceUnitExcepti
+             throw new InvalidPersistenceUnitException();
+           }
+ 
+-          for(ManagedPersistenceUnitInfo info : persistenceUnits){
+-            PersistenceUnitInfo pUnitInfo = info.getPersistenceUnitInfo();
+-        
+-            emfs.put(pUnitInfo.getPersistenceUnitName(), new CountingEntityManagerFactory(
++          for(Entry<String, ? extends ManagedPersistenceUnitInfo> entry : 
++               persistenceUnits.entrySet()){
++            ManagedPersistenceUnitInfo mpui = entry.getValue();
++            emfs.put(entry.getKey(), new CountingEntityManagerFactory(
+                 providerService.createContainerEntityManagerFactory(
+-                    pUnitInfo, info.getContainerProperties()), pUnitInfo.getPersistenceUnitName()));
++                    mpui.getPersistenceUnitInfo(), mpui.getContainerProperties()), entry.getKey()));
+           }
+         } finally {
+           //Remember to unget the provider
+@@ -275,7 +350,7 @@ private void createEntityManagerFactories() throws InvalidPersistenceUnitExcepti
+   public synchronized void manage(ServiceReference ref,
+       Collection<? extends ManagedPersistenceUnitInfo> infos)  throws IllegalStateException{
+     provider = ref;
+-    persistenceUnits = infos;
++    persistenceUnits = getInfoMap(infos);
+   }
+   
+   /**
+@@ -292,7 +367,7 @@ public synchronized void manage(Collection<ParsedPersistenceUnit> parsedUnits, S
+       Collection<? extends ManagedPersistenceUnitInfo> infos)  throws IllegalStateException{
+     parsedData = parsedUnits;
+     provider = ref;
+-    persistenceUnits = infos;
++    persistenceUnits = getInfoMap(infos);
+   }
+ 
+   /**
+@@ -305,6 +380,10 @@ public synchronized void destroy() {
+     
+     provider = null;
+     persistenceUnits = null;
++    if(tracker != null) {
++      tracker.close();
++      tracker = null;
++    }
+   }
+ 
+   /**
+@@ -361,4 +440,76 @@ public void quiesce(DestroyCallback countdown) {
+     }
+   }
+ 
++  @Override
++  public StringBuffer addingService(ServiceReference reference) {
++    //Use String.valueOf to save us from nulls
++    StringBuffer sb = new StringBuffer(String.valueOf(reference.getProperty("osgi.jdbc.driver.class")));
++    
++    //Only notify of a potential change if a new data source class is available
++    if(dataSourceFactories.putIfAbsent(sb.toString(), new ArrayList<String>()) == null) {
++      if(_logger.isDebugEnabled())
++        _logger.debug(NLS.MESSAGES.getMessage("new.datasourcefactory.available", sb.toString(), 
++            bundle.getSymbolicName(), bundle.getVersion()));
++      try {
++        bundleStateChange();
++      } catch (InvalidPersistenceUnitException e) {
++        //Not much we can do here unfortunately
++        _logger.warn(NLS.MESSAGES.getMessage("new.datasourcefactory.error", sb.toString(), 
++          bundle.getSymbolicName(), bundle.getVersion()), e);
++      }
++    }
++    return sb;
++  }
++
++  @Override
++  public void modifiedService(ServiceReference reference, Object service) {
++    //Updates only matter if they change the value of the driver class
++    if(!!!service.toString().equals(reference.getProperty("osgi.jdbc.driver.class"))) {
++      
++      if(_logger.isDebugEnabled())
++        _logger.debug(NLS.MESSAGES.getMessage("changed.datasourcefactory.available", service.toString(), 
++            reference.getProperty("osgi.jdbc.driver.class"), bundle.getSymbolicName(), bundle.getVersion()));
++      
++      //Remove the service
++      removedService(reference, service);
++      //Clear the old driver class
++      StringBuffer sb = (StringBuffer) service;
++      sb.delete(0, sb.length());
++      //add the new one
++      sb.append(addingService(reference));
++    }
++  }
++
++  @Override
++  public void removedService(ServiceReference reference, Object service) {
++    
++    if(_logger.isDebugEnabled())
++      _logger.debug(NLS.MESSAGES.getMessage("datasourcefactory.unavailable", service.toString(), 
++          bundle.getSymbolicName(), bundle.getVersion()));
++    
++    Object[] objects = tracker.getServices();
++
++    boolean gone = true;
++    if(objects != null) {
++      for(Object o : objects) {
++        if(service.equals(o)) {
++          gone = false;
++          break;
++        }
++      }
++    }
++    if(gone) {
++      Collection<String> units = dataSourceFactories.remove(service.toString());
++      if(units != null) {
++        synchronized (this) {
++          if(_logger.isInfoEnabled())
++            _logger.info(NLS.MESSAGES.getMessage("in.use.datasourcefactory.unavailable", service.toString(), 
++                bundle.getSymbolicName(), bundle.getVersion(), units));
++          for(String unit : units) {
++            unregisterEntityManagerFactory(unit);
++          }
++        }
++      } 
++    }
++  }
+ }
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DataSourceFactoryDataSource.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DataSourceFactoryDataSource.java
+index e69de29b..60fdb13f 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DataSourceFactoryDataSource.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DataSourceFactoryDataSource.java
+@@ -0,0 +1,121 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIESOR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.jpa.container.unit.impl;
++
++import java.sql.SQLException;
++import java.util.Properties;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.sql.DataSource;
++
++import org.apache.aries.jpa.container.impl.NLS;
++import org.apache.aries.util.tracker.SingleServiceTracker;
++import org.apache.aries.util.tracker.SingleServiceTracker.SingleServiceListener;
++import org.osgi.framework.Bundle;
++import org.osgi.framework.InvalidSyntaxException;
++import org.osgi.service.jdbc.DataSourceFactory;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class DataSourceFactoryDataSource extends DelayedLookupDataSource implements SingleServiceListener {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
++  
++  private AtomicReference<DataSource> ds = new AtomicReference<DataSource>();
++  
++  private final String driverName;
++  private final Bundle persistenceBundle;
++  private final Properties props;
++  
++  private final AtomicReference<SingleServiceTracker<DataSourceFactory>> trackerRef =
++    new AtomicReference<SingleServiceTracker<DataSourceFactory>>();
++  
++  public DataSourceFactoryDataSource(Bundle bundle, String driverName, String dbURL, 
++      String dbUserName, String dbPassword) {
++    this.persistenceBundle = bundle;
++    this.driverName = driverName;
++    props = new Properties();
++    if(dbURL != null)
++      props.setProperty(DataSourceFactory.JDBC_URL, dbURL);
++    if(dbUserName != null)
++      props.setProperty(DataSourceFactory.JDBC_USER, dbUserName);
++    if(dbPassword != null)
++      props.setProperty(DataSourceFactory.JDBC_PASSWORD, dbPassword);
++  }
++
++  @Override
++  protected DataSource getDs() {
++    if(ds.get() == null) {
++      SingleServiceTracker<DataSourceFactory> tracker = trackerRef.get();
++      
++      if(tracker == null) {
++        try {
++          tracker = new SingleServiceTracker<DataSourceFactory>(
++              persistenceBundle.getBundleContext(), DataSourceFactory.class, "(" +
++              DataSourceFactory.OSGI_JDBC_DRIVER_CLASS + "=" + driverName + ")", this);
++        } catch (InvalidSyntaxException ise) {
++          //This should never happen
++          throw new RuntimeException(ise);
++        }
++        if(trackerRef.compareAndSet(null, tracker))
++          tracker.open();
++        else 
++          tracker = trackerRef.get(); 
++      } 
++      
++      DataSourceFactory dsf = tracker.getService();
++      if(dsf != null) {
++        try {
++          ds.compareAndSet(null, dsf.createDataSource(props));
++        } catch (SQLException e) {
++          String message = NLS.MESSAGES.getMessage("datasourcefactory.sql.exception", driverName, props, 
++              persistenceBundle.getSymbolicName(), persistenceBundle.getVersion());
++          _logger.error(message, e);
++          throw new RuntimeException(message, e);
++        }
++      } else {
++        _logger.error(NLS.MESSAGES.getMessage("no.datasource.factory", driverName, props, 
++            persistenceBundle.getSymbolicName(), persistenceBundle.getVersion()));
++      }
++    }
++    return ds.get();
++  }
++
++  public void closeTrackers() {
++    SingleServiceTracker<DataSourceFactory> tracker = trackerRef.getAndSet(null);
++    if(tracker != null) {
++      tracker.close();
++    }
++  }
++
++  @Override
++  public void serviceFound() {
++    //No op
++  }
++
++  @Override
++  public void serviceLost() {
++    ds.set(null);
++  }
++
++  @Override
++  public void serviceReplaced() {
++    ds.set(null);
++  }
++}
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DelayedLookupDataSource.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DelayedLookupDataSource.java
+index 25c77b11..655e853e 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DelayedLookupDataSource.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/DelayedLookupDataSource.java
+@@ -21,53 +21,12 @@
+ import java.io.PrintWriter;
+ import java.sql.Connection;
+ import java.sql.SQLException;
+-import java.util.Hashtable;
+ 
+-import javax.naming.InitialContext;
+-import javax.naming.NamingException;
+ import javax.sql.DataSource;
+ 
+-import org.apache.aries.jpa.container.impl.NLS;
+-import org.osgi.framework.Bundle;
+-import org.osgi.framework.BundleContext;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
++public abstract class DelayedLookupDataSource implements DataSource {
+ 
+-public class DelayedLookupDataSource implements DataSource {
+-
+-  /** Logger */
+-  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
+-  
+-  private DataSource ds = null;
+-  
+-  private DataSource getDs() {
+-    if(ds == null) {
+-      try {
+-        
+-        Hashtable<String, Object> props = new Hashtable<String, Object>();
+-        
+-        BundleContext bCtx = persistenceBundle.getBundleContext();
+-        if(bCtx == null)
+-          throw new IllegalStateException(NLS.MESSAGES.getMessage("persistence.bundle.not.active", persistenceBundle.getSymbolicName(), persistenceBundle.getVersion()));
+-        props.put("osgi.service.jndi.bundleContext", bCtx);
+-        InitialContext ctx = new InitialContext(props);
+-        ds = (DataSource) ctx.lookup(jndiName);
+-      } catch (NamingException e) {
+-        String message = NLS.MESSAGES.getMessage("no.data.source.found", jndiName, persistenceBundle.getSymbolicName(), persistenceBundle.getVersion());
+-        _logger.error(message, e);
+-        throw new RuntimeException(message, e);
+-      }
+-    }
+-    return ds;
+-  }
+-
+-  private final String jndiName;
+-  private final Bundle persistenceBundle;
+-  
+-  public DelayedLookupDataSource (String jndi, Bundle persistenceBundle) {
+-    jndiName = jndi;
+-    this.persistenceBundle = persistenceBundle;
+-  }
++  protected abstract DataSource getDs();
+   
+   public Connection getConnection() throws SQLException {
+     return getDs().getConnection();
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/JndiDataSource.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/JndiDataSource.java
+index e69de29b..f3881019 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/JndiDataSource.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/JndiDataSource.java
+@@ -0,0 +1,69 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIESOR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.jpa.container.unit.impl;
++
++import java.util.Hashtable;
++import java.util.concurrent.atomic.AtomicReference;
++
++import javax.naming.InitialContext;
++import javax.naming.NamingException;
++import javax.sql.DataSource;
++
++import org.apache.aries.jpa.container.impl.NLS;
++import org.osgi.framework.Bundle;
++import org.osgi.framework.BundleContext;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class JndiDataSource extends DelayedLookupDataSource {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
++  
++  private AtomicReference<DataSource> ds = new AtomicReference<DataSource>();
++  
++  private final String jndiName;
++  private final Bundle persistenceBundle;
++  
++  public JndiDataSource (String jndi, Bundle persistenceBundle) {
++    jndiName = jndi;
++    this.persistenceBundle = persistenceBundle;
++  }
++  
++  @Override
++  protected DataSource getDs() {
++    if(ds.get() == null) {
++      try {
++        Hashtable<String, Object> props = new Hashtable<String, Object>();
++        
++        BundleContext bCtx = persistenceBundle.getBundleContext();
++        if(bCtx == null)
++          throw new IllegalStateException(NLS.MESSAGES.getMessage("persistence.bundle.not.active", persistenceBundle.getSymbolicName(), persistenceBundle.getVersion()));
++        props.put("osgi.service.jndi.bundleContext", bCtx);
++        InitialContext ctx = new InitialContext(props);
++        ds.compareAndSet(null, (DataSource) ctx.lookup(jndiName));
++      } catch (NamingException e) {
++        String message = NLS.MESSAGES.getMessage("no.data.source.found", jndiName, persistenceBundle.getSymbolicName(), persistenceBundle.getVersion());
++        _logger.error(message, e);
++        throw new RuntimeException(message, e);
++      }
++    }
++    return ds.get();
++  }
++
++}
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/ManagedPersistenceUnitInfoImpl.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/ManagedPersistenceUnitInfoImpl.java
+index 9f1fec5d..38da65c5 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/ManagedPersistenceUnitInfoImpl.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/ManagedPersistenceUnitInfoImpl.java
+@@ -18,29 +18,53 @@
+  */
+ package org.apache.aries.jpa.container.unit.impl;
+ 
+-import java.util.Collections;
++import java.util.HashMap;
+ import java.util.Map;
+ 
+ import javax.persistence.spi.PersistenceUnitInfo;
+ 
+ import org.apache.aries.jpa.container.ManagedPersistenceUnitInfo;
++import org.apache.aries.jpa.container.PersistenceUnitConstants;
++import org.apache.aries.jpa.container.impl.NLS;
+ import org.apache.aries.jpa.container.parsing.ParsedPersistenceUnit;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.ServiceReference;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ public class ManagedPersistenceUnitInfoImpl implements
+     ManagedPersistenceUnitInfo {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
++  
++  private static final Boolean useDataSourceFactory;
++  
++  static {
++    boolean b;
++    try {
++      Class.forName("org.osgi.service.jdbc.DataSourceFactory", false, 
++          ManagedPersistenceUnitInfoImpl.class.getClassLoader());
++      b = true;
++    } catch (ClassNotFoundException cnfe) {
++      if(_logger.isInfoEnabled())
++        _logger.info(NLS.MESSAGES.getMessage("no.datasourcefactory.integration"));
++      b = false;
++    }
++    useDataSourceFactory = b;
++  }
+ 
+   private final PersistenceUnitInfoImpl info;
+   
+   public ManagedPersistenceUnitInfoImpl(Bundle persistenceBundle,
+       ParsedPersistenceUnit unit,
+       ServiceReference providerRef) {
+-    info = new PersistenceUnitInfoImpl(persistenceBundle, unit, providerRef);
++    info = new PersistenceUnitInfoImpl(persistenceBundle, unit, providerRef, useDataSourceFactory);
+   }
+ 
+   public Map<String, Object> getContainerProperties() {
+-    return Collections.emptyMap();
++    Map<String, Object> props = new HashMap<String, Object>();
++    props.put(PersistenceUnitConstants.USE_DATA_SOURCE_FACTORY, useDataSourceFactory.toString());
++    return props;
+   }
+ 
+   public PersistenceUnitInfo getPersistenceUnitInfo() {
+@@ -50,4 +74,14 @@ public PersistenceUnitInfo getPersistenceUnitInfo() {
+   public void destroy() {
+     info.clearUp();
+   }
++
++  @Override
++  public void registered() {
++   //No op, our PersistenceUnitInfoImpl is lazy
++  }
++
++  @Override
++  public void unregistered() {
++    info.unregistered();
++  }
+ }
+diff --git a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/PersistenceUnitInfoImpl.java b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/PersistenceUnitInfoImpl.java
+index 11139e4a..ddd2899d 100644
+--- a/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/PersistenceUnitInfoImpl.java
++++ b/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/unit/impl/PersistenceUnitInfoImpl.java
+@@ -32,6 +32,7 @@
+ import javax.persistence.spi.PersistenceUnitTransactionType;
+ import javax.sql.DataSource;
+ 
++import org.apache.aries.jpa.container.PersistenceUnitConstants;
+ import org.apache.aries.jpa.container.annotation.impl.AnnotationScanner;
+ import org.apache.aries.jpa.container.annotation.impl.AnnotationScannerFactory;
+ import org.apache.aries.jpa.container.impl.NLS;
+@@ -52,19 +53,33 @@
+   
+   private final ServiceReference providerRef;
+   
++  private final Boolean useDataSourceFactory;
++  
+   private ClassTransformer transformer;
+   
++  private final AtomicReference<DataSourceFactoryDataSource> jtaDSFDS = 
++    new AtomicReference<DataSourceFactoryDataSource>();
++  
++  private final AtomicReference<DataSourceFactoryDataSource> nonJtaDSFDS = 
++    new AtomicReference<DataSourceFactoryDataSource>();
++  
+   // initialize it lazily because we create a PersistenceUnitInfoImpl when the bundle is INSTALLED state
+   private final AtomicReference<ClassLoader> cl = new AtomicReference<ClassLoader>();
+   
+   /** Logger */
+   private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container");
+   
+-  public PersistenceUnitInfoImpl (Bundle b, ParsedPersistenceUnit parsedData, final ServiceReference providerRef)
++  public PersistenceUnitInfoImpl (Bundle b, ParsedPersistenceUnit parsedData, 
++      final ServiceReference providerRef, Boolean globalUsedatasourcefactory)
+   {
+     bundle = b;
+     unit = parsedData;
+     this.providerRef = providerRef;
++    //Local override for global DataSourceFactory usage
++    Boolean localUseDataSourceFactory = Boolean.parseBoolean(getInternalProperties().getProperty(
++        PersistenceUnitConstants.USE_DATA_SOURCE_FACTORY, "true"));
++    
++    this.useDataSourceFactory = globalUsedatasourcefactory && localUseDataSourceFactory;
+   }
+   
+   public synchronized void addTransformer(ClassTransformer arg0) {
+@@ -114,7 +129,24 @@ public DataSource getJtaDataSource() {
+     String jndiString = (String) unit.getPersistenceXmlMetadata().get(ParsedPersistenceUnit.JTA_DATASOURCE);
+     DataSource toReturn = null;
+     if(jndiString != null) {
+-      toReturn = new DelayedLookupDataSource(jndiString, bundle);
++      toReturn = new JndiDataSource(jndiString, bundle);
++    } else if(useDataSourceFactory) {
++      toReturn = jtaDSFDS.get();
++      if(toReturn == null) {
++        Properties props = getInternalProperties();
++        String driverName = props.getProperty("javax.persistence.jdbc.driver");
++        if(driverName != null) {
++          if(_logger.isDebugEnabled())
++            _logger.debug(NLS.MESSAGES.getMessage("using.datasource.factory", getPersistenceUnitName(),
++                bundle.getSymbolicName(), bundle.getVersion()));
++          
++          jtaDSFDS.compareAndSet(null, new DataSourceFactoryDataSource(bundle, driverName,
++              props.getProperty("javax.persistence.jdbc.url"), 
++              props.getProperty("javax.persistence.jdbc.user"), 
++              props.getProperty("javax.persistence.jdbc.password")));
++          toReturn = jtaDSFDS.get();
++        }
++      }
+     }
+     return toReturn;
+   }
+@@ -152,7 +184,24 @@ public DataSource getNonJtaDataSource() {
+     String jndiString = (String) unit.getPersistenceXmlMetadata().get(ParsedPersistenceUnit.NON_JTA_DATASOURCE);
+     DataSource toReturn = null;
+     if(jndiString != null) {
+-      toReturn = new DelayedLookupDataSource(jndiString, bundle);
++      toReturn = new JndiDataSource(jndiString, bundle);
++    } else if(useDataSourceFactory) {
++      toReturn = nonJtaDSFDS.get();
++      if(toReturn == null) {
++        Properties props = getInternalProperties();
++        String driverName = props.getProperty("javax.persistence.jdbc.driver");
++        if(driverName != null) {
++          if(_logger.isDebugEnabled())
++            _logger.debug(NLS.MESSAGES.getMessage("using.datasource.factory", getPersistenceUnitName(),
++                bundle.getSymbolicName(), bundle.getVersion()));
++          
++          nonJtaDSFDS.compareAndSet(null, new DataSourceFactoryDataSource(bundle, driverName,
++              props.getProperty("javax.persistence.jdbc.url"), 
++              props.getProperty("javax.persistence.jdbc.user"), 
++              props.getProperty("javax.persistence.jdbc.password")));
++          toReturn = nonJtaDSFDS.get();
++        }
++      }
+     }
+     return toReturn;
+   }
+@@ -173,10 +222,23 @@ public String getPersistenceXMLSchemaVersion() {
+     return (String) unit.getPersistenceXmlMetadata().get(ParsedPersistenceUnit.SCHEMA_VERSION);
+   }
+ 
+-  public Properties getProperties() {
++  private Properties getInternalProperties() {
+     return (Properties) unit.getPersistenceXmlMetadata().get(ParsedPersistenceUnit.PROPERTIES);
+   }
+ 
++  public Properties getProperties() {
++    Properties p = new Properties();
++    p.putAll(getInternalProperties());
++    
++    String jdbcClass = p.getProperty("javax.persistence.jdbc.driver");
++    if(useDataSourceFactory && jdbcClass != null) {
++      p.setProperty(PersistenceUnitConstants.DATA_SOURCE_FACTORY_CLASS_NAME, 
++          jdbcClass);
++      p.remove("javax.persistence.jdbc.driver");
++    }
++    return p;
++  }
++
+   public SharedCacheMode getSharedCacheMode() {
+     String s = (String) unit.getPersistenceXmlMetadata().get(ParsedPersistenceUnit.SHARED_CACHE_MODE);
+     
+@@ -214,4 +276,16 @@ public synchronized void clearUp() {
+     }
+   }
+   
++  public void unregistered() {
++    DataSourceFactoryDataSource dsfds = jtaDSFDS.get();
++    if(dsfds != null) {
++      dsfds.closeTrackers();
++    }
++    
++    dsfds = nonJtaDSFDS.get();
++    if(dsfds != null) {
++      dsfds.closeTrackers();
++    }
++  }
++  
+ }
+diff --git a/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java b/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
+index 6e09db9c..6967760d 100644
+--- a/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
++++ b/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
+@@ -68,6 +68,7 @@
+ import org.osgi.framework.ServiceReference;
+ import org.osgi.framework.ServiceRegistration;
+ import org.osgi.framework.Version;
++import org.osgi.service.jdbc.DataSourceFactory;
+ 
+ public class PersistenceBundleLifecycleTest
+ {
+@@ -1207,6 +1208,61 @@ public void testQuiesceAllComplex() throws Exception
+     BundleContextMock.assertNoServiceExists(EntityManagerFactory.class.getName());
+   }
+   
++  @Test
++  public void testDataSourceFactoryLifecycle() throws Exception
++  {
++    //Basic startup
++    BundleContext extenderContext = preExistingBundleSetup();
++    
++    Hashtable<String,String> hash1 = new Hashtable<String, String>();
++    hash1.put("javax.persistence.provider", "no.such.Provider");
++    ServiceRegistration reg = persistenceBundle.getBundleContext().registerService(new String[] {PersistenceProvider.class.getName()} ,
++        pp, hash1 );
++    ServiceReference ref = reg.getReference();
++
++    setupPersistenceBundle("file25", "");
++    
++    mgr.start(extenderContext);
++    
++    //Check the persistence.xml was looked for
++    Skeleton.getSkeleton(persistenceBundle).assertCalled(new MethodCall(Bundle.class, "getEntry", "META-INF/persistence.xml"));
++    //Check we didn't use getResource()
++    Skeleton.getSkeleton(persistenceBundle).assertNotCalled(new MethodCall(Bundle.class, "getResource", String.class));
++    
++    //We should create them all, but then wait for the DataSourceFactory services
++    testSuccessfulCreationEvent(ref, extenderContext, 3);
++    testSuccessfulRegistrationEvent(ref, extenderContext, 0);
++    
++    //Register the DSF for alpha and it should appear
++    hash1 = new Hashtable<String, String>();
++    hash1.put(DataSourceFactory.OSGI_JDBC_DRIVER_CLASS, "alpha.db.class");
++    reg = persistenceBundle.getBundleContext().registerService(new String[] {DataSourceFactory.class.getName()} ,
++        Skeleton.newMock(DataSourceFactory.class), hash1 );
++    
++    testSuccessfulRegistrationEvent(ref, extenderContext, 1, "alpha");
++    
++    //Register the other DSF
++    hash1 = new Hashtable<String, String>();
++    hash1.put(DataSourceFactory.OSGI_JDBC_DRIVER_CLASS, "shared.db.class");
++    persistenceBundle.getBundleContext().registerService(new String[] {DataSourceFactory.class.getName()} ,
++        Skeleton.newMock(DataSourceFactory.class), hash1 );
++    
++    testSuccessfulRegistrationEvent(ref, extenderContext, 3, "alpha", "bravo", "charlie");
++    
++    
++    //Unregister the service for alpha and it should go away again!
++    reg.unregister();
++    
++    ServiceReference[] emfs = extenderContext.getServiceReferences(EntityManagerFactory.class.getName(), null);
++    assertEquals("Too many services registered", 2, emfs.length);
++    
++    assertNotNull(extenderContext.getServiceReferences(
++        EntityManagerFactory.class.getName(), "(osgi.unit.name=bravo)"));
++    assertNotNull(extenderContext.getServiceReferences(
++        EntityManagerFactory.class.getName(), "(osgi.unit.name=charlie)"));
++  }
++  
++  
+   private void setupPersistenceBundle21() throws Exception {
+     persistenceBundle.getHeaders().put("Meta-Persistence", "OSGI-INF/found.xml, jarfile.jar!/jar.xml,persistence/another.xml, does-not-exist.xml");
+     
+@@ -1379,7 +1435,11 @@ private void testSuccessfulRegistrationEvent(ServiceReference providerRef, Bundl
+   {
+     Skeleton.getSkeleton(persistenceBundleContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "registerService", EntityManagerFactory.class.getName(), EntityManagerFactory.class, Dictionary.class), numberOfPersistenceUnits);
+     
+-    if(numberOfPersistenceUnits != 0)
++    if(numberOfPersistenceUnits == 0) {
++      BundleContextMock.assertNoServiceExists(EntityManagerFactory.class.getName());
++      return;
++    }
++      
+       BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
+     
+     ServiceReference[] emfs = extenderContext.getServiceReferences(EntityManagerFactory.class.getName(), null);
+diff --git a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/advanced/features/itest/JPAWeavingAndAnnotationScanningTest.java b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/advanced/features/itest/JPAWeavingAndAnnotationScanningTest.java
+index eff6bccd..d456fdac 100644
+--- a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/advanced/features/itest/JPAWeavingAndAnnotationScanningTest.java
++++ b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/advanced/features/itest/JPAWeavingAndAnnotationScanningTest.java
+@@ -18,6 +18,7 @@
+ import static org.junit.Assert.assertEquals;
+ import static org.ops4j.pax.exam.CoreOptions.equinox;
+ import static org.apache.aries.itest.ExtraOptions.*;
++import static org.ops4j.pax.exam.container.def.PaxRunnerOptions.vmOption;
+ 
+ import javax.persistence.EntityManager;
+ import javax.persistence.EntityManagerFactory;
+diff --git a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerDataSourceFactoryTest.java b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerDataSourceFactoryTest.java
+index e69de29b..37b4b3be 100644
+--- a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerDataSourceFactoryTest.java
++++ b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerDataSourceFactoryTest.java
+@@ -0,0 +1,163 @@
++/*  Licensed to the Apache Software Foundation (ASF) under one or more
++ *  contributor license agreements.  See the NOTICE file distributed with
++ *  this work for additional information regarding copyright ownership.
++ *  The ASF licenses this file to You under the Apache License, Version 2.0
++ *  (the "License"); you may not use this file except in compliance with
++ *  the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing, software
++ *  distributed under the License is distributed on an "AS IS" BASIS,
++ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ *  See the License for the specific language governing permissions and
++ *  limitations under the License.
++ */
++package org.apache.aries.jpa.container.itest;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.ops4j.pax.exam.CoreOptions.equinox;
++import static org.apache.aries.itest.ExtraOptions.*;
++import static org.ops4j.pax.exam.container.def.PaxRunnerOptions.vmOption;
++
++import java.sql.Driver;
++import java.sql.SQLException;
++import java.util.Hashtable;
++import java.util.Properties;
++
++import javax.persistence.EntityManager;
++import javax.persistence.EntityManagerFactory;
++import javax.sql.ConnectionPoolDataSource;
++import javax.sql.DataSource;
++import javax.sql.XADataSource;
++
++import org.apache.aries.itest.AbstractIntegrationTest;
++import org.apache.aries.jpa.container.PersistenceUnitConstants;
++import org.apache.aries.jpa.container.itest.entities.Car;
++import org.apache.derby.jdbc.EmbeddedDataSource;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.ops4j.pax.exam.Option;
++import org.ops4j.pax.exam.container.def.PaxRunnerOptions;
++import org.ops4j.pax.exam.junit.JUnit4TestRunner;
++import org.osgi.framework.ServiceReference;
++import org.osgi.framework.ServiceRegistration;
++import org.osgi.service.jdbc.DataSourceFactory;
++
++@RunWith(JUnit4TestRunner.class)
++public class JPAContainerDataSourceFactoryTest extends AbstractIntegrationTest {
++
++  @Test
++  public void testDataSourceFactoryLifecycle() throws Exception {
++    //Wait for startup
++    context().getService(EntityManagerFactory.class, "(&(osgi.unit.name=test-unit)(" + PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true))");
++    
++    //Now go
++    ServiceReference[] refs = context().getServiceReferences(
++        EntityManagerFactory.class.getName(), "(&(osgi.unit.name=dsf-test-unit)(" + PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true))");
++    
++    assertNull(refs);
++    
++    Hashtable<String, Object> props = new Hashtable();
++    props.put(DataSourceFactory.OSGI_JDBC_DRIVER_CLASS, "org.apache.derby.jdbc.EmbeddedDriver");
++    
++    ServiceRegistration reg = context().registerService(DataSourceFactory.class.getName(), 
++        new DerbyDataSourceFactory(), props);
++    
++    
++    EntityManagerFactory emf = context().getService(EntityManagerFactory.class, 
++        "(&(osgi.unit.name=dsf-test-unit)(" + PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true))");
++    
++    
++    EntityManager em = emf.createEntityManager();
++    
++    em.getTransaction().begin();
++    
++    Car c = new Car();
++    c.setNumberPlate("123456");
++    c.setColour("blue");
++    em.persist(c);
++    
++    em.getTransaction().commit();
++    
++    em.close();
++    
++    em = emf.createEntityManager();
++    
++    assertEquals("blue", em.find(Car.class, "123456").getColour());
++    
++    reg.unregister();
++    
++    refs = context().getServiceReferences(
++        EntityManagerFactory.class.getName(), "(&(osgi.unit.name=dsf-test-unit)(" + PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true))");
++    
++    assertNull(refs);
++  }
++  
++  private static class DerbyDataSourceFactory implements DataSourceFactory {
++
++    public DataSource createDataSource(Properties props) throws SQLException {
++      EmbeddedDataSource ds = new EmbeddedDataSource();
++      ds.setDatabaseName("memory:TEST");
++      ds.setCreateDatabase("create");
++      return ds;
++    }
++
++    public ConnectionPoolDataSource createConnectionPoolDataSource(
++        Properties props) throws SQLException {
++      // TODO Auto-generated method stub
++      return null;
++    }
++
++    public XADataSource createXADataSource(Properties props)
++        throws SQLException {
++      // TODO Auto-generated method stub
++      return null;
++    }
++
++    public Driver createDriver(Properties props) throws SQLException {
++      // TODO Auto-generated method stub
++      return null;
++    }
++    
++  }
++  
++  @org.ops4j.pax.exam.junit.Configuration
++  public static Option[] configuration() {
++    return testOptions(
++        transactionBootDelegation(),
++        paxLogging("DEBUG"),
++
++        // Bundles
++        mavenBundle("commons-lang", "commons-lang"),
++        mavenBundle("commons-collections", "commons-collections"),
++        mavenBundle("commons-pool", "commons-pool"),
++        mavenBundle("org.apache.aries", "org.apache.aries.util"),
++        mavenBundle("org.apache.aries.blueprint", "org.apache.aries.blueprint"),
++        mavenBundle("asm", "asm-all"),
++        mavenBundle("org.apache.aries.proxy", "org.apache.aries.proxy"),
++        mavenBundle("org.apache.aries.jndi", "org.apache.aries.jndi.api"),
++        mavenBundle("org.apache.aries.jndi", "org.apache.aries.jndi.core"),
++        mavenBundle("org.apache.aries.jndi", "org.apache.aries.jndi.url"),
++        mavenBundle("org.apache.aries.jpa", "org.apache.aries.jpa.api"),
++        mavenBundle("org.apache.aries.jpa", "org.apache.aries.jpa.container"),
++        mavenBundle("org.apache.aries.transaction", "org.apache.aries.transaction.manager" ),
++        mavenBundle("org.apache.aries.transaction", "org.apache.aries.transaction.wrappers" ),
++        mavenBundle("org.apache.derby", "derby"),
++        mavenBundle("org.apache.geronimo.specs", "geronimo-jta_1.1_spec"),
++        mavenBundle("org.apache.geronimo.specs", "geronimo-jpa_2.0_spec"),
++        mavenBundle("org.apache.openjpa", "openjpa"),
++        mavenBundle("org.apache.servicemix.bundles", "org.apache.servicemix.bundles.serp"),
++        mavenBundle("org.osgi", "org.osgi.compendium"),
++        mavenBundle("org.osgi", "org.osgi.enterprise"),
++//        vmOption ("-Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5006"),
++        //waitForFrameworkStartup(),
++        
++        mavenBundle("org.apache.aries.jpa", "org.apache.aries.jpa.container.itest.bundle"),
++        
++        PaxRunnerOptions.rawPaxRunnerOption("config", "classpath:ss-runner.properties"),
++        equinox().version("3.7.0.v20110613"));
++  }
++
++}
+diff --git a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
+index dd242a63..a8036b82 100644
+--- a/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
++++ b/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
+@@ -83,10 +83,6 @@ public void findEntityManager2() throws Exception {
+         //vmOption ("-Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5006"),
+         //waitForFrameworkStartup(),
+        
+-//        mavenBundle("org.eclipse.persistence", "org.eclipse.persistence.jpa"),
+-//        mavenBundle("org.eclipse.persistence", "org.eclipse.persistence.core"),
+-//        mavenBundle("org.eclipse.persistence", "org.eclipse.persistence.asm"),
+-        
+         mavenBundle("org.apache.aries.jpa", "org.apache.aries.jpa.container.itest.bundle"),
+         
+         equinox().version("3.5.0"));

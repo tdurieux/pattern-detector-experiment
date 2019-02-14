@@ -1,0 +1,491 @@
+diff --git a/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java b/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
+index e69daf10..ae9fd6f5 100644
+--- a/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/EntityManagerFactoryManager.java
+@@ -31,6 +31,7 @@
+ 
+ import org.apache.aries.jpa.container.ManagedPersistenceUnitInfo;
+ import org.apache.aries.jpa.container.PersistenceUnitConstants;
++import org.apache.aries.jpa.container.parsing.ParsedPersistenceUnit;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.BundleContext;
+ import org.osgi.framework.ServiceReference;
+@@ -51,6 +52,8 @@
+   private ServiceReference provider;
+   /** The persistence units to manage */
+   private Collection<ManagedPersistenceUnitInfo> persistenceUnits;
++  /** The original parsed data */
++  private Collection<ParsedPersistenceUnit> parsedData;
+   /** A Map of created {@link EntityManagerFactory}s */
+   private Map<String, EntityManagerFactory> emfs = null;
+   /** The {@link ServiceRegistration} objects for the {@link EntityManagerFactory}s */
+@@ -71,12 +74,14 @@
+    * @param b
+    * @param infos 
+    * @param ref 
++   * @param parsedUnits 
+    */
+-  public EntityManagerFactoryManager(BundleContext containerCtx, Bundle b, ServiceReference ref, Collection<ManagedPersistenceUnitInfo> infos) {
++  public EntityManagerFactoryManager(BundleContext containerCtx, Bundle b, Collection<ParsedPersistenceUnit> parsedUnits, ServiceReference ref, Collection<ManagedPersistenceUnitInfo> infos) {
+     containerContext = containerCtx;
+     bundle = b;
+     provider = ref;
+     persistenceUnits = infos;
++    parsedData = parsedUnits;
+   }
+ 
+   /**
+@@ -251,6 +256,23 @@ public synchronized void manage(ServiceReference ref,
+     persistenceUnits = infos;
+   }
+ 
++  /**
++   * Manage the EntityManagerFactories for the following
++   * provider, updated persistence xmls and {@link PersistenceUnitInfo}s
++   * 
++   * This method should only be called when not holding any locks
++   * 
++   * @param parsedUnits The updated {@link ParsedPersistenceUnit}s for this bundle 
++   * @param ref The {@link PersistenceProvider} {@link ServiceReference}
++   * @param infos The {@link PersistenceUnitInfo}s defined by our bundle
++   */
++  public synchronized void manage(Collection<ParsedPersistenceUnit> parsedUnits, ServiceReference ref,
++      Collection<ManagedPersistenceUnitInfo> infos)  throws IllegalStateException{
++    parsedData = parsedUnits;
++    provider = ref;
++    persistenceUnits = infos;
++  }
++
+   /**
+    * Stop managing any {@link EntityManagerFactory}s 
+    * 
+@@ -282,5 +304,13 @@ private void destroyEntityManagerFactories() {
+     emfs = null;
+   }
+ 
++  public Bundle getBundle() {
++    return bundle;
++  }
++
++  public Collection<ParsedPersistenceUnit> getParsedPersistenceUnits()
++  {
++    return parsedData;
++  }
+ 
+ }
+diff --git a/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/PersistenceBundleManager.java b/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/PersistenceBundleManager.java
+index 8e4d9e26..b2232b3a 100644
+--- a/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/PersistenceBundleManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container/src/main/java/org/apache/aries/jpa/container/impl/PersistenceBundleManager.java
+@@ -27,6 +27,7 @@
+ import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Properties;
+@@ -74,6 +75,12 @@
+    * synchronized on {@code this}. Use a Set for constant access and add times.
+    */
+   private Set<ServiceReference> persistenceProviders = new HashSet<ServiceReference>();
++  /** 
++   * Managers that do not have a suitable provider yet
++   * should only ever be accessed when synchronized on {@code this} 
++   * Use a set so we don't have to be careful about adding multiple times!
++   */
++  private Collection<EntityManagerFactoryManager> managersAwaitingProviders = new ArrayList<EntityManagerFactoryManager>();
+   /** Plug-point for persistence unit providers */
+   private ManagedPersistenceUnitInfoFactory persistenceUnitFactory; 
+   /** Configuration for this extender */
+@@ -115,8 +122,7 @@ public void open() {
+   
+   public Object addingBundle(Bundle bundle, BundleEvent event) 
+   {
+-    EntityManagerFactoryManager mgr = null;
+-    mgr = setupManager(bundle, mgr);
++    EntityManagerFactoryManager mgr = setupManager(bundle, null, true);
+     return mgr;
+   }
+ 
+@@ -124,11 +130,54 @@ public Object addingBundle(Bundle bundle, BundleEvent event)
+    * A provider is being added, add it to our Set
+    * @param ref
+    */
+-  public synchronized void addingProvider(ServiceReference ref)
++  public void addingProvider(ServiceReference ref)
+   {
++    Map<EntityManagerFactoryManager, ServiceReference> managersToManage = new HashMap<EntityManagerFactoryManager, ServiceReference>();
++    synchronized (this) {
+     if(_logger.isDebugEnabled())
+       _logger.debug("Adding a provider: {}", new Object[] {ref});
++      
+     persistenceProviders.add(ref);
++    
++      Iterator<EntityManagerFactoryManager> it = managersAwaitingProviders.iterator();
++      while(it.hasNext()) {
++        EntityManagerFactoryManager mgr = it.next();
++        ServiceReference reference = getProviderServiceReference(mgr.getParsedPersistenceUnits());
++        if(ref != null) {
++          managersToManage.put(mgr, reference);
++          it.remove();
++        }
++      }
++    }
++    
++    for(Entry<EntityManagerFactoryManager, ServiceReference> entry 
++        : managersToManage.entrySet()) {
++      EntityManagerFactoryManager mgr = entry.getKey();
++      ServiceReference reference = entry.getValue();
++      Collection<ManagedPersistenceUnitInfo> infos = null;
++      try {
++         infos = persistenceUnitFactory.createManagedPersistenceUnitMetadata(
++             ctx, mgr.getBundle(), reference, mgr.getParsedPersistenceUnits());
++      
++        mgr.manage(reference, infos);
++        mgr.bundleStateChange();
++      } catch (Exception e) {
++        if(e instanceof InvalidPersistenceUnitException) {
++          logInvalidPersistenceUnitException(mgr.getBundle(), (InvalidPersistenceUnitException)e);
++        } else {
++          _logger.warn("An error occured whilst trying to manage persistence units for bundle " 
++              + mgr.getBundle().getSymbolicName() + "_" + mgr.getBundle().getVersion(), e);
++        }
++        mgr.destroy();
++        if(infos != null)
++          persistenceUnitFactory.destroyPersistenceBundle(mgr.getBundle());
++        //Put the manager into the list of managers waiting for a new
++        //provider, one that might work!
++        synchronized (this) {
++          managersAwaitingProviders.add(mgr);
++        }
++      }
++    }
+   }
+   
+   /**
+@@ -152,8 +201,14 @@ public void removingProvider(ServiceReference ref)
+     }
+     //If the entry is removed then make sure we notify the persistenceUnitFactory
+     for(Entry<Bundle, EntityManagerFactoryManager> entry : mgrs.entrySet()) {
+-      if(entry.getValue().providerRemoved(ref))
+-        persistenceUnitFactory.destroyPersistenceBundle(entry.getKey());
++      EntityManagerFactoryManager mgr = entry.getValue();
++      if(mgr.providerRemoved(ref)) {
++        Bundle bundle = entry.getKey();
++        persistenceUnitFactory.destroyPersistenceBundle(bundle);
++        //Allow the manager to re-initialize with a new provider
++        //No change to the units
++        setupManager(bundle, mgr, false);
++      }
+     }
+   }
+   
+@@ -191,13 +246,19 @@ public void modifiedBundle(Bundle bundle, BundleEvent event, Object object) {
+     if(event != null && event.getType() == BundleEvent.UPDATED) {
+       mgr.destroy();
+       persistenceUnitFactory.destroyPersistenceBundle(bundle);
+-      setupManager(bundle, mgr);
++      //Don't add to the managersAwaitingProviders, the setupManager will do it
++      setupManager(bundle, mgr, true);
+     } else {
+       try {
+         mgr.bundleStateChange();
+       } catch (InvalidPersistenceUnitException e) {
+         logInvalidPersistenceUnitException(bundle, e);
+         mgr.destroy();
++        persistenceUnitFactory.destroyPersistenceBundle(bundle);
++        
++        //Try re-initializing the manager immediately, this wasn't an
++        //update so the units don't need to be re-parsed
++        setupManager(bundle, mgr, false);
+       }
+     }
+   }
+@@ -212,41 +273,52 @@ public void removedBundle(Bundle bundle, BundleEvent event, Object object) {
+     }
+   }
+   
+-  /**
+-   * Set up an {@link EntityManagerFactoryManager} for the supplied bundle
+-   * 
+-   * @param bundle The bundle
+-   * @param mgr The previously existing {@link EntityManagerFactoryManager} or {@code null} if none existed
+-   * @return The manager to use, or null if no persistence units can be managed for this bundle
+-   */
+-  private EntityManagerFactoryManager setupManager(Bundle bundle,
+-      EntityManagerFactoryManager mgr) {
+-    //Find Persistence descriptors
+-    Collection <PersistenceDescriptor> persistenceXmls = PersistenceBundleHelper.findPersistenceXmlFiles(bundle);
++  private Collection<ParsedPersistenceUnit> parseBundle(Bundle b) {
++    
++    Collection<ParsedPersistenceUnit> pUnits = new ArrayList<ParsedPersistenceUnit>();
++    
++    Collection <PersistenceDescriptor> persistenceXmls = PersistenceBundleHelper.findPersistenceXmlFiles(b);
+ 
+       //If we have no persistence units then our job is done
+       if (!!!persistenceXmls.isEmpty()) {
+         
+         if(_logger.isDebugEnabled())
+-          _logger.debug("Located Persistence descriptors: {} in bundle {}", new Object[] {persistenceXmls, bundle.getSymbolicName() + "_" + bundle.getVersion()});
++        _logger.debug("Located Persistence descriptors: {} in bundle {}", new Object[] {persistenceXmls, b.getSymbolicName() + "_" + b.getVersion()});
+         
+-        if(bundle.getState() == Bundle.ACTIVE) {
++      if(b.getState() == Bundle.ACTIVE) {
+           _logger.warn("The bundle {} is already active, it may not be possible to create managed persistence units for it.", 
+-              new Object[] {bundle.getSymbolicName() + "_" + bundle.getVersion()});
++            new Object[] {b.getSymbolicName() + "_" + b.getVersion()});
+         }
+         
+-        Collection<ParsedPersistenceUnit> pUnits = new ArrayList<ParsedPersistenceUnit>();
++      
+         
+         //Parse each descriptor
+         for(PersistenceDescriptor descriptor : persistenceXmls) {
+           try {
+-            pUnits.addAll(PersistenceDescriptorParser.parse(bundle, descriptor));
++          pUnits.addAll(PersistenceDescriptorParser.parse(b, descriptor));
+           } catch (PersistenceDescriptorParserException e) {
+             _logger.error("There was an error while parsing the persistence descriptor " 
+-                + descriptor.getLocation() + " in bundle " + bundle.getSymbolicName() 
+-                + "_" + bundle.getVersion() + ". No persistence units will be managed for this bundle", e);
++              + descriptor.getLocation() + " in bundle " + b.getSymbolicName() 
++              + "_" + b.getVersion() + ". No persistence units will be managed for this bundle", e);
++        }
+           }
+         }
++    return pUnits;
++  }
++  /**
++   * Set up an {@link EntityManagerFactoryManager} for the supplied bundle
++   * 
++   * @param bundle The bundle
++   * @param mgr The previously existing {@link EntityManagerFactoryManager} or {@code null} if none existed
++   * @return The manager to use, or null if no persistence units can be managed for this bundle
++   */
++  private EntityManagerFactoryManager setupManager(Bundle bundle,
++      EntityManagerFactoryManager mgr, boolean reParse) {
++
++    
++    Collection<ParsedPersistenceUnit> pUnits = 
++        (mgr == null ||reParse) ? parseBundle(bundle) : mgr.getParsedPersistenceUnits();
++ 
+         
+         //If we have any persistence units then find a provider to use
+         if(!!!pUnits.isEmpty()) {
+@@ -256,30 +328,38 @@ private EntityManagerFactoryManager setupManager(Bundle bundle,
+           
+           ServiceReference ref = getProviderServiceReference(pUnits);
+           //If we found a provider then create the ManagedPersistenceUnitInfo objects
++        Collection<ManagedPersistenceUnitInfo> infos = null;
+           if(ref != null) {  
+-            Collection<ManagedPersistenceUnitInfo> infos = persistenceUnitFactory.
++          infos = persistenceUnitFactory.
+                 createManagedPersistenceUnitMetadata(ctx, bundle, ref, pUnits);
++        }
+             //Either update the existing manager or create a new one
+             if(mgr != null)
+-              mgr.manage(ref, infos);
+-            else {
++          mgr.manage(pUnits, ref, infos);
++        else 
++          mgr = new EntityManagerFactoryManager(ctx, bundle, pUnits, ref, infos);
++          
++        //Register the manager (this may re-add, but who cares)
+               synchronized (this) {
+-                if(persistenceProviders.contains(ref)) {
+-                    mgr = new EntityManagerFactoryManager(ctx, bundle, ref, infos);
+                     bundleToManagerMap.put(bundle, mgr);
++          //If the provider is gone then we need to wait
++          if(ref == null) {
++            managersAwaitingProviders.add(mgr);
+                 }
+               }
+-            }
+-          }
+-          //If we have a manager then prod it to get it into the right state
+-          if(mgr != null) {
++          
++        //prod the manager to get it into the right state
+             try {
+               mgr.bundleStateChange();
+             } catch (InvalidPersistenceUnitException e) {
+               logInvalidPersistenceUnitException(bundle, e);
+               mgr.destroy();
++          if(infos != null)
+               persistenceUnitFactory.destroyPersistenceBundle(bundle);
+-            }
++          //Put the manager into the list of managers waiting for a new
++          //provider, one that might work!
++          synchronized (this) {
++            managersAwaitingProviders.add(mgr);
+           }
+         }
+       }
+@@ -292,7 +372,7 @@ private EntityManagerFactoryManager setupManager(Bundle bundle,
+    * @param parsedPersistenceUnits
+    * @return A service reference or null if no suitable reference is available
+    */
+-  private ServiceReference getProviderServiceReference(Collection<ParsedPersistenceUnit> parsedPersistenceUnits)
++  private synchronized ServiceReference getProviderServiceReference(Collection<ParsedPersistenceUnit> parsedPersistenceUnits)
+   {
+     Set<String> ppClassNames = new HashSet<String>();
+     List<VersionRange> versionRanges = new ArrayList<VersionRange>();
+diff --git a/incubator/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java b/incubator/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
+index de2d2ee7..17ed3358 100644
+--- a/incubator/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
++++ b/incubator/aries/trunk/jpa/jpa-container/src/test/java/org/apache/aries/jpa/container/PersistenceBundleLifecycleTest.java
+@@ -22,6 +22,7 @@
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertSame;
+ import static org.junit.Assert.assertTrue;
+ 
+@@ -164,7 +165,7 @@ public void testManager_OnePreExistingPersistenceBundle_NoProvider() throws Exce
+     //Check we don't have an EMF
+     BundleContextMock.assertNoServiceExists(EntityManagerFactory.class.getName());
+     
+-    assertNull("We should not have an EntityManagerFactoryManager", getTrackedObject());
++    assertNotNull("We should have an EntityManagerFactoryManager", getTrackedObject());
+   }
+   
+   @Test
+@@ -216,6 +217,94 @@ public void testManager_OnePreExistingPersistenceBundle_OneExistingProvider() th
+     testSuccessfulRegistrationEvent(ref, extenderContext, 1);
+   }
+   
++  @Test
++  public void testManager_OnePreExistingPersistenceBundle_OneProviderLater() throws Exception
++  {
++    BundleContext extenderContext = preExistingBundleSetup();
++    
++    setupPersistenceBundle("file4", "");
++    
++    mgr.open();
++    
++    //Check the persistence.xml was looked for
++    Skeleton.getSkeleton(persistenceBundle).assertCalled(new MethodCall(Bundle.class, "getEntry", "META-INF/persistence.xml"));
++    //Check we didn't use getResource()
++    Skeleton.getSkeleton(persistenceBundle).assertNotCalled(new MethodCall(Bundle.class, "getResource", String.class));
++    
++    BundleContextMock.assertNoServiceExists(EntityManagerFactory.class.getName());
++    assertNotNull("We should have an EntityManagerFactoryManager", getTrackedObject());
++    
++    Hashtable<String,String> hash1 = new Hashtable<String, String>();
++    hash1.put("javax.persistence.provider", "no.such.Provider");
++    ServiceRegistration reg = persistenceBundle.getBundleContext().registerService(new String[] {PersistenceProvider.class.getName()} ,
++        pp, hash1 );
++    ServiceReference ref = reg.getReference();
++    
++    mgr.addingProvider(ref);
++    
++    BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
++    
++    testSuccessfulCreationEvent(ref, extenderContext, 1);
++    testSuccessfulRegistrationEvent(ref, extenderContext, 1);
++  }
++  
++  @Test
++  public void testManager_OnePersistenceBundle_SwitchProviders() throws Exception
++  {
++    BundleContext extenderContext = preExistingBundleSetup();
++    
++    setupPersistenceBundle("file4", "");
++    
++    mgr.open();
++    
++    //Check the persistence.xml was looked for
++    Skeleton.getSkeleton(persistenceBundle).assertCalled(new MethodCall(Bundle.class, "getEntry", "META-INF/persistence.xml"));
++    //Check we didn't use getResource()
++    Skeleton.getSkeleton(persistenceBundle).assertNotCalled(new MethodCall(Bundle.class, "getResource", String.class));
++    
++    BundleContextMock.assertNoServiceExists(EntityManagerFactory.class.getName());
++    assertNotNull("We should have an EntityManagerFactoryManager", getTrackedObject());
++    
++    Hashtable<String,String> hash1 = new Hashtable<String, String>();
++    hash1.put("javax.persistence.provider", "no.such.Provider");
++    ServiceRegistration reg = persistenceBundle.getBundleContext().registerService(new String[] {PersistenceProvider.class.getName()} ,
++        pp, hash1 );
++    ServiceReference ref = reg.getReference();
++    
++    mgr.addingProvider(ref);
++    
++    BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
++    
++    testSuccessfulCreationEvent(ref, extenderContext, 1);
++    testSuccessfulRegistrationEvent(ref, extenderContext, 1);
++    
++    Hashtable<String,String> hash2 = new Hashtable<String, String>();
++    hash2.put("javax.persistence.provider", "no.such.Provider");
++    hash2.put("key", "value");
++    ServiceRegistration reg2 = persistenceBundle.getBundleContext().registerService(new String[] {PersistenceProvider.class.getName()} ,
++        pp, hash2 );
++    ServiceReference ref2 = reg2.getReference();
++    
++    mgr.addingProvider(ref2);
++    
++    BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
++    
++    testSuccessfulCreationEvent(ref, extenderContext, 1);
++    testSuccessfulRegistrationEvent(ref, extenderContext, 1);
++    //Clear the call to createContainerEntityManagerFactory so that we can check nothing
++    //was done with the new reference
++    Skeleton.getSkeleton(pp).clearMethodCalls();
++    testSuccessfulCreationEvent(ref2, extenderContext, 0);
++    
++    //Clear the registration call
++    Skeleton.getSkeleton(persistenceBundleContext).clearMethodCalls();
++    mgr.removingProvider(ref);
++    
++    BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
++    testSuccessfulCreationEvent(ref2, extenderContext, 1);
++    testSuccessfulRegistrationEvent(ref2, extenderContext, 1);
++  }
++  
+   @Test
+   public void testManagerStopUnregistersUnits() throws Exception
+   {
+@@ -938,8 +1027,8 @@ private void registerVersionedPersistenceProviders() {
+   private void testSuccessfulCreationEvent(ServiceReference providerRef, BundleContext extenderContext, int numberOfPersistenceUnits)
+   {
+   //Check we loaded the Provider service
+-    Skeleton.getSkeleton(extenderContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "getService", providerRef), 1);
+-    Skeleton.getSkeleton(extenderContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "ungetService", providerRef), 1);
++    Skeleton.getSkeleton(extenderContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "getService", providerRef), (numberOfPersistenceUnits == 0) ? 0 : 1);
++    Skeleton.getSkeleton(extenderContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "ungetService", providerRef), (numberOfPersistenceUnits == 0) ? 0 : 1);
+     Skeleton.getSkeleton(pp).assertCalledExactNumberOfTimes(new MethodCall(PersistenceProvider.class, "createContainerEntityManagerFactory", PersistenceUnitInfo.class, Map.class), numberOfPersistenceUnits);
+   }
+   
+@@ -947,6 +1036,7 @@ private void testSuccessfulRegistrationEvent(ServiceReference providerRef, Bundl
+   {
+     Skeleton.getSkeleton(persistenceBundleContext).assertCalledExactNumberOfTimes(new MethodCall(BundleContext.class, "registerService", EntityManagerFactory.class.getName(), EntityManagerFactory.class, Dictionary.class), numberOfPersistenceUnits);
+     
++    if(numberOfPersistenceUnits != 0)
+     BundleContextMock.assertServiceExists(EntityManagerFactory.class.getName());
+     
+     ServiceReference[] emfs = extenderContext.getServiceReferences(EntityManagerFactory.class.getName(), null);
+diff --git a/incubator/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java b/incubator/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
+index 2592db00..261c0dda 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
++++ b/incubator/aries/trunk/jpa/jpa-container-itest/src/test/java/org/apache/aries/jpa/container/itest/JPAContainerTest.java
+@@ -53,18 +53,6 @@
+   @Inject
+   protected BundleContext bundleContext;
+  
+-  @Before
+-  public void setupApplication() throws Exception
+-  {
+-    //Wait for everything to be started then refresh the app
+-    Thread.sleep(3000);
+-    
+-    Bundle app = getBundle("org.apache.aries.jpa.jpa-container-testbundle");
+-    
+-    PackageAdmin pa = getOsgiService(PackageAdmin.class);
+-    pa.refreshPackages(new Bundle[] {app});
+-  }
+-  
+   @Test
+   public void findEntityManagerFactory() throws Exception {
+     EntityManagerFactory emf = getOsgiService(EntityManagerFactory.class, "(osgi.unit.name=test-unit)", DEFAULT_TIMEOUT);

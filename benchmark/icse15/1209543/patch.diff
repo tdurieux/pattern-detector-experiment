@@ -1,0 +1,120 @@
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 0e547fda..7638ffca 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -230,7 +230,7 @@ private ColumnFamilyStore(Table table, String columnFamilyName, IPartitioner par
+         data = new DataTracker(this);
+         Set<DecoratedKey> savedKeys = keyCache.readSaved();
+         Set<Map.Entry<Descriptor, Set<Component>>> entries = files(table.name, columnFamilyName, false, false).entrySet();
+-        data.addSSTables(SSTableReader.batchOpen(entries, savedKeys, data, metadata, this.partitioner));
++        data.addInitialSSTables(SSTableReader.batchOpen(entries, savedKeys, data, metadata, this.partitioner));
+ 
+         // compaction strategy should be created after the CFS has been prepared
+         this.compactionStrategy = metadata.createCompactionStrategyInstance(this);
+@@ -916,7 +916,7 @@ public boolean isKeyInRemainingSSTables(DecoratedKey key, Set<? extends SSTable>
+     public void addSSTable(SSTableReader sstable)
+     {
+         assert sstable.getColumnFamilyName().equals(columnFamily);
+-        data.addStreamedSSTable(sstable);
++        data.addSSTables(Arrays.asList(sstable));
+         CompactionManager.instance.submitBackground(this);
+     }
+ 
+@@ -971,6 +971,7 @@ public void sstablesRewrite() throws ExecutionException, InterruptedException
+ 
+     public void markCompacted(Collection<SSTableReader> sstables)
+     {
++        assert !sstables.isEmpty();
+         data.markCompacted(sstables);
+     }
+ 
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/DataTracker.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/DataTracker.java
+index 0b5ec2d1..3cce6dd9 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/DataTracker.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/DataTracker.java
+@@ -225,28 +225,36 @@ public void unmarkCompacting(Collection<SSTableReader> unmark)
+     public void markCompacted(Collection<SSTableReader> sstables)
+     {
+         replace(sstables, Collections.<SSTableReader>emptyList());
++        notifySSTablesChanged(sstables, Collections.<SSTableReader>emptyList());
+     }
+ 
+     public void replaceCompactedSSTables(Collection<SSTableReader> sstables, Iterable<SSTableReader> replacements)
+     {
+         replace(sstables, replacements);
++        notifySSTablesChanged(sstables, replacements);
+     }
+ 
+-    public void addSSTables(Collection<SSTableReader> sstables)
++    public void addInitialSSTables(Collection<SSTableReader> sstables)
+     {
+         replace(Collections.<SSTableReader>emptyList(), sstables);
++        // no notifications or backup necessary
+     }
+ 
+-    public void addStreamedSSTable(SSTableReader sstable)
++    public void addSSTables(Collection<SSTableReader> sstables)
++    {
++        replace(Collections.<SSTableReader>emptyList(), sstables);
++        for (SSTableReader sstable : sstables)
+     {
+-        addSSTables(Arrays.asList(sstable));
+         incrementallyBackup(sstable);
+         notifyAdded(sstable);
+     }
++    }
+ 
+     public void removeAllSSTables()
+     {
+-        replace(getSSTables(), Collections.<SSTableReader>emptyList());
++        List<SSTableReader> sstables = getSSTables();
++        replace(sstables, Collections.<SSTableReader>emptyList());
++        notifySSTablesChanged(sstables, Collections.<SSTableReader>emptyList());
+     }
+ 
+     /** (Re)initializes the tracker, purging all references. */
+@@ -272,7 +280,6 @@ private void replace(Collection<SSTableReader> oldSSTables, Iterable<SSTableRead
+         addNewSSTablesSize(replacements);
+         removeOldSSTablesSize(oldSSTables);
+ 
+-        notifySSTablesChanged(replacements, oldSSTables);
+         cfstore.updateCacheSizes();
+     }
+ 
+@@ -473,7 +480,7 @@ public double getRecentBloomFilterFalseRatio()
+         return (double) falseCount / (trueCount + falseCount);
+     }
+ 
+-    public void notifySSTablesChanged(Iterable<SSTableReader> added, Iterable<SSTableReader> removed)
++    public void notifySSTablesChanged(Iterable<SSTableReader> removed, Iterable<SSTableReader> added)
+     {
+         for (INotificationConsumer subscriber : subscribers)
+         {
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/CompactionManager.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+index f34fe7ba..8d91891b 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/CompactionManager.java
+@@ -937,6 +937,7 @@ public void runMayThrow() throws InterruptedException, IOException
+                             if (!sstable.newSince(truncatedAt))
+                                 truncatedSSTables.add(sstable);
+                         }
++                        if (!truncatedSSTables.isEmpty())
+                         cfs.markCompacted(truncatedSSTables);
+                     }
+                 }
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/LeveledManifest.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/LeveledManifest.java
+index 5f7ed4ad..f61a26ae 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/LeveledManifest.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/compaction/LeveledManifest.java
+@@ -153,9 +153,10 @@ private int skipLevels(int newLevel, Iterable<SSTableReader> added)
+ 
+     public synchronized void promote(Iterable<SSTableReader> removed, Iterable<SSTableReader> added)
+     {
++        assert !Iterables.isEmpty(removed); // use add() instead of promote when adding new sstables
+         logDistribution();
+         if (logger.isDebugEnabled())
+-            logger.debug((Iterables.isEmpty(added) ? "Removing [" : "Replacing [") + toString(removed) + "]");
++            logger.debug("Replacing [" + toString(removed) + "]");
+ 
+         // the level for the added sstables is the max of the removed ones,
+         // plus one if the removed were all on the same level

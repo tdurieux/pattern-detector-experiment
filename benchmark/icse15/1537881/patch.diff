@@ -1,0 +1,221 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClientResultSet.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClientResultSet.java
+index b34591ff..ebc24168 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClientResultSet.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClientResultSet.java
+@@ -139,6 +139,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     // and getter methods cannot be called.
+     // Also, if a cursor is exhausted (+100), the cursor position is invalid.
+     private boolean isValidCursorPosition_ = false;
++    private boolean savedIsValidCursorPosition_ = false;
+ 
+     public boolean cursorHold_;
+ 
+@@ -378,7 +379,6 @@ boolean nextX() throws SqlException {
+         // else
+         //   fetch the next rowset from the server
+         else {
+-
+             // These flags will only be used for dynamic cursors where we don't know the row count
+             // and can't keep track of the absolute position of the cursor.
+             isAfterLast_ = false;
+@@ -3803,8 +3803,20 @@ public void moveToInsertRow() throws SQLException {
+ 
+                 resetUpdatedColumnsForInsert();
+ 
++                // Note that even though we navigate "away" from the current row
++                // we do not clean up the current row (i.e. release locators), so
++                // locators will still be valid when returning to the current row.
++                // See DERBY-6228.
+                 isOnInsertRow_ = true;
+                 isOnCurrentRow_ = false;
++
++                // It is possible to navigate from a row for which 
++                // isValidCursorPosition_==false to the insert row. By
++                // saving the old value here we can restore it when leaving
++                // the insert row. This is important since attempting to 
++                // release locators for a non-valid cursor position will trigger 
++                // an error on the server. See DERBY-6228.
++                savedIsValidCursorPosition_ = isValidCursorPosition_;
+                 isValidCursorPosition_ = true;
+             }
+         }
+@@ -3847,7 +3859,8 @@ private void moveToCurrentRowX() throws SqlException {
+             if (currentRowInRowset_ > 0) {
+                 updateColumnInfoFromCache();
+             }
+-            isValidCursorPosition_ = true;
++            // Restore the old value when leaving the insert row. See DERBY-6228.
++            isValidCursorPosition_ = savedIsValidCursorPosition_;
+         }
+         if (isValidCursorPosition_) {
+             // isOnInsertRow must be false here.
+@@ -5450,7 +5463,6 @@ private final int checkRowsetSqlca() throws SqlException {
+     private final int checkRowsetSqlca(int row) throws SqlException {
+         int sqlcode = 0;
+         if (!isRowsetCursor_ || rowsetSqlca_ == null || rowsetSqlca_[row] == null) {
+-            warnings_ = null;    // clear any previous warnings
+             return sqlcode;
+         }
+ 
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/LOBStateTracker.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/LOBStateTracker.java
+index 6625d8f9..d8d77300 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/LOBStateTracker.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/LOBStateTracker.java
+@@ -104,7 +104,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     void checkCurrentRow(Cursor cursor)
+             throws SqlException {
+-        if (this.doRelease) {
++        // If we are on a delete hole, there are no locators to release, and 
++        // trying to release them will cause an error. See DERBY-6228.
++        if (this.doRelease && !cursor.getIsUpdateDeleteHole()) {
+             CallableLocatorProcedures procs = cursor.getLocatorProcedures();
+             for (int i=0; i < this.columns.length; i++) {
+                 // Note the conversion from 1-based to 0-based index when
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
+index 7d84093a..60be2453 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
+@@ -270,7 +270,10 @@ private String getMessage(int messageNumber) throws SqlException {
+         synchronized (connection_) {
+             try {
+                 cs = connection_.prepareMessageProc("call SYSIBM.SQLCAMESSAGE(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+-
++                // Cannot let this statement commit the transaction. Otherwise, 
++                // calling getWarnings while navigating a ResultSet will 
++                // release and invalidate locators used by the cursor.
++                cs.isAutoCommittableStatement_ = false;
+                 String errmc = null;
+                 String sqlState = null;
+ 
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetResultSetReply.java b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetResultSetReply.java
+index b55a742f..410357ba 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetResultSetReply.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetResultSetReply.java
+@@ -126,6 +126,10 @@ private void parseCNTQRYreply(ResultSetCallbackInterface resultSetI,
+                 }
+ 
+                 peekCP = peekCodePoint();
++                if (peekCP == CodePoint.SQLCARD) {
++                    NetSqlca netSqlca = parseSQLCARD(((ClientResultSet) resultSetI).rowsetSqlca_);
++                    resultSetI.completeSqlca(netSqlca);
++                }
+                 if (peekCP == CodePoint.RDBUPDRM) {
+                     parseRDBUPDRM();
+                     peekCP = peekCodePoint();
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ConcurrencyTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ConcurrencyTest.java
+index e0bddc12..b30d90d3 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ConcurrencyTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ConcurrencyTest.java
+@@ -421,11 +421,12 @@ public void testUpdatePurgedTuple3()
+             ps2.executeUpdate();
+             con2.commit();
+             
+-            ps2 = con2.prepareStatement("insert into t1 values(?,?,?,?)");
++            ps2 = con2.prepareStatement("insert into t1 values(?,?,?,?,?)");
+             ps2.setInt(1, firstKey);
+             ps2.setInt(2, -1);
+             ps2.setInt(3, -1);
+             ps2.setString(4, "UPDATED TUPLE");
++            ps2.setString(5, "UPDATED CLOB");
+             assertEquals("Expected one record to be inserted", 1, 
+                          ps2.executeUpdate());
+             println("T4: Inserted record (" + firstKey + ",-1,-1)" );
+@@ -505,11 +506,12 @@ public void testUpdatePurgedTuple4()
+             con2.commit();
+             println("T3: commit");
+             
+-            ps2 = con2.prepareStatement("insert into t1 values(?,?,?,?)");
++            ps2 = con2.prepareStatement("insert into t1 values(?,?,?,?,?)");
+             ps2.setInt(1, firstKey);
+             ps2.setInt(2, valA);
+             ps2.setInt(3, valB);
+             ps2.setString(4, "UPDATE TUPLE " + firstKey);
++            ps2.setString(5, "UPDATED CLOB " + firstKey);
+             assertEquals("Expected one record to be inserted", 1, 
+                          ps2.executeUpdate());
+             println("T4: Inserted record (" + firstKey + "," + valA + "," + 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/HoldabilityTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/HoldabilityTest.java
+index d90179a0..86f40af1 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/HoldabilityTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/HoldabilityTest.java
+@@ -473,7 +473,7 @@ private void verifyResultSetUpdatableAfterCompress(ResultSet rs)
+         
+         // Now reinsert the tuples:
+         PreparedStatement ps = 
+-            prepareStatement("insert into t1 values (?,?,?,?)");
++            prepareStatement("insert into t1 values (?,?,?,?,?)");
+         
+         for (int i=0; i<recordCount*2; i++) {
+             int recordId = i + recordCount + 1000;
+@@ -481,6 +481,7 @@ private void verifyResultSetUpdatableAfterCompress(ResultSet rs)
+             ps.setInt(2, recordId);
+             ps.setInt(3, recordId *2 + 17);
+             ps.setString(4, "m" + recordId);
++            ps.setString(5, "c"+recordId);
+             ps.addBatch();
+         }
+         ps.executeBatch();
+@@ -544,7 +545,7 @@ private void verifyCompressInvalidation(ResultSet rs)
+         
+         // Now reinsert the tuples:
+         PreparedStatement ps = 
+-            prepareStatement("insert into t1 values (?,?,?,?)");
++            prepareStatement("insert into t1 values (?,?,?,?,?)");
+         
+         for (int i=0; i<recordCount*2; i++) {
+             int recordId = i + recordCount + 1000;
+@@ -552,6 +553,7 @@ private void verifyCompressInvalidation(ResultSet rs)
+             ps.setInt(2, recordId);
+             ps.setInt(3, recordId *2 + 17);
+             ps.setString(4, "m" + recordId);
++            ps.setString(5, "c" + recordId);
+             ps.addBatch();
+         }
+         ps.executeBatch();
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURBaseTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURBaseTest.java
+index 3062f87f..3b1068b7 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURBaseTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURBaseTest.java
+@@ -66,8 +66,8 @@ protected void verifyTuple(ResultSet rs) throws SQLException {
+         int b = rs.getInt(3);
+         int sum = a + id + 17;
+         println("Reading tuple:(" + id + "," + a  + "," + b + ",'" + 
+-                rs.getString(4) + "')");
+-        assertEquals("Expecting b==id+a+17", b, sum);
++                rs.getString(4) + "', '"+rs.getString(5)+"'");
++        assertEquals("Expecting b==id+a+17", sum, b);
+     }
+     
+     /**
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURDataModelSetup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURDataModelSetup.java
+index 7fa40ab9..deff07af 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURDataModelSetup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/SURDataModelSetup.java
+@@ -79,13 +79,14 @@ public static void createDataModel(SURDataModel model, Connection con,
+         
+         /** Populate with data */
+         PreparedStatement ps = con.
+-            prepareStatement("insert into t1 values (?,?,?,?)");
++            prepareStatement("insert into t1 values (?,?,?,?,?)");
+         
+         for (int i=0; i<records; i++) {
+             ps.setInt(1, i);
+             ps.setInt(2, i);
+             ps.setInt(3, i*2 + 17);
+             ps.setString(4, "Tuple " +i);
++            ps.setString(5, "C-tuple "+i);
+             ps.addBatch();
+         }
+         ps.executeBatch();
+@@ -204,8 +205,8 @@ public boolean hasSecondaryKey() {
+          */
+         public String getCreateTableStatement() {
+             return hasPrimaryKey() 
+-                ? "create table t1 (id int primary key, a int, b int, c varchar(5000))"
+-                : "create table t1 (id int, a int, b int, c varchar(5000))";
++                ? "create table t1 (id int primary key, a int, b int, c varchar(5000), d clob)"
++                : "create table t1 (id int, a int, b int, c varchar(5000), d clob)";
+         }
+ 
+         /**

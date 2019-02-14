@@ -1,0 +1,203 @@
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintQuiesceParticipant.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintQuiesceParticipant.java
+index c48685ad..3edaf775 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintQuiesceParticipant.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintQuiesceParticipant.java
+@@ -27,6 +27,8 @@
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.aries.blueprint.di.Recipe;
+ import org.apache.aries.quiesce.manager.QuiesceCallback;
+@@ -106,22 +108,21 @@ public void run()
+   			BlueprintRepository repository = container.getRepository();
+   			Set<String> names = repository.getNames();
+   			container.quiesce();
+-  			boolean hasServices = false;
+   			
++  			QuiesceDelegatingCallback qdcbk = new QuiesceDelegatingCallback(callback, bundleToQuiesce);
+   			for (String name: names)
+   			{
+   				Recipe recipe = repository.getRecipe(name);
+   				if (recipe instanceof ServiceRecipe)
+   				{
+-  					hasServices = true;
+-  					((ServiceRecipe)recipe).quiesce(new QuiesceDelegatingCallback(callback, bundleToQuiesce));
++  					qdcbk.callCountDown.incrementAndGet();
++  					((ServiceRecipe)recipe).quiesce(qdcbk);
+   				}
+   			}
+-  			//If the bundle has no services we can quiesce immediately
+-  			if (!hasServices)
+-  			{
+-  				callback.bundleQuiesced(bundleToQuiesce);
+-  			}
++  			//Either there were no services and we win, or there were services but they
++  			//have all finished and we win, or they still have tidy up to do, but we
++  			//end up at 0 eventually
++  			qdcbk.callback();
+ 			} else {
+ 			  // for non-Blueprint bundles just call return completed
+ 			  
+@@ -142,25 +143,18 @@ public void run()
+ 	
+ 	  /** The single bundle being quiesced by this DestroyCallback */
+ 	  private final Bundle toQuiesce;
+-	
+-	  private final Set<String> services = new HashSet<String>();
++	  /** A countdown that starts at one so it can't finish before we do! */
++	  private final AtomicInteger callCountDown = new AtomicInteger(1);
+ 	    
+ 	  public QuiesceDelegatingCallback(QuiesceCallback cbk, Bundle b) 
+ 	  {
+ 	    callback = cbk;
+ 	    toQuiesce = b;
+-	      
+-	    ServiceReference[] serviceRefs = b.getRegisteredServices();
+-	    
+-	    for (ServiceReference ref : serviceRefs)
+-	    {
+-	  	  services.add(b.getBundleContext().getService(ref).toString());
+-	    }
+ 	  }
+ 	    
+-	  public void callback(Object key) 
++	  public void callback() 
+ 	  {
+-	    if (key != null && services.remove(key.toString()) && services.isEmpty())
++	    if (callCountDown.decrementAndGet() == 0)
+ 	    {
+ 	 	  	callback.bundleQuiesced(toQuiesce);
+ 	    }
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/DestroyCallback.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/DestroyCallback.java
+index 70e0e937..586541d6 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/DestroyCallback.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/DestroyCallback.java
+@@ -22,5 +22,5 @@
+  * A callback to indicate that a destroy operation has completed
+  */
+ public interface DestroyCallback {
+-  public void callback(Object key);
++  public void callback();
+ }
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
+index b82cba60..11133a23 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
+@@ -83,9 +83,11 @@
+     private Map registrationProperties;
+     private List<ServiceListener> listeners;
+     private volatile Object service;
++    /** Only ever access when holding a lock on <code>this</code> */
+     private int activeCalls;
++    /** Only ever access when holding a lock on <code>this</code> */
+     private boolean quiesce;
+-    private DestroyCallback destroyCallback;
++    private Collection<DestroyCallback> destroyCallbacks = new ArrayList<DestroyCallback>();
+     
+     public ServiceRecipe(String name,
+                          ExtendedBlueprintContainer blueprintContainer,
+@@ -415,26 +417,33 @@ protected void incrementActiveCalls()
+     
+ 	protected void decrementActiveCalls() 
+ 	{
+-		
++  	    List<DestroyCallback> callbacksToCall = new ArrayList<DestroyCallback>();
+     	synchronized(this) 
+     	{
+     		activeCalls--;
+-
+-			if (quiesce && activeCalls == 0)
+-			{
+-				destroyCallback.callback(service);
++  			    if(quiesce && activeCalls == 0) {
++  			        callbacksToCall.addAll(destroyCallbacks);
++  			        destroyCallbacks.clear();
++  			    }
+ 			}
++      	if(!!!callbacksToCall.isEmpty()) {
++      	    for(DestroyCallback cbk : callbacksToCall)
++      	        cbk.callback();
+     	}
+ 	}
+ 	
+     public void quiesce(DestroyCallback destroyCallback)
+     {
+-    	this.destroyCallback = destroyCallback;
+-    	quiesce = true;
+     	unregister();
+-    	if(activeCalls == 0)
+-		{
+-			destroyCallback.callback(service);
++    	  int calls;
++    	  synchronized (this) {
++            if(activeCalls != 0)
++              destroyCallbacks.add(destroyCallback);
++    	      quiesce = true;
++            calls = activeCalls;
++        }
++    	  if(calls == 0) {
++    	      destroyCallback.callback();
+ 		}
+     }
+      
+diff --git a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/QuiesceBlueprintTest.java b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/QuiesceBlueprintTest.java
+index 86c645fc..6707b617 100644
+--- a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/QuiesceBlueprintTest.java
++++ b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/QuiesceBlueprintTest.java
+@@ -27,6 +27,7 @@
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Arrays;
+ 
+ import junit.framework.Assert;
+ 
+@@ -59,12 +60,12 @@
+   {
+     private int calls = 0;
+ 
+-	public void bundleQuiesced(Bundle... bundlesQuiesced) {
+-		System.out.println("bundleQuiesced "+ bundlesQuiesced);
++  	public synchronized void bundleQuiesced(Bundle... bundlesQuiesced) {
++  		System.out.println("bundleQuiesced "+ Arrays.toString(bundlesQuiesced));
+ 	      calls++;
+ 	}
+ 	
+-	public int getCalls() {
++  	public synchronized int getCalls() {
+ 		return calls;
+ 	}
+   }
+@@ -196,9 +197,9 @@ public void testBasicQuieseEmptyCounter() throws Exception
+ 	    
+ 	    Assert.assertTrue("Quiesce callback should not have occurred yet; calls should be 0, but it is "+callback.getCalls(), callback.getCalls()==0);
+ 	    
+-	    Thread.sleep(1500);
++	    t.join();
+ 	    
+-	    System.out.println("After second sleep");
++	    System.out.println("After join");
+ 	    
+ 	    Assert.assertTrue("Quiesce callback should have occurred once; calls should be 1, but it is "+callback.getCalls(), callback.getCalls()==1);
+ 	    
+@@ -244,6 +245,8 @@ public void testNoServicesQuiesce() throws Exception {
+ 	        assertNotNull(bundleb);
+ 	        bundleb.start();
+ 	        
++	        getBlueprintContainerForBundle(bundleContext, "org.apache.aries.blueprint.testbundleb", DEFAULT_TIMEOUT);
++	        
+ 			participant.quiesce(callbackB, Collections.singletonList(getBundle(
+ 				"org.apache.aries.blueprint.testbundleb")));
+ 			
+@@ -254,6 +257,8 @@ public void testNoServicesQuiesce() throws Exception {
+ 		    Assert.assertTrue("Quiesce callback B should have occurred; calls should be 1, but it is "+callbackB.getCalls(), callbackB.getCalls()==1);
+ 		    Assert.assertTrue("Quiesce callback A should not have occurred yet; calls should be 0, but it is "+callbackA.getCalls(), callbackA.getCalls()==0);
+ 		    
++		    bundleb.stop();
++		    
+ 		    participant.quiesce(callbackA, Collections.singletonList(getBundle(
+ 			"org.apache.aries.blueprint.testbundlea")));
+ 				    

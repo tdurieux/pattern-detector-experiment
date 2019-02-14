@@ -1,0 +1,187 @@
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/ProcessStreamResult.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/ProcessStreamResult.java
+index 4376d499..56bfd33e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/ProcessStreamResult.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/ProcessStreamResult.java
+@@ -32,11 +32,30 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	protected OutputStreamWriter outStream;
+ 	// Encoding to be used to read output of test jvm process
+ 	protected String encoding;
++
++    /**
++     * Flag to find out if the work was finished 
++     * successfully without being interrupted 
++     * in between because of a timeout setting
++     */
+ 	protected boolean finished;
+ 	protected IOException ioe;
+ 	protected Thread myThread;
+ 	protected long startTime;
++    
++    /**
++     * Flag to keep state of whether the myThread has timed out.
++     * When interrupted is true, the myThread will exit 
++     * from its work. 
++     */
+ 	protected boolean interrupted;
++    
++    /**
++     * time in minutes for myThread to timeout in case it 
++     * has not finished its work before that.
++     * timeout handling only comes into effect only when Wait()
++     * is called.
++     */
+ 	protected int timeout;
+ 
+ 	public ProcessStreamResult(InputStream in, BufferedOutputStream bos,
+@@ -92,7 +111,10 @@ public void run()
+         	else
+         		inStream = new InputStreamReader(in);
+ 			
+-			while ((valid = inStream.read(ca, 0, ca.length)) != -1)
++            // keep reading from the stream as long as we have not 
++            // timed out
++			while (((valid = inStream.read(ca, 0, ca.length)) != -1) &&
++                    !interrupted)
+ 			{
+ 			    //System.out.println("Still reading thread: " + tname);
+ /*				if (timeout > 0) {
+@@ -124,17 +146,51 @@ public void run()
+ 			//ioe.printStackTrace();
+ 		}
+ 
++        // if we timed out, then just leave
++        if ( interrupted )
++            return;
++        
+ 		synchronized (this)
+ 		{
++            // successfully finished the work, notifyAll and leave.
+ 			finished = true;
+ 			notifyAll();
+ 		}
+ 	}
+ 
++    /**
++     * Wait till the myThread has finished its work or incase a timeout was set on this 
++     * object, then to set a flag to indicate the myThread to leave at the end of the 
++     * timeout period.
++     * 
++     * Behavior is as follows:
++     * 1) If timeout is set to a valid value (>0) - in this case, if myThread has not
++     * finished its work by the time this method was called, then it will wait
++     * till the timeout has elapsed or if the myThread has finished its work.
++     * 
++     * 2)If timeout is not set ( <= 0) - in this case, if myThread has not
++     * finished its work by the time this method was called, then it will wait
++     * till myThread has finished its work.
++     * 
++     * If timeout is set to a valid value, and the timeout amount of time has elapsed, 
++     * then the interrupted  flag is set to true to indicate that it is time for the 
++     * myThread to stop its work and leave.
++     *
++     * @return true if the timeout happened before myThread work was finished
++     *         else false
++     * @throws IOException
++     */
+ 	public boolean Wait() throws IOException
+ 	{
+ 	    synchronized(this)
+ 	    {
++            // It is possible that we have finished the work 
++            // by the time this method Wait() was called,
++            // so need to check if that is the case, before we
++            // go into a wait.
++            if ( finished )
++                return interrupted;
++            
+ 			if (timeout > 0) {
+ 				long millis = System.currentTimeMillis();
+ 
+@@ -144,18 +200,32 @@ public boolean Wait() throws IOException
+ 
+ 				if (mins > timeout)
+ 				{
++                    interrupted = true;
+ 					return interrupted;
+ 				}
+ 			}
+ 			try
+ 			{
+-				while (!finished && !interrupted)
+-				{
+-					wait();
+-				}
++                // find timeout in milliseconds
++                long timeoutms = timeout * 60 *1000L;
++                
++                if ( timeout > 0 )
++                    // wait till notified or till timeoutms has elapsed
++                    wait(timeoutms);
++                else
++                    wait(); // wait till notified
++                
++                // if myThread didnt finish its work and we reached
++                // here, that means we just timedout. 
++                // In that case, indicate that we were interrupted and leave.
++                // myThread will read the value of interrupted and 
++                // stop its work and leave.
++    		    if ( !finished )
++                    interrupted = true;
+ 			}
+ 			catch (InterruptedException ie)
+ 			{
++                interrupted = true;
+ 				System.out.println("Interrupted: " + ie.toString());
+ 			}
+ 	    }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/testProperties.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/testProperties.java
+index 1faaf4ef..644b216e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/testProperties.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/testProperties.java
+@@ -57,6 +57,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	private static Vector vCmd;
+     private static  BufferedOutputStream bos = null;
+ 
++    /**
++     * For each new exec process done as part of this test, set 
++     * timeout for ProcessStreamResult after which the thread that 
++     * handles the streams for the process exits.  Timeout is in minutes. 
++     * Note: timeout handling will only come into effect when 
++     * ProcessStreamResult#Wait() is called
++     */
++    private static String timeoutMinutes = "2";
++
+     //Command to start server specifying system properties without values
+     private static String[] startServerCmd =
+ 					new String[] {  "-Dderby.drda.logConnections",
+@@ -115,8 +124,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 * Execute the given command and optionally wait and dump the results to standard out
+ 	 *
+ 	 * @param args	command and arguments
+-	 * @param wait  true =wait for completion and dump output, false don't wait and
+-     * ignore the output.
++	 * @param wait  true =wait for either completion or timeout time and dump output, 
++     * false don't wait and ignore the output.
+ 	 * @exception Exception
+ 	 */
+ 
+@@ -138,13 +147,16 @@ private static void execCmdDumpResults (String[] args, boolean wait) throws Exce
+         }
+ 		// Start a process to run the command
+ 		Process pr = execCmd(args);
+-        prout = new ProcessStreamResult(pr.getInputStream(), _bos, null);
+-        prerr = new ProcessStreamResult(pr.getErrorStream(), _bos, null);
++        
++        // Note, the timeout handling will only come into effect when we make
++        // the Wait() call on ProcessStreamResult. 
++        prout = new ProcessStreamResult(pr.getInputStream(), _bos, timeoutMinutes);
++        prerr = new ProcessStreamResult(pr.getErrorStream(), _bos, timeoutMinutes);
+         
+         if (!wait)
+             return;
+ 
+-		// wait until all the results have been processed
++		// wait until all the results have been processed or if we timed out
+ 		prout.Wait();
+ 		prerr.Wait();
+         _bos.flush();

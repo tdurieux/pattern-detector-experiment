@@ -1,0 +1,192 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index d6789607..7dbce4cd 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -837,7 +837,7 @@ public void forceFlushIfExpired()
+ 
+         if (clean)
+         {
+-            logger.debug("forceFlush requested but everything is clean");
++            logger.debug("forceFlush requested but everything is clean in {}", columnFamily);
+             return null;
+         }
+ 
+@@ -1966,7 +1966,7 @@ private void waitForActiveFlushes()
+      * @return a Future to the delete operation. Call the future's get() to make
+      * sure the column family has been deleted
+      */
+-    public Future<?> truncate() throws IOException
++    public Future<?> truncate() throws IOException, ExecutionException, InterruptedException
+     {
+         // We have two goals here:
+         // - truncate should delete everything written before truncate was invoked
+@@ -1984,11 +1984,15 @@ private void waitForActiveFlushes()
+         //
+         // Bonus bonus: simply forceFlush of all the CF is not enough, because if
+         // for a given column family the memtable is clean, forceFlush will return
+-        // immediately, even though there could be a memtable being flush at the same
+-        // time.  So to guarantee that all segments can be cleaned out, we need
++        // immediately, even though there could be a memtable being flushed at the same
++        // time.  So to guarantee that all segments can be cleaned out, we need to
+         // "waitForActiveFlushes" after the new segment has been created.
++        logger.debug("truncating {}", columnFamily);
++        // flush the CF being truncated before forcing the new segment
++        forceBlockingFlush();
+         CommitLog.instance.forceNewSegment();
+         ReplayPosition position = CommitLog.instance.getContext();
++        // now flush everyone else.  re-flushing ourselves is not necessary, but harmless
+         for (ColumnFamilyStore cfs : ColumnFamilyStore.all())
+             cfs.forceFlush();
+         waitForActiveFlushes();
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Truncation.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Truncation.java
+index 8e5b0135..f50d4571 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Truncation.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/Truncation.java
+@@ -55,15 +55,6 @@ public Truncation(String keyspace, String columnFamily)
+         this.columnFamily = columnFamily;
+     }
+ 
+-    /**
+-     * This is equivalent to calling commit. Applies the changes to
+-     * to the table that is obtained by calling Table.open().
+-     */
+-    public void apply() throws IOException
+-    {
+-        Table.open(keyspace).getColumnFamilyStore(columnFamily).truncate();
+-    }
+-
+     public Message getMessage(Integer version) throws IOException
+     {
+         ByteArrayOutputStream bos = new ByteArrayOutputStream();
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 026a79dc..36738f7c 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -120,6 +120,8 @@ private CommitLog()
+ 
+     public void resetUnsafe()
+     {
++        for (CommitLogSegment segment : segments)
++            segment.close();
+         segments.clear();
+         segments.add(new CommitLogSegment());
+     }
+@@ -474,7 +476,6 @@ private void maybeDiscardSegment(CommitLogSegment segment, Iterator<CommitLogSeg
+         if (segment.isSafeToDelete() && iter.hasNext())
+         {
+             logger.info("Discarding obsolete commit log:" + segment);
+-            segment.close();
+             DeletionService.executeDelete(segment.getPath());
+             // usually this will be the first (remaining) segment, but not always, if segment A contains
+             // writes to a CF that is unflushed but is followed by segment B whose CFs are all flushed.
+@@ -492,34 +493,26 @@ void sync() throws IOException
+         currentSegment().sync();
+     }
+ 
+-    public void forceNewSegment()
++    public void forceNewSegment() throws ExecutionException, InterruptedException
+     {
+         Callable<?> task = new Callable()
+         {
+             public Object call() throws IOException
+             {
++                if (currentSegment().length() > 0)
+                 createNewSegment();
+                 return null;
+             }
+         };
+ 
+-        try
+-        {
+             executor.submit(task).get();
+         }
+-        catch (InterruptedException e)
+-        {
+-            throw new AssertionError(e);
+-        }
+-        catch (ExecutionException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-    }
+ 
+     private void createNewSegment() throws IOException
+     {
++        assert !segments.isEmpty();
+         sync();
++        segments.getLast().close();
+         segments.add(new CommitLogSegment());
+     }
+ 
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+index 1fc2ad7c..222bae9f 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+@@ -47,6 +47,7 @@
+ 
+     public final long id;
+     private final BufferedRandomAccessFile logWriter;
++    private long finalSize = -1;
+ 
+     // cache which cf is dirty in this segment to avoid having to lookup all ReplayPositions to decide if we could delete this segment
+     private Map<Integer, Integer> cfLastWrite = new HashMap<Integer, Integer>();
+@@ -162,6 +163,9 @@ public String getName()
+ 
+     public long length()
+     {
++        if (finalSize >= 0)
++            return finalSize;
++        
+         try
+         {
+             return logWriter.length();
+@@ -174,8 +178,12 @@ public long length()
+ 
+     public void close()
+     {
++        if (finalSize >= 0)
++            return;
++
+         try
+         {
++            finalSize = logWriter.length();
+             logWriter.close();
+         }
+         catch (IOException e)
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/RecoveryManagerTruncateTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/RecoveryManagerTruncateTest.java
+index 4957578d..89dec3e2 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/RecoveryManagerTruncateTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/RecoveryManagerTruncateTest.java
+@@ -48,7 +48,7 @@ public void testTruncate() throws IOException, ExecutionException, InterruptedEx
+ 		RowMutation rm;
+ 		ColumnFamily cf;
+ 
+-		// trucate clears memtable
++		// add a single cell
+ 		rm = new RowMutation("Keyspace1", ByteBufferUtil.bytes("keymulti"));
+ 		cf = ColumnFamily.create("Keyspace1", "Standard1");
+ 		cf.addColumn(column("col1", "val1", 1L));
+@@ -60,22 +60,11 @@ public void testTruncate() throws IOException, ExecutionException, InterruptedEx
+ 
+ 		// and now truncate it
+ 		cfs.truncate().get();
++        CommitLog.instance.resetUnsafe();
+ 		CommitLog.recover();
+ 
+ 		// and validate truncation.
+ 		assertNull(getFromTable(table, "Standard1", "keymulti", "col1"));
+-
+-		// truncate clears sstable
+-		rm = new RowMutation("Keyspace1", ByteBufferUtil.bytes("keymulti"));
+-		cf = ColumnFamily.create("Keyspace1", "Standard1");
+-		cf.addColumn(column("col1", "val1", 1L));
+-		rm.add(cf);
+-		rm.apply();
+-		cfs.forceBlockingFlush();
+-		cfs.truncate().get();
+-        CommitLog.instance.resetUnsafe();
+-		CommitLog.recover();
+-		assertNull(getFromTable(table, "Standard1", "keymulti", "col1"));
+ 	}
+ 
+ 	private IColumn getFromTable(Table table, String cfName, String keyName, String columnName)

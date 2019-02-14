@@ -1,0 +1,504 @@
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/archive/Manifest.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/archive/Manifest.java
+index 04a3eb59..b285bb31 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/archive/Manifest.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/archive/Manifest.java
+@@ -60,6 +60,10 @@ public Header getHeader(String name) {
+ 		return Collections.unmodifiableCollection(headers.values());
+ 	}
+ 
++	public java.util.jar.Manifest getManifest() {
++		return manifest;
++	}
++
+ 	public Header getManifestVersion() {
+ 		return getHeader(Attributes.Name.MANIFEST_VERSION.toString());
+ 	}
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResource.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResource.java
+index 5faeab84..281898fa 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResource.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResource.java
+@@ -13,13 +13,17 @@
+  */
+ package org.apache.aries.subsystem.core.internal;
+ 
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.net.URL;
++import java.net.MalformedURLException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.jar.JarEntry;
++import java.util.jar.JarOutputStream;
+ 
+ import org.apache.aries.application.modelling.ExportedService;
+ import org.apache.aries.application.modelling.ImportedService;
+@@ -38,9 +42,8 @@
+ import org.apache.aries.subsystem.core.archive.RequireBundleRequirement;
+ import org.apache.aries.subsystem.core.archive.RequireCapabilityHeader;
+ import org.apache.aries.subsystem.core.archive.RequireCapabilityRequirement;
+-import org.apache.aries.util.filesystem.FileSystem;
+-import org.apache.aries.util.filesystem.ICloseableDirectory;
+ import org.apache.aries.util.filesystem.IDirectory;
++import org.apache.aries.util.filesystem.IFile;
+ import org.apache.aries.util.io.IOUtils;
+ import org.osgi.namespace.service.ServiceNamespace;
+ import org.osgi.resource.Capability;
+@@ -58,39 +61,20 @@ private static BundleManifest computeManifest(IDirectory directory) {
+ 	}
+ 	
+ 	private final List<Capability> capabilities = new ArrayList<Capability>();
+-	private final URL content;
++	private final IFile content;
+ 	private final BundleManifest manifest;
+ 	private final List<Requirement> requirements = new ArrayList<Requirement>();
+ 	
+-	public BundleResource(URL content) throws IOException, ModellerException {
++	public BundleResource(IFile content) throws ModellerException {
+ 		this.content = content;
+-		InputStream is = content.openStream();
+-		try {
+-			ICloseableDirectory directory = FileSystem.getFSRoot(is);
+-			try {
+-				manifest = computeManifest(directory);
+-				// TODO Could use ModelledResourceManager.getServiceElements
+-				// instead. Only the service dependency info is being used
+-				// right now.
+-				ModelledResource resource = getModelledResourceManager().getModelledResource(directory);
++		IDirectory dir = content.isDirectory() ? content.convert() : content.convertNested();
++		manifest = computeManifest(dir);
++		// TODO Could use ModelledResourceManager.getServiceElements instead. 
++		// Only the service dependency info is being used right now.
++		ModelledResource resource = getModelledResourceManager().getModelledResource(dir);
+ 				computeRequirements(resource);
+ 				computeCapabilities(resource);
+ 			}
+-			finally {
+-				IOUtils.close(directory);
+-			}
+-		}
+-		finally {
+-			// Although FileSystem.getFSRoot ultimately tries to close the
+-			// provided input stream, it is possible an exception will be thrown
+-			// before that happens.
+-			IOUtils.close(is);
+-		}
+-	}
+-	
+-	public BundleResource(String content) throws IOException, ModellerException {
+-		this(new URL(content));
+-	}
+ 
+ 	public List<Capability> getCapabilities(String namespace) {
+ 		if (namespace == null)
+@@ -103,12 +87,33 @@ public BundleResource(String content) throws IOException, ModellerException {
+ 		return Collections.unmodifiableList(result);
+ 	}
+ 	
++	public String getLocation() {
++		return getFileName(content);
++	}
++	
+ 	@Override
+ 	public InputStream getContent() {
+ 		try {
+-			return content.openStream();
++			if (content.isFile())
++				return content.open();
++			try {
++				// Give the IDirectory a shot at opening in case it supports it.
++				return content.open();
++			}
++			catch (UnsupportedOperationException e) {
++				// As a last ditch effort, try to jar up the contents.
++				ByteArrayOutputStream baos = new ByteArrayOutputStream();
++				JarOutputStream out = new JarOutputStream(baos, manifest.getManifest());
++				try {
++					jar(out, "", content.convert());
+ 		}
+-		catch (IOException e) {
++				finally {
++					IOUtils.close(out);
++				}
++				return new ByteArrayInputStream(baos.toByteArray());
++			}
++		}
++		catch (Exception e) {
+ 			throw new SubsystemException(e);
+ 		}
+ 	}
+@@ -126,7 +131,7 @@ public InputStream getContent() {
+ 	
+ 	@Override
+ 	public String toString() {
+-        return content.toExternalForm();
++        return content.toString();
+     }
+ 	
+ 	private void computeCapabilities(ModelledResource resource) {
+@@ -223,7 +228,47 @@ private void computeRequirements(ModelledResource resource) {
+ 		// TODO Bundle-RequiredExecutionEnvironment
+ 	}
+ 	
++	private String getFileName(IFile file) {
++		String name = file.getName();
++		if ("".equals(name)) {
++			// The file is the root directory of an archive. Use the URL
++			// instead. Using the empty string will likely result in duplicate
++			// locations during installation.
++			try {
++				name = file.toURL().toString();
++			}
++			catch (MalformedURLException e) {
++				throw new SubsystemException(e);
++			}
++		}
++		int index = name.lastIndexOf('/');
++		if (index == -1 || index == name.length() - 1)
++			return name;
++		return name.substring(index + 1);
++	}
++
+ 	private ModelledResourceManager getModelledResourceManager() {
+ 		return Activator.getInstance().getModelledResourceManager();
+ 	}
++
++	private void jar(JarOutputStream out, String prefix, IDirectory directory) throws IOException {
++		List<IFile> files = directory.listFiles();
++		for (IFile f : files) {        
++			String fileName; 
++			if (f.isDirectory())
++				fileName = prefix + getFileName(f) + "/";
++			else
++				fileName = prefix + getFileName(f);
++			if ("META-INF/".equalsIgnoreCase(fileName) || "META-INF/MANIFEST.MF".equalsIgnoreCase(fileName))
++				continue;
++			JarEntry entry = new JarEntry(fileName);
++			entry.setSize(f.getSize());
++			entry.setTime(f.getLastModified());
++			out.putNextEntry(entry);
++			if (f.isDirectory()) 
++				jar(out, fileName, f.convert());
++			else
++				IOUtils.copy(f.open(), out);
++		}
++	}
+ }
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResourceInstaller.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResourceInstaller.java
+index 6fe31a89..5452183d 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResourceInstaller.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/BundleResourceInstaller.java
+@@ -166,7 +166,7 @@ private BundleRevision installBundle() {
+ 		final Bundle bundle;
+ 		InputStream is = ((RepositoryContent)resource).getContent();
+ 		try {
+-			bundle = provisionTo.getRegion().installBundle(getLocation(), is);
++			bundle = provisionTo.getRegion().installBundleAtLocation(getLocation(), is);
+ 		}
+ 		catch (BundleException e) {
+ 			throw new SubsystemException(e);
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/RawSubsystemResource.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/RawSubsystemResource.java
+index c4653e70..3e07ced0 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/RawSubsystemResource.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/RawSubsystemResource.java
+@@ -326,13 +326,15 @@ private RequireCapabilityHeader computeRequireCapabilityHeader() {
+ 			String name = file.getName();
+ 			if (file.isFile()) {
+ 				if (name.endsWith(".jar"))
+-					result.add(new BundleResource(file.toURL()));
++					result.add(new BundleResource(file));
+ 				else if (name.endsWith(".esa"))
+ 					result.add(new RawSubsystemResource(convertFileToLocation(file), file.open()));
+ 			}
+ 			else {
+ 				if (name.endsWith(".esa"))
+ 					result.add(new RawSubsystemResource(convertFileToLocation(file), file.convert()));
++				else if (name.endsWith(".jar"))
++					result.add(new BundleResource(file));
+ 			}
+ 		}
+ 		result.trimToSize();
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceHelper.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceHelper.java
+index bc921750..a5f6a147 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceHelper.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceHelper.java
+@@ -24,6 +24,7 @@
+ import org.osgi.framework.InvalidSyntaxException;
+ import org.osgi.framework.Version;
+ import org.osgi.framework.namespace.IdentityNamespace;
++import org.osgi.framework.wiring.BundleRevision;
+ import org.osgi.resource.Capability;
+ import org.osgi.resource.Requirement;
+ import org.osgi.resource.Resource;
+@@ -63,6 +64,20 @@ public static Object getIdentityAttribute(Resource resource, String name) {
+ 		return capability.getAttributes().get(name);
+ 	}
+ 	
++	public static String getLocation(Resource resource) {
++		if (resource instanceof BundleResource)
++			return ((BundleResource)resource).getLocation();
++		if (resource instanceof BundleRevision)
++			return ((BundleRevision)resource).getBundle().getLocation();
++		if (resource instanceof AriesSubsystem)
++			return ((AriesSubsystem)resource).getLocation();
++		if (resource instanceof SubsystemResource)
++			return ((SubsystemResource)resource).getLocation();
++		if (resource instanceof RawSubsystemResource)
++			return ((RawSubsystemResource)resource).getLocation().getValue();
++		return getSymbolicNameAttribute(resource) + '@' + getVersionAttribute(resource);
++	}
++	
+ 	public static Resource getResource(Requirement requirement, Repository repository) {
+ 		Map<Requirement, Collection<Capability>> map = repository.findProviders(Arrays.asList(requirement));
+ 		Collection<Capability> capabilities = map.get(requirement);
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceInstaller.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceInstaller.java
+index e3f1bcfc..dcc966c1 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceInstaller.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/ResourceInstaller.java
+@@ -99,7 +99,7 @@ public void failed(Coordination arg0) throws Exception {
+ 	}
+ 	
+ 	protected String getLocation() {
+-		return provisionTo.getSubsystemId() + "@" + provisionTo.getSymbolicName() + "@" + ResourceHelper.getSymbolicNameAttribute(resource);
++		return provisionTo.getLocation() + "!/" + ResourceHelper.getLocation(resource);
+ 	}
+ 	
+ 	protected boolean isContent() {
+diff --git a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/SubsystemResource.java b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/SubsystemResource.java
+index 25959962..540dc902 100644
+--- a/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/SubsystemResource.java
++++ b/aries/trunk/subsystem/subsystem-core/src/main/java/org/apache/aries/subsystem/core/internal/SubsystemResource.java
+@@ -58,7 +58,6 @@
+ import org.osgi.framework.hooks.weaving.WeavingHook;
+ import org.osgi.framework.namespace.IdentityNamespace;
+ import org.osgi.framework.wiring.BundleRevision;
+-import org.osgi.framework.wiring.BundleWiring;
+ import org.osgi.resource.Capability;
+ import org.osgi.resource.Requirement;
+ import org.osgi.resource.Resource;
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4ATest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4ATest.java
+index 6eb8163a..73fe2574 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4ATest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4ATest.java
+@@ -1,13 +1,9 @@
+ package org.apache.aries.subsystem.ctt.itests;
+ 
+-import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+ 
+ import java.util.HashMap;
+-import java.util.HashSet;
+ import java.util.Map;
+-import java.util.Set;
+ 
+ import org.junit.Before;
+ import org.junit.Test;
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4CTest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4CTest.java
+index 8ea56ec6..98f115c0 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4CTest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4CTest.java
+@@ -1,17 +1,11 @@
+ package org.apache.aries.subsystem.ctt.itests;
+ 
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+-
+-import java.util.Arrays;
+-import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.Map;
+ 
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.osgi.framework.Bundle;
+-import org.osgi.framework.BundleContext;
+ import org.osgi.framework.Constants;
+ import org.osgi.service.subsystem.Subsystem;
+ import org.osgi.service.subsystem.SubsystemConstants;
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4DTest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4DTest.java
+index 04755a71..9fb8f512 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4DTest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/ctt/itests/SubsystemDependency_4DTest.java
+@@ -8,7 +8,6 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.osgi.framework.Bundle;
+-import org.osgi.framework.BundleContext;
+ import org.osgi.service.subsystem.Subsystem;
+ import org.osgi.service.subsystem.SubsystemConstants;
+ 
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/CompositeTest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/CompositeTest.java
+index 749f9a01..b99e97d3 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/CompositeTest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/CompositeTest.java
+@@ -20,7 +20,6 @@
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+-import org.ops4j.pax.exam.junit.JUnit4TestRunner;
+ import org.ops4j.pax.exam.junit.MavenConfiguredJUnit4TestRunner;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.Constants;
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/InstallTest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/InstallTest.java
+index f297679b..398832b2 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/InstallTest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/InstallTest.java
+@@ -36,6 +36,7 @@
+ import org.junit.runner.RunWith;
+ import org.ops4j.pax.exam.junit.MavenConfiguredJUnit4TestRunner;
+ import org.osgi.framework.Bundle;
++import org.osgi.framework.Version;
+ import org.osgi.framework.startlevel.BundleStartLevel;
+ import org.osgi.framework.startlevel.FrameworkStartLevel;
+ import org.osgi.service.subsystem.Subsystem;
+@@ -47,18 +48,41 @@ public static void createApplications() throws Exception {
+ 		if (createdApplications) {
+ 			return;
+ 		}
+-		
+ 		ZipFixture feature = ArchiveFixture
+ 				.newZip()
+ 				.binary("OSGI-INF/SUBSYSTEM.MF",
+ 						SubsystemTest.class.getClassLoader().getResourceAsStream(
+ 								"compositeDir" + "/OSGI-INF/SUBSYSTEM.MF"))
++				.binary("a.jar/META-INF/MANIFEST.MF", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/a.jar/META-INF/MANIFEST.MF"))
++				.binary("a.jar/a/A.class", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/a.jar/a/A.class"))
+ 				.binary("applicationDir.esa/OSGI-INF/SUBSYSTEM.MF",
+ 						SubsystemTest.class.getClassLoader().getResourceAsStream(
+ 								"compositeDir" + "/applicationDir/OSGI-INF/SUBSYSTEM.MF"))
++				.binary("applicationDir.esa/b.jar/META-INF/MANIFEST.MF", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/b.jar/META-INF/MANIFEST.MF"))
++				.binary("applicationDir.esa/b.jar/b/B.class", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/b.jar/b/B.class"))
+ 				.binary("applicationDir.esa/featureDir.esa/OSGI-INF/SUBSYSTEM.MF",
+ 						SubsystemTest.class.getClassLoader().getResourceAsStream(
+-								"compositeDir" + "/applicationDir/featureDir/OSGI-INF/SUBSYSTEM.MF"));
++								"compositeDir" + "/applicationDir/featureDir/OSGI-INF/SUBSYSTEM.MF"))
++				.binary("applicationDir.esa/featureDir.esa/a.jar/META-INF/MANIFEST.MF", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/featureDir/a.jar/META-INF/MANIFEST.MF"))
++				.binary("applicationDir.esa/featureDir.esa/a.jar/a/A.class", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/featureDir/a.jar/a/A.class"))
++				.binary("applicationDir.esa/featureDir.esa/b.jar/META-INF/MANIFEST.MF", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/featureDir/b.jar/META-INF/MANIFEST.MF"))
++				.binary("applicationDir.esa/featureDir.esa/b.jar/b/B.class", 
++						SubsystemTest.class.getClassLoader().getResourceAsStream(
++								"compositeDir" + "/applicationDir/featureDir/b.jar/b/B.class"));
+ 		feature.end();
+ 		FileOutputStream fos = new FileOutputStream("compositeDir" + ".esa");
+ 		try {
+@@ -66,7 +90,6 @@ public static void createApplications() throws Exception {
+ 		} finally {
+ 			Utils.closeQuietly(fos);
+ 		}
+-		
+ 		createApplication("feature3", new String[]{"tb3.jar"});
+ 		createApplication("feature2", new String[]{"tb3.jar", "tb2.jar"});
+ 		createdApplications = true;
+@@ -95,7 +118,8 @@ public void testReturnExistingSubsystemWithSameLocation() throws Exception {
+ 	
+ 	/*
+      * Install a subsystem using a location string and a null input stream. The
+-     * location string is a file URL pointing to a directory.
++     * location string is a file URL pointing to a subsystem directory 
++     * containing nested subsystem and bundle directories.
+      */
+     @Test
+     public void testLocationAsDirectoryUrl() throws Exception {
+@@ -104,15 +128,45 @@ public void testLocationAsDirectoryUrl() throws Exception {
+     		Subsystem subsystem = installSubsystem(getRootSubsystem(), file.toURI().toString(), null);
+     		try {
+     			assertSymbolicName("org.apache.aries.subsystem.itests.composite.dir", subsystem);
++    			assertConstituents(3, subsystem);
++    			assertConstituent(subsystem, "org.apache.aries.subsystem.itests.composite.dir.bundle.a");
++    			Bundle b = getConstituentAsBundle(
++    					subsystem, 
++    					"org.apache.aries.subsystem.itests.composite.dir.bundle.a", 
++    					null, null);
++    			assertLocation(subsystem.getLocation() + "!/" + "a.jar", b.getLocation());
++    			assertClassLoadable("a.A", b);
+     			assertChildren(1, subsystem);
+     			Subsystem child = subsystem.getChildren().iterator().next();
+     			assertSymbolicName(
+     					"org.apache.aries.subsystem.itests.application.dir",
+     					child);
++    			assertConstituent(child, "org.apache.aries.subsystem.itests.composite.dir.bundle.b");
++    			b = getConstituentAsBundle(
++    					child, 
++    					"org.apache.aries.subsystem.itests.composite.dir.bundle.b", 
++    					null, null);
++    			assertLocation(child.getLocation() + "!/" + "b.jar", b.getLocation());
++    			assertClassLoadable("b.B", b);
+     			assertChildren(1, child);
++    			child = child.getChildren().iterator().next();
+     			assertSymbolicName(
+     					"org.apache.aries.subsystem.itests.feature.dir",
+-    					child.getChildren().iterator().next());
++    					child);
++    			assertConstituent(subsystem, "org.apache.aries.subsystem.itests.composite.dir.bundle.a");
++    			b = getConstituentAsBundle(
++    					child, 
++    					"org.apache.aries.subsystem.itests.composite.dir.bundle.a", 
++    					null, null);
++    			assertLocation(child.getLocation() + "!/" + "a.jar", b.getLocation());
++    			assertClassLoadable("a.A", b);
++    			assertConstituent(child, "org.apache.aries.subsystem.itests.composite.dir.bundle.b", Version.parseVersion("1"));
++    			b = getConstituentAsBundle(
++    					child, 
++    					"org.apache.aries.subsystem.itests.composite.dir.bundle.b", 
++    					Version.parseVersion("1"), null);
++    			assertLocation(child.getLocation() + "!/" + "b.jar", b.getLocation());
++    			assertClassLoadable("b.B", b);
+     		}
+     		finally {
+     			uninstallSubsystemSilently(subsystem);
+diff --git a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/SubsystemTest.java b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/SubsystemTest.java
+index ce38d0a0..543a7add 100644
+--- a/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/SubsystemTest.java
++++ b/aries/trunk/subsystem/subsystem-itests/src/test/java/org/apache/aries/subsystem/itests/SubsystemTest.java
+@@ -50,6 +50,7 @@
+ import org.apache.aries.unittest.fixture.ArchiveFixture.JarFixture;
+ import org.apache.aries.unittest.fixture.ArchiveFixture.ManifestFixture;
+ import org.apache.aries.unittest.fixture.ArchiveFixture.ZipFixture;
++import org.apache.aries.util.filesystem.FileSystem;
+ import org.eclipse.equinox.region.Region;
+ import org.eclipse.equinox.region.RegionDigraph;
+ import org.ops4j.pax.exam.Option;
+@@ -259,6 +260,16 @@ protected void assertChildren(Subsystem parent, Collection<Subsystem> children)
+ 		assertTrue("Parent did not contain all children", parent.getChildren().containsAll(children));
+ 	}
+ 	
++	protected void assertClassLoadable(String clazz, Bundle bundle) {
++		try {
++			bundle.loadClass(clazz);
++		}
++		catch (Exception e) {
++			e.printStackTrace();
++			fail("Class " + clazz + " from bundle " + bundle + " should be loadable");
++		}
++	}
++	
+ 	protected void assertConstituent(Subsystem subsystem, String symbolicName) {
+ 		assertConstituent(subsystem, symbolicName, Version.emptyVersion);
+ 	}
+@@ -517,7 +528,7 @@ protected RepositoryContent createBundleRepositoryContent(String file) throws Ex
+ 	}
+ 	
+ 	protected RepositoryContent createBundleRepositoryContent(File file) throws Exception {
+-		return new BundleResource(file.toURI().toURL());
++		return new BundleResource(FileSystem.getFSRoot(file));
+ 	}
+ 	
+ 	protected static void createManifest(String name, Map<String, String> headers) throws IOException {

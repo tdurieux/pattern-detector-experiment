@@ -1,0 +1,141 @@
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+index a3c3de44..fc8fadf9 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+@@ -64,6 +64,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.jdbc.BrokeredConnectionControl;
+ import org.apache.derby.iapi.jdbc.EngineParameterMetaData;
+ import org.apache.derby.iapi.jdbc.EnginePreparedStatement;
++import org.apache.derby.iapi.services.loader.GeneratedClass;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.types.StringDataValue;
+ 
+@@ -1072,28 +1073,33 @@ public void clearParameters() throws SQLException {
+ 			setupContextStack(); // make sure there's context
+ 
+ 			try {
+-				//bug 4579 - if the statement is invalid, regenerate the metadata info
+-				if (preparedStatement.isValid() == false)
+-				{
+-					//need to revalidate the statement here, otherwise getResultDescription would
+-					//still have info from previous valid statement
+-					preparedStatement.rePrepare(lcc);
+-					rMetaData = null;
+-				}
+ 				//bug 4579 - gcDuringGetMetaData will be null if this is the first time
+ 				//getMetaData call is made.
+ 				//Second check - if the statement was revalidated since last getMetaData call,
+ 				//then gcDuringGetMetaData wouldn't match with current generated class name
+-				if (gcDuringGetMetaData == null || gcDuringGetMetaData.equals(execp.getActivationClass().getName()) == false)
+-				{
++
++                GeneratedClass currAc = null;
++                ResultDescription resd = null;
++
++                synchronized(execp) {
++                    // DERBY-3823 Some other thread may be repreparing
++                    do {
++                        while (!execp.upToDate()) {
++                            execp.rePrepare(lcc);
++                        }
++
++                        currAc = execp.getActivationClass();
++                        resd = execp.getResultDescription();
++                    } while (currAc == null);
++                }
++
++                if (gcDuringGetMetaData == null ||
++                        !gcDuringGetMetaData.equals(currAc.getName())) {
+ 					rMetaData = null;
+-					gcDuringGetMetaData = execp.getActivationClass().getName();
++                    gcDuringGetMetaData = currAc.getName();
+ 				}
+-				if (rMetaData == null)
+-				{
+-					ResultDescription resd = preparedStatement.getResultDescription();
+-					if (resd != null)
+-					{
++
++                if (rMetaData == null && resd != null) {
+ 						// Internally, the result description has information
+ 						// which is used for insert, update and delete statements
+ 						// Externally, we decided that statements which don't
+@@ -1108,7 +1114,7 @@ public void clearParameters() throws SQLException {
+ 						else
+ 				    		rMetaData = newEmbedResultSetMetaData(resd);
+ 					}
+-				}
++
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			}	finally {
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+index eb984a12..8ec04de3 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+@@ -1710,6 +1710,65 @@ public void testAlterColumn() throws Exception {
+ 
+         st.executeUpdate(
+                 "rename column renc_schema_2.renc_8.b to b2");
++        
++        //DERBY-3823 While a resulset is still open, network server allows
++        // ALTER TABLE to change the length of the column in the resultset,
++        // but that length is not reflected in resultset's metadata. This
++        // most likely is happening because of the pre-fetching by the 
++        // server. Related jiras are DERBY-3839 and DERBY-4373.
++        //Once DERBY-3823 is fixed, we should see the change in metadata
++        // reflected in resultset's metadata. A fix for DERBY-3823 will
++        // cause the following test to fail. Right now, the following
++        // test accepts the incorrect metadata length obtained through
++        // the resultset's metadata after ALTER TABLE has been performed.
++        conn.setAutoCommit(false);
++        //Create table and load data
++        st.executeUpdate(
++                "create table derby_3823_t1 (c11 int, c12 varchar(5))");
++        PreparedStatement ps = prepareStatement(
++        		"insert into derby_3823_t1 values(?,'aaaaa')");
++        for (int i = 0; i < 1000; i++) { 
++        	ps.setInt(1, i); 
++        	ps.executeUpdate(); 
++    	} 
++        conn.commit();
++        //Open a resultset on the table which will be altered because
++        // the resultset has been exhausted. The alter table will fail
++        // in embedded mode because of the open resulset but will succeed
++        // in network server because of the pre-fetching.
++        rs = st.executeQuery("select * from derby_3823_t1");
++        //Just get first 100 rows rather than going through all the rows
++        //Next, we will attempt to change the column length of one of the
++        // columns in the resultset and see what happens
++        for (int i = 0; i < 100; i++) { 
++        	rs.next(); 
++    	}
++        rsmd = rs.getMetaData();
++        //The column c12's length at this point is 2
++        assertEquals(5, rsmd.getColumnDisplaySize(2));
++        Statement st1 = createStatement();
++        // This should fail, as c12's column length at this point is 2 and
++        //  data being inserted is 8 characters in length
++        assertStatementError("22001", st1, "insert into derby_3823_t1 values(99,'12345678')");
++        if (usingEmbedded()) 
++        {
++        	//ALTER TABLE will fail in embedded because of the open resulset
++            assertStatementError("X0X95", st1,
++                    "alter table derby_3823_t1 alter column c12 set data type varchar(8)");
++        } else {
++        	//ALTER TABLE does not fail in network server because of pre-fetching
++            st1.execute("alter table derby_3823_t1 alter column c12 set data type varchar(8)"); 
++            //BUG - but the following metadata of the resultset does not show
++            //  the new column length for C12 which is 8 rather than 2
++            rsmd = rs.getMetaData(); 
++            //Following is incorrect. The column length should have been 8
++            // rather than 5
++            assertEquals(5, rsmd.getColumnDisplaySize(2));
++            //Following shows that we are able to enter 8character string after
++            // alter table alter column. It is the resulset metadata which does
++            // not reflect the change in length
++            st1.executeUpdate("insert into derby_3823_t1 values(99,'12345678')"); 
++        }
+     }
+ 
+     // alter table tests for ALTER TABLE DROP COLUMN. The 

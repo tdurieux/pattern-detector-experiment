@@ -1,0 +1,401 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/conn/Authorizer.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/conn/Authorizer.java
+index 40194e70..16d320c6 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/conn/Authorizer.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/conn/Authorizer.java
+@@ -57,7 +57,22 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	public static final int DELETE_PRIV = 4;
+ 	public static final int TRIGGER_PRIV = 5;
+ 	public static final int EXECUTE_PRIV = 6;
+-	public static final int PRIV_TYPE_COUNT = 7;
++	/*
++	 * DERBY-4191
++	 * Used to check if user has a table level select privilege/any column
++	 * level select privilege to fulfill the requirements for following kind
++	 * of queries
++	 * select count(*) from t1
++	 * select count(1) from t1
++	 * select 1 from t1
++	 * select t1.c1 from t1, t2
++	 * DERBY-4191 was added for Derby bug where for first 3 queries above,
++	 * we were not requiring any select privilege on t1. And for the 4th
++	 * query, we were not requiring any select privilege on t2 since no
++	 * column was selected from t2
++	 */
++        public static final int MIN_SELECT_PRIV = 7;
++	public static final int PRIV_TYPE_COUNT = 8;
+ 
+ 	/* Used to check who can create schemas or who can modify objects in schema */
+ 	public static final int CREATE_SCHEMA_PRIV = 16;
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementColumnPermission.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementColumnPermission.java
+index e73f93c2..0d595611 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementColumnPermission.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementColumnPermission.java
+@@ -114,6 +114,17 @@ public void check( LanguageConnectionContext lcc,
+ 												authorizationId,
+ 												permittedColumns);
+ 												
++		//DERBY-4191
++		//If we are looking for select privilege on ANY column,
++		//then we can quit as soon as we find some column with select
++		//privilege. This is needed for queries like
++		//select count(*) from t1
++		//select count(1) from t1
++		//select 1 from t1
++		//select t1.c1 from t1, t2
++		if (privType == Authorizer.MIN_SELECT_PRIV && permittedColumns != null)
++			return;
++
+ 		for( int i = columns.anySetBit(); i >= 0; i = columns.anySetBit( i))
+ 		{
+ 			if( permittedColumns != null && permittedColumns.get(i))
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementTablePermission.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementTablePermission.java
+index 15ba93fc..39ae2bce 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementTablePermission.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/sql/dictionary/StatementTablePermission.java
+@@ -154,6 +154,7 @@ protected boolean oneAuthHasPermissionOnTable(DataDictionary dd, String authoriz
+ 		switch( privType)
+ 		{
+ 		case Authorizer.SELECT_PRIV:
++		case Authorizer.MIN_SELECT_PRIV:
+ 			priv = perms.getSelectPriv();
+ 			break;
+ 		case Authorizer.UPDATE_PRIV:
+@@ -199,6 +200,7 @@ public String getPrivName( )
+ 		switch( privType)
+ 		{
+ 		case Authorizer.SELECT_PRIV:
++		case Authorizer.MIN_SELECT_PRIV:
+ 			return "select";
+ 		case Authorizer.UPDATE_PRIV:
+ 			return "update";
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index ae19029f..4391e48d 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -10929,6 +10929,8 @@ public ColPermsDescriptor getColumnPermissions( UUID tableUUID,
+     static {
+         colPrivTypeMap = new String[ Authorizer.PRIV_TYPE_COUNT];
+         colPrivTypeMapForGrant = new String[ Authorizer.PRIV_TYPE_COUNT];
++        colPrivTypeMap[ Authorizer.MIN_SELECT_PRIV] = "s";
++        colPrivTypeMapForGrant[ Authorizer.MIN_SELECT_PRIV] = "S";
+         colPrivTypeMap[ Authorizer.SELECT_PRIV] = "s";
+         colPrivTypeMapForGrant[ Authorizer.SELECT_PRIV] = "S";
+         colPrivTypeMap[ Authorizer.UPDATE_PRIV] = "u";
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+index 16b64233..6fec4bdd 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+@@ -756,6 +756,36 @@ public void addRequiredColumnPriv( ColumnDescriptor column)
+ 		if (td == null)
+ 			return;
+ 		UUID tableUUID = td.getUUID();
++
++		//DERBY-4191
++		if( currPrivType == Authorizer.MIN_SELECT_PRIV){
++			//If we are here for MIN_SELECT_PRIV requirement, then first
++			//check if there is already a SELECT privilege requirement on any 
++			//of the columns in the table. If yes, then we do not need to add 
++			//MIN_SELECT_PRIV requirement for the table because that 
++			//requirement is already getting satisfied with the already
++			//existing SELECT privilege requirement
++			StatementTablePermission key = new StatementTablePermission( 
++					tableUUID, Authorizer.SELECT_PRIV);
++			StatementColumnPermission tableColumnPrivileges
++			  = (StatementColumnPermission) requiredColumnPrivileges.get( key);
++			if( tableColumnPrivileges != null)
++				return;
++		}
++		if( currPrivType == Authorizer.SELECT_PRIV){
++			//If we are here for SELECT_PRIV requirement, then first check
++			//if there is already any MIN_SELECT_PRIV privilege required
++			//on this table. If yes, then that requirement will be fulfilled
++			//by the SELECT_PRIV requirement we are adding now. Because of
++			//that, remove the MIN_SELECT_PRIV privilege requirement
++			StatementTablePermission key = new StatementTablePermission( 
++					tableUUID, Authorizer.MIN_SELECT_PRIV);
++			StatementColumnPermission tableColumnPrivileges
++			  = (StatementColumnPermission) requiredColumnPrivileges.get( key);
++			if( tableColumnPrivileges != null)
++				requiredColumnPrivileges.remove(key);
++		}
++		
+ 		StatementTablePermission key = new StatementTablePermission( tableUUID, currPrivType);
+ 		StatementColumnPermission tableColumnPrivileges
+ 		  = (StatementColumnPermission) requiredColumnPrivileges.get( key);
+@@ -779,6 +809,20 @@ public void addRequiredTablePriv( TableDescriptor table)
+ 		if( requiredTablePrivileges == null || table == null)
+ 			return;
+ 
++		if( currPrivType == Authorizer.SELECT_PRIV){
++			//DERBY-4191
++			//Check if there is any MIN_SELECT_PRIV select privilege required
++			//on this table. If yes, then that requirement will be fulfilled
++			//by the SELECT_PRIV requirement we are adding now. Because of
++			//that, remove the MIN_SELECT_PRIV privilege requirement
++			StatementTablePermission key = new StatementTablePermission( 
++					table.getUUID(), Authorizer.MIN_SELECT_PRIV);
++			StatementColumnPermission tableColumnPrivileges
++			  = (StatementColumnPermission) requiredColumnPrivileges.get( key);
++			if( tableColumnPrivileges != null)
++				requiredColumnPrivileges.remove(key);
++		}
++
+ 		StatementTablePermission key = new StatementTablePermission( table.getUUID(), currPrivType);
+ 		requiredTablePrivileges.put(key, key);
+ 	}
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CursorNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CursorNode.java
+index 56496bf2..68ec0394 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CursorNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CursorNode.java
+@@ -30,6 +30,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.sql.ResultColumnDescriptor;
+ import org.apache.derby.iapi.sql.compile.C_NodeTypes;
++import org.apache.derby.iapi.sql.conn.Authorizer;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+ import org.apache.derby.impl.sql.CursorInfo;
+@@ -254,6 +255,28 @@ public void bindStatement() throws StandardException
+ 							+ fromList.size()
+ 							+ " on return from RS.bindExpressions()");
+ 			}
++			
++			//DERBY-4191 Make sure that we have minimum select privilege on 
++			//each of the tables in the query.
++			getCompilerContext().pushCurrentPrivType(Authorizer.MIN_SELECT_PRIV);
++			FromList resultSetFromList = resultSet.getFromList();
++			for (int index = 0; index < resultSetFromList.size(); index++) {
++				FromTable fromTable = (FromTable) resultSetFromList.elementAt(index);
++				if (fromTable.isPrivilegeCollectionRequired() && fromTable instanceof FromBaseTable)
++					//We ask for MIN_SELECT_PRIV requirement of the first
++					//column in the table. The first column is just a 
++					//place holder. What we really do at execution time when 
++					//we see we are looking for MIN_SELECT_PRIV privilege is
++					//as follows
++					//1)we will look for SELECT privilege at table level
++					//2)If not found, we will look for SELECT privilege on 
++					//ANY column, not necessarily the first column. But since
++					//the constructor for column privilege requires us to pass
++					//a column descriptor, we just choose the first column for
++					//MIN_SELECT_PRIV requirement.
++					getCompilerContext().addRequiredColumnPriv(fromTable.getTableDescriptor().getColumnDescriptor(1));
++			}
++			getCompilerContext().popCurrentPrivType();
+ 		}
+ 		finally
+ 		{
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+index 654a89e6..65ffe817 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+@@ -28,6 +28,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.compile.Visitable;
+ import org.apache.derby.iapi.sql.compile.Visitor;
+ import org.apache.derby.iapi.sql.compile.C_NodeTypes;
++import org.apache.derby.iapi.sql.conn.Authorizer;
+ 
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.reference.SQLState;
+@@ -466,6 +467,17 @@ public ValueNode bindExpression(FromList fromList, SubqueryList subqueryList,
+ 		 * any *'s have been replaced, so that they don't get expanded.
+ 		 */
+ 		CompilerContext cc = getCompilerContext();
++		/* DERBY-4191
++		 * We should make sure that we require select privileges
++		 * on the tables in the underlying subquery and not the
++		 * parent sql's privilege. eg
++		 * update t1 set c1=(select c2 from t2) 
++		 * For the query above, when working with the subquery, we should
++		 * require select privilege on t2.c2 rather than update privilege.
++		 * Prior to fix for DERBY-4191, we were collecting update privilege
++		 * requirement for t2.c2 rather than select privilege 
++		 */
++		cc.pushCurrentPrivType(Authorizer.SELECT_PRIV);
+ 
+ 		resultSet = resultSet.bindNonVTITables(getDataDictionary(), fromList);
+ 		resultSet = resultSet.bindVTITables(fromList);
+@@ -533,6 +545,7 @@ public ValueNode bindExpression(FromList fromList, SubqueryList subqueryList,
+ 		/* Add this subquery to the subquery list */
+ 		subqueryList.addSubqueryNode(this);
+ 
++		cc.popCurrentPrivType();
+ 		return this;
+ 	}
+ 
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+index 41f00f2a..a2aa7cca 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+@@ -9852,4 +9852,172 @@ public void testGrantRevokeDDL2() throws SQLException {
+         user2.close();
+         user1.close();
+     }
++
++    /**
++     * DERBY-4191
++     * Make sure that we check for atleast table level select privilege or
++     * any column level select privilege for following kind of queries
++     * select count(*) from t1
++     * select count(1) from t1
++     * select 1 from t1
++     * select t1.c1 from t1, t2
++     */
++    public void testMinimumSelectPrivilegeRequirement() throws SQLException {
++        Connection user1 = openUserConnection("user1");
++        Statement user1St = user1.createStatement();
++        user1St.executeUpdate("create schema authorization user1");
++
++        Connection user2 = openUserConnection("user2");
++        Statement user2St = user2.createStatement();
++        user2St.executeUpdate("create schema authorization user2");
++
++        ResultSet rs = null;
++
++        //user1 creates table t4191 and t4191_table2
++        user1St.executeUpdate("create table t4191(x int, y int)");
++        user1St.executeUpdate("create table t4191_table2(z int)");
++        user1St.executeUpdate("create table t4191_table3(c31 int, c32 int)");
++        user1St.executeUpdate("create view view_t4191_table3(v31, v32) " +
++        		"as select c31, c32 from t4191_table3");
++
++        user1St.execute("grant update on t4191_table3 to public");
++        user1St.execute("grant insert on t4191_table3 to public");
++        user1St.execute("grant delete on t4191_table3 to public");
++        //none of following DMLs will work because there is no select
++        //privilege available on the view to user2.
++        assertStatementError("42502", user2St, "update user1.t4191_table3 "+
++        		"set c31 = ( select max(v31) from user1.view_t4191_table3 )");
++        assertStatementError("42502", user2St, "update user1.t4191_table3 "+
++        		"set c31 = ( select count(*) from user1.view_t4191_table3 )");
++        assertStatementError("42502", user2St, "update user1.t4191_table3 "+
++        		"set c31 = ( select 1 from user1.view_t4191_table3 )");
++        //Following should succeed
++        user2St.execute("delete from user1.t4191_table3");
++
++        //Grant select privilege on view so the above DMLs will start working
++        user1St.execute("grant select on view_t4191_table3 to public");
++        user2St.execute("update user1.t4191_table3 "+
++        		"set c31 = ( select max(v31) from user1.view_t4191_table3 )");
++        user2St.execute("update user1.t4191_table3 "+
++        		"set c31 = ( select count(*) from user1.view_t4191_table3 )");
++        user2St.execute("update user1.t4191_table3 "+
++        		"set c31 = ( select 1 from user1.view_t4191_table3 )");
++
++        //none of following selects will work because there is no select
++        //privilege available to user2 yet.
++        assertStatementError("42502", user2St, "select count(*) from user1.t4191");
++        assertStatementError("42502", user2St, "select count(1) from user1.t4191");
++        assertStatementError("42502", user2St, "select count(y) from user1.t4191");
++        assertStatementError("42502", user2St, "select 1 from user1.t4191");
++        //update below should fail because user2 does not have update 
++        //privileges on user1.t4191
++        assertStatementError("42502", user2St, "update user1.t4191 set x=0");
++        //update with subquery should fail too
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select z from user1.t4191_table2 )");
++
++        //grant select on user1.t4191(x) to user2 and now the above select 
++        //statements will work
++        user1St.execute("grant select(x) on t4191 to user2");
++        String[][] expRS = new String [][]
++                              {
++                                  {"0"}
++                              };
++        rs = user2St.executeQuery("select count(*) from user1.t4191");
++        JDBC.assertFullResultSet(rs, expRS, true);
++        rs = user2St.executeQuery("select count(1) from user1.t4191");
++        JDBC.assertFullResultSet(rs, expRS, true);
++        rs = user2St.executeQuery("select 1 from user1.t4191");
++        JDBC.assertEmpty(rs);
++
++        //user2 does not have select privilege on 2nd column from user1.t4191
++        assertStatementError("42502", user2St, "select count(y) from user1.t4191");
++        //user2 does not have any select privilege on user1.table t4191_table2
++        assertStatementError("42502", user2St, "select x from user1.t4191_table2, user1.t4191");
++        
++        //grant select privilege on a column in user1.table t4191_table2 to user2
++        user1St.execute("grant select(z) on t4191_table2 to user2");
++        //now the following should run fine without any privilege issues
++        rs = user2St.executeQuery("select x from user1.t4191_table2, user1.t4191");
++        JDBC.assertEmpty(rs);
++        
++        //revoke some column level privileges from user2
++        user1St.execute("revoke select(x) on t4191 from user2");
++        user1St.execute("revoke select(z) on t4191_table2 from user2");
++        //update below should fail because user2 does not have update 
++        //privileges on user1.t4191
++        assertStatementError("42502", user2St, "update user1.t4191 set x=0");
++        //update with subquery should fail too
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select z from user1.t4191_table2 )");
++        //grant update on user1.t4191 to user2
++        user1St.execute("grant update on t4191 to user2");
++        //following update will now work because it has the required update
++        //privilege
++        assertUpdateCount(user2St, 0, "update user1.t4191 set x=0");
++        //folowing will still fail because there is no select privilege on 
++        //user1.t4191(x)
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        //following update will fail because there is no select privilege
++        //on user1.t4191_table2
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select z from user1.t4191_table2 )");
++        user1St.execute("grant select(y) on t4191 to user2");
++        //folowing will still fail because there is no select privilege on 
++        //user1.t4191(x)
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        user1St.execute("grant select(x) on t4191 to user2");
++        //following will now work because we have all the required privileges
++        assertUpdateCount(user2St, 0, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        //folowing will still fail because there is no select privilege on 
++        //user1.t4191(x)
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select z from user1.t4191_table2 )");
++        user1St.execute("grant select on t4191_table2 to user2");
++        //following will now pass
++        assertUpdateCount(user2St, 0, "update user1.t4191 set x=" +
++		" ( select z from user1.t4191_table2 )");
++
++        //take away select privilege from one column and grant privilege on
++        //another column in user1.t4191 to user2
++        user1St.execute("revoke select(x) on t4191 from user2");
++        //the following update will work because we still have update
++        //privilege granted to user2
++        assertUpdateCount(user2St, 0, "update user1.t4191 set x=0");
++        //but following update won't work because there are no select
++        //privileges available to user2 on user1.t4191(x)
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        user1St.execute("grant select(y) on t4191 to user2");
++        //following update still won't work because the select is granted on
++        //user1.t4191(y) and not user1.t4191(x)
++        assertStatementError("42502", user2St, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++        //following queries will still work because there is still a 
++        //select privilege on user1.t4191 available to user2
++        rs = user2St.executeQuery("select count(*) from user1.t4191");
++        JDBC.assertFullResultSet(rs, expRS, true);
++        rs = user2St.executeQuery("select count(1) from user1.t4191");
++        JDBC.assertFullResultSet(rs, expRS, true);
++        rs = user2St.executeQuery("select 1 from user1.t4191");
++        JDBC.assertEmpty(rs);
++        rs = user2St.executeQuery("select count(y) from user1.t4191");
++        JDBC.assertFullResultSet(rs, expRS, true);
++        //grant select privilege on user1.t4191(x) back to user2 so following
++        //update can succeed
++        user1St.execute("grant select(x) on t4191 to user2");
++        assertUpdateCount(user2St, 0, "update user1.t4191 set x=" +
++		" ( select max(x) + 2 from user1.t4191 )");
++
++        user1St.execute("drop table t4191");
++        user1.close();
++        user2.close();
++}
+ }

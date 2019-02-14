@@ -1,0 +1,121 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/StageManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/StageManager.java
+index 75fc8add..7eb34400 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/StageManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/StageManager.java
+@@ -53,7 +53,7 @@
+     {
+         stages.put(MUTATION_STAGE, multiThreadedStage(MUTATION_STAGE, getConcurrentWriters()));
+         stages.put(READ_STAGE, multiThreadedStage(READ_STAGE, getConcurrentReaders()));
+-        stages.put(RESPONSE_STAGE, multiThreadedStage("RESPONSE-STAGE", MessagingService.MESSAGE_DESERIALIZE_THREADS));
++        stages.put(RESPONSE_STAGE, multiThreadedStage("RESPONSE-STAGE", Runtime.getRuntime().availableProcessors()));
+         // the rest are all single-threaded
+         stages.put(STREAM_STAGE, new JMXEnabledThreadPoolExecutor(STREAM_STAGE));
+         stages.put(GOSSIP_STAGE, new JMXEnabledThreadPoolExecutor("GMFD"));
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index 75f701d2..ff888014 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -67,7 +67,7 @@
+     private static Map<String, IVerbHandler> verbHandlers_;
+ 
+     /* Thread pool to handle messaging read activities of Socket and default stage */
+-    private static ExecutorService messageDeserializationExecutor_;
++    private static ExecutorService messageReadExecutor_;
+     
+     /* Thread pool to handle deserialization of messages read from the socket. */
+     private static ExecutorService messageDeserializerExecutor_;
+@@ -83,8 +83,6 @@
+     
+     private static volatile MessagingService messagingService_ = new MessagingService();
+ 
+-    public static final int MESSAGE_DESERIALIZE_THREADS = 4;
+-
+     public static int getVersion()
+     {
+         return version_;
+@@ -124,23 +122,17 @@ protected MessagingService()
+         callbackMap_ = new Cachetable<String, IAsyncCallback>( 2 * DatabaseDescriptor.getRpcTimeout() );
+         taskCompletionMap_ = new Cachetable<String, IAsyncResult>( 2 * DatabaseDescriptor.getRpcTimeout() );        
+         
+-        messageDeserializationExecutor_ = new JMXEnabledThreadPoolExecutor(
+-                MESSAGE_DESERIALIZE_THREADS,
+-                MESSAGE_DESERIALIZE_THREADS,
+-                Integer.MAX_VALUE,
+-                TimeUnit.SECONDS,
+-                new LinkedBlockingQueue<Runnable>(),
+-                new NamedThreadFactory("MESSAGING-SERVICE-POOL")
+-        );
++        // read executor will have one runnable enqueued per connection with stuff to read on it,
++        // so there is no need to make it bounded, and one thread should be plenty.
++        messageReadExecutor_ = new JMXEnabledThreadPoolExecutor("MS-CONNECTION-READ-POOL");
+ 
+-        messageDeserializerExecutor_ = new JMXEnabledThreadPoolExecutor(
+-                MESSAGE_DESERIALIZE_THREADS,
+-                MESSAGE_DESERIALIZE_THREADS,
++        // read executor puts messages to deserialize on this.
++        messageDeserializerExecutor_ = new JMXEnabledThreadPoolExecutor(1,
++                                                                        Runtime.getRuntime().availableProcessors(),
+                 Integer.MAX_VALUE,
+                 TimeUnit.SECONDS,
+                 new LinkedBlockingQueue<Runnable>(),
+-                new NamedThreadFactory("MESSAGE-DESERIALIZER-POOL")
+-        );
++                                                                        new NamedThreadFactory("MESSAGE-DESERIALIZER-POOL"));
+         
+         streamExecutor_ = new JMXEnabledThreadPoolExecutor("MESSAGE-STREAMING-POOL");
+                 
+@@ -451,7 +443,7 @@ public static void shutdown()
+             udpConnections_.clear();
+ 
+             /* Shutdown the threads in the EventQueue's */
+-            messageDeserializationExecutor_.shutdownNow();
++            messageReadExecutor_.shutdownNow();
+             messageDeserializerExecutor_.shutdownNow();
+             streamExecutor_.shutdownNow();
+ 
+@@ -508,7 +500,7 @@ public static IAsyncResult getAsyncResult(String key)
+ 
+     public static ExecutorService getReadExecutor()
+     {
+-        return messageDeserializationExecutor_;
++        return messageReadExecutor_;
+     }
+ 
+     public static ExecutorService getDeserializationExecutor()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+index 6aa3a261..7a46b4e2 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+@@ -48,7 +48,7 @@
+     private TcpConnectionManager pool_;
+     private boolean isIncoming_ = false;
+     private TcpReader tcpReader_;
+-    private ReadWorkItem readWork_ = new ReadWorkItem(); 
++    private ConnectionReader reader_ = new ConnectionReader();
+     private Queue<ByteBuffer> pendingWrites_ = new ConcurrentLinkedQueue<ByteBuffer>();
+     private InetAddress localEp_;
+     private InetAddress remoteEp_;
+@@ -401,12 +401,12 @@ public void read(SelectionKey key)
+     {
+         turnOffInterestOps(key, SelectionKey.OP_READ);
+         // publish this event onto to the TCPReadEvent Queue.
+-        MessagingService.getReadExecutor().execute(readWork_);
++        MessagingService.getReadExecutor().execute(reader_);
+     }
+     
+-    class ReadWorkItem implements Runnable
++    class ConnectionReader implements Runnable
+     {                 
+-        // called from the TCP READ thread pool
++        // called from the TCP READ executor
+         public void run()
+         {                         
+             if ( tcpReader_ == null )
+@@ -441,7 +441,6 @@ public void run()
+                     }
+                     else
+                     {
+-                        /* Close this socket connection  used for streaming */
+                         closeSocket();
+                     }                    
+                 }

@@ -1,0 +1,545 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 1b95e33a..e1fc0ac4 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1032,6 +1032,9 @@ boolean doFileAntiCompaction(List<String> files, List<Range> ranges, EndPoint ta
+             rangeWriter.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
+             if (fileList != null)
+             {
++                //Retain order. The -Data.db file needs to be last because 
++                //the receiving end checks for this file before opening the SSTable
++                //and adding this to the list of SSTables.
+                 fileList.add(rangeWriter.indexFilename());
+                 fileList.add(rangeWriter.filterFilename());
+                 fileList.add(rangeWriter.getFilename());
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index d8b403e3..c7c0448f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -176,23 +176,24 @@ public void onStreamCompletion(String host, StreamContextManager.StreamContext s
+             /* Parse the stream context and the file to the list of SSTables in the associated Column Family Store. */            
+             if (streamContext.getTargetFile().contains("-Data.db"))
+             {
++                String tableName = streamContext.getTable();
+                 File file = new File( streamContext.getTargetFile() );
+                 String fileName = file.getName();
+-                String [] temp = null;
+-                String tableName;
+-                temp = fileName.split("-");
+-                tableName = temp[0];
+-                /*
+-                 * If the file is a Data File we need to load the indicies associated
+-                 * with this file. We also need to cache the file name in the SSTables
+-                 * list of the associated Column Family. Also merge the CBF into the
+-                 * sampler.
+-                */                
+-                SSTableReader sstable = SSTableReader.open(streamContext.getTargetFile());
+-                if (logger_.isDebugEnabled())
+-                  logger_.debug("Merging the counting bloom filter in the sampler ...");                
+-                String[] peices = FBUtilities.strip(fileName, "-");
+-                Table.open(peices[0]).getColumnFamilyStore(peices[1]).addToList(sstable);                
++                String [] temp = fileName.split("-");
++                
++                //Open the file to see if all parts are now here
++                SSTableReader sstable = null;
++                try 
++                {
++                    sstable = SSTableReader.open(streamContext.getTargetFile());
++                    //TODO add a sanity check that this sstable has all its parts and is ok
++                    Table.open(tableName).getColumnFamilyStore(temp[0]).addToList(sstable);
++                    logger_.info("Bootstrap added " + sstable.getFilename());
++                }
++                catch (IOException e)
++                {
++                    logger_.error("Not able to bootstrap with file " + streamContext.getTargetFile(), e);                    
++                }
+             }
+             
+             EndPoint to = new EndPoint(host, DatabaseDescriptor.getStoragePort());
+@@ -234,11 +235,9 @@ public void doVerb(Message message)
+                 for (StreamContextManager.StreamContext streamContext : streamContexts )
+                 {                    
+                     StreamContextManager.StreamStatus streamStatus = new StreamContextManager.StreamStatus(streamContext.getTargetFile(), streamContext.getExpectedBytes() );
+-                    File sourceFile = new File( streamContext.getTargetFile() );
+-                    String[] peices = FBUtilities.strip(sourceFile.getName(), "-");
+-                    String newFileName = fileNames.get( peices[1] + "-" + peices[2] );
++                    String file = getNewFileNameFromOldContextAndNames(fileNames, streamContext);
+                     
+-                    String file = DatabaseDescriptor.getDataFileLocationForTable(streamContext.getTable()) + File.separator + newFileName + "-Data.db";
++                    //String file = DatabaseDescriptor.getDataFileLocationForTable(streamContext.getTable()) + File.separator + newFileName + "-Data.db";
+                     if (logger_.isDebugEnabled())
+                       logger_.debug("Received Data from  : " + message.getFrom() + " " + streamContext.getTargetFile() + " " + file);
+                     streamContext.setTargetFile(file);
+@@ -258,21 +257,37 @@ public void doVerb(Message message)
+             }
+         }
+         
+-        private Map<String, String> getNewNames(StreamContextManager.StreamContext[] streamContexts) throws IOException
++        String getNewFileNameFromOldContextAndNames(Map<String, String> fileNames,
++                StreamContextManager.StreamContext streamContext)
++        {
++            File sourceFile = new File( streamContext.getTargetFile() );
++            String[] piece = FBUtilities.strip(sourceFile.getName(), "-");
++            String cfName = piece[0];
++            String ssTableNum = piece[1];
++            String typeOfFile = piece[2];             
++
++            String newFileNameExpanded = fileNames.get( streamContext.getTable() + "-" + cfName + "-" + ssTableNum );
++            //Drop type (Data.db) from new FileName
++            String newFileName = newFileNameExpanded.replace("Data.db", typeOfFile);
++            String file = DatabaseDescriptor.getDataFileLocationForTable(streamContext.getTable()) + File.separator + newFileName ;
++            return file;
++        }
++
++        Map<String, String> getNewNames(StreamContextManager.StreamContext[] streamContexts) throws IOException
+         {
+             /* 
+              * Mapping for each file with unique CF-i ---> new file name. For eg.
+-             * for a file with name <Table>-<CF>-<i>-Data.db there is a corresponding
+-             * <Table>-<CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
++             * for a file with name <CF>-<i>-Data.db there is a corresponding
++             * <CF>-<i>-Index.db. We maintain a mapping from <CF>-<i> to a newly
+              * generated file name.
+             */
+             Map<String, String> fileNames = new HashMap<String, String>();
+-            /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index file combination */
++            /* Get the distinct entries from StreamContexts i.e have one entry per Data/Index/Filter file set */
+             Set<String> distinctEntries = new HashSet<String>();
+             for ( StreamContextManager.StreamContext streamContext : streamContexts )
+             {
+-                String[] peices = FBUtilities.strip(streamContext.getTargetFile(), "-");
+-                distinctEntries.add(peices[0] + "-" + peices[1] + "-" + peices[2]);
++                String[] pieces = FBUtilities.strip(new File(streamContext.getTargetFile()).getName(), "-");
++                distinctEntries.add(streamContext.getTable() + "-" + pieces[0] + "-" + pieces[1] );
+             }
+             
+             /* Generate unique file names per entry */
+@@ -462,7 +477,6 @@ public boolean forceCompaction(List<Range> ranges, EndPoint target, List<String>
+             ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+             if ( cfStore != null )
+             {
+-                /* Counting Bloom Filter for the Column Family */
+                 cfStore.forceCompaction(ranges, target, 0, fileList);                
+             }
+         }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
+index 62b1b282..3042c778 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
+@@ -46,7 +46,6 @@
+     /* tokens of the nodes being bootstrapped. */
+     protected final Token[] tokens_;
+     protected TokenMetadata tokenMetadata_ = null;
+-    private List<EndPoint> filters_ = new ArrayList<EndPoint>();
+ 
+     public BootStrapper(EndPoint[] target, Token... token)
+     {
+@@ -55,12 +54,6 @@ public BootStrapper(EndPoint[] target, Token... token)
+         tokenMetadata_ = StorageService.instance().getTokenMetadata();
+     }
+     
+-    public BootStrapper(EndPoint[] target, Token[] token, EndPoint[] filters)
+-    {
+-        this(target, token);
+-        Collections.addAll(filters_, filters);
+-    }
+-
+     public void run()
+     {
+         try
+@@ -122,7 +115,7 @@ public void run()
+             /* Calculate ranges that need to be sent and from whom to where */
+             Map<Range, List<BootstrapSourceTarget>> rangesWithSourceTarget = LeaveJoinProtocolHelper.getRangeSourceTargetInfo(oldRangeToEndPointMap, newRangeToEndPointMap);
+             /* Send messages to respective folks to stream data over to the new nodes being bootstrapped */
+-            LeaveJoinProtocolHelper.assignWork(rangesWithSourceTarget, filters_);                
++            LeaveJoinProtocolHelper.assignWork(rangesWithSourceTarget);                
+         }
+         catch ( Throwable th )
+         {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/LeaveJoinProtocolHelper.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/LeaveJoinProtocolHelper.java
+index d5a3bb9d..4b43712f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/LeaveJoinProtocolHelper.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/LeaveJoinProtocolHelper.java
+@@ -158,15 +158,6 @@
+      * to stream the specified ranges to specified target nodes. 
+     */
+     protected static void assignWork(Map<Range, List<BootstrapSourceTarget>> rangesWithSourceTarget) throws IOException
+-    {
+-        assignWork(rangesWithSourceTarget, null);
+-    }
+-    
+-    /**
+-     * This method sends messages out to nodes instructing them 
+-     * to stream the specified ranges to specified target nodes. 
+-    */
+-    protected static void assignWork(Map<Range, List<BootstrapSourceTarget>> rangesWithSourceTarget, List<EndPoint> filters) throws IOException
+     {
+         /*
+          * Map whose key is the source node and the value is a map whose key is the
+@@ -199,14 +190,6 @@ protected static void assignWork(Map<Range, List<BootstrapSourceTarget>> rangesW
+         Set<EndPoint> sources = rangeInfo.keySet();
+         for ( EndPoint source : sources )
+         {
+-            /* only send the message to the nodes that are in the filter. */
+-            if ( filters != null && filters.size() > 0 && !filters.contains(source) )
+-            {
+-                if (logger_.isDebugEnabled())
+-                  logger_.debug("Filtering endpoint " + source + " as source ...");
+-                continue;
+-            }
+-            
+             Map<EndPoint, List<Range>> targetRangesMap = rangeInfo.get(source);
+             Set<EndPoint> targets = targetRangesMap.keySet();
+             List<BootstrapMetadata> bsmdList = new ArrayList<BootstrapMetadata>();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ContentStreamState.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ContentStreamState.java
+index ef4f8aa1..bff588c9 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ContentStreamState.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ContentStreamState.java
+@@ -48,7 +48,7 @@
+         super(stream); 
+         SocketChannel socketChannel = stream.getStream();
+         InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+-        String remoteHost = remoteAddress.getHostName();        
++        String remoteHost = remoteAddress.getAddress().getHostAddress();        
+         streamContext_ = StreamContextManager.getStreamContext(remoteHost);   
+         streamStatus_ = StreamContextManager.getStreamStatus(remoteHost);
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 8f9adff4..21640ed1 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -21,6 +21,9 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.UnknownHostException;
+ import java.util.*;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.LinkedBlockingQueue;
+@@ -105,12 +108,6 @@ public static IPartitioner getPartitioner() {
+         return partitioner_;
+     }
+     
+-    public static enum BootstrapMode
+-    {
+-        HINT,
+-        FULL
+-    }
+-
+     static
+     {
+         partitioner_ = DatabaseDescriptor.getPartitioner();
+@@ -427,7 +424,7 @@ public void onChange(EndPoint endpoint, EndPointState epState)
+                     */
+                     if (logger_.isDebugEnabled())
+                       logger_.debug("Sending hinted data to " + ep);
+-                    doBootstrap(endpoint, BootstrapMode.HINT);
++                    deliverHints(endpoint);
+                 }
+             }
+             else
+@@ -448,7 +445,7 @@ public void onChange(EndPoint endpoint, EndPointState epState)
+             {
+                 if (logger_.isDebugEnabled())
+                   logger_.debug("EndPoint " + ep + " just recovered from a partition. Sending hinted data.");
+-                doBootstrap(ep, BootstrapMode.HINT);
++                deliverHints(ep);
+             }
+         }
+ 
+@@ -459,7 +456,7 @@ public void onChange(EndPoint endpoint, EndPointState epState)
+             String nodes = loadAllState.getState();
+             if ( nodes != null )
+             {
+-                doBootstrap(ep, BootstrapMode.FULL);
++                doBootstrap(ep);
+             }
+         }
+     }
+@@ -543,76 +540,46 @@ public void relocate(String[] keys) throws IOException
+     
+     /**
+      * This method takes a colon separated string of nodes that need
+-     * to be bootstrapped. It is also used to filter some source of 
+-     * data. Suppose the nodes to be bootstrapped are A, B and C. Then
+-     * <i>allNodes</i> must be specified as A:B:C.
++     * to be bootstrapped. * <i>nodes</i> must be specified as A:B:C.
++     * @throws UnknownHostException 
+      * 
+     */
+-    private void doBootstrap(String nodes)
+-    {
+-        String[] allNodesAndFilter = nodes.split("-");
+-        String nodesToLoad;
+-        String filterSources = null;
+-        
+-        if ( allNodesAndFilter.length == 2 )
++    private void doBootstrap(String nodes) throws UnknownHostException
+         {
+-            nodesToLoad = allNodesAndFilter[0];
+-            filterSources = allNodesAndFilter[1];
+-        }
+-        else
+-        {
+-            nodesToLoad = allNodesAndFilter[0];
+-        }        
+-        String[] allNodes = nodesToLoad.split(":");
++        String[] allNodes = nodes.split(":");
+         EndPoint[] endpoints = new EndPoint[allNodes.length];
+         Token[] tokens = new Token[allNodes.length];
+         
+         for ( int i = 0; i < allNodes.length; ++i )
+         {
+-            endpoints[i] = new EndPoint( allNodes[i].trim(), DatabaseDescriptor.getStoragePort() );
++            String host = allNodes[i].trim();
++            InetAddress ip = InetAddress.getByName(host);
++            host = ip.getHostAddress();
++            endpoints[i] = new EndPoint( host, DatabaseDescriptor.getStoragePort() );
+             tokens[i] = tokenMetadata_.getToken(endpoints[i]);
+         }
+         
+         /* Start the bootstrap algorithm */
+-        if ( filterSources == null )
+         bootStrapper_.submit( new BootStrapper(endpoints, tokens) );
+-        else
+-        {
+-            String[] allFilters = filterSources.split(":");
+-            EndPoint[] filters = new EndPoint[allFilters.length];
+-            for ( int i = 0; i < allFilters.length; ++i )
+-            {
+-                filters[i] = new EndPoint( allFilters[i].trim(), DatabaseDescriptor.getStoragePort() );
+-            }
+-            bootStrapper_.submit( new BootStrapper(endpoints, tokens, filters) );
+-        }
+     }
+ 
+     /**
+      * Starts the bootstrap operations for the specified endpoint.
+-     * The name of this method is however a misnomer since it does
+-     * handoff of data to the specified node when it has crashed
+-     * and come back up, marked as alive after a network partition
+-     * and also when it joins the ring either as an old node being
+-     * relocated or as a brand new node.
++     * @param endpoint
+     */
+-    public final void doBootstrap(EndPoint endpoint, BootstrapMode mode)
+-    {
+-        switch ( mode )
++    public final void doBootstrap(EndPoint endpoint)
+         {
+-            case FULL:
+                 Token token = tokenMetadata_.getToken(endpoint);
+                 bootStrapper_.submit(new BootStrapper(new EndPoint[]{endpoint}, token));
+-                break;
++    }
+ 
+-            case HINT:
+-                /* Deliver the hinted data to this endpoint. */
++    /**
++     * Deliver hints to the specified node when it has crashed
++     * and come back up/ marked as alive after a network partition
++    */
++    public final void deliverHints(EndPoint endpoint)
++    {
+                 HintedHandOffManager.instance().deliverHints(endpoint);
+-                break;
+-
+-            default:
+-                break;
+-        }
+     }
+ 
+     /* This methods belong to the MBean interface */
+@@ -660,7 +627,7 @@ private String stringify(Set<EndPoint> eps)
+         return sb.toString();
+     }
+ 
+-    public void loadAll(String nodes)
++    public void loadAll(String nodes) throws UnknownHostException
+     {        
+         doBootstrap(nodes);
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 2fa16565..9d14cf5f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.service;
+ 
+ import java.io.IOException;
++import java.net.UnknownHostException;
+ import java.util.List;
+ import java.util.Map;
+ import org.apache.cassandra.dht.Range;
+@@ -48,8 +49,9 @@
+      * 
+      * @param nodes colon delimited list of endpoints that need
+      *              to be bootstrapped
++     * @throws UnknownHostException 
+     */
+-    public void loadAll(String nodes);
++    public void loadAll(String nodes) throws UnknownHostException;
+     
+     /**
+      * 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 152b165f..f4dde3ae 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -24,6 +24,7 @@
+ import java.lang.management.MemoryMXBean;
+ import java.lang.management.MemoryUsage;
+ import java.lang.management.RuntimeMXBean;
++import java.net.UnknownHostException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -239,6 +240,15 @@ public void forceTableCleanup() throws IOException
+         ssProxy.forceTableCleanup();
+     }
+     
++    /**
++     * Bootstrap the listed nodes with data
++     * @param nodeList a colon separated list of nodes to bootstrap
++     */
++    public void bootStrapNodes(String nodeList) throws UnknownHostException
++    {
++        ssProxy.loadAll(nodeList);
++    }
++    
+     /**
+      * Trigger compaction of all tables.
+      */
+@@ -472,7 +482,7 @@ private static void printUsage()
+     {
+         HelpFormatter hf = new HelpFormatter();
+         String header = String.format(
+-                "%nAvailable commands: ring, cluster, info, cleanup, compact, cfstats, snapshot [name], clearsnapshot");
++                "%nAvailable commands: ring, cluster, info, cleanup, compact, cfstats, snapshot [name], clearsnapshot, bootstrap");
+         String usage = String.format("java %s -host <arg> <command>%n", NodeProbe.class.getName());
+         hf.printHelp(usage, "", options, header);
+     }
+@@ -547,6 +557,19 @@ else if (cmdName.equals("clearsnapshot"))
+         {
+             probe.clearSnapshot();
+         }
++        else if (cmdName.equals("bootstrap"))
++        {
++            if (arguments.length == 2)
++            {
++                probe.bootStrapNodes(arguments[1]);
++            }
++            else 
++            {
++                System.err.println(cmdName + " needs a node to work with");
++                NodeProbe.printUsage();
++                System.exit(1);                
++            }
++        }
+         else
+         {
+             System.err.println("Unrecognized command: " + cmdName + ".");
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/BootstrapTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/BootstrapTest.java
+index e69de29b..cc1085b2 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/BootstrapTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/BootstrapTest.java
+@@ -0,0 +1,97 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++package org.apache.cassandra.db;
++
++import static junit.framework.Assert.assertEquals;
++import static org.junit.Assert.*;
++
++import java.io.File;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ExecutionException;
++
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.StringToken;
++import org.apache.cassandra.net.EndPoint;
++import org.apache.cassandra.net.io.StreamContextManager;
++import org.junit.Test;
++
++public class BootstrapTest
++{
++    /**
++     * 
++     * Writes out a bunch of keys into an SSTable, then runs anticompaction on a range.
++     * Checks to see if anticompaction returns true.
++     */
++    private void testAntiCompaction(String columnFamilyName, int insertsPerTable) throws IOException, ExecutionException, InterruptedException
++    {
++        Table table = Table.open("Keyspace1");
++        ColumnFamilyStore store = table.getColumnFamilyStore(columnFamilyName);
++
++       
++        for (int j = 0; j < insertsPerTable; j++) 
++        {
++            String key = String.valueOf(j);
++            RowMutation rm = new RowMutation("Keyspace1", key);
++            rm.add(new QueryPath(columnFamilyName, null, "0".getBytes()), new byte[0], j);
++            rm.apply();
++        }
++        
++        store.forceBlockingFlush();
++        List<String> fileList = new ArrayList<String>();
++        List<Range> ranges  = new ArrayList<Range>();
++        Range r = new Range(new StringToken("0"), new StringToken("zzzzzz"));
++        ranges.add(r);
++
++        boolean result = store.doAntiCompaction(ranges, new EndPoint("127.0.0.1", 9150), fileList);
++
++        assertEquals(true, result); // some keys should have qualified
++        assertEquals(true, fileList.size() >= 3); //Data, index, filter files
++    }
++
++    @Test
++    public void testAntiCompaction1() throws IOException, ExecutionException, InterruptedException
++    {
++        testAntiCompaction("Standard1", 100);
++    }
++    
++    @Test
++    public void testGetNewNames() throws IOException
++    {
++        StreamContextManager.StreamContext[] streamContexts = new StreamContextManager.StreamContext[3];
++        streamContexts[0] = new StreamContextManager.StreamContext("/foo/Standard1-500-Data.db", 100, "Keyspace1");
++        streamContexts[1] = new StreamContextManager.StreamContext("/foo/Standard1-500-Index.db", 100, "Keyspace1");
++        streamContexts[2] = new StreamContextManager.StreamContext("/foo/Standard1-500-Filter.db", 100, "Keyspace1");
++        Table.BootStrapInitiateVerbHandler bivh = new Table.BootStrapInitiateVerbHandler();
++        Map<String, String> fileNames = bivh.getNewNames(streamContexts);
++        String result = fileNames.get("Keyspace1-Standard1-500");
++        assertEquals(true, result.contains("Standard1"));
++        assertEquals(true, result.contains("Data.db"));
++        assertEquals(1, fileNames.entrySet().size());
++        
++        assertTrue( new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, streamContexts[0])).getName().matches("Standard1-\\d+-Data.db"));
++        assertTrue( new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, streamContexts[1])).getName().matches("Standard1-\\d+-Index.db"));
++        assertTrue( new File(bivh.getNewFileNameFromOldContextAndNames(fileNames, streamContexts[2])).getName().matches("Standard1-\\d+-Filter.db"));
++    }
++
++    
++}

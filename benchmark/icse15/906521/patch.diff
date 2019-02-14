@@ -1,0 +1,2812 @@
+diff --git a/incubator/cassandra/trunk/contrib/circuit/src/org/apache/cassandra/contrib/circuit/RingModel.java b/incubator/cassandra/trunk/contrib/circuit/src/org/apache/cassandra/contrib/circuit/RingModel.java
+index 1f431258..e9f9a89a 100644
+--- a/incubator/cassandra/trunk/contrib/circuit/src/org/apache/cassandra/contrib/circuit/RingModel.java
++++ b/incubator/cassandra/trunk/contrib/circuit/src/org/apache/cassandra/contrib/circuit/RingModel.java
+@@ -101,7 +101,7 @@ public RingModel(String seedName) throws IOException
+                     "Invalid ObjectName? Please report this as a bug.", e);
+         }
+ 
+-        Map<Range, List<String>> rangeMap = ssProxy.getRangeToEndPointMap();
++        Map<Range, List<String>> rangeMap = ssProxy.getRangeToEndPointMap(null);
+         List<Range> ranges = new ArrayList<Range>(rangeMap.keySet());
+         Collections.sort(ranges);
+         
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/client/RingCache.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/client/RingCache.java
+index ff28a200..19ffef28 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/client/RingCache.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/client/RingCache.java
+@@ -48,9 +48,9 @@
+     final private static Logger logger_ = Logger.getLogger(RingCache.class);
+ 
+     private Set<String> seeds_ = new HashSet<String>();
+-    final private int port_=DatabaseDescriptor.getThriftPort();
+-    private volatile AbstractReplicationStrategy nodePicker_;
++    final private int port_= DatabaseDescriptor.getThriftPort();
+     final private static IPartitioner partitioner_ = DatabaseDescriptor.getPartitioner();
++    private TokenMetadata tokenMetadata;
+ 
+     public RingCache()
+     {
+@@ -89,8 +89,7 @@ public void refreshEndPointMap()
+                     }
+                 }
+ 
+-                TokenMetadata tokenMetadata = new TokenMetadata(tokenEndpointMap);
+-                nodePicker_ = StorageService.getReplicationStrategy(tokenMetadata);
++                tokenMetadata = new TokenMetadata(tokenEndpointMap);
+ 
+                 break;
+             }
+@@ -102,8 +101,11 @@ public void refreshEndPointMap()
+         }
+     }
+ 
+-    public List<InetAddress> getEndPoint(String key)
++    public List<InetAddress> getEndPoint(String table, String key)
+     {
+-        return nodePicker_.getNaturalEndpoints(partitioner_.getToken(key));
++        if (tokenMetadata == null)
++            throw new RuntimeException("Must refresh endpoints before looking up a key.");
++        AbstractReplicationStrategy strat = StorageService.getReplicationStrategy(tokenMetadata, table);
++        return strat.getNaturalEndpoints(partitioner_.getToken(key), table);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 4b4cbc08..399edb5b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -69,7 +69,6 @@
+     private static InetAddress listenAddress_; // leave null so we can fall through to getLocalHost
+     private static InetAddress thriftAddress_;
+     private static String clusterName_ = "Test";
+-    private static int replicationFactor_ = 3;
+     private static long rpcTimeoutInMillis_ = 2000;
+     private static Set<InetAddress> seeds_ = new HashSet<InetAddress>();
+     /* Keeps the list of data file directories */
+@@ -96,12 +95,17 @@
+      * corresponding meta data for that column family.
+     */
+     private static Map<String, Map<String, CFMetaData>> tableToCFMetaDataMap_;
++
++    // map tables to replication strategies.
++    private static Map<String, Class<AbstractReplicationStrategy>> replicationStrategyClasses_;
++
++    // map tables to replication factors.
++    private static Map<String, Integer> replicationFactors_;
++
+     /* Hashing strategy Random or OPHF */
+     private static IPartitioner partitioner_;
+ 
+-    private static IEndPointSnitch endPointSnitch_;
+-
+-    private static Class<AbstractReplicationStrategy> replicaPlacementStrategyClass_;
++    private static Map<String, IEndPointSnitch> endPointSnitches_;
+ 
+     /* if the size of columns or super-columns are more than this, indexing will kick in */
+     private static int columnIndexSizeInKB_;
+@@ -256,22 +260,6 @@ else if (diskAccessMode_ == DiskAccessMode.mmap_index_only)
+                 throw new ConfigurationException("Invalid partitioner class " + partitionerClassName);
+             }
+ 
+-            /* end point snitch */
+-            String endPointSnitchClassName = xmlUtils.getNodeValue("/Storage/EndPointSnitch");
+-            if (endPointSnitchClassName == null)
+-            {
+-                throw new ConfigurationException("Missing endpointsnitch directive /Storage/EndPointSnitch");
+-            }
+-            try
+-            {
+-                Class cls = Class.forName(endPointSnitchClassName);
+-                endPointSnitch_ = (IEndPointSnitch) cls.getConstructor().newInstance();
+-            }
+-            catch (ClassNotFoundException e)
+-            {
+-                throw new ConfigurationException("Invalid endpointsnitch class " + endPointSnitchClassName);
+-            }
+-            
+             /* JobTracker address */
+             jobTrackerHost_ = xmlUtils.getNodeValue("/Storage/JobTrackerHost");
+ 
+@@ -284,11 +272,6 @@ else if (diskAccessMode_ == DiskAccessMode.mmap_index_only)
+ 
+             initialToken_ = xmlUtils.getNodeValue("/Storage/InitialToken");
+ 
+-            /* Data replication factor */
+-            String replicationFactor = xmlUtils.getNodeValue("/Storage/ReplicationFactor");
+-            if ( replicationFactor != null )
+-                replicationFactor_ = Integer.parseInt(replicationFactor);
+-
+             /* RPC Timeout */
+             String rpcTimeoutInMillis = xmlUtils.getNodeValue("/Storage/RpcTimeoutInMillis");
+             if ( rpcTimeoutInMillis != null )
+@@ -457,21 +440,9 @@ else if (diskAccessMode_ == DiskAccessMode.mmap_index_only)
+                 CommitLog.setSegmentSize(Integer.parseInt(value) * 1024 * 1024);
+ 
+             tableToCFMetaDataMap_ = new HashMap<String, Map<String, CFMetaData>>();
+-
+-            /* See which replica placement strategy to use */
+-            String replicaPlacementStrategyClassName = xmlUtils.getNodeValue("/Storage/ReplicaPlacementStrategy");
+-            if (replicaPlacementStrategyClassName == null)
+-            {
+-                throw new ConfigurationException("Missing replicaplacementstrategy directive /Storage/ReplicaPlacementStrategy");
+-            }
+-            try
+-            {
+-                replicaPlacementStrategyClass_ = (Class<AbstractReplicationStrategy>) Class.forName(replicaPlacementStrategyClassName);
+-            }
+-            catch (ClassNotFoundException e)
+-            {
+-                throw new ConfigurationException("Invalid replicaplacementstrategy class " + replicaPlacementStrategyClassName);
+-            }
++            replicationFactors_ = new HashMap<String, Integer>();
++            replicationStrategyClasses_ = new HashMap<String, Class<AbstractReplicationStrategy>>();
++            endPointSnitches_ = new HashMap<String, IEndPointSnitch>();
+ 
+             /* Read the table related stuff from config */
+             NodeList tables = xmlUtils.getRequestedNodeList("/Storage/Keyspaces/Keyspace");
+@@ -493,6 +464,45 @@ else if (diskAccessMode_ == DiskAccessMode.mmap_index_only)
+                 tables_.add(tName);
+                 tableToCFMetaDataMap_.put(tName, new HashMap<String, CFMetaData>());
+ 
++                /* See which replica placement strategy to use */
++                String replicaPlacementStrategyClassName = xmlUtils.getNodeValue("/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/ReplicaPlacementStrategy");
++                if (replicaPlacementStrategyClassName == null)
++                {
++                    throw new ConfigurationException("Missing replicaplacementstrategy directive for " + tName);
++                }
++                try
++                {
++                    Class cls = (Class<AbstractReplicationStrategy>) Class.forName(replicaPlacementStrategyClassName);
++                    replicationStrategyClasses_.put(tName, cls);
++                }
++                catch (ClassNotFoundException e)
++                {
++                    throw new ConfigurationException("Invalid replicaplacementstrategy class " + replicaPlacementStrategyClassName);
++                }
++
++                /* Data replication factor */
++                String replicationFactor = xmlUtils.getNodeValue("/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/ReplicationFactor");
++                if (replicationFactor == null)
++                    throw new ConfigurationException("Missing replicationfactor directory for keyspace " + tName);
++                else
++                    replicationFactors_.put(tName, Integer.parseInt(replicationFactor));
++
++                /* end point snitch */
++                String endPointSnitchClassName = xmlUtils.getNodeValue("/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/EndPointSnitch");
++                if (endPointSnitchClassName == null)
++                {
++                    throw new ConfigurationException("Missing endpointsnitch directive for keyspace " + tName);
++                }
++                try
++                {
++                    Class cls = Class.forName(endPointSnitchClassName);
++                    endPointSnitches_.put(tName, (IEndPointSnitch)cls.getConstructor().newInstance());
++                }
++                catch (ClassNotFoundException e)
++                {
++                    throw new ConfigurationException("Invalid endpointsnitch class " + endPointSnitchClassName);
++                }
++
+                 String xqlTable = "/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/";
+                 NodeList columnFamilies = xmlUtils.getRequestedNodeList(xqlTable + "ColumnFamily");
+ 
+@@ -729,14 +739,14 @@ public static IPartitioner getPartitioner()
+         return partitioner_;
+     }
+     
+-    public static IEndPointSnitch getEndPointSnitch()
++    public static IEndPointSnitch getEndPointSnitch(String table)
+     {
+-        return endPointSnitch_;
++        return endPointSnitches_.get(table);
+     }
+ 
+-    public static Class<AbstractReplicationStrategy> getReplicaPlacementStrategyClass()
++    public static Class<AbstractReplicationStrategy> getReplicaPlacementStrategyClass(String table)
+     {
+-        return replicaPlacementStrategyClass_;
++        return replicationStrategyClasses_.get(table);
+     }
+     
+     public static String getJobTrackerAddress()
+@@ -851,14 +861,14 @@ public static int getThriftPort()
+         return thriftPort_;
+     }
+ 
+-    public static int getReplicationFactor()
++    public static int getReplicationFactor(String table)
+     {
+-        return replicationFactor_;
++        return replicationFactors_.get(table);
+     }
+ 
+-    public static int getQuorum()
++    public static int getQuorum(String table)
+     {
+-        return (replicationFactor_ / 2) + 1;
++        return (replicationFactors_.get(table) / 2) + 1;
+     }
+ 
+     public static long getRpcTimeout()
+@@ -1079,8 +1089,9 @@ public static boolean isAutoBootstrap()
+     /**
+      * For testing purposes.
+      */
+-    static void setReplicationFactorUnsafe(int factor)
++    static void setReplicationFactorUnsafe(String table, int factor)
+     {
+-        replicationFactor_ = factor;
++        replicationFactors_.remove(table);
++        replicationFactors_.put(table, factor);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index 13a46a7d..88e3bd99 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -433,7 +433,7 @@ int doCompaction(ColumnFamilyStore cfs, Collection<SSTableReader> sstables, int
+     private void doCleanupCompaction(ColumnFamilyStore cfs) throws IOException
+     {
+         Collection<SSTableReader> originalSSTables = cfs.getSSTables();
+-        List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(), null);
++        List<SSTableReader> sstables = doAntiCompaction(cfs, originalSSTables, StorageService.instance.getLocalRanges(cfs.getTable().name), null);
+         if (!sstables.isEmpty())
+         {
+             cfs.replaceCompactedSSTables(originalSSTables, sstables);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+index d814a7f3..10e82a50 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -124,7 +124,7 @@ private static boolean sendMessage(InetAddress endPoint, String tableName, Strin
+                 rm.add(cf);
+         }
+         Message message = rm.makeRowMutationMessage();
+-        WriteResponseHandler responseHandler = new WriteResponseHandler(1);
++        WriteResponseHandler responseHandler = new WriteResponseHandler(1, tableName);
+         MessagingService.instance.sendRR(message, new InetAddress[] { endPoint }, responseHandler);
+ 
+         try
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ReadVerbHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ReadVerbHandler.java
+index b8ff2c4c..8114e4da 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ReadVerbHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ReadVerbHandler.java
+@@ -106,7 +106,7 @@ public void doVerb(Message message)
+             /* Do read repair if header of the message says so */
+             if (message.getHeader(ReadCommand.DO_REPAIR) != null)
+             {
+-                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.key);
++                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+                 /* Remove the local storage endpoint from the list. */
+                 endpoints.remove(FBUtilities.getLocalAddress());
+                 if (endpoints.size() > 0 && DatabaseDescriptor.getConsistencyCheck())
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
+index 7e21c3ed..7436ebd3 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/BootStrapper.java
+@@ -24,6 +24,7 @@
+  import java.io.UnsupportedEncodingException;
+  import java.net.InetAddress;
+ 
++ import org.apache.commons.lang.StringUtils;
+  import org.apache.log4j.Logger;
+ 
+  import org.apache.commons.lang.ArrayUtils;
+@@ -51,14 +52,12 @@
+     /* tokens of the nodes being bootstrapped. */
+     protected final Token token;
+     protected final TokenMetadata tokenMetadata;
+-    private final AbstractReplicationStrategy replicationStrategy;
+ 
+-    public BootStrapper(AbstractReplicationStrategy rs, InetAddress address, Token token, TokenMetadata tmd)
++    public BootStrapper(InetAddress address, Token token, TokenMetadata tmd)
+     {
+         assert address != null;
+         assert token != null;
+ 
+-        replicationStrategy = rs;
+         this.address = address;
+         this.token = token;
+         tokenMetadata = tmd;
+@@ -70,16 +69,20 @@ public void startBootstrap() throws IOException
+         {
+             public void run()
+             {
+-                Multimap<Range, InetAddress> rangesWithSourceTarget = getRangesWithSources();
+                 if (logger.isDebugEnabled())
+                     logger.debug("Beginning bootstrap process");
++                for (String table : DatabaseDescriptor.getNonSystemTables())
++                {
++                    Multimap<Range, InetAddress> rangesWithSourceTarget = getRangesWithSources(table);
+                 /* Send messages to respective folks to stream data over to me */
+                 for (Map.Entry<InetAddress, Collection<Range>> entry : getWorkMap(rangesWithSourceTarget).asMap().entrySet())
+                 {
+                     InetAddress source = entry.getKey();
+-                    for (String table : DatabaseDescriptor.getNonSystemTables())
+                         StorageService.instance.addBootstrapSource(source, table);
+-                    StreamIn.requestRanges(source, entry.getValue());
++                        if (logger.isDebugEnabled())
++                            logger.debug("Requesting from " + source + " ranges " + StringUtils.join(entry.getValue(), ", "));
++                        StreamIn.requestRanges(source, table, entry.getValue());
++                    }
+                 }
+             }
+         }, "Boostrap requester").start();
+@@ -144,20 +147,21 @@ public int compare(InetAddress ia1, InetAddress ia2)
+     }
+ 
+     /** get potential sources for each range, ordered by proximity (as determined by EndPointSnitch) */
+-    Multimap<Range, InetAddress> getRangesWithSources()
++    Multimap<Range, InetAddress> getRangesWithSources(String table)
+     {
+         assert tokenMetadata.sortedTokens().size() > 0;
+-        Collection<Range> myRanges = replicationStrategy.getPendingAddressRanges(tokenMetadata, token, address);
++        final AbstractReplicationStrategy strat = StorageService.instance.getReplicationStrategy(table);
++        Collection<Range> myRanges = strat.getPendingAddressRanges(tokenMetadata, token, address, table);
+ 
+         Multimap<Range, InetAddress> myRangeAddresses = ArrayListMultimap.create();
+-        Multimap<Range, InetAddress> rangeAddresses = replicationStrategy.getRangeAddresses(tokenMetadata);
++        Multimap<Range, InetAddress> rangeAddresses = strat.getRangeAddresses(tokenMetadata, table);
+         for (Range range : rangeAddresses.keySet())
+         {
+             for (Range myRange : myRanges)
+             {
+                 if (range.contains(myRange))
+                 {
+-                    List<InetAddress> preferred = DatabaseDescriptor.getEndPointSnitch().getSortedListByProximity(address, rangeAddresses.get(range));
++                    List<InetAddress> preferred = DatabaseDescriptor.getEndPointSnitch(table).getSortedListByProximity(address, rangeAddresses.get(range));
+                     myRangeAddresses.putAll(myRange, preferred);
+                     break;
+                 }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
+index 19bd501c..a982d2e4 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
+@@ -21,6 +21,7 @@
+ import java.net.InetAddress;
+ import java.util.*;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.log4j.Logger;
+ 
+ import com.google.common.collect.HashMultimap;
+@@ -43,25 +44,25 @@
+ {
+     protected static final Logger logger_ = Logger.getLogger(AbstractReplicationStrategy.class);
+ 
+-    protected TokenMetadata tokenMetadata_;
+-    protected int replicas_;
++    private TokenMetadata tokenMetadata_;
++    protected final IEndPointSnitch snitch_;
+ 
+-    AbstractReplicationStrategy(TokenMetadata tokenMetadata, int replicas)
++    AbstractReplicationStrategy(TokenMetadata tokenMetadata, IEndPointSnitch snitch)
+     {
+         tokenMetadata_ = tokenMetadata;
+-        replicas_ = replicas;
++        snitch_ = snitch;
+     }
+ 
+-    public abstract ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata);
++    public abstract ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata, String table);
+     
+-    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level)
++    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level, String table)
+     {
+-        return new WriteResponseHandler(blockFor);
++        return new WriteResponseHandler(blockFor, table);
+     }
+ 
+-    public ArrayList<InetAddress> getNaturalEndpoints(Token token)
++    public ArrayList<InetAddress> getNaturalEndpoints(Token token, String table)
+     {
+-        return getNaturalEndpoints(token, tokenMetadata_);
++        return getNaturalEndpoints(token, tokenMetadata_, table);
+     }
+     
+     /*
+@@ -69,9 +70,9 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+      * on which the data is being placed and the value is the
+      * endpoint to which it should be forwarded.
+      */
+-    public Map<InetAddress, InetAddress> getHintedEndpoints(Token token, Collection<InetAddress> naturalEndpoints)
++    public Map<InetAddress, InetAddress> getHintedEndpoints(Token token, String table, Collection<InetAddress> naturalEndpoints)
+     {
+-        return getHintedMapForEndpoints(getWriteEndpoints(token, naturalEndpoints));
++        return getHintedMapForEndpoints(table, getWriteEndpoints(token, table, naturalEndpoints));
+     }
+ 
+     /**
+@@ -81,15 +82,16 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+      * Thus, this method may return more nodes than the Replication Factor.
+      *
+      * Only ReplicationStrategy should care about this method (higher level users should only ask for Hinted).
++     * todo: this method should be moved into TokenMetadata.
+      */
+-    public Collection<InetAddress> getWriteEndpoints(Token token, Collection<InetAddress> naturalEndpoints)
++    public Collection<InetAddress> getWriteEndpoints(Token token, String table, Collection<InetAddress> naturalEndpoints)
+     {
+-        if (tokenMetadata_.getPendingRanges().isEmpty())
++        if (tokenMetadata_.getPendingRanges(table).isEmpty())
+             return naturalEndpoints;
+ 
+         List<InetAddress> endpoints = new ArrayList<InetAddress>(naturalEndpoints);
+ 
+-        for (Map.Entry<Range, Collection<InetAddress>> entry : tokenMetadata_.getPendingRanges().entrySet())
++        for (Map.Entry<Range, Collection<InetAddress>> entry : tokenMetadata_.getPendingRanges(table).entrySet())
+         {
+             if (entry.getKey().contains(token))
+             {
+@@ -107,12 +109,12 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+      *
+      * A destination node may be the destination for multiple targets.
+      */
+-    private Map<InetAddress, InetAddress> getHintedMapForEndpoints(Collection<InetAddress> targets)
++    private Map<InetAddress, InetAddress> getHintedMapForEndpoints(String table, Collection<InetAddress> targets)
+     {
+         Set<InetAddress> usedEndpoints = new HashSet<InetAddress>();
+         Map<InetAddress, InetAddress> map = new HashMap<InetAddress, InetAddress>();
+ 
+-        IEndPointSnitch endPointSnitch = StorageService.instance.getEndPointSnitch();
++        IEndPointSnitch endPointSnitch = DatabaseDescriptor.getEndPointSnitch(table);
+         Set<InetAddress> liveNodes = Gossiper.instance.getLiveMembers();
+ 
+         for (InetAddress ep : targets)
+@@ -160,14 +162,14 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+      this is fine as long as we don't use this on any critical path.
+      (fixing this would probably require merging tokenmetadata into replicationstrategy, so we could cache/invalidate cleanly.)
+      */
+-    public Multimap<InetAddress, Range> getAddressRanges(TokenMetadata metadata)
++    public Multimap<InetAddress, Range> getAddressRanges(TokenMetadata metadata, String table)
+     {
+         Multimap<InetAddress, Range> map = HashMultimap.create();
+ 
+         for (Token token : metadata.sortedTokens())
+         {
+             Range range = metadata.getPrimaryRangeFor(token);
+-            for (InetAddress ep : getNaturalEndpoints(token, metadata))
++            for (InetAddress ep : getNaturalEndpoints(token, metadata, table))
+             {
+                 map.put(ep, range);
+             }
+@@ -176,14 +178,14 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+         return map;
+     }
+ 
+-    public Multimap<Range, InetAddress> getRangeAddresses(TokenMetadata metadata)
++    public Multimap<Range, InetAddress> getRangeAddresses(TokenMetadata metadata, String table)
+     {
+         Multimap<Range, InetAddress> map = HashMultimap.create();
+ 
+         for (Token token : metadata.sortedTokens())
+         {
+             Range range = metadata.getPrimaryRangeFor(token);
+-            for (InetAddress ep : getNaturalEndpoints(token, metadata))
++            for (InetAddress ep : getNaturalEndpoints(token, metadata, table))
+             {
+                 map.put(range, ep);
+             }
+@@ -192,16 +194,16 @@ public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLev
+         return map;
+     }
+ 
+-    public Multimap<InetAddress, Range> getAddressRanges()
++    public Multimap<InetAddress, Range> getAddressRanges(String table)
+     {
+-        return getAddressRanges(tokenMetadata_);
++        return getAddressRanges(tokenMetadata_, table);
+     }
+ 
+-    public Collection<Range> getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddress pendingAddress)
++    public Collection<Range> getPendingAddressRanges(TokenMetadata metadata, Token pendingToken, InetAddress pendingAddress, String table)
+     {
+         TokenMetadata temp = metadata.cloneOnlyTokenMap();
+         temp.updateNormalToken(pendingToken, pendingAddress);
+-        return getAddressRanges(temp).get(pendingAddress);
++        return getAddressRanges(temp, table).get(pendingAddress);
+     }
+ 
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
+index b648be35..13b99767 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
+@@ -48,7 +48,6 @@
+     private static Map<String, Integer> dcReplicationFactor = new HashMap<String, Integer>();
+     private static Map<String, Integer> quorumRepFactor = new HashMap<String, Integer>();
+     private static int locQFactor = 0;
+-    private static DatacenterEndPointSnitch endPointSnitch;
+     ArrayList<Token> tokens;
+ 
+     private List<InetAddress> localEndPoints = new ArrayList<InetAddress>();
+@@ -69,14 +68,13 @@
+      */
+     private synchronized void loadEndPoints(TokenMetadata metadata) throws IOException
+     {
+-        endPointSnitch = (DatacenterEndPointSnitch) StorageService.instance.getEndPointSnitch();
+         this.tokens = new ArrayList<Token>(tokens);
+-        String localDC = endPointSnitch.getLocation(InetAddress.getLocalHost());
++        String localDC = ((DatacenterEndPointSnitch)snitch_).getLocation(InetAddress.getLocalHost());
+         dcMap = new HashMap<String, List<Token>>();
+         for (Token token : this.tokens)
+         {
+             InetAddress endPoint = metadata.getEndPoint(token);
+-            String dataCenter = endPointSnitch.getLocation(endPoint);
++            String dataCenter = ((DatacenterEndPointSnitch)snitch_).getLocation(endPoint);
+             if (dataCenter.equals(localDC))
+             {
+                 localEndPoints.add(endPoint);
+@@ -95,7 +93,7 @@ private synchronized void loadEndPoints(TokenMetadata metadata) throws IOExcepti
+             Collections.sort(valueList);
+             dcMap.put(entry.getKey(), valueList);
+         }
+-        dcReplicationFactor = endPointSnitch.getMapReplicationFactor();
++        dcReplicationFactor = ((DatacenterEndPointSnitch)snitch_).getMapReplicationFactor();
+         for (Entry<String, Integer> entry : dcReplicationFactor.entrySet())
+         {
+             String datacenter = entry.getKey();
+@@ -108,17 +106,17 @@ private synchronized void loadEndPoints(TokenMetadata metadata) throws IOExcepti
+         }
+     }
+ 
+-    public DatacenterShardStategy(TokenMetadata tokenMetadata, int replicas)
++    public DatacenterShardStategy(TokenMetadata tokenMetadata, IEndPointSnitch snitch)
+     throws UnknownHostException
+     {
+-        super(tokenMetadata, replicas);
+-        if ((!(DatabaseDescriptor.getEndPointSnitch() instanceof DatacenterEndPointSnitch)))
++        super(tokenMetadata, snitch);
++        if ((!(snitch instanceof DatacenterEndPointSnitch)))
+         {
+             throw new IllegalArgumentException("DatacenterShardStrategy requires DatacenterEndpointSnitch");
+         }
+     }
+ 
+-    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata)
++    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata, String table)
+     {
+         try
+         {
+@@ -187,7 +185,7 @@ public DatacenterShardStategy(TokenMetadata tokenMetadata, int replicas)
+                 // Now try to find one on a different rack
+                 if (!bOtherRack)
+                 {
+-                    if (!endPointSnitch.isOnSameRack(primaryHost, endPointOfIntrest))
++                    if (!((DatacenterEndPointSnitch)snitch_).isOnSameRack(primaryHost, endPointOfIntrest))
+                     {
+                         forloopReturn.add(metadata.getEndPoint((Token) tokens.get(i)));
+                         bOtherRack = true;
+@@ -228,16 +226,16 @@ public DatacenterShardStategy(TokenMetadata tokenMetadata, int replicas)
+      * return a DCQRH with a map of all the DC rep facor.
+      */
+     @Override
+-    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level)
++    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level, String table)
+     {
+         if (consistency_level == ConsistencyLevel.DCQUORUM)
+         {
+-            return new DatacenterWriteResponseHandler(locQFactor);
++            return new DatacenterWriteResponseHandler(locQFactor, table);
+         }
+         else if (consistency_level == ConsistencyLevel.DCQUORUMSYNC)
+         {
+-            return new DatacenterSyncWriteResponseHandler(getQuorumRepFactor());
++            return new DatacenterSyncWriteResponseHandler(getQuorumRepFactor(), table);
+         }
+-        return super.getWriteResponseHandler(blockFor, consistency_level);
++        return super.getWriteResponseHandler(blockFor, consistency_level, table);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackAwareStrategy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackAwareStrategy.java
+index 490ec4fd..bde48bb0 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackAwareStrategy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackAwareStrategy.java
+@@ -23,6 +23,7 @@
+ import java.util.Collections;
+ import java.util.List;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.dht.Token;
+ import java.net.InetAddress;
+ import org.apache.cassandra.service.StorageService;
+@@ -36,12 +37,14 @@
+  */
+ public class RackAwareStrategy extends AbstractReplicationStrategy
+ {
+-    public RackAwareStrategy(TokenMetadata tokenMetadata, int replicas)
++    public RackAwareStrategy(TokenMetadata tokenMetadata, IEndPointSnitch snitch)
+     {
+-        super(tokenMetadata, replicas);
++        super(tokenMetadata, snitch);
++        if (!(snitch instanceof EndPointSnitch))
++            throw new IllegalArgumentException(("RackAwareStrategy requires EndPointSnitch."));
+     }
+ 
+-    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata)
++    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata, String table)
+     {
+         int startIndex;
+         ArrayList<InetAddress> endpoints = new ArrayList<InetAddress>();
+@@ -65,20 +68,20 @@ public RackAwareStrategy(TokenMetadata tokenMetadata, int replicas)
+         Token primaryToken = (Token) tokens.get(index);
+         endpoints.add(metadata.getEndPoint(primaryToken));
+         foundCount++;
+-        if (replicas_ == 1)
++        final int replicas = DatabaseDescriptor.getReplicationFactor(table);
++        if (replicas == 1)
+         {
+             return endpoints;
+         }
+         startIndex = (index + 1)%totalNodes;
+-        EndPointSnitch endPointSnitch = (EndPointSnitch) StorageService.instance.getEndPointSnitch();
+ 
+-        for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas_; ++count, i = (i + 1) % totalNodes)
++        for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas; ++count, i = (i + 1) % totalNodes)
+         {
+             try
+             {
+                 // First try to find one in a different data center
+                 Token t = (Token) tokens.get(i);
+-                if (!endPointSnitch.isInSameDataCenter(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)))
++                if (!((EndPointSnitch)snitch_).isInSameDataCenter(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)))
+                 {
+                     // If we have already found something in a diff datacenter no need to find another
+                     if (!bDataCenter)
+@@ -90,8 +93,8 @@ public RackAwareStrategy(TokenMetadata tokenMetadata, int replicas)
+                     continue;
+                 }
+                 // Now  try to find one on a different rack
+-                if (!endPointSnitch.isOnSameRack(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)) &&
+-                    endPointSnitch.isInSameDataCenter(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)))
++                if (!((EndPointSnitch)snitch_).isOnSameRack(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)) &&
++                    ((EndPointSnitch)snitch_).isInSameDataCenter(metadata.getEndPoint(primaryToken), metadata.getEndPoint(t)))
+                 {
+                     // If we have already found something in a diff rack no need to find another
+                     if (!bOtherRack)
+@@ -110,7 +113,7 @@ public RackAwareStrategy(TokenMetadata tokenMetadata, int replicas)
+         }
+         // If we found N number of nodes we are good. This loop wil just exit. Otherwise just
+         // loop through the list and add until we have N nodes.
+-        for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas_; ++count, i = (i+1)%totalNodes)
++        for (int i = startIndex, count = 1; count < totalNodes && foundCount < replicas; ++count, i = (i+1)%totalNodes)
+         {
+             Token t = (Token) tokens.get(i);
+             if (!endpoints.contains(metadata.getEndPoint(t)))
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackUnawareStrategy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackUnawareStrategy.java
+index 9cd319ad..bca93995 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackUnawareStrategy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/RackUnawareStrategy.java
+@@ -22,6 +22,7 @@
+ import java.util.Collections;
+ import java.util.List;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.dht.Token;
+ import java.net.InetAddress;
+ 
+@@ -33,12 +34,12 @@
+  */
+ public class RackUnawareStrategy extends AbstractReplicationStrategy
+ {
+-    public RackUnawareStrategy(TokenMetadata tokenMetadata, int replicas)
++    public RackUnawareStrategy(TokenMetadata tokenMetadata, IEndPointSnitch snitch)
+     {
+-        super(tokenMetadata, replicas);
++        super(tokenMetadata, snitch);
+     }
+ 
+-    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata)
++    public ArrayList<InetAddress> getNaturalEndpoints(Token token, TokenMetadata metadata, String table)
+     {
+         int startIndex;
+         List<Token> tokenList = new ArrayList<Token>();
+@@ -61,7 +62,8 @@ public RackUnawareStrategy(TokenMetadata tokenMetadata, int replicas)
+         startIndex = (index + 1) % totalNodes;
+         // If we found N number of nodes we are good. This loop will just exit. Otherwise just
+         // loop through the list and add until we have N nodes.
+-        for (int i = startIndex, count = 1; count < totalNodes && tokenList.size() < replicas_; ++count, i = (i + 1) % totalNodes)
++        final int replicas = DatabaseDescriptor.getReplicationFactor(table);
++        for (int i = startIndex, count = 1; count < totalNodes && tokenList.size() < replicas; ++count, i = (i + 1) % totalNodes)
+         {
+             assert !tokenList.contains(tokens.get(i));
+             tokenList.add((Token) tokens.get(i));
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/TokenMetadata.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/TokenMetadata.java
+index b0e5ea40..74544cd5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/TokenMetadata.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/TokenMetadata.java
+@@ -19,6 +19,8 @@
+ package org.apache.cassandra.locator;
+ 
+ import java.util.*;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+@@ -55,7 +57,7 @@
+     // (See CASSANDRA-603 for more detail + examples).
+     private Set<InetAddress> leavingEndPoints;
+ 
+-    private Multimap<Range, InetAddress> pendingRanges;
++    private ConcurrentMap<String, Multimap<Range, InetAddress>> pendingRanges;
+ 
+     /* Use this lock for manipulating the token map */
+     private final ReadWriteLock lock = new ReentrantReadWriteLock(true);
+@@ -73,7 +75,7 @@ public TokenMetadata(BiMap<Token, InetAddress> tokenToEndPointMap)
+         this.tokenToEndPointMap = tokenToEndPointMap;
+         bootstrapTokens = HashBiMap.create();
+         leavingEndPoints = new HashSet<InetAddress>();
+-        pendingRanges = HashMultimap.create();
++        pendingRanges = new ConcurrentHashMap<String, Multimap<Range, InetAddress>>();
+         sortedTokens = sortTokens();
+     }
+ 
+@@ -335,16 +337,27 @@ public Range getPrimaryRangeFor(Token right)
+         }
+     }
+ 
++    private synchronized Multimap<Range, InetAddress> getPendingRangesMM(String table)
++    {
++        Multimap<Range, InetAddress> map = pendingRanges.get(table);
++        if (map == null)
++        {
++             map = HashMultimap.create();
++            pendingRanges.put(table, map);
++        }
++        return map;
++    }
++
+     /** a mutable map may be returned but caller should not modify it */
+-    public Map<Range, Collection<InetAddress>> getPendingRanges()
++    public Map<Range, Collection<InetAddress>> getPendingRanges(String table)
+     {
+-        return pendingRanges.asMap();
++        return getPendingRangesMM(table).asMap();
+     }
+ 
+-    public List<Range> getPendingRanges(InetAddress endpoint)
++    public List<Range> getPendingRanges(String table, InetAddress endpoint)
+     {
+         List<Range> ranges = new ArrayList<Range>();
+-        for (Map.Entry<Range, InetAddress> entry : pendingRanges.entries())
++        for (Map.Entry<Range, InetAddress> entry : getPendingRangesMM(table).entries())
+         {
+             if (entry.getValue().equals(endpoint))
+             {
+@@ -354,9 +367,9 @@ public Range getPrimaryRangeFor(Token right)
+         return ranges;
+     }
+ 
+-    public void setPendingRanges(Multimap<Range, InetAddress> pendingRanges)
++    public void setPendingRanges(String table, Multimap<Range, InetAddress> rangeMap)
+     {
+-        this.pendingRanges = pendingRanges;
++        pendingRanges.put(table, rangeMap);
+     }
+ 
+     public Token getPredecessor(Token token)
+@@ -463,11 +476,14 @@ public String printPendingRanges()
+     {
+         StringBuilder sb = new StringBuilder();
+ 
+-        for (Map.Entry<Range, InetAddress> entry : pendingRanges.entries())
++        for (Map.Entry<String, Multimap<Range, InetAddress>> entry : pendingRanges.entrySet())
+         {
+-            sb.append(entry.getValue() + ":" + entry.getKey());
++            for (Map.Entry<Range, InetAddress> rmap : entry.getValue().entries())
++            {
++                sb.append(rmap.getValue() + ":" + rmap.getKey());
+             sb.append(System.getProperty("line.separator"));
+         }
++        }
+ 
+         return sb.toString();
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+index fac929d7..9ebd6f37 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+@@ -142,11 +142,11 @@ protected AntiEntropyService()
+     /**
+      * Return all of the neighbors with whom we share data.
+      */
+-    private static Collection<InetAddress> getNeighbors()
++    private static Collection<InetAddress> getNeighbors(String table)
+     {
+         InetAddress local = FBUtilities.getLocalAddress();
+         StorageService ss = StorageService.instance;
+-        return Collections2.filter(ss.getNaturalEndpoints(ss.getLocalToken()),
++        return Collections2.filter(ss.getNaturalEndpoints(table, ss.getLocalToken()),
+                                    Predicates.not(Predicates.equalTo(local)));
+     }
+ 
+@@ -158,7 +158,7 @@ protected AntiEntropyService()
+      * @param endpoint The endpoint which owns the given tree.
+      * @param tree The tree for the endpoint.
+      */
+-    void rendezvous(CFPair cf, InetAddress endpoint, MerkleTree tree)
++    private void rendezvous(CFPair cf, InetAddress endpoint, MerkleTree tree)
+     {
+         InetAddress LOCAL = FBUtilities.getLocalAddress();
+ 
+@@ -169,7 +169,7 @@ void rendezvous(CFPair cf, InetAddress endpoint, MerkleTree tree)
+         if (LOCAL.equals(endpoint))
+         {
+             // we're registering a local tree: rendezvous with all remote trees
+-            for (InetAddress neighbor : getNeighbors())
++            for (InetAddress neighbor : getNeighbors(cf.left))
+             {
+                 TreePair waiting = ctrees.remove(neighbor);
+                 if (waiting != null && waiting.right != null)
+@@ -243,7 +243,7 @@ void notifyNeighbors(Validator validator, InetAddress local, Collection<InetAddr
+      * @param remote The remote endpoint for the rendezvous.
+      * @return The tree pair for the given rendezvous if it exists, else  null.
+      */
+-    TreePair getRendezvousPair(String table, String cf, InetAddress remote)
++    TreePair getRendezvousPair_TestsOnly(String table, String cf, InetAddress remote)
+     {
+         return rendezvousPairs(new CFPair(table, cf)).get(remote);
+     }
+@@ -251,7 +251,7 @@ TreePair getRendezvousPair(String table, String cf, InetAddress remote)
+     /**
+      * Should only be used for testing.
+      */
+-    void clearNaturalRepairs()
++    void clearNaturalRepairs_TestsOnly()
+     {
+         naturalRepairs.clear();
+     }
+@@ -484,7 +484,7 @@ public Object call() throws Exception
+             AntiEntropyService aes = AntiEntropyService.instance;
+             InetAddress local = FBUtilities.getLocalAddress();
+ 
+-            Collection<InetAddress> neighbors = getNeighbors();
++            Collection<InetAddress> neighbors = getNeighbors(cf.left);
+ 
+             // store the local tree and then broadcast it to our neighbors
+             aes.rendezvous(cf, local, tree);
+@@ -562,8 +562,8 @@ public void run()
+                 rtree.partitioner(ss.getPartitioner());
+ 
+             // determine the ranges where responsibility overlaps
+-            Set<Range> interesting = new HashSet(ss.getRangesForEndPoint(local));
+-            interesting.retainAll(ss.getRangesForEndPoint(remote));
++            Set<Range> interesting = new HashSet(ss.getRangesForEndPoint(cf.left, local));
++            interesting.retainAll(ss.getRangesForEndPoint(cf.left, remote));
+ 
+             // compare trees, and filter out uninteresting differences
+             for (MerkleTree.TreeRange diff : MerkleTree.difference(ltree, rtree))
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
+index 0ab327d9..25d8817b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
+@@ -44,12 +44,12 @@
+     private final Map<String, Integer> responseCounts;
+     private final DatacenterEndPointSnitch endPointSnitch;
+ 
+-    public DatacenterSyncWriteResponseHandler(Map<String, Integer> responseCounts)
++    public DatacenterSyncWriteResponseHandler(Map<String, Integer> responseCounts, String table)
+     {
+         // Response is been managed by the map so make it 1 for the superclass.
+-        super(1);
++        super(1, table);
+         this.responseCounts = responseCounts;
+-        endPointSnitch = (DatacenterEndPointSnitch) DatabaseDescriptor.getEndPointSnitch();
++        endPointSnitch = (DatacenterEndPointSnitch) DatabaseDescriptor.getEndPointSnitch(table);
+     }
+ 
+     @Override
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
+index 07812a6b..f2db44bc 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
+@@ -44,12 +44,12 @@
+     private DatacenterEndPointSnitch endpointsnitch;
+     private InetAddress localEndpoint;
+ 
+-    public DatacenterWriteResponseHandler(int blockFor)
++    public DatacenterWriteResponseHandler(int blockFor, String table)
+     {
+         // Response is been managed by the map so the waitlist size really doesnt matter.
+-        super(blockFor);
++        super(blockFor, table);
+         this.blockFor = blockFor;
+-        endpointsnitch = (DatacenterEndPointSnitch) DatabaseDescriptor.getEndPointSnitch();
++        endpointsnitch = (DatacenterEndPointSnitch) DatabaseDescriptor.getEndPointSnitch(table);
+         localEndpoint = FBUtilities.getLocalAddress();
+     }
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/ReadResponseResolver.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/ReadResponseResolver.java
+index c68bdf14..cca93bf6 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/ReadResponseResolver.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/ReadResponseResolver.java
+@@ -49,7 +49,7 @@
+ 
+     public ReadResponseResolver(String table, int responseCount)
+     {
+-        assert 1 <= responseCount && responseCount <= DatabaseDescriptor.getReplicationFactor()
++        assert 1 <= responseCount && responseCount <= DatabaseDescriptor.getReplicationFactor(table)
+             : "invalid response count " + responseCount;
+ 
+         this.responseCount = responseCount;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index 612099e2..f6b97cdd 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -105,8 +105,8 @@ public static void mutate(List<RowMutation> mutations)
+             {
+                 try
+                 {
+-                    List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(rm.key());
+-                    Map<InetAddress, InetAddress> endpointMap = StorageService.instance.getHintedEndpointMap(rm.key(), naturalEndpoints);
++                    List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(rm.getTable(), rm.key());
++                    Map<InetAddress, InetAddress> endpointMap = StorageService.instance.getHintedEndpointMap(rm.getTable(), rm.key(), naturalEndpoints);
+                     Message unhintedMessage = null; // lazy initialize for non-local, unhinted writes
+ 
+                     // 3 cases:
+@@ -174,15 +174,15 @@ public static void mutateBlocking(List<RowMutation> mutations, ConsistencyLevel
+             for (RowMutation rm: mutations)
+             {
+                 mostRecentRowMutation = rm;
+-                List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(rm.key());
+-                Map<InetAddress, InetAddress> endpointMap = StorageService.instance.getHintedEndpointMap(rm.key(), naturalEndpoints);
++                List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(rm.getTable(), rm.key());
++                Map<InetAddress, InetAddress> endpointMap = StorageService.instance.getHintedEndpointMap(rm.getTable(), rm.key(), naturalEndpoints);
+                 int blockFor = determineBlockFor(naturalEndpoints.size(), endpointMap.size(), consistency_level);
+                 
+                 // avoid starting a write we know can't achieve the required consistency
+                 assureSufficientLiveNodes(endpointMap, blockFor, consistency_level);
+                 
+                 // send out the writes, as in insert() above, but this time with a callback that tracks responses
+-                final WriteResponseHandler responseHandler = StorageService.instance.getWriteResponseHandler(blockFor, consistency_level);
++                final WriteResponseHandler responseHandler = StorageService.instance.getWriteResponseHandler(blockFor, consistency_level, rm.getTable());
+                 responseHandlers.add(responseHandler);
+                 Message unhintedMessage = null;
+                 for (Map.Entry<InetAddress, InetAddress> entry : endpointMap.entrySet())
+@@ -337,7 +337,7 @@ else if (consistency_level == ConsistencyLevel.ANY)
+ 
+         for (ReadCommand command: commands)
+         {
+-            InetAddress endPoint = StorageService.instance.findSuitableEndPoint(command.key);
++            InetAddress endPoint = StorageService.instance.findSuitableEndPoint(command.table, command.key);
+             Message message = command.makeReadMessage();
+ 
+             if (logger.isDebugEnabled())
+@@ -376,7 +376,7 @@ else if (consistency_level == ConsistencyLevel.ANY)
+ 
+             for (ReadCommand command: commands)
+             {
+-                List<InetAddress> endpoints = StorageService.instance.getNaturalEndpoints(command.key);
++                List<InetAddress> endpoints = StorageService.instance.getNaturalEndpoints(command.table, command.key);
+                 boolean foundLocal = endpoints.contains(FBUtilities.getLocalAddress());
+                 //TODO: Throw InvalidRequest if we're in bootstrap mode?
+                 if (foundLocal && !StorageService.instance.isBootstrapMode())
+@@ -423,7 +423,6 @@ else if (consistency_level == ConsistencyLevel.ANY)
+         List<InetAddress[]> commandEndPoints = new ArrayList<InetAddress[]>();
+         List<Row> rows = new ArrayList<Row>();
+ 
+-        int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(), DatabaseDescriptor.getReplicationFactor(), consistency_level);
+         int commandIndex = 0;
+ 
+         for (ReadCommand command: commands)
+@@ -434,8 +433,10 @@ else if (consistency_level == ConsistencyLevel.ANY)
+             Message message = command.makeReadMessage();
+             Message messageDigestOnly = readMessageDigestOnly.makeReadMessage();
+ 
+-            InetAddress dataPoint = StorageService.instance.findSuitableEndPoint(command.key);
+-            List<InetAddress> endpointList = StorageService.instance.getLiveNaturalEndpoints(command.key);
++            InetAddress dataPoint = StorageService.instance.findSuitableEndPoint(command.table, command.key);
++            List<InetAddress> endpointList = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
++            final String table = command.table;
++            int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(table), DatabaseDescriptor.getReplicationFactor(table), consistency_level);
+             if (endpointList.size() < responseCount)
+                 throw new UnavailableException();
+ 
+@@ -452,7 +453,7 @@ else if (consistency_level == ConsistencyLevel.ANY)
+                 if (logger.isDebugEnabled())
+                     logger.debug("strongread reading " + (m == message ? "data" : "digest") + " for " + command + " from " + m.getMessageId() + "@" + endpoint);
+             }
+-            QuorumResponseHandler<Row> quorumResponseHandler = new QuorumResponseHandler<Row>(DatabaseDescriptor.getQuorum(), new ReadResponseResolver(command.table, responseCount));
++            QuorumResponseHandler<Row> quorumResponseHandler = new QuorumResponseHandler<Row>(DatabaseDescriptor.getQuorum(command.table), new ReadResponseResolver(command.table, responseCount));
+             MessagingService.instance.sendRR(messages, endPoints, quorumResponseHandler);
+             quorumResponseHandlers.add(quorumResponseHandler);
+             commandEndPoints.add(endPoints);
+@@ -476,9 +477,9 @@ else if (consistency_level == ConsistencyLevel.ANY)
+             {
+                 if (DatabaseDescriptor.getConsistencyCheck())
+                 {
+-                    IResponseResolver<Row> readResponseResolverRepair = new ReadResponseResolver(command.table, DatabaseDescriptor.getQuorum());
++                    IResponseResolver<Row> readResponseResolverRepair = new ReadResponseResolver(command.table, DatabaseDescriptor.getQuorum(command.table));
+                     QuorumResponseHandler<Row> quorumResponseHandlerRepair = new QuorumResponseHandler<Row>(
+-                            DatabaseDescriptor.getQuorum(),
++                            DatabaseDescriptor.getQuorum(command.table),
+                             readResponseResolverRepair);
+                     logger.info("DigestMismatchException: " + ex.getMessage());
+                     Message messageRepair = command.makeReadMessage();
+@@ -539,13 +540,14 @@ else if (consistency_level == ConsistencyLevel.ANY)
+ 
+         InetAddress endPoint = StorageService.instance.getPrimary(command.startKey.token);
+         InetAddress startEndpoint = endPoint;
+-        int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(), DatabaseDescriptor.getReplicationFactor(), consistency_level);
++        final String table = command.keyspace;
++        int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(table), DatabaseDescriptor.getReplicationFactor(table), consistency_level);
+ 
+         Map<String, ColumnFamily> rows = new HashMap<String, ColumnFamily>(command.max_keys);
+         do
+         {
+             Range primaryRange = StorageService.instance.getPrimaryRangeForEndPoint(endPoint);
+-            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(primaryRange.right);
++            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.keyspace, primaryRange.right);
+             if (endpoints.size() < responseCount)
+                 throw new UnavailableException();
+ 
+@@ -666,7 +668,7 @@ public double getRecentWriteLatency()
+ 
+         public Object call() throws IOException
+         {
+-            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.key);
++            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+             /* Remove the local storage endpoint from the list. */
+             endpoints.remove(FBUtilities.getLocalAddress());
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index d532fcc2..ed654a8b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -23,7 +23,11 @@
+ import java.lang.management.ManagementFactory;
+ import java.lang.reflect.Constructor;
+ import java.util.*;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Future;
++import java.util.concurrent.FutureTask;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.net.InetAddress;
+@@ -109,9 +113,9 @@ public static IPartitioner getPartitioner() {
+         return partitioner_;
+     }
+ 
+-    public Collection<Range> getLocalRanges()
++    public Collection<Range> getLocalRanges(String table)
+     {
+-        return getRangesForEndPoint(FBUtilities.getLocalAddress());
++        return getRangesForEndPoint(table, FBUtilities.getLocalAddress());
+     }
+ 
+     public Range getLocalPrimaryRange()
+@@ -119,14 +123,6 @@ public Range getLocalPrimaryRange()
+         return getPrimaryRangeForEndPoint(FBUtilities.getLocalAddress());
+     }
+ 
+-    /*
+-     * This is the endpoint snitch which depends on the network architecture. We
+-     * need to keep this information for each endpoint so that we make decisions
+-     * while doing things like replication etc.
+-     *
+-     */
+-    private IEndPointSnitch endPointSnitch_;
+-
+     /* This abstraction maintains the token/endpoint metadata information */
+     private TokenMetadata tokenMetadata_ = new TokenMetadata();
+     private SystemTable.StorageMetadata storageMetadata_;
+@@ -140,7 +136,8 @@ public Range getLocalPrimaryRange()
+                                                                                    new NamedThreadFactory("CONSISTENCY-MANAGER"));
+ 
+     /* We use this interface to determine where replicas need to be placed */
+-    private AbstractReplicationStrategy replicationStrategy_;
++    private Map<String, AbstractReplicationStrategy> replicationStrategies = new HashMap<String, AbstractReplicationStrategy>();
++
+     /* Are we starting this node in bootstrap mode? */
+     private boolean isBootstrapMode;
+     private Multimap<InetAddress, String> bootstrapSet;
+@@ -150,7 +147,7 @@ public Range getLocalPrimaryRange()
+     public synchronized void addBootstrapSource(InetAddress s, String table)
+     {
+         if (logger_.isDebugEnabled())
+-            logger_.debug("Added " + s + " as a bootstrap source");
++            logger_.debug(String.format("Added %s/%s as a bootstrap source", s, table));
+         bootstrapSet.put(s, table);
+     }
+     
+@@ -161,7 +158,7 @@ public synchronized void removeBootstrapSource(InetAddress s, String table)
+         else
+             bootstrapSet.remove(s, table);
+         if (logger_.isDebugEnabled())
+-            logger_.debug("Removed " + s + " as a bootstrap source; remaining is [" + StringUtils.join(bootstrapSet.keySet(), ", ") + "]");
++            logger_.debug(String.format("Removed %s/%s as a bootstrap source; remaining is [%s]", s, table == null ? "<ALL>" : table, StringUtils.join(bootstrapSet.keySet(), ", ")));
+ 
+         if (bootstrapSet.isEmpty())
+         {
+@@ -200,7 +197,6 @@ public StorageService()
+         }
+ 
+         bootstrapSet = HashMultimap.create();
+-        endPointSnitch_ = DatabaseDescriptor.getEndPointSnitch();
+ 
+         /* register the verb handlers */
+         MessagingService.instance.registerVerbHandlers(Verb.BINARY, new BinaryVerbHandler());
+@@ -222,19 +218,30 @@ public StorageService()
+         MessagingService.instance.registerVerbHandlers(Verb.GOSSIP_DIGEST_SYN, new Gossiper.GossipDigestSynVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.GOSSIP_DIGEST_ACK, new Gossiper.GossipDigestAckVerbHandler());
+         MessagingService.instance.registerVerbHandlers(Verb.GOSSIP_DIGEST_ACK2, new Gossiper.GossipDigestAck2VerbHandler());
++    }
+ 
+-        replicationStrategy_ = getReplicationStrategy(tokenMetadata_);
++    public synchronized AbstractReplicationStrategy getReplicationStrategy(String table)
++    {
++        AbstractReplicationStrategy strat = replicationStrategies.get(table);
++        if (strat == null)
++        {
++            strat = StorageService.getReplicationStrategy(tokenMetadata_, table);
++            replicationStrategies.put(table, strat);
++        }
++        return strat;
+     }
+ 
+-    public static AbstractReplicationStrategy getReplicationStrategy(TokenMetadata tokenMetadata)
++    public static AbstractReplicationStrategy getReplicationStrategy(TokenMetadata tokenMetadata, String table)
+     {
+         AbstractReplicationStrategy replicationStrategy = null;
+-        Class<AbstractReplicationStrategy> cls = DatabaseDescriptor.getReplicaPlacementStrategyClass();
+-        Class [] parameterTypes = new Class[] { TokenMetadata.class, int.class};
++        Class<AbstractReplicationStrategy> cls = DatabaseDescriptor.getReplicaPlacementStrategyClass(table);
++        if (cls == null)
++            throw new RuntimeException(String.format("No replica strategy configured for %s", table));
++        Class [] parameterTypes = new Class[] { TokenMetadata.class, IEndPointSnitch.class};
+         try
+         {
+             Constructor<AbstractReplicationStrategy> constructor = cls.getConstructor(parameterTypes);
+-            replicationStrategy = constructor.newInstance(tokenMetadata, DatabaseDescriptor.getReplicationFactor());
++            replicationStrategy = constructor.newInstance(tokenMetadata, DatabaseDescriptor.getEndPointSnitch(table));
+         }
+         catch (Exception e)
+         {
+@@ -327,7 +334,7 @@ private void startBootstrap(Token token) throws IOException
+         {
+             throw new AssertionError(e);
+         }
+-        new BootStrapper(replicationStrategy_, FBUtilities.getLocalAddress(), token, tokenMetadata_).startBootstrap(); // handles token update
++        new BootStrapper(FBUtilities.getLocalAddress(), token, tokenMetadata_).startBootstrap(); // handles token update
+     }
+ 
+     public boolean isBootstrapMode()
+@@ -340,11 +347,6 @@ public TokenMetadata getTokenMetadata()
+         return tokenMetadata_;
+     }
+ 
+-    public IEndPointSnitch getEndPointSnitch()
+-    {
+-        return endPointSnitch_;
+-    }
+-
+     /**
+      * This method performs the requisite operations to make
+      * sure that the N replicas are in sync. We do this in the
+@@ -355,12 +357,28 @@ public void doConsistencyCheck(Row row, List<InetAddress> endpoints, ReadCommand
+         consistencyManager_.submit(new ConsistencyManager(command.table, row, endpoints, command));
+     }
+ 
+-    public Map<Range, List<String>> getRangeToEndPointMap()
++    /**
++     * for a keyspace, return the ranges and corresponding hosts for a given keyspace.
++     * @param keyspace
++     * @return
++     */
++    public Map<Range, List<String>> getRangeToEndPointMap(String keyspace)
++    {
++        // some people just want to get a visual representation of things. Allow null and set it to the first
++        // non-system table.
++        if (keyspace == null)
+     {
++            for (String ks : DatabaseDescriptor.getNonSystemTables())
++            {
++                keyspace = ks;
++                break;
++            }
++        }
++
+         /* All the ranges for the tokens */
+         List<Range> ranges = getAllRanges(tokenMetadata_.sortedTokens());
+         Map<Range, List<String>> map = new HashMap<Range, List<String>>();
+-        for (Map.Entry<Range,List<InetAddress>> entry : constructRangeToEndPointMap(ranges).entrySet())
++        for (Map.Entry<Range,List<InetAddress>> entry : constructRangeToEndPointMap(keyspace, ranges, keyspace).entrySet())
+         {
+             map.put(entry.getKey(), stringify(entry.getValue()));
+         }
+@@ -373,12 +391,12 @@ public void doConsistencyCheck(Row row, List<InetAddress> endpoints, ReadCommand
+      * @param ranges
+      * @return mapping of ranges to the replicas responsible for them.
+     */
+-    public Map<Range, List<InetAddress>> constructRangeToEndPointMap(List<Range> ranges)
++    private Map<Range, List<InetAddress>> constructRangeToEndPointMap(String keyspace, List<Range> ranges, String table)
+     {
+         Map<Range, List<InetAddress>> rangeToEndPointMap = new HashMap<Range, List<InetAddress>>();
+         for (Range range : ranges)
+         {
+-            rangeToEndPointMap.put(range, replicationStrategy_.getNaturalEndpoints(range.right));
++            rangeToEndPointMap.put(range, getReplicationStrategy(keyspace).getNaturalEndpoints(range.right, table));
+         }
+         return rangeToEndPointMap;
+     }
+@@ -593,12 +611,14 @@ private void removeEndPointLocally(InetAddress endPoint)
+      */
+     private void calculatePendingRanges()
+     {
+-        calculatePendingRanges(tokenMetadata_, replicationStrategy_);
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++            calculatePendingRanges(getReplicationStrategy(table), table);
+     }
+ 
+     // public & static for testing purposes
+-    public static void calculatePendingRanges(TokenMetadata tm, AbstractReplicationStrategy strategy)
++    public static void calculatePendingRanges(AbstractReplicationStrategy strategy, String table)
+     {
++        TokenMetadata tm = StorageService.instance.getTokenMetadata();
+         Multimap<Range, InetAddress> pendingRanges = HashMultimap.create();
+         Map<Token, InetAddress> bootstrapTokens = tm.getBootstrapTokens();
+         Set<InetAddress> leavingEndPoints = tm.getLeavingEndPoints();
+@@ -606,12 +626,12 @@ public static void calculatePendingRanges(TokenMetadata tm, AbstractReplicationS
+         if (bootstrapTokens.isEmpty() && leavingEndPoints.isEmpty())
+         {
+             if (logger_.isDebugEnabled())
+-                logger_.debug("No bootstrapping or leaving nodes -> empty pending ranges");
+-            tm.setPendingRanges(pendingRanges);
++                logger_.debug("No bootstrapping or leaving nodes -> empty pending ranges for " + table);
++            tm.setPendingRanges(table, pendingRanges);
+             return;
+         }
+ 
+-        Multimap<InetAddress, Range> addressRanges = strategy.getAddressRanges();
++        Multimap<InetAddress, Range> addressRanges = strategy.getAddressRanges(table);
+ 
+         // Copy of metadata reflecting the situation after all leave operations are finished.
+         TokenMetadata allLeftMetadata = tm.cloneAfterAllLeft();
+@@ -625,8 +645,8 @@ public static void calculatePendingRanges(TokenMetadata tm, AbstractReplicationS
+         // all leaving nodes are gone.
+         for (Range range : affectedRanges)
+         {
+-            List<InetAddress> currentEndPoints = strategy.getNaturalEndpoints(range.right, tm);
+-            List<InetAddress> newEndPoints = strategy.getNaturalEndpoints(range.right, allLeftMetadata);
++            List<InetAddress> currentEndPoints = strategy.getNaturalEndpoints(range.right, tm, table);
++            List<InetAddress> newEndPoints = strategy.getNaturalEndpoints(range.right, allLeftMetadata, table);
+             newEndPoints.removeAll(currentEndPoints);
+             pendingRanges.putAll(range, newEndPoints);
+         }
+@@ -641,19 +661,19 @@ public static void calculatePendingRanges(TokenMetadata tm, AbstractReplicationS
+             InetAddress endPoint = entry.getValue();
+ 
+             allLeftMetadata.updateNormalToken(entry.getKey(), endPoint);
+-            for (Range range : strategy.getAddressRanges(allLeftMetadata).get(endPoint))
++            for (Range range : strategy.getAddressRanges(allLeftMetadata, table).get(endPoint))
+                 pendingRanges.put(range, endPoint);
+             allLeftMetadata.removeEndpoint(endPoint);
+         }
+ 
+-        tm.setPendingRanges(pendingRanges);
++        tm.setPendingRanges(table, pendingRanges);
+ 
+         if (logger_.isDebugEnabled())
+             logger_.debug("Pending ranges:\n" + (pendingRanges.isEmpty() ? "<empty>" : tm.printPendingRanges()));
+     }
+ 
+     /**
+-     * Called when endPoint is removed from the ring without proper
++     * Called when an endPoint is removed from the ring without proper
+      * STATE_LEAVING -> STATE_LEFT sequence. This function checks
+      * whether this node becomes responsible for new ranges as a
+      * consequence and streams data if needed.
+@@ -667,9 +687,11 @@ private void restoreReplicaCount(InetAddress endPoint)
+     {
+         InetAddress myAddress = FBUtilities.getLocalAddress();
+ 
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
+         // get all ranges that change ownership (that is, a node needs
+         // to take responsibility for new range)
+-        Multimap<Range, InetAddress> changedRanges = getChangedRangesForLeaving(endPoint);
++            Multimap<Range, InetAddress> changedRanges = getChangedRangesForLeaving(table, endPoint);
+ 
+         // check if any of these ranges are coming our way
+         Set<Range> myNewRanges = new HashSet<Range>();
+@@ -684,14 +706,14 @@ private void restoreReplicaCount(InetAddress endPoint)
+             if (logger_.isDebugEnabled())
+                 logger_.debug(endPoint + " was removed, my added ranges: " + StringUtils.join(myNewRanges, ", "));
+ 
+-            Multimap<Range, InetAddress> rangeAddresses = replicationStrategy_.getRangeAddresses(tokenMetadata_);
++                Multimap<Range, InetAddress> rangeAddresses = getReplicationStrategy(table).getRangeAddresses(tokenMetadata_, table);
+             Multimap<InetAddress, Range> sourceRanges = HashMultimap.create();
+             IFailureDetector failureDetector = FailureDetector.instance;
+ 
+             // find alive sources for our new ranges
+             for (Range myNewRange : myNewRanges)
+             {
+-                List<InetAddress> sources = DatabaseDescriptor.getEndPointSnitch().getSortedListByProximity(myAddress, rangeAddresses.get(myNewRange));
++                    List<InetAddress> sources = DatabaseDescriptor.getEndPointSnitch(table).getSortedListByProximity(myAddress, rangeAddresses.get(myNewRange));
+ 
+                 assert (!sources.contains(myAddress));
+ 
+@@ -708,16 +730,23 @@ private void restoreReplicaCount(InetAddress endPoint)
+                 }
+             }
+ 
+-            // Finally we have a list of addresses and ranges to stream. Proceed to stream
++                // Finally we have a list of addresses and ranges to
++                // stream. Proceed to stream
+             for (Map.Entry<InetAddress, Collection<Range>> entry : sourceRanges.asMap().entrySet())
+-                StreamIn.requestRanges(entry.getKey(), entry.getValue());
++                {
++                    if (logger_.isDebugEnabled())
++                        logger_.debug("Requesting from " + entry.getKey() + " ranges " + StringUtils.join(entry.getValue(), ", "));
++                    StreamIn.requestRanges(entry.getKey(), table, entry.getValue());
++                }
++            }
+         }
+     }
+ 
+-    private Multimap<Range, InetAddress> getChangedRangesForLeaving(InetAddress endpoint)
++    // needs to be modified to accept either a table or ARS.
++    private Multimap<Range, InetAddress> getChangedRangesForLeaving(String table, InetAddress endpoint)
+     {
+         // First get all ranges the leaving endpoint is responsible for
+-        Collection<Range> ranges = getRangesForEndPoint(endpoint);
++        Collection<Range> ranges = getRangesForEndPoint(table, endpoint);
+ 
+         if (logger_.isDebugEnabled())
+             logger_.debug("Node " + endpoint + " ranges [" + StringUtils.join(ranges, ", ") + "]");
+@@ -726,7 +755,7 @@ private void restoreReplicaCount(InetAddress endPoint)
+ 
+         // Find (for each range) all nodes that store replicas for these ranges as well
+         for (Range range : ranges)
+-            currentReplicaEndpoints.put(range, replicationStrategy_.getNaturalEndpoints(range.right, tokenMetadata_));
++            currentReplicaEndpoints.put(range, getReplicationStrategy(table).getNaturalEndpoints(range.right, tokenMetadata_, table));
+ 
+         TokenMetadata temp = tokenMetadata_.cloneAfterAllLeft();
+ 
+@@ -744,7 +773,7 @@ private void restoreReplicaCount(InetAddress endPoint)
+         // range.
+         for (Range range : ranges)
+         {
+-            ArrayList<InetAddress> newReplicaEndpoints = replicationStrategy_.getNaturalEndpoints(range.right, temp);
++            ArrayList<InetAddress> newReplicaEndpoints = getReplicationStrategy(table).getNaturalEndpoints(range.right, temp, table);
+             newReplicaEndpoints.removeAll(currentReplicaEndpoints.get(range));
+             if (logger_.isDebugEnabled())
+                 if (newReplicaEndpoints.isEmpty())
+@@ -872,10 +901,10 @@ public int getCurrentGenerationNumber()
+ 
+     public void forceTableCleanup() throws IOException
+     {
+-        for (Table table : Table.all())
++        List<String> tables = DatabaseDescriptor.getNonSystemTables();
++        for (String tName : tables)
+         {
+-            if (table.name.equals(Table.SYSTEM_TABLE))
+-                continue;
++            Table table = Table.open(tName);
+             table.forceCleanup();
+         }
+     }
+@@ -925,6 +954,7 @@ public void clearSnapshot() throws IOException
+     {
+         for (Table table : Table.all())
+             table.clearSnapshot();
++
+         if (logger_.isDebugEnabled())
+             logger_.debug("Cleared out all snapshot directories");
+     }
+@@ -975,7 +1005,7 @@ public void forceTableRepair(final String tableName, final String... columnFamil
+     {
+         // request that all relevant endpoints generate trees
+         final MessagingService ms = MessagingService.instance;
+-        final List<InetAddress> endpoints = getNaturalEndpoints(getLocalToken());
++        final List<InetAddress> endpoints = getNaturalEndpoints(tableName, getLocalToken());
+         for (ColumnFamilyStore cfStore : getValidColumnFamilies(tableName, columnFamilies))
+         {
+             Message request = TreeRequestVerbHandler.makeVerb(tableName, cfStore.getColumnFamilyName());
+@@ -1021,9 +1051,9 @@ public Range getPrimaryRangeForEndPoint(InetAddress ep)
+      * @param ep endpoint we are interested in.
+      * @return ranges for the specified endpoint.
+      */
+-    Collection<Range> getRangesForEndPoint(InetAddress ep)
++    Collection<Range> getRangesForEndPoint(String table, InetAddress ep)
+     {
+-        return replicationStrategy_.getAddressRanges().get(ep);
++        return getReplicationStrategy(table).getAddressRanges(table).get(ep);
+     }
+         
+     /**
+@@ -1108,9 +1138,9 @@ public boolean isPrimary(String key)
+      * @param key - key for which we need to find the endpoint return value -
+      * the endpoint responsible for this key
+      */
+-    public List<InetAddress> getNaturalEndpoints(String key)
++    public List<InetAddress> getNaturalEndpoints(String table, String key)
+     {
+-        return getNaturalEndpoints(partitioner_.getToken(key));
++        return getNaturalEndpoints(table, partitioner_.getToken(key));
+     }    
+ 
+     /**
+@@ -1120,9 +1150,9 @@ public boolean isPrimary(String key)
+      * @param token - token for which we need to find the endpoint return value -
+      * the endpoint responsible for this token
+      */
+-    public List<InetAddress> getNaturalEndpoints(Token token)
++    public List<InetAddress> getNaturalEndpoints(String table, Token token)
+     {
+-        return replicationStrategy_.getNaturalEndpoints(token);
++        return getReplicationStrategy(table).getNaturalEndpoints(token, table);
+     }    
+     
+     /**
+@@ -1132,15 +1162,15 @@ public boolean isPrimary(String key)
+      * @param key - key for which we need to find the endpoint return value -
+      * the endpoint responsible for this key
+      */
+-    public List<InetAddress> getLiveNaturalEndpoints(String key)
++    public List<InetAddress> getLiveNaturalEndpoints(String table, String key)
+     {
+-        return getLiveNaturalEndpoints(partitioner_.getToken(key));
++        return getLiveNaturalEndpoints(table, partitioner_.getToken(key));
+     }
+ 
+-    public List<InetAddress> getLiveNaturalEndpoints(Token token)
++    public List<InetAddress> getLiveNaturalEndpoints(String table, Token token)
+     {
+         List<InetAddress> liveEps = new ArrayList<InetAddress>();
+-        List<InetAddress> endpoints = replicationStrategy_.getNaturalEndpoints(token);
++        List<InetAddress> endpoints = getReplicationStrategy(table).getNaturalEndpoints(token, table);
+ 
+         for (InetAddress endpoint : endpoints)
+         {
+@@ -1158,18 +1188,18 @@ public boolean isPrimary(String key)
+      * @param key - key for which we need to find the endpoint return value -
+      * the endpoint responsible for this key
+      */
+-    public Map<InetAddress, InetAddress> getHintedEndpointMap(String key, List<InetAddress> naturalEndpoints)
++    public Map<InetAddress, InetAddress> getHintedEndpointMap(String table, String key, List<InetAddress> naturalEndpoints)
+     {
+-        return replicationStrategy_.getHintedEndpoints(partitioner_.getToken(key), naturalEndpoints);
++        return getReplicationStrategy(table).getHintedEndpoints(partitioner_.getToken(key), table, naturalEndpoints);
+     }
+ 
+     /**
+      * This function finds the closest live endpoint that contains a given key.
+      */
+-    public InetAddress findSuitableEndPoint(String key) throws IOException, UnavailableException
++    public InetAddress findSuitableEndPoint(String table, String key) throws IOException, UnavailableException
+     {
+-        List<InetAddress> endpoints = getNaturalEndpoints(key);
+-        endPointSnitch_.sortByProximity(FBUtilities.getLocalAddress(), endpoints);
++        List<InetAddress> endpoints = getNaturalEndpoints(table, key);
++        DatabaseDescriptor.getEndPointSnitch(table).sortByProximity(FBUtilities.getLocalAddress(), endpoints);
+         for (InetAddress endpoint : endpoints)
+         {
+             if (FailureDetector.instance.isAlive(endpoint))
+@@ -1260,8 +1290,11 @@ public void decommission() throws InterruptedException
+             throw new UnsupportedOperationException("local node is not a member of the token ring yet");
+         if (tokenMetadata_.cloneAfterAllLeft().sortedTokens().size() < 2)
+             throw new UnsupportedOperationException("no other normal nodes in the ring; decommission would be pointless");
+-        if (tokenMetadata_.getPendingRanges(FBUtilities.getLocalAddress()).size() > 0)
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            if (tokenMetadata_.getPendingRanges(table, FBUtilities.getLocalAddress()).size() > 0)
+             throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
++        }
+ 
+         logger_.info("DECOMMISSIONING");
+         startLeaving();
+@@ -1302,33 +1335,30 @@ private void leaveRing()
+ 
+     private void unbootstrap(final Runnable onFinish)
+     {
+-        Multimap<Range, InetAddress> rangesMM = getChangedRangesForLeaving(FBUtilities.getLocalAddress());
++        final CountDownLatch latch = new CountDownLatch(DatabaseDescriptor.getNonSystemTables().size());
++        for (final String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            Multimap<Range, InetAddress> rangesMM = getChangedRangesForLeaving(table, FBUtilities.getLocalAddress());
+         if (logger_.isDebugEnabled())
+             logger_.debug("Ranges needing transfer are [" + StringUtils.join(rangesMM.keySet(), ",") + "]");
+-
+         if (rangesMM.isEmpty())
+         {
+-            // nothing needs transfer, so leave immediately.  this can happen when replication factor == number of nodes.
+-            leaveRing();
+-            onFinish.run();
+-            return;
++                latch.countDown();
++                continue;
+         }
+ 
+-        final Set<Map.Entry<Range, InetAddress>> pending = new HashSet<Map.Entry<Range, InetAddress>>(rangesMM.entries());
++            final Set<Map.Entry<Range, InetAddress>> pending = Collections.synchronizedSet(new HashSet<Map.Entry<Range, InetAddress>>(rangesMM.entries()));
+         for (final Map.Entry<Range, InetAddress> entry : rangesMM.entries())
+         {
+             final Range range = entry.getKey();
+             final InetAddress newEndpoint = entry.getValue();
+             final Runnable callback = new Runnable()
+             {
+-                public synchronized void run()
++                    public void run()
+                 {
+                     pending.remove(entry);
+                     if (pending.isEmpty())
+-                    {
+-                        leaveRing();
+-                        onFinish.run();
+-                    }
++                            latch.countDown();
+                 }
+             };
+             StageManager.getStage(StageManager.STREAM_STAGE).execute(new Runnable()
+@@ -1336,12 +1366,27 @@ public synchronized void run()
+                 public void run()
+                 {
+                     // TODO each call to transferRanges re-flushes, this is potentially a lot of waste
+-                    StreamOut.transferRanges(newEndpoint, Arrays.asList(range), callback);
++                        StreamOut.transferRanges(newEndpoint, table, Arrays.asList(range), callback);
+                 }
+             });
+         }
+     }
+ 
++        // wait for the transfer runnables to signal the latch.
++        logger_.debug("waiting for stream aks.");
++        try
++        {
++            latch.await();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        logger_.debug("stream acks all received.");
++        leaveRing();
++        onFinish.run();
++    }
++
+     public void move(String newToken) throws InterruptedException
+     {
+         move(partitioner_.getTokenFactory().fromString(newToken));
+@@ -1359,8 +1404,11 @@ public void loadBalance() throws IOException, InterruptedException
+      */
+     private void move(final Token token) throws InterruptedException
+     {
+-        if (tokenMetadata_.getPendingRanges(FBUtilities.getLocalAddress()).size() > 0)
++        for (String table : DatabaseDescriptor.getTables())
++        {
++            if (tokenMetadata_.getPendingRanges(table, FBUtilities.getLocalAddress()).size() > 0)
+             throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
++        }
+ 
+         logger_.info("starting move. leaving token " + getLocalToken());
+         startLeaving();
+@@ -1409,19 +1457,14 @@ public void removeToken(String tokenString)
+         // to add new AP state for this command, but that would again
+         // increase the amount of data to be gossiped in the cluster -
+         // not good. REMOVE_TOKEN|LEFT_NORMALLY is used to distinguish
+-        // between removetoken command and normal state left, so it is
++        // between ``removetoken command and normal state left, so it is
+         // not so bad.
+         Gossiper.instance.addLocalApplicationState(MOVE_STATE, new ApplicationState(STATE_LEFT + Delimiter + REMOVE_TOKEN + Delimiter + token.toString()));
+     }
+ 
+-    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level)
++    public WriteResponseHandler getWriteResponseHandler(int blockFor, ConsistencyLevel consistency_level, String table)
+     {
+-        return replicationStrategy_.getWriteResponseHandler(blockFor, consistency_level);
+-    }
+-
+-    public AbstractReplicationStrategy getReplicationStrategy()
+-    {
+-        return replicationStrategy_;
++        return getReplicationStrategy(table).getWriteResponseHandler(blockFor, consistency_level, table);
+     }
+ 
+     public boolean isClientMode()
+@@ -1430,11 +1473,11 @@ public boolean isClientMode()
+     }
+ 
+     // Never ever do this at home. Used by tests.
+-    AbstractReplicationStrategy setReplicationStrategyUnsafe(AbstractReplicationStrategy newStrategy)
++    Map<String, AbstractReplicationStrategy> setReplicationStrategyUnsafe(Map<String, AbstractReplicationStrategy> replacement)
+     {
+-        AbstractReplicationStrategy oldStrategy = replicationStrategy_;
+-        replicationStrategy_ = newStrategy;
+-        return oldStrategy;
++        Map<String, AbstractReplicationStrategy> old = replicationStrategies;
++        replicationStrategies = replacement;
++        return old;
+     }
+ 
+     // Never ever do this at home. Used by tests.
+@@ -1445,4 +1488,11 @@ IPartitioner setPartitionerUnsafe(IPartitioner newPartitioner)
+         return oldPartitioner;
+     }
+ 
++    TokenMetadata setTokenMetadataUnsafe(TokenMetadata tmd)
++    {
++        TokenMetadata old = tokenMetadata_;
++        tokenMetadata_ = tmd;
++        return old;
++    }
++
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index f2d6dcd7..29d0741b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -60,7 +60,7 @@
+      *
+      * @return mapping of ranges to end points
+      */
+-    public Map<Range, List<String>> getRangeToEndPointMap();
++    public Map<Range, List<String>> getRangeToEndPointMap(String keyspace);
+ 
+     /** Human-readable load value */
+     public String getLoadString();
+@@ -82,7 +82,7 @@
+      * @param key - key for which we need to find the endpoint return value -
+      * the endpoint responsible for this key
+      */
+-    public List<InetAddress> getNaturalEndpoints(String key);
++    public List<InetAddress> getNaturalEndpoints(String key, String table);
+ 
+     /**
+      * Forces major compaction (all sstable files compacted)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/WriteResponseHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/WriteResponseHandler.java
+index 3257a40a..e1f299df 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/WriteResponseHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/WriteResponseHandler.java
+@@ -41,11 +41,11 @@
+     protected int localResponses;
+     private final long startTime;
+ 
+-    public WriteResponseHandler(int responseCount)
++    public WriteResponseHandler(int responseCount, String table)
+     {
+         // at most one node per range can bootstrap at a time, and these will be added to the write until
+         // bootstrap finishes (at which point we no longer need to write to the old ones).
+-        assert 1 <= responseCount && responseCount <= 2 * DatabaseDescriptor.getReplicationFactor()
++        assert 1 <= responseCount && responseCount <= 2 * DatabaseDescriptor.getReplicationFactor(table)
+             : "invalid response count " + responseCount;
+ 
+         this.responseCount = responseCount;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
+index f4d2b602..02c9d79d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamIn.java
+@@ -19,11 +19,11 @@
+     /**
+      * Request ranges to be transferred from source to local node
+      */
+-    public static void requestRanges(InetAddress source, Collection<Range> ranges)
++    public static void requestRanges(InetAddress source, String tableName, Collection<Range> ranges)
+     {
+         if (logger.isDebugEnabled())
+             logger.debug("Requesting from " + source + " ranges " + StringUtils.join(ranges, ", "));
+-        StreamRequestMetadata streamRequestMetadata = new StreamRequestMetadata(FBUtilities.getLocalAddress(), ranges);
++        StreamRequestMetadata streamRequestMetadata = new StreamRequestMetadata(FBUtilities.getLocalAddress(), ranges, tableName);
+         Message message = StreamRequestMessage.makeStreamRequestMessage(new StreamRequestMessage(streamRequestMetadata));
+         MessagingService.instance.sendOneWay(message, source);
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+index 0ed1de91..2a34f307 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+@@ -63,7 +63,7 @@
+     /**
+      * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
+     */
+-    public static void transferRanges(InetAddress target, Collection<Range> ranges, Runnable callback)
++    public static void transferRanges(InetAddress target, String tableName, Collection<Range> ranges, Runnable callback)
+     {
+         assert ranges.size() > 0;
+ 
+@@ -75,10 +75,9 @@ public static void transferRanges(InetAddress target, Collection<Range> ranges,
+          * (2) anticompaction -- split out the keys in the range specified
+          * (3) transfer the data.
+         */
+-        for (Table table : Table.all())
+-        {
+             try
+             {
++            Table table = Table.open(tableName);
+                 if (logger.isDebugEnabled())
+                   logger.debug("Flushing memtables ...");
+                 for (Future f : table.flush())
+@@ -99,13 +98,12 @@ public static void transferRanges(InetAddress target, Collection<Range> ranges,
+                 if (logger.isDebugEnabled())
+                   logger.debug("Performing anticompaction ...");
+                 /* Get the list of files that need to be streamed */
+-                transferSSTables(target, table.forceAntiCompaction(ranges, target), table.name); // SSTR GC deletes the file when done
++            transferSSTables(target, table.forceAntiCompaction(ranges, target), tableName); // SSTR GC deletes the file when done
+             }
+             catch (IOException e)
+             {
+                 throw new IOError(e);
+             }
+-        }
+         if (callback != null)
+             callback.run();
+     }
+@@ -127,7 +125,7 @@ public static void transferSSTables(InetAddress target, List<SSTableReader> ssta
+             }
+         }
+         if (logger.isDebugEnabled())
+-          logger.debug("Stream context metadata " + StringUtils.join(pendingFiles, ", "));
++          logger.debug("Stream context metadata " + StringUtils.join(pendingFiles, ", " + " " + sstables.size() + " sstables."));
+ 
+         StreamOutManager.get(target).addFilesToStream(pendingFiles);
+         StreamInitiateMessage biMessage = new StreamInitiateMessage(pendingFiles);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
+index 6300afbf..37af6374 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestMetadata.java
+@@ -33,16 +33,20 @@
+ 
+     protected InetAddress target_;
+     protected Collection<Range> ranges_;
++    protected String table_;
+ 
+-    StreamRequestMetadata(InetAddress target, Collection<Range> ranges)
++    StreamRequestMetadata(InetAddress target, Collection<Range> ranges, String table)
+     {
+         target_ = target;
+         ranges_ = ranges;
++        table_ = table;
+     }
+ 
+     public String toString()
+     {
+         StringBuilder sb = new StringBuilder("");
++        sb.append(table_);
++        sb.append("@");
+         sb.append(target_);
+         sb.append("------->");
+         for ( Range range : ranges_ )
+@@ -52,12 +56,14 @@ public String toString()
+         }
+         return sb.toString();
+     }
++}
+ 
+-    private static class StreamRequestMetadataSerializer implements ICompactSerializer<StreamRequestMetadata>
+-    {
++class StreamRequestMetadataSerializer implements ICompactSerializer<StreamRequestMetadata>
++{
+         public void serialize(StreamRequestMetadata srMetadata, DataOutputStream dos) throws IOException
+         {
+             CompactEndPointSerializationHelper.serialize(srMetadata.target_, dos);
++        dos.writeUTF(srMetadata.table_);
+             dos.writeInt(srMetadata.ranges_.size());
+             for (Range range : srMetadata.ranges_)
+             {
+@@ -68,13 +74,13 @@ public void serialize(StreamRequestMetadata srMetadata, DataOutputStream dos) th
+         public StreamRequestMetadata deserialize(DataInputStream dis) throws IOException
+         {
+             InetAddress target = CompactEndPointSerializationHelper.deserialize(dis);
++        String table = dis.readUTF();
+             int size = dis.readInt();
+             List<Range> ranges = (size == 0) ? null : new ArrayList<Range>();
+             for( int i = 0; i < size; ++i )
+             {
+                 ranges.add(Range.serializer().deserialize(dis));
+             }
+-            return new StreamRequestMetadata( target, ranges );
+-        }
++        return new StreamRequestMetadata(target, ranges, table);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
+index 97c41428..d0d98143 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamRequestVerbHandler.java
+@@ -52,7 +52,7 @@ public void doVerb(Message message)
+             {
+                 if (logger_.isDebugEnabled())
+                     logger_.debug(srm.toString());
+-                StreamOut.transferRanges(srm.target_, srm.ranges_, null);
++                StreamOut.transferRanges(srm.target_, srm.table_, srm.ranges_, null);
+             }
+         }
+         catch (IOException ex)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/ClusterCmd.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/ClusterCmd.java
+index b2a2113a..5ff2e771 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/ClusterCmd.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/ClusterCmd.java
+@@ -144,9 +144,9 @@ private static void printUsage()
+         hf.printHelp(usage, "", options, header);
+     }
+     
+-    public void printEndPoints(String key)
++    public void printEndPoints(String key, String table)
+     {
+-        List<InetAddress> endpoints = probe.getEndPoints(key);
++        List<InetAddress> endpoints = probe.getEndPoints(key, table);
+         System.out.println(String.format("%-17s: %s", "Key", key));
+         System.out.println(String.format("%-17s: %s", "Endpoints", endpoints));
+     }
+@@ -254,11 +254,11 @@ public static void main(String[] args) throws IOException, InterruptedException
+         String cmdName = arguments[0];
+         if (cmdName.equals("get_endpoints"))
+         {
+-            if (arguments.length <= 1)
++            if (arguments.length <= 2)
+             {
+-                System.err.println("missing key argument");
++                System.err.println("missing key and/or table argument");
+             }
+-            clusterCmd.printEndPoints(arguments[1]);
++            clusterCmd.printEndPoints(arguments[1], arguments[2]);
+         }
+ 	else if (cmdName.equals("global_snapshot"))
+ 	{
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
+index 32257fc3..3de909a8 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
+@@ -66,7 +66,7 @@ private static void printUsage()
+      */
+     public void printRing(PrintStream outs)
+     {
+-        Map<Range, List<String>> rangeMap = probe.getRangeToEndPointMap();
++        Map<Range, List<String>> rangeMap = probe.getRangeToEndPointMap(null);
+         List<Range> ranges = new ArrayList<Range>(rangeMap.keySet());
+         Collections.sort(ranges);
+         Set<String> liveNodes = probe.getLiveNodes();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 589b1ee8..9175de32 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -26,6 +26,8 @@
+ import java.lang.management.RuntimeMXBean;
+ import java.net.InetAddress;
+ import java.util.AbstractMap;
++import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -139,9 +141,9 @@ public void forceTableRepair(String tableName, String... columnFamilies) throws
+         ssProxy.forceTableRepair(tableName, columnFamilies);
+     }
+     
+-    public Map<Range, List<String>> getRangeToEndPointMap()
++    public Map<Range, List<String>> getRangeToEndPointMap(String tableName)
+     {
+-        return ssProxy.getRangeToEndPointMap();
++        return ssProxy.getRangeToEndPointMap(tableName);
+     }
+     
+     public Set<String> getLiveNodes()
+@@ -149,6 +151,75 @@ public void forceTableRepair(String tableName, String... columnFamilies) throws
+         return ssProxy.getLiveNodes();
+     }
+     
++    /**
++     * Write a textual representation of the Cassandra ring.
++     * 
++     * @param outs the stream to write to
++     */
++    public void printRing(PrintStream outs)
++    {
++        Map<Range, List<String>> rangeMap = ssProxy.getRangeToEndPointMap(null);
++        List<Range> ranges = new ArrayList<Range>(rangeMap.keySet());
++        Collections.sort(ranges);
++        Set<String> liveNodes = ssProxy.getLiveNodes();
++        Set<String> deadNodes = ssProxy.getUnreachableNodes();
++        Map<String, String> loadMap = ssProxy.getLoadMap();
++
++        // Print range-to-endpoint mapping
++        int counter = 0;
++        outs.print(String.format("%-14s", "Address"));
++        outs.print(String.format("%-11s", "Status"));
++        outs.print(String.format("%-14s", "Load"));
++        outs.print(String.format("%-43s", "Range"));
++        outs.println("Ring");
++        // emphasize that we're showing the right part of each range
++        if (ranges.size() > 1)
++        {
++            outs.println(String.format("%-14s%-11s%-14s%-43s", "", "", "", ranges.get(0).left));
++        }
++        // normal range & node info
++        for (Range range : ranges) {
++            List<String> endpoints = rangeMap.get(range);
++            String primaryEndpoint = endpoints.get(0);
++
++            outs.print(String.format("%-14s", primaryEndpoint));
++
++            String status = liveNodes.contains(primaryEndpoint)
++                          ? "Up"
++                          : deadNodes.contains(primaryEndpoint)
++                            ? "Down"
++                            : "?";
++            outs.print(String.format("%-11s", status));
++
++            String load = loadMap.containsKey(primaryEndpoint) ? loadMap.get(primaryEndpoint) : "?";
++            outs.print(String.format("%-14s", load));
++
++            outs.print(String.format("%-43s", range.right));
++
++            String asciiRingArt;
++            if (counter == 0)
++            {
++                asciiRingArt = "|<--|";
++            }
++            else if (counter == (rangeMap.size() - 1))
++            {
++                asciiRingArt = "|-->|";
++            }
++            else
++            {
++                if ((rangeMap.size() > 4) && ((counter % 2) == 0))
++                    asciiRingArt = "v   |";
++                else if ((rangeMap.size() > 4) && ((counter % 2) != 0))
++                    asciiRingArt = "|   ^";
++                else
++                    asciiRingArt = "|   |";
++            }
++            outs.println(asciiRingArt);
++            
++            counter++;
++        }
++    }
++    
+     public Set<String> getUnreachableNodes()
+     {
+         return ssProxy.getUnreachableNodes();
+@@ -325,9 +396,9 @@ public void setCacheCapacities(String tableName, String cfName, int keyCacheCapa
+         }
+     }
+ 
+-    public List<InetAddress> getEndPoints(String key)
++    public List<InetAddress> getEndPoints(String key, String table)
+     {
+-        return ssProxy.getNaturalEndpoints(key);
++        return ssProxy.getNaturalEndpoints(key, table);
+     }
+ }
+ 
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/client/TestRingCache.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/client/TestRingCache.java
+index 4cf51c16..db4a943b 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/client/TestRingCache.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/client/TestRingCache.java
+@@ -59,19 +59,39 @@ private static void setup(String server, int port) throws Exception
+     }
+ 
+     /**
+-     * usage: java -Dstorage-config="confpath" org.apache.cassandra.client.TestRingCache
++     * usage: java -Dstorage-config="confpath" org.apache.cassandra.client.TestRingCache [keyspace row-id-prefix row-id-int]
++     * to test a single keyspace/row, use the parameters. row-id-prefix and row-id-int are appended together to form a
++     * single row id.  If you supply now parameters, 'Keyspace1' is assumed and will check 9 rows ('row1' through 'row9').
+      * @param args
+      * @throws Exception
+      */
+     public static void main(String[] args) throws Throwable
+     {
+-        String table = "Keyspace1";
+-        for (int nRows=1; nRows<10; nRows++)
++        String table;
++        int minRow;
++        int maxRow;
++        String rowPrefix;
++        if (args.length > 0)
+         {
+-            String row = "row" + nRows;
++            table = args[0];
++            rowPrefix = args[1];
++            minRow = Integer.parseInt(args[2]);
++            maxRow = minRow + 1;
++        }
++        else
++        {
++            table = "Keyspace1";
++            minRow = 1;
++            maxRow = 10;
++            rowPrefix = "row";
++        }
++
++        for (int nRows = minRow; nRows < maxRow; nRows++)
++        {
++            String row = rowPrefix + nRows;
+             ColumnPath col = createColumnPath("Standard1", null, "col1".getBytes());
+ 
+-            List<InetAddress> endPoints = ringCache.getEndPoint(row);
++            List<InetAddress> endPoints = ringCache.getEndPoint(table, row);
+             String hosts="";
+             for (int i = 0; i < endPoints.size(); i++)
+                 hosts = hosts + ((i > 0) ? "," : "") + endPoints.get(i);
+@@ -83,6 +103,7 @@ public static void main(String[] args) throws Throwable
+             Column column=thriftClient.get(table, row, col, ConsistencyLevel.ONE).column;
+             System.out.println("read row " + row + " " + new String(column.name) + ":" + new String(column.value) + ":" + column.timestamp);
+         }
++
+         System.exit(1);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/config/DatabaseDescriptorTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/config/DatabaseDescriptorTest.java
+index 42ad5e1c..e7ba4c74 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/config/DatabaseDescriptorTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/config/DatabaseDescriptorTest.java
+@@ -34,8 +34,8 @@ public void testShouldHaveConfigFileNameAvailable()
+      * TODO: A more general method of property modification would be useful, but
+      *       will probably have to wait for a refactor away from all the static fields.
+      */
+-    public static void setReplicationFactor(int factor)
++    public static void setReplicationFactor(String table, int factor)
+     {
+-        DatabaseDescriptor.setReplicationFactorUnsafe(factor);
++        DatabaseDescriptor.setReplicationFactorUnsafe(table, factor);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BootStrapperTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BootStrapperTest.java
+index ac9d9658..5639f241 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BootStrapperTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BootStrapperTest.java
+@@ -25,6 +25,7 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.commons.lang.StringUtils;
+ import static org.junit.Assert.assertEquals;
+ import org.junit.Test;
+@@ -71,12 +72,17 @@ public void testGuessToken() throws IOException
+     @Test
+     public void testSourceTargetComputation() throws UnknownHostException
+     {
+-        testSourceTargetComputation(1);
+-        testSourceTargetComputation(3);
+-        testSourceTargetComputation(100);
++        final int[] clusterSizes = new int[] { 1, 3, 5, 10, 100};
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            int replicationFactor = DatabaseDescriptor.getReplicationFactor(table);
++            for (int clusterSize : clusterSizes)
++                if (clusterSize >= replicationFactor)
++                    testSourceTargetComputation(table, clusterSize, replicationFactor);
++        }
+     }
+ 
+-    private void testSourceTargetComputation(int numOldNodes) throws UnknownHostException
++    private void testSourceTargetComputation(String table, int numOldNodes, int replicationFactor) throws UnknownHostException
+     {
+         StorageService ss = StorageService.instance;
+ 
+@@ -86,8 +92,8 @@ private void testSourceTargetComputation(int numOldNodes) throws UnknownHostExce
+ 
+         TokenMetadata tmd = ss.getTokenMetadata();
+         assertEquals(numOldNodes, tmd.sortedTokens().size());
+-        BootStrapper b = new BootStrapper(ss.getReplicationStrategy(), myEndpoint, myToken, tmd);
+-        Multimap<Range, InetAddress> res = b.getRangesWithSources();
++        BootStrapper b = new BootStrapper(myEndpoint, myToken, tmd);
++        Multimap<Range, InetAddress> res = b.getRangesWithSources(table);
+         
+         int transferCount = 0;
+         for (Map.Entry<Range, Collection<InetAddress>> e : res.asMap().entrySet())
+@@ -96,8 +102,7 @@ private void testSourceTargetComputation(int numOldNodes) throws UnknownHostExce
+             transferCount++;
+         }
+ 
+-        /* Only 1 transfer from old node to new node */
+-        assertEquals(1, transferCount);
++        assertEquals(replicationFactor, transferCount);
+         IFailureDetector mockFailureDetector = new IFailureDetector()
+         {
+             public boolean isAlive(InetAddress ep)
+@@ -112,8 +117,10 @@ public boolean isAlive(InetAddress ep)
+             public void remove(InetAddress ep) { throw new UnsupportedOperationException(); }
+         };
+         Multimap<InetAddress, Range> temp = BootStrapper.getWorkMap(res, mockFailureDetector);
+-        assertEquals(1, temp.keySet().size());
+-        assertEquals(1, temp.asMap().values().iterator().next().size());
++        // there isn't any point in testing the size of these collections for any specific size.  When a random partitioner
++        // is used, they will vary.
++        assert temp.keySet().size() > 0;
++        assert temp.asMap().values().iterator().next().size() > 0;
+         assert !temp.keySet().iterator().next().equals(myEndpoint);
+     }
+ 
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
+index db4c8f22..9df5a192 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
+@@ -25,6 +25,9 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.gms.ApplicationState;
++import org.apache.cassandra.service.StorageServiceAccessor;
+ import org.junit.Test;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.dht.RandomPartitioner;
+@@ -39,11 +42,27 @@
+ 
+ public class RackUnawareStrategyTest
+ {
++    @Test
++    public void tryBogusTable()
++    {
++        AbstractReplicationStrategy rs = StorageService.instance.getReplicationStrategy("Keyspace1");
++        assertNotNull(rs);
++        try
++        {
++            rs = StorageService.instance.getReplicationStrategy("SomeBogusTableThatDoesntExist");
++            throw new AssertionError("SS.getReplicationStrategy() should have thrown a RuntimeException.");
++        }
++        catch (RuntimeException ex)
++        {
++            // This exception should be thrown.
++        }
++    }
++
+     @Test
+     public void testBigIntegerEndpoints() throws UnknownHostException
+     {
+         TokenMetadata tmd = new TokenMetadata();
+-        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, null);
+ 
+         List<Token> endPointTokens = new ArrayList<Token>();
+         List<Token> keyTokens = new ArrayList<Token>();
+@@ -51,7 +70,8 @@ public void testBigIntegerEndpoints() throws UnknownHostException
+             endPointTokens.add(new BigIntegerToken(String.valueOf(10 * i)));
+             keyTokens.add(new BigIntegerToken(String.valueOf(10 * i + 5)));
+         }
+-        testGetEndpoints(tmd, strategy, endPointTokens.toArray(new Token[0]), keyTokens.toArray(new Token[0]));
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++            testGetEndpoints(tmd, strategy, endPointTokens.toArray(new Token[0]), keyTokens.toArray(new Token[0]), table);
+     }
+ 
+     @Test
+@@ -59,7 +79,7 @@ public void testStringEndpoints() throws UnknownHostException
+     {
+         TokenMetadata tmd = new TokenMetadata();
+         IPartitioner partitioner = new OrderPreservingPartitioner();
+-        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, null);
+ 
+         List<Token> endPointTokens = new ArrayList<Token>();
+         List<Token> keyTokens = new ArrayList<Token>();
+@@ -67,12 +87,13 @@ public void testStringEndpoints() throws UnknownHostException
+             endPointTokens.add(new StringToken(String.valueOf((char)('a' + i * 2))));
+             keyTokens.add(partitioner.getToken(String.valueOf((char)('a' + i * 2 + 1))));
+         }
+-        testGetEndpoints(tmd, strategy, endPointTokens.toArray(new Token[0]), keyTokens.toArray(new Token[0]));
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++            testGetEndpoints(tmd, strategy, endPointTokens.toArray(new Token[0]), keyTokens.toArray(new Token[0]), table);
+     }
+ 
+     // given a list of endpoint tokens, and a set of key tokens falling between the endpoint tokens,
+     // make sure that the Strategy picks the right endpoints for the keys.
+-    private void testGetEndpoints(TokenMetadata tmd, AbstractReplicationStrategy strategy, Token[] endPointTokens, Token[] keyTokens) throws UnknownHostException
++    private void testGetEndpoints(TokenMetadata tmd, AbstractReplicationStrategy strategy, Token[] endPointTokens, Token[] keyTokens, String table) throws UnknownHostException
+     {
+         List<InetAddress> hosts = new ArrayList<InetAddress>();
+         for (int i = 0; i < endPointTokens.length; i++)
+@@ -84,8 +105,8 @@ private void testGetEndpoints(TokenMetadata tmd, AbstractReplicationStrategy str
+ 
+         for (int i = 0; i < keyTokens.length; i++)
+         {
+-            List<InetAddress> endPoints = strategy.getNaturalEndpoints(keyTokens[i]);
+-            assertEquals(3, endPoints.size());
++            List<InetAddress> endPoints = strategy.getNaturalEndpoints(keyTokens[i], table);
++            assertEquals(DatabaseDescriptor.getReplicationFactor(table), endPoints.size());
+             for (int j = 0; j < endPoints.size(); j++)
+             {
+                 assertEquals(endPoints.get(j), hosts.get((i + j + 1) % hosts.size()));
+@@ -96,16 +117,19 @@ private void testGetEndpoints(TokenMetadata tmd, AbstractReplicationStrategy str
+     @Test
+     public void testGetEndpointsDuringBootstrap() throws UnknownHostException
+     {
++        // the token difference will be RING_SIZE * 2.
++        final int RING_SIZE = 10;
+         TokenMetadata tmd = new TokenMetadata();
+-        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, 3);
++        TokenMetadata oldTmd = StorageServiceAccessor.setTokenMetadata(tmd);
++        AbstractReplicationStrategy strategy = new RackUnawareStrategy(tmd, null);
+ 
+-        Token[] endPointTokens = new Token[5]; 
+-        Token[] keyTokens = new Token[5];
++        Token[] endPointTokens = new Token[RING_SIZE];
++        Token[] keyTokens = new Token[RING_SIZE];
+         
+-        for (int i = 0; i < 5; i++) 
++        for (int i = 0; i < RING_SIZE; i++)
+         {
+-            endPointTokens[i] = new BigIntegerToken(String.valueOf(10 * i));
+-            keyTokens[i] = new BigIntegerToken(String.valueOf(10 * i + 5));
++            endPointTokens[i] = new BigIntegerToken(String.valueOf(RING_SIZE * 2 * i));
++            keyTokens[i] = new BigIntegerToken(String.valueOf(RING_SIZE * 2 * i + RING_SIZE));
+         }
+         
+         List<InetAddress> hosts = new ArrayList<InetAddress>();
+@@ -116,27 +140,35 @@ public void testGetEndpointsDuringBootstrap() throws UnknownHostException
+             hosts.add(ep);
+         }
+         
+-        //Add bootstrap node id=6
+-        Token bsToken = new BigIntegerToken(String.valueOf(25));
+-        InetAddress bootstrapEndPoint = InetAddress.getByName("127.0.0.6");
++        // bootstrap at the end of the ring
++        Token bsToken = new BigIntegerToken(String.valueOf(210));
++        InetAddress bootstrapEndPoint = InetAddress.getByName("127.0.0.11");
+         tmd.addBootstrapToken(bsToken, bootstrapEndPoint);
+-        StorageService.calculatePendingRanges(tmd, strategy);
++
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            StorageService.calculatePendingRanges(strategy, table);
++            int replicationFactor = DatabaseDescriptor.getReplicationFactor(table);
+ 
+         for (int i = 0; i < keyTokens.length; i++)
+         {
+-            Collection<InetAddress> endPoints = strategy.getWriteEndpoints(keyTokens[i], strategy.getNaturalEndpoints(keyTokens[i]));
+-            assertTrue(endPoints.size() >= 3);
++                Collection<InetAddress> endPoints = strategy.getWriteEndpoints(keyTokens[i], table, strategy.getNaturalEndpoints(keyTokens[i], table));
++                assertTrue(endPoints.size() >= replicationFactor);
+ 
+-            for (int j = 0; j < 3; j++)
++                for (int j = 0; j < replicationFactor; j++)
+             {
+                 //Check that the old nodes are definitely included
+                 assertTrue(endPoints.contains(hosts.get((i + j + 1) % hosts.size())));
+             }
+-            // for 5, 15, 25 this should include bootstrap node
+-            if (i < 3)
+-                assertTrue(endPoints.contains(bootstrapEndPoint));
+-            else
++
++                // bootstrapEndPoint should be in the endPoints for i in MAX-RF to MAX, but not in any earlier ep.
++                if (i < RING_SIZE - replicationFactor)
+                 assertFalse(endPoints.contains(bootstrapEndPoint));
++                else
++                    assertTrue(endPoints.contains(bootstrapEndPoint));
+         }
+     }
++
++        StorageServiceAccessor.setTokenMetadata(oldTmd);
++    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+index 0c1bb0f0..5120f4e9 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+@@ -61,8 +61,9 @@ public void prepare() throws Exception
+         if (!initialized)
+         {
+             LOCAL = FBUtilities.getLocalAddress();
++            tablename = DatabaseDescriptor.getTables().iterator().next();
+             // bump the replication factor so that local overlaps with REMOTE below
+-            DatabaseDescriptorTest.setReplicationFactor(2);
++            DatabaseDescriptorTest.setReplicationFactor(tablename, 2);
+ 
+             StorageService.instance.initServer();
+             // generate a fake endpoint for which we can spoof receiving/sending trees
+@@ -72,7 +73,6 @@ public void prepare() throws Exception
+             tmd.updateNormalToken(part.getMinimumToken(), REMOTE);
+             assert tmd.isMember(REMOTE);
+ 
+-            tablename = DatabaseDescriptor.getTables().iterator().next();
+             cfname = Table.open(tablename).getColumnFamilies().iterator().next();
+             initialized = true;
+         }
+@@ -89,7 +89,7 @@ public void testInstance() throws Throwable
+     @Test
+     public void testGetValidator() throws Throwable
+     {
+-        aes.clearNaturalRepairs();
++        aes.clearNaturalRepairs_TestsOnly();
+ 
+         // not major
+         assert aes.getValidator(tablename, cfname, null, false) instanceof NoopValidator;
+@@ -174,13 +174,13 @@ public void testTreeStore() throws Throwable
+         Util.writeColumnFamily(rms);
+         ColumnFamilyStore store = Util.writeColumnFamily(rms);
+         
+-        TreePair old = aes.getRendezvousPair(tablename, cfname, REMOTE);
++        TreePair old = aes.getRendezvousPair_TestsOnly(tablename, cfname, REMOTE);
+         // force a readonly compaction, and wait for it to finish
+         CompactionManager.instance.submitReadonly(store, REMOTE).get(5000, TimeUnit.MILLISECONDS);
+ 
+         // check that a tree was created and stored
+         flushAES().get(5000, TimeUnit.MILLISECONDS);
+-        assert old != aes.getRendezvousPair(tablename, cfname, REMOTE);
++        assert old != aes.getRendezvousPair_TestsOnly(tablename, cfname, REMOTE);
+     }
+ 
+     @Test
+@@ -200,7 +200,7 @@ public void testNotifyNeighbors() throws Throwable
+         
+         // confirm that our reference is not equal to the original due
+         // to (de)serialization
+-        assert tree != aes.getRendezvousPair(tablename, cfname, REMOTE).left;
++        assert tree != aes.getRendezvousPair_TestsOnly(tablename, cfname, REMOTE).left;
+     }
+ 
+     @Test
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/MoveTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/MoveTest.java
+index 8bdddd1d..cca21af4 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/MoveTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/MoveTest.java
+@@ -24,8 +24,13 @@
+ import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ 
++import com.google.common.collect.HashMultimap;
++import com.google.common.collect.Multimap;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.commons.lang.StringUtils;
+ import org.junit.Test;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ 
+ import org.apache.cassandra.dht.IPartitioner;
+@@ -40,6 +45,16 @@
+ 
+ public class MoveTest
+ {
++    // handy way of creating a mapping of strategies to use in StorageService.
++    private static Map<String, AbstractReplicationStrategy> createReplacements(AbstractReplicationStrategy strat)
++    {
++        Map<String, AbstractReplicationStrategy> replacements = new HashMap<String, AbstractReplicationStrategy>();
++        for (String table : DatabaseDescriptor.getTables())
++            replacements.put(table, strat);
++        return replacements;
++    }
++
++
+     /**
+      * Test whether write endpoints is correct when the node is leaving. Uses
+      * StorageService.onChange and does not manipulate token metadata directly.
+@@ -48,53 +63,74 @@
+     public void testWriteEndPointsDuringLeave() throws UnknownHostException
+     {
+         StorageService ss = StorageService.instance;
++        final int RING_SIZE = 5;
++        final int LEAVING_NODE = 2;
+ 
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategies = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+         List<InetAddress> hosts = new ArrayList<InetAddress>();
+ 
+-        createInitialRing(ss, partitioner, endPointTokens, keyTokens, hosts, 5);
++        createInitialRing(ss, partitioner, endPointTokens, keyTokens, hosts, RING_SIZE);
++
++        final Map<String, List<Range>> deadNodesRanges = new HashMap<String, List<Range>>();
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            List<Range> list = new ArrayList<Range>();
++            list.addAll(testStrategy.getAddressRanges(table).get(hosts.get(LEAVING_NODE)));
++            Collections.sort(list);
++            deadNodesRanges.put(table, list);
++        }
+ 
+         // Third node leaves
+-        ss.onChange(hosts.get(2), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(2))));
++        ss.onChange(hosts.get(LEAVING_NODE), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(LEAVING_NODE))));
+ 
+         // check that it is correctly marked as leaving in tmd
+-        assertTrue(tmd.isLeaving(hosts.get(2)));
++        assertTrue(tmd.isLeaving(hosts.get(LEAVING_NODE)));
+ 
+         // check that pending ranges are correct (primary range should go to 1st node, first
+         // replica range to 4th node and 2nd replica range to 5th node)
+-        assertTrue(tmd.getPendingRanges(hosts.get(0)).get(0).equals(new Range(endPointTokens.get(1),
+-                                                                              endPointTokens.get(2))));
+-        assertTrue(tmd.getPendingRanges(hosts.get(3)).get(0).equals(new Range(endPointTokens.get(4),
+-                                                                              endPointTokens.get(0))));
+-        assertTrue(tmd.getPendingRanges(hosts.get(4)).get(0).equals(new Range(endPointTokens.get(0),
+-                                                                              endPointTokens.get(1))));
+-
+-        for (int i=0; i<keyTokens.size(); ++i)
++        for (String table : DatabaseDescriptor.getNonSystemTables())
+         {
+-            Collection<InetAddress> endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), testStrategy.getNaturalEndpoints(keyTokens.get(i)));
+-
+-            // Original third node does not store replicas for 4th and 5th node (ranges 20-30
+-            // and 30-40 respectively), so their write endpoints count should be still 3. The
+-            // third node stores data for ranges 40-0, 0-10 and 10-20, so writes falling to
+-            // these ranges should have four endpoints now. keyTokens[2] is 25 and keyTokens[3]
+-            // is 35, so these are the ones that should have 3 endpoints.
+-            if (i==2 || i==3)
+-                assertTrue(endPoints.size() == 3);
++            int replicationFactor = DatabaseDescriptor.getReplicationFactor(table);
++
++            // if the ring minus the leaving node leaves us with less than RF, we're hosed.
++            if (hosts.size()-1 < replicationFactor)
++                continue;
++            
++            // verify that the replicationFactor nodes after the leaving node are gatherings it's pending ranges.
++            // in the case where rf==5, we're screwed because we basically just lost data.
++            for (int i = 0; i < replicationFactor; i++)
++        {
++                assertTrue(tmd.getPendingRanges(table, hosts.get((LEAVING_NODE + 1 + i) % RING_SIZE)).size() > 0);
++                assertEquals(tmd.getPendingRanges(table, hosts.get((LEAVING_NODE + 1 + i) % RING_SIZE)).get(0), deadNodesRanges.get(table).get(i));
++            }
++
++            // note that we're iterating over nodes and sample tokens.
++            final int replicaStart = (LEAVING_NODE-replicationFactor+RING_SIZE)%RING_SIZE;
++            for (int i=0; i<keyTokens.size(); ++i)
++            {
++                Collection<InetAddress> endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), table, testStrategy.getNaturalEndpoints(keyTokens.get(i), table));
++                // figure out if this node is one of the nodes previous to the failed node (2).
++                boolean isReplica = (i - replicaStart + RING_SIZE) % RING_SIZE < replicationFactor;
++                // the preceeding leaving_node-replication_factor nodes should have and additional ep (replication_factor+1);
++                if (isReplica)
++                    assertTrue(endPoints.size() == replicationFactor + 1);
+             else
+-                assertTrue(endPoints.size() == 4);
++                    assertTrue(endPoints.size() == replicationFactor);
++
++            }
+         }
+ 
+         ss.setPartitionerUnsafe(oldPartitioner);
+-        ss.setReplicationStrategyUnsafe(oldStrategy);
++        ss.setReplicationStrategyUnsafe(oldStrategies);
+     }
+ 
+     /**
+@@ -105,25 +141,26 @@ public void testWriteEndPointsDuringLeave() throws UnknownHostException
+     public void testSimultaneousMove() throws UnknownHostException
+     {
+         StorageService ss = StorageService.instance;
++        final int RING_SIZE = 10;
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategy = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+         List<InetAddress> hosts = new ArrayList<InetAddress>();
+ 
+         // create a ring or 10 nodes
+-        createInitialRing(ss, partitioner, endPointTokens, keyTokens, hosts, 10);
++        createInitialRing(ss, partitioner, endPointTokens, keyTokens, hosts, RING_SIZE);
+ 
+         // nodes 6, 8 and 9 leave
+-        ss.onChange(hosts.get(6), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(6))));
+-        ss.onChange(hosts.get(8), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(8))));
+-        ss.onChange(hosts.get(9), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(9))));
++        final int[] LEAVING = new int[] { 6, 8, 9};
++        for (int leaving : LEAVING)
++            ss.onChange(hosts.get(leaving), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEAVING + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(leaving))));
+         
+         // boot two new nodes with keyTokens.get(5) and keyTokens.get(7)
+         InetAddress boot1 = InetAddress.getByName("127.0.1.1");
+@@ -133,10 +170,69 @@ public void testSimultaneousMove() throws UnknownHostException
+ 
+         Collection<InetAddress> endPoints = null;
+ 
++        // pre-calculate the results.
++        Map<String, Multimap<Token, InetAddress>> expectedEndpoints = new HashMap<String, Multimap<Token, InetAddress>>();
++        expectedEndpoints.put("Keyspace1", HashMultimap.<Token, InetAddress>create());
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("5"), makeAddrs("127.0.0.2"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("15"), makeAddrs("127.0.0.3"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("25"), makeAddrs("127.0.0.4"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("35"), makeAddrs("127.0.0.5"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("45"), makeAddrs("127.0.0.6"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("55"), makeAddrs("127.0.0.7", "127.0.0.8", "127.0.1.1"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("65"), makeAddrs("127.0.0.8"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("75"), makeAddrs("127.0.0.9", "127.0.1.2", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("85"), makeAddrs("127.0.0.10", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace1").putAll(new BigIntegerToken("95"), makeAddrs("127.0.0.1"));
++        expectedEndpoints.put("Keyspace2", HashMultimap.<Token, InetAddress>create());
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("5"), makeAddrs("127.0.0.2"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("15"), makeAddrs("127.0.0.3"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("25"), makeAddrs("127.0.0.4"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("35"), makeAddrs("127.0.0.5"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("45"), makeAddrs("127.0.0.6"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("55"), makeAddrs("127.0.0.7", "127.0.0.8", "127.0.1.1"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("65"), makeAddrs("127.0.0.8"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("75"), makeAddrs("127.0.0.9", "127.0.1.2", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("85"), makeAddrs("127.0.0.10", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace2").putAll(new BigIntegerToken("95"), makeAddrs("127.0.0.1"));
++        expectedEndpoints.put("Keyspace3", HashMultimap.<Token, InetAddress>create());
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("5"), makeAddrs("127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("15"), makeAddrs("127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6", "127.0.0.7", "127.0.1.1", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("25"), makeAddrs("127.0.0.4", "127.0.0.5", "127.0.0.6", "127.0.0.7", "127.0.0.8", "127.0.1.2", "127.0.0.1", "127.0.1.1"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("35"), makeAddrs("127.0.0.5", "127.0.0.6", "127.0.0.7", "127.0.0.8", "127.0.0.9", "127.0.1.2", "127.0.0.1", "127.0.0.2", "127.0.1.1"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("45"), makeAddrs("127.0.0.6", "127.0.0.7", "127.0.0.8", "127.0.0.9", "127.0.0.10", "127.0.1.2", "127.0.0.1", "127.0.0.2", "127.0.1.1", "127.0.0.3"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("55"), makeAddrs("127.0.0.7", "127.0.0.8", "127.0.0.9", "127.0.0.10", "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.1.1", "127.0.1.2"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("65"), makeAddrs("127.0.0.8", "127.0.0.9", "127.0.0.10", "127.0.0.1", "127.0.0.2", "127.0.1.2", "127.0.0.3", "127.0.0.4"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("75"), makeAddrs("127.0.0.9", "127.0.0.10", "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.1.2", "127.0.0.4", "127.0.0.5"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("85"), makeAddrs("127.0.0.10", "127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"));
++        expectedEndpoints.get("Keyspace3").putAll(new BigIntegerToken("95"), makeAddrs("127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"));
++        expectedEndpoints.put("Keyspace4", HashMultimap.<Token, InetAddress>create());
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("5"), makeAddrs("127.0.0.2", "127.0.0.3", "127.0.0.4"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("15"), makeAddrs("127.0.0.3", "127.0.0.4", "127.0.0.5"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("25"), makeAddrs("127.0.0.4", "127.0.0.5", "127.0.0.6"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("35"), makeAddrs("127.0.0.5", "127.0.0.6", "127.0.0.7", "127.0.1.1", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("45"), makeAddrs("127.0.0.6", "127.0.0.7", "127.0.0.8", "127.0.1.2", "127.0.0.1", "127.0.1.1"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("55"), makeAddrs("127.0.0.7", "127.0.0.8", "127.0.0.9", "127.0.0.1", "127.0.0.2", "127.0.1.1", "127.0.1.2"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("65"), makeAddrs("127.0.0.8", "127.0.0.9", "127.0.0.10", "127.0.1.2", "127.0.0.1", "127.0.0.2"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("75"), makeAddrs("127.0.0.9", "127.0.0.10", "127.0.0.1", "127.0.1.2", "127.0.0.2", "127.0.0.3"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("85"), makeAddrs("127.0.0.10", "127.0.0.1", "127.0.0.2", "127.0.0.3"));
++        expectedEndpoints.get("Keyspace4").putAll(new BigIntegerToken("95"), makeAddrs("127.0.0.1", "127.0.0.2", "127.0.0.3"));
++
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            for (int i = 0; i < keyTokens.size(); i++)
++            {
++                endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), table, testStrategy.getNaturalEndpoints(keyTokens.get(i), table));
++                assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).size() == endPoints.size());
++                assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).containsAll(endPoints));
++            }
++
++            // just to be sure that things still work according to the old tests, run them:
++            if (DatabaseDescriptor.getReplicationFactor(table) != 3)
++                continue;
+         // tokens 5, 15 and 25 should go three nodes
+         for (int i=0; i<3; ++i)
+         {
+-            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), testStrategy.getNaturalEndpoints(keyTokens.get(i)));
++                endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), table, testStrategy.getNaturalEndpoints(keyTokens.get(i), table));
+             assertTrue(endPoints.size() == 3);
+             assertTrue(endPoints.contains(hosts.get(i+1)));
+             assertTrue(endPoints.contains(hosts.get(i+2)));
+@@ -144,7 +240,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         }
+ 
+         // token 35 should go to nodes 4, 5, 6, 7 and boot1
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(3), testStrategy.getNaturalEndpoints(keyTokens.get(3)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(3), table, testStrategy.getNaturalEndpoints(keyTokens.get(3), table));
+         assertTrue(endPoints.size() == 5);
+         assertTrue(endPoints.contains(hosts.get(4)));
+         assertTrue(endPoints.contains(hosts.get(5)));
+@@ -153,7 +249,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(boot1));
+ 
+         // token 45 should go to nodes 5, 6, 7, 0, boot1 and boot2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(4), testStrategy.getNaturalEndpoints(keyTokens.get(4)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(4), table, testStrategy.getNaturalEndpoints(keyTokens.get(4), table));
+         assertTrue(endPoints.size() == 6);
+         assertTrue(endPoints.contains(hosts.get(5)));
+         assertTrue(endPoints.contains(hosts.get(6)));
+@@ -163,7 +259,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(boot2));
+ 
+         // token 55 should go to nodes 6, 7, 8, 0, 1, boot1 and boot2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(5), testStrategy.getNaturalEndpoints(keyTokens.get(5)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(5), table, testStrategy.getNaturalEndpoints(keyTokens.get(5), table));
+         assertTrue(endPoints.size() == 7);
+         assertTrue(endPoints.contains(hosts.get(6)));
+         assertTrue(endPoints.contains(hosts.get(7)));
+@@ -174,7 +270,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(boot2));
+ 
+         // token 65 should go to nodes 7, 8, 9, 0, 1 and boot2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(6), testStrategy.getNaturalEndpoints(keyTokens.get(6)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(6), table, testStrategy.getNaturalEndpoints(keyTokens.get(6), table));
+         assertTrue(endPoints.size() == 6);
+         assertTrue(endPoints.contains(hosts.get(7)));
+         assertTrue(endPoints.contains(hosts.get(8)));
+@@ -184,7 +280,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(boot2));
+ 
+         // token 75 should to go nodes 8, 9, 0, 1, 2 and boot2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(7), testStrategy.getNaturalEndpoints(keyTokens.get(7)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(7), table, testStrategy.getNaturalEndpoints(keyTokens.get(7), table));
+         assertTrue(endPoints.size() == 6);
+         assertTrue(endPoints.contains(hosts.get(8)));
+         assertTrue(endPoints.contains(hosts.get(9)));
+@@ -194,7 +290,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(boot2));
+ 
+         // token 85 should go to nodes 9, 0, 1 and 2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(8), testStrategy.getNaturalEndpoints(keyTokens.get(8)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(8), table, testStrategy.getNaturalEndpoints(keyTokens.get(8), table));
+         assertTrue(endPoints.size() == 4);
+         assertTrue(endPoints.contains(hosts.get(9)));
+         assertTrue(endPoints.contains(hosts.get(0)));
+@@ -202,22 +298,56 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(hosts.get(2)));
+ 
+         // token 95 should go to nodes 0, 1 and 2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(9), testStrategy.getNaturalEndpoints(keyTokens.get(9)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(9), table, testStrategy.getNaturalEndpoints(keyTokens.get(9), table));
+         assertTrue(endPoints.size() == 3);
+         assertTrue(endPoints.contains(hosts.get(0)));
+         assertTrue(endPoints.contains(hosts.get(1)));
+         assertTrue(endPoints.contains(hosts.get(2)));
+ 
++        }
++
+         // Now finish node 6 and node 9 leaving, as well as boot1 (after this node 8 is still
+         // leaving and boot2 in progress
+-        ss.onChange(hosts.get(6), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEFT + StorageService.Delimiter + StorageService.LEFT_NORMALLY + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(6))));
+-        ss.onChange(hosts.get(9), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEFT + StorageService.Delimiter + StorageService.LEFT_NORMALLY + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(9))));
++        ss.onChange(hosts.get(LEAVING[0]), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEFT + StorageService.Delimiter + StorageService.LEFT_NORMALLY + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(LEAVING[0]))));
++        ss.onChange(hosts.get(LEAVING[2]), StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_LEFT + StorageService.Delimiter + StorageService.LEFT_NORMALLY + StorageService.Delimiter + partitioner.getTokenFactory().toString(endPointTokens.get(LEAVING[2]))));
+         ss.onChange(boot1, StorageService.MOVE_STATE, new ApplicationState(StorageService.STATE_NORMAL + StorageService.Delimiter + partitioner.getTokenFactory().toString(keyTokens.get(5))));
+ 
++        // adjust precalcuated results.  this changes what the epected endpoints are.
++        expectedEndpoints.get("Keyspace1").get(new BigIntegerToken("55")).removeAll(makeAddrs("127.0.0.7", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace1").get(new BigIntegerToken("85")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace2").get(new BigIntegerToken("55")).removeAll(makeAddrs("127.0.0.7", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace2").get(new BigIntegerToken("85")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("15")).removeAll(makeAddrs("127.0.0.7", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("25")).removeAll(makeAddrs("127.0.0.7", "127.0.1.2", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("35")).removeAll(makeAddrs("127.0.0.7", "127.0.0.2"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("45")).removeAll(makeAddrs("127.0.0.7", "127.0.0.10", "127.0.0.3"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("55")).removeAll(makeAddrs("127.0.0.7", "127.0.0.10", "127.0.0.4"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("65")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("75")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace3").get(new BigIntegerToken("85")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("35")).removeAll(makeAddrs("127.0.0.7", "127.0.0.8"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("45")).removeAll(makeAddrs("127.0.0.7", "127.0.1.2", "127.0.0.1"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("55")).removeAll(makeAddrs("127.0.0.2", "127.0.0.7"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("65")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("75")).removeAll(makeAddrs("127.0.0.10"));
++        expectedEndpoints.get("Keyspace4").get(new BigIntegerToken("85")).removeAll(makeAddrs("127.0.0.10"));
++
++        for (String table : DatabaseDescriptor.getNonSystemTables())
++        {
++            for (int i = 0; i < keyTokens.size(); i++)
++            {
++                endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), table, testStrategy.getNaturalEndpoints(keyTokens.get(i), table));
++                assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).size() == endPoints.size());
++                assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).containsAll(endPoints));
++            }
++
++            if (DatabaseDescriptor.getReplicationFactor(table) != 3)
++                continue;
++            // leave this stuff in to guarantee the old tests work the way they were supposed to.
+         // tokens 5, 15 and 25 should go three nodes
+         for (int i=0; i<3; ++i)
+         {
+-            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), testStrategy.getNaturalEndpoints(keyTokens.get(i)));
++                endPoints = testStrategy.getWriteEndpoints(keyTokens.get(i), table, testStrategy.getNaturalEndpoints(keyTokens.get(i), table));
+             assertTrue(endPoints.size() == 3);
+             assertTrue(endPoints.contains(hosts.get(i+1)));
+             assertTrue(endPoints.contains(hosts.get(i+2)));
+@@ -225,21 +355,21 @@ public void testSimultaneousMove() throws UnknownHostException
+         }
+ 
+         // token 35 goes to nodes 4, 5 and boot1
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(3), testStrategy.getNaturalEndpoints(keyTokens.get(3)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(3), table, testStrategy.getNaturalEndpoints(keyTokens.get(3), table));
+         assertTrue(endPoints.size() == 3);
+         assertTrue(endPoints.contains(hosts.get(4)));
+         assertTrue(endPoints.contains(hosts.get(5)));
+         assertTrue(endPoints.contains(boot1));
+ 
+         // token 45 goes to nodes 5, boot1 and node7
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(4), testStrategy.getNaturalEndpoints(keyTokens.get(4)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(4), table, testStrategy.getNaturalEndpoints(keyTokens.get(4), table));
+         assertTrue(endPoints.size() == 3);
+         assertTrue(endPoints.contains(hosts.get(5)));
+         assertTrue(endPoints.contains(boot1));
+         assertTrue(endPoints.contains(hosts.get(7)));
+ 
+         // token 55 goes to boot1, 7, boot2, 8 and 0
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(5), testStrategy.getNaturalEndpoints(keyTokens.get(5)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(5), table, testStrategy.getNaturalEndpoints(keyTokens.get(5), table));
+         assertTrue(endPoints.size() == 5);
+         assertTrue(endPoints.contains(boot1));
+         assertTrue(endPoints.contains(hosts.get(7)));
+@@ -248,7 +378,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(hosts.get(0)));
+ 
+         // token 65 goes to nodes 7, boot2, 8, 0 and 1
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(6), testStrategy.getNaturalEndpoints(keyTokens.get(6)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(6), table, testStrategy.getNaturalEndpoints(keyTokens.get(6), table));
+         assertTrue(endPoints.size() == 5);
+         assertTrue(endPoints.contains(hosts.get(7)));
+         assertTrue(endPoints.contains(boot2));
+@@ -257,7 +387,7 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(hosts.get(1)));
+ 
+         // token 75 goes to nodes boot2, 8, 0, 1 and 2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(7), testStrategy.getNaturalEndpoints(keyTokens.get(7)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(7), table, testStrategy.getNaturalEndpoints(keyTokens.get(7), table));
+         assertTrue(endPoints.size() == 5);
+         assertTrue(endPoints.contains(boot2));
+         assertTrue(endPoints.contains(hosts.get(8)));
+@@ -266,18 +396,19 @@ public void testSimultaneousMove() throws UnknownHostException
+         assertTrue(endPoints.contains(hosts.get(2)));
+ 
+         // token 85 goes to nodes 0, 1 and 2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(8), testStrategy.getNaturalEndpoints(keyTokens.get(8)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(8), table, testStrategy.getNaturalEndpoints(keyTokens.get(8), table));
+         assertTrue(endPoints.size() == 3);
+         assertTrue(endPoints.contains(hosts.get(0)));
+         assertTrue(endPoints.contains(hosts.get(1)));
+         assertTrue(endPoints.contains(hosts.get(2)));
+ 
+         // token 95 goes to nodes 0, 1 and 2
+-        endPoints = testStrategy.getWriteEndpoints(keyTokens.get(9), testStrategy.getNaturalEndpoints(keyTokens.get(9)));
++            endPoints = testStrategy.getWriteEndpoints(keyTokens.get(9), table, testStrategy.getNaturalEndpoints(keyTokens.get(9), table));
+         assertTrue(endPoints.size() == 3);
+         assertTrue(endPoints.contains(hosts.get(0)));
+         assertTrue(endPoints.contains(hosts.get(1)));
+         assertTrue(endPoints.contains(hosts.get(2)));
++        }
+ 
+         ss.setPartitionerUnsafe(oldPartitioner);
+         ss.setReplicationStrategyUnsafe(oldStrategy);
+@@ -290,10 +421,10 @@ public void testStateJumpToBootstrap() throws UnknownHostException
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategy = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+@@ -359,10 +490,10 @@ public void testStateJumpToNormal() throws UnknownHostException
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategy = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+@@ -403,10 +534,10 @@ public void testStateJumpToLeaving() throws UnknownHostException
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategy = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+@@ -453,10 +584,10 @@ public void testStateJumpToLeft() throws UnknownHostException
+         TokenMetadata tmd = ss.getTokenMetadata();
+         tmd.clearUnsafe();
+         IPartitioner partitioner = new RandomPartitioner();
+-        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, 3);
++        AbstractReplicationStrategy testStrategy = new RackUnawareStrategy(tmd, null);
+ 
+         IPartitioner oldPartitioner = ss.setPartitionerUnsafe(partitioner);
+-        AbstractReplicationStrategy oldStrategy = ss.setReplicationStrategyUnsafe(testStrategy);
++        Map<String, AbstractReplicationStrategy> oldStrategy = ss.setReplicationStrategyUnsafe(createReplacements(testStrategy));
+ 
+         ArrayList<Token> endPointTokens = new ArrayList<Token>();
+         ArrayList<Token> keyTokens = new ArrayList<Token>();
+@@ -513,4 +644,11 @@ private void createInitialRing(StorageService ss, IPartitioner partitioner, List
+             assertTrue(ss.getTokenMetadata().isMember(hosts.get(i)));
+     }
+ 
++    private static Collection<InetAddress> makeAddrs(String... hosts) throws UnknownHostException
++    {
++        ArrayList<InetAddress> addrs = new ArrayList<InetAddress>(hosts.length);
++        for (String host : hosts)
++            addrs.add(InetAddress.getByName(host));
++        return addrs;
++    }
+ }

@@ -1,0 +1,240 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/AbstractColumnContainer.java b/cassandra/trunk/src/java/org/apache/cassandra/db/AbstractColumnContainer.java
+index 181aa42c..b1486d63 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/AbstractColumnContainer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/AbstractColumnContainer.java
+@@ -225,6 +225,19 @@ public int getEstimatedColumnCount()
+         return getColumnCount();
+     }
+ 
++    public int getLiveColumnCount()
++    {
++        int count = 0;
++
++        for (IColumn column : columns.values())
++        {
++            if (column.isLive())
++                count++;
++        }
++
++        return count;
++    }
++
+     public Iterator<IColumn> iterator()
+     {
+         return columns.values().iterator();
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractRowResolver.java b/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractRowResolver.java
+index 34bb3a19..82829c9a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractRowResolver.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractRowResolver.java
+@@ -83,4 +83,9 @@ public void injectPreProcessed(ReadResponse result)
+     {
+         return replies.keySet();
+     }
++
++    public int getMaxLiveColumns()
++    {
++        throw new UnsupportedOperationException();
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/IResponseResolver.java b/cassandra/trunk/src/java/org/apache/cassandra/service/IResponseResolver.java
+index f4f972a3..69d8bb99 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/IResponseResolver.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/IResponseResolver.java
+@@ -43,4 +43,6 @@
+ 
+     public void preprocess(Message message);
+     public Iterable<Message> getMessages();
++
++    public int getMaxLiveColumns();
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java b/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+index e18fa330..28ea5962 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+@@ -158,4 +158,9 @@ public void close() {}
+     {
+         return responses;
+     }
++
++    public int getMaxLiveColumns()
++    {
++        throw new UnsupportedOperationException();
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/RepairCallback.java b/cassandra/trunk/src/java/org/apache/cassandra/service/RepairCallback.java
+index d79ea1dc..fea2d637 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/RepairCallback.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/RepairCallback.java
+@@ -82,4 +82,9 @@ public boolean isLatencyForSnitch()
+     {
+         return true;
+     }
++
++    public int getMaxLiveColumns()
++    {
++        return resolver.getMaxLiveColumns();
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/RowRepairResolver.java b/cassandra/trunk/src/java/org/apache/cassandra/service/RowRepairResolver.java
+index e65e88d5..aac06540 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/RowRepairResolver.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/RowRepairResolver.java
+@@ -37,6 +37,8 @@
+ 
+ public class RowRepairResolver extends AbstractRowResolver
+ {
++    protected int maxLiveColumns = 0;
++
+     public RowRepairResolver(String table, ByteBuffer key)
+     {
+         super(key, table);
+@@ -76,6 +78,12 @@ public Row resolve() throws DigestMismatchException, IOException
+         ColumnFamily resolved;
+         if (versions.size() > 1)
+         {
++            for (ColumnFamily cf : versions)
++            {
++                int liveColumns = cf.getLiveColumnCount();
++                if (liveColumns > maxLiveColumns)
++                    maxLiveColumns = liveColumns;
++            }
+             resolved = resolveSuperset(versions);
+             if (logger.isDebugEnabled())
+                 logger.debug("versions merged");
+@@ -90,6 +98,7 @@ public Row resolve() throws DigestMismatchException, IOException
+ 
+         if (logger.isDebugEnabled())
+             logger.debug("resolve: " + (System.currentTimeMillis() - startTime) + " ms.");
++
+ 		return new Row(key, resolved);
+ 	}
+ 
+@@ -163,4 +172,9 @@ public boolean isDataPresent()
+ 	{
+         throw new UnsupportedOperationException();
+     }
++
++    public int getMaxLiveColumns()
++    {
++        return maxLiveColumns;
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index 16858eb9..a4c09a35 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -501,14 +501,24 @@ public void runMayThrow() throws IOException
+     {
+         List<ReadCallback<Row>> readCallbacks = new ArrayList<ReadCallback<Row>>();
+         List<Row> rows = new ArrayList<Row>();
++        List<ReadCommand> commandsToRetry = Collections.emptyList();
++        List<ReadCommand> repairCommands = Collections.emptyList();
++
++        do
++        {
++            List<ReadCommand> commandsToSend = commandsToRetry.isEmpty() ? commands : commandsToRetry;
++
++            if (!commandsToRetry.isEmpty())
++                logger.debug("Retrying {} commands", commandsToRetry.size());
+ 
+         // send out read requests
+-        for (ReadCommand command: commands)
++            for (ReadCommand command : commandsToSend)
+         {
+             assert !command.isDigestQuery();
+             logger.debug("Command/ConsistencyLevel is {}/{}", command, consistency_level);
+ 
+-            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
++                List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table,
++                                                                                              command.key);
+             DatabaseDescriptor.getEndpointSnitch().sortByProximity(FBUtilities.getBroadcastAddress(), endpoints);
+ 
+             RowDigestResolver resolver = new RowDigestResolver(command.table, command.key);
+@@ -557,9 +567,12 @@ public void runMayThrow() throws IOException
+             readCallbacks.add(handler);
+         }
+ 
++            if (repairCommands != Collections.EMPTY_LIST)
++                repairCommands.clear();
++
+         // read results and make a second pass for any digest mismatches
+         List<RepairCallback<Row>> repairResponseHandlers = null;
+-        for (int i = 0; i < commands.size(); i++)
++            for (int i = 0; i < commandsToSend.size(); i++)
+         {
+             ReadCallback<Row> handler = readCallbacks.get(i);
+             Row row;
+@@ -586,6 +599,11 @@ public void runMayThrow() throws IOException
+                     logger.debug("Digest mismatch: {}", ex.toString());
+                 RowRepairResolver resolver = new RowRepairResolver(command.table, command.key);
+                 RepairCallback<Row> repairHandler = new RepairCallback<Row>(resolver, handler.endpoints);
++
++                    if (repairCommands == Collections.EMPTY_LIST)
++                        repairCommands = new ArrayList<ReadCommand>();
++                    repairCommands.add(command);
++
+                 for (InetAddress endpoint : handler.endpoints)
+                     MessagingService.instance().sendRR(command, endpoint, repairHandler);
+ 
+@@ -595,15 +613,51 @@ public void runMayThrow() throws IOException
+             }
+         }
+ 
++            if (commandsToRetry != Collections.EMPTY_LIST)
++                commandsToRetry.clear();
++
+         // read the results for the digest mismatch retries
+         if (repairResponseHandlers != null)
+         {
+-            for (RepairCallback<Row> handler : repairResponseHandlers)
++                for (int i = 0; i < repairCommands.size(); i++)
+             {
++                    ReadCommand command = repairCommands.get(i);
++                    RepairCallback<Row> handler = repairResponseHandlers.get(i);
++
+                 try
+                 {
+                     Row row = handler.get();
+-                    if (row != null)
++
++                        if (command instanceof SliceFromReadCommand)
++                        {
++                            // short reads are only possible on SliceFromReadCommand
++                            SliceFromReadCommand sliceCommand = (SliceFromReadCommand)command;
++                            int maxLiveColumns = handler.getMaxLiveColumns();
++                            int liveColumnsInRow = row != null ? row.cf.getLiveColumnCount() : 0;
++
++                            assert maxLiveColumns <= sliceCommand.count;
++                            if ((maxLiveColumns == sliceCommand.count) && (liveColumnsInRow < sliceCommand.count))
++                            {
++                                if (logger.isDebugEnabled())
++                                    logger.debug("detected short read: expected {} columns, but only resolved {} columns",
++                                                 sliceCommand.count, liveColumnsInRow);
++
++                                int retryCount = sliceCommand.count + sliceCommand.count - liveColumnsInRow;
++                                SliceFromReadCommand retryCommand = new SliceFromReadCommand(command.table,
++                                                                                             command.key,
++                                                                                             command.queryPath,
++                                                                                             sliceCommand.start,
++                                                                                             sliceCommand.finish,
++                                                                                             sliceCommand.reversed,
++                                                                                             retryCount);
++                                if (commandsToRetry == Collections.EMPTY_LIST)
++                                    commandsToRetry = new ArrayList<ReadCommand>();
++                                commandsToRetry.add(retryCommand);
++                            }
++                            else if (row != null)
++                                rows.add(row);
++                        }
++                        else if (row != null)
+                         rows.add(row);
+                 }
+                 catch (DigestMismatchException e)
+@@ -612,6 +666,7 @@ public void runMayThrow() throws IOException
+                 }
+             }
+         }
++        } while (!commandsToRetry.isEmpty());
+ 
+         return rows;
+     }

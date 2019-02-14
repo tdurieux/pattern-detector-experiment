@@ -1,0 +1,226 @@
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/index/DocumentWriter.java b/lucene/java/trunk/src/java/org/apache/lucene/index/DocumentWriter.java
+index 45ed02f7..addb6ef4 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/index/DocumentWriter.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/index/DocumentWriter.java
+@@ -35,6 +35,8 @@
+ import java.util.Enumeration;
+ import java.util.Hashtable;
+ import java.util.Iterator;
++import java.util.LinkedList;
++import java.util.List;
+ 
+ final class DocumentWriter {
+   private Analyzer analyzer;
+@@ -84,6 +86,8 @@ final void addDocument(String segment, Document doc)
+     fieldBoosts = new float[fieldInfos.size()];	  // init fieldBoosts
+     Arrays.fill(fieldBoosts, doc.getBoost());
+ 
++    try {
++    
+     // Before we write the FieldInfos we invert the Document. The reason is that
+     // during invertion the TokenStreams of tokenized fields are being processed 
+     // and we might encounter tokens that have payloads associated with them. In 
+@@ -123,7 +127,26 @@ final void addDocument(String segment, Document doc)
+ 
+     // write norms of indexed fields
+     writeNorms(segment);
++    } finally {
++      // close TokenStreams
++      IOException ex = null;
+ 
++      Iterator it = openTokenStreams.iterator();
++      while (it.hasNext()) {
++        try {
++          ((TokenStream) it.next()).close();
++        } catch (IOException e) {
++          if (ex != null) {
++            ex = e;
++          }
++        }
++      }
++      openTokenStreams.clear();
++      
++      if (ex != null) {
++        throw ex;
++      }
++    }
+   }
+ 
+   // Keys are Terms, values are Postings.
+@@ -138,6 +161,10 @@ final void addDocument(String segment, Document doc)
+   // then we enable payloads for that field. 
+   private BitSet fieldStoresPayloads;
+ 
++  // Keep references of the token streams. We must close them after
++  // the postings are written to the segment.
++  private List openTokenStreams = new LinkedList();
++
+   // Tokenizes the fields of a document into Postings.
+   private final void invertDocument(Document doc)
+           throws IOException {
+@@ -181,10 +208,13 @@ else if (field.stringValue() != null)
+             stream = analyzer.tokenStream(fieldName, reader);
+           }
+           
++          // remember this TokenStream, we must close it later
++          openTokenStreams.add(stream);
++          
+           // reset the TokenStream to the first token
+           stream.reset();
+           
+-          try {
++
+             Token lastToken = null;
+             for (Token t = stream.next(); t != null; t = stream.next()) {
+               position += (t.getPositionIncrement() - 1);
+@@ -213,10 +243,6 @@ else if (field.stringValue() != null)
+             
+             if(lastToken != null)
+               offset += lastToken.endOffset() + 1;
+-            
+-          } finally {
+-            stream.close();
+-          }
+         }
+ 
+         fieldLengths[fieldNumber] = length;	  // save field length
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/index/TestPayloads.java b/lucene/java/trunk/src/test/org/apache/lucene/index/TestPayloads.java
+index b45881a0..1bac3842 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/index/TestPayloads.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/index/TestPayloads.java
+@@ -20,7 +20,9 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.io.Reader;
++import java.util.ArrayList;
+ import java.util.HashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
+ 
+@@ -319,10 +321,15 @@ private void performTest(Directory dir) throws Exception {
+         
+     }
+     
+-    private byte[] generateRandomData(int n) {
+-        Random rnd = new Random();
+-        byte[] data = new byte[n];
++    private static Random rnd = new Random();
++    
++    private static void generateRandomData(byte[] data) {
+         rnd.nextBytes(data);
++    }
++
++    private static byte[] generateRandomData(int n) {
++        byte[] data = new byte[n];
++        generateRandomData(data);
+         return data;
+     }
+     
+@@ -440,4 +447,106 @@ public Token next() throws IOException {
+             return nextToken;
+         }
+       }
++    
++    public void testThreadSafety() throws IOException {
++        final int numThreads = 5;
++        final int numDocs = 50;
++        final ByteArrayPool pool = new ByteArrayPool(numThreads, 5);
++        
++        Directory dir = new RAMDirectory();
++        final IndexWriter writer = new IndexWriter(dir, new WhitespaceAnalyzer());
++        final String field = "test";
++        
++        Thread[] ingesters = new Thread[numThreads];
++        for (int i = 0; i < numThreads; i++) {
++            ingesters[i] = new Thread() {
++                public void run() {
++                    try {
++                        for (int j = 0; j < numDocs; j++) {
++                            Document d = new Document();
++                            d.add(new Field(field, new PoolingPayloadTokenStream(pool)));
++                            writer.addDocument(d);
++                        }
++                    } catch (IOException e) {
++                        fail(e.toString());
++                    }
++                }
++            };
++            ingesters[i].start();
++        }
++        
++        for (int i = 0; i < numThreads; i++) {
++            try {
++                ingesters[i].join();
++            } catch (InterruptedException e) {}
++        }
++        
++        writer.close();
++        IndexReader reader = IndexReader.open(dir);
++        TermEnum terms = reader.terms();
++        while (terms.next()) {
++            TermPositions tp = reader.termPositions(terms.term());
++            while(tp.next()) {
++                int freq = tp.freq();
++                for (int i = 0; i < freq; i++) {
++                    tp.nextPosition();
++                    String s = new String(tp.getPayload(new byte[5], 0));
++                    assertEquals(s, terms.term().text);
++                }
++            }
++            tp.close();
++        }
++        terms.close();
++        reader.close();
++        
++        assertEquals(pool.size(), numThreads);
++    }
++    
++    private static class PoolingPayloadTokenStream extends TokenStream {
++        private byte[] payload;
++        private boolean first;
++        private ByteArrayPool pool;
++        
++        PoolingPayloadTokenStream(ByteArrayPool pool) {
++            this.pool = pool;
++            payload = pool.get();
++            generateRandomData(payload);
++            first = true;
++        }
++        
++        public Token next() throws IOException {
++            if (!first) return null;            
++            Token t = new Token(new String(payload), 0, 0);
++            t.setPayload(new Payload(payload));
++            return t;        
++        }
++        
++        public void close() throws IOException {
++            pool.release(payload);
++        }
++        
++    }
++    
++    private static class ByteArrayPool {
++        private List pool;
++        
++        ByteArrayPool(int capacity, int size) {
++            pool = new ArrayList();
++            for (int i = 0; i < capacity; i++) {
++                pool.add(new byte[size]);
++            }
++        }
++        
++        synchronized byte[] get() {
++            return (byte[]) pool.remove(0);
++        }
++        
++        synchronized void release(byte[] b) {
++            pool.add(b);
++        }
++        
++        synchronized int size() {
++            return pool.size();
++        }
++    }
+ }

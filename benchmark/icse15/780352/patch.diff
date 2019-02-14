@@ -1,0 +1,319 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
+index 5d75da1a..232c4e04 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
+@@ -848,9 +848,11 @@ public void disableLogArchiveMode(boolean deleteOnlineArchivedLogFiles)
+ 
+ 
+ 	/**
+-		Try to checkpoint the database to minimize recovery time.
+-		The raw store does not guarentee that a checkpoint will indeed have
+-		happened by the time this routine returns.
++        Checkpoint the database.
++
++        The raw store will wait for any current checkpoints to complete.  It
++        will start a new checkpoint and not return until that checkpoint 
++        completes.
+ 
+ 		@exception StandardException Standard Derby error policy
+ 	*/
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+index b960b6e9..25df432a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+@@ -89,21 +89,28 @@ public void recover(DataFactory dataFactory,
+ 		properties,
+ 		RawStore.LOG_SWITCH_INTERVAL and RawStore.CHECKPOINT_INTERVAL.  
+ 
+-		By default, LOG_SWITCH_INTERVAL is every 100K bytes of log record
++		By default, LOG_SWITCH_INTERVAL is every 1M bytes of log record
+ 		written.  User can change this value by setting the property to some
+ 		other values during boot time.   The legal range of LOG_SWITCH_INTERVAL
+ 		is from 100K to 128M.
+ 
+-		By default, CHECKPOINT_INTERVAL equals LOG_SWITCH_INTERVAL, but user
++		By default, CHECKPOINT_INTERVAL equals 10M, but user
+ 		can set it to less if more frequent checkpoint is desired.  The legal
+-		range of CHECKPOINT_INTERVAL is from 100K to LOG_SWITCH_INTERVAL.
++		range of CHECKPOINT_INTERVAL is from 100K to 128M.
+ 
+ 		@param rawStoreFactory - the raw store
+ 		@param dataFactory - the data factory
+ 		@param transactionFactory - the transaction factory
+-		@param wait - if true; waits for the checkpoint to completed even if it is being done my an another thread.
+-		@return true if checkpoint is successful
+-		@exception StandardException - encounter exception while doing checkpoint.
++		@param wait - if true waits for any existing checkpoint to complete 
++                         and then executes and waits for another checkpoint.
++                      if false if another thead is executing a checkpoint 
++                      routine will return immediately.
++
++		@return true if checkpoint is successful,  Will return false if wait
++                is false and the routine finds another thread executing a 
++                checkpoint.
++
++		@exception StandardException - got exception while doing checkpoint.
+ 	*/
+ 	public boolean checkpoint(RawStoreFactory rawStoreFactory,
+ 							  DataFactory dataFactory,
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+index 05455d82..436a0a11 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+@@ -367,6 +367,11 @@ public void	stop() {
+ 
+ 			if (logFactory.checkpoint(this, dataFactory, xactFactory, false))
+ 			{
++                // checkpoint with "wait" = false.  If set to true shutdown
++                // might loop forever if we are shutting down on a serious 
++                // error where some factory has already shut down and thus
++                // log checkpoint always returns false.
++
+ 				if (dataFactory != null)
+ 					dataFactory.removeStubsOK();
+ 			}
+@@ -468,7 +473,7 @@ public Transaction startInternalTransaction(ContextManager contextMgr) throws St
+ 
+ 	public void checkpoint() throws StandardException
+ 	{
+-		logFactory.checkpoint(this, dataFactory, xactFactory, false);
++		logFactory.checkpoint(this, dataFactory, xactFactory, true);
+ 	}
+ 
+     /**
+@@ -1200,7 +1205,7 @@ public void getRawStoreProperties(PersistentSet set)
+ 	public void freezePersistentStore() throws StandardException
+ 	{
+ 		// do a checkpoint to get the persistent store up to date.
+-		logFactory.checkpoint(this, dataFactory, xactFactory,true);
++		logFactory.checkpoint(this, dataFactory, xactFactory, true);
+ 		logFactory.freezePersistentStore();
+ 
+ 	}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+index 3286f836..3546f24e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+@@ -1476,16 +1476,27 @@ transaction in the first phase (between undoLWM and redoLWM).  No
+ 
+ 		@exception StandardException - encounter exception while doing 
+                                        checkpoint.
++
++        @param rsf          The RawStoreFactory to use to do the checkpoint.
++        @param df           The DataFactory to use to do the checkpoint. 
++        @param tf           The TransactionFactory to use to do the checkpoint.
++        @param wait         If an existing checkpoint is in progress, then if
++                            wait=true then this routine will wait for the 
++                            checkpoint to complete and the do another checkpoint
++                            and wait for it to finish before returning.
+ 	*/
+-	public boolean checkpoint(RawStoreFactory rsf,
++
++	public boolean checkpoint(
++    RawStoreFactory     rsf,
+ 							  DataFactory df,
+ 							  TransactionFactory tf, 
+ 							  boolean wait)
+ 		 throws StandardException
+ 	{
+ 
+-		if (inReplicationSlavePreMode) {
+-			// Writing a checkpoing updates the log files and the log.ctrl
++		if (inReplicationSlavePreMode) 
++        {
++			// Writing a checkpoint updates the log files and the log.ctrl
+ 			// file. This cannot be allowed in slave pre mode because the slave
+ 			// and master log files need to be equal when the database is
+ 			// booted in slave mode (the next phase of the start slave command).
+@@ -1493,52 +1504,32 @@ public boolean checkpoint(RawStoreFactory rsf,
+ 		}
+ 
+ 		// call checkpoint with no pre-started transaction
+-		boolean done = checkpointWithTran(null, rsf, df, tf);
+-
+-		//above checpoint call will return 'false'  without
+-		//performing the checkpoint if some other  thread is doing checkpoint. 
+-		//In  cases like backup it is necesary to wait for the 
+-		//checkpoint to complete before copying the files. 'wait' flag get passed 
+-		//in as 'true' by  such cases.
+-		//When wait flag is true, we will wait here until the other thread which
+-		//is actually doing the the checkpoint completes.
+- 
+-		if(!done && wait)
+-		{
+-			synchronized(this)
+-			{
+-				//wait until the thread that is doing the checkpoint completes it.
+-				while(inCheckpoint)
+-				{
+-					try
+-					{
+-						wait();
+-					}	
+-					catch (InterruptedException ie)
+-					{
+-						throw StandardException.interrupt(ie);
+-					}	
+-				}
+-				done = true;
+-			}
+-		}
++		boolean done = checkpointWithTran(null, rsf, df, tf, wait);
+ 
+ 		return done;
+ 	}
+ 
+-
+ 	/**
+ 		checkpoint with pre-start transaction
+ 
++        @param rsf          The RawStoreFactory to use to do the checkpoint.
++        @param df           The DataFactory to use to do the checkpoint. 
++        @param tf           The TransactionFactory to use to do the checkpoint.
++        @param wait         If an existing checkpoint is in progress, then if
++                            wait=true then this routine will wait for the 
++                            checkpoint to complete and the do another checkpoint
++                            and wait for it to finish before returning.
++
+ 		@exception StandardException Derby Standard Error Policy 
+ 	*/
+-	protected boolean checkpointWithTran(RawTransaction cptran, 
++	protected boolean checkpointWithTran(
++    RawTransaction      cptran, 
+ 							   RawStoreFactory rsf,
+ 							   DataFactory df,
+-							   TransactionFactory tf)
++    TransactionFactory  tf,
++    boolean             wait)
+ 		 throws StandardException
+ 	{
+-		boolean proceed = true;
+ 		LogInstant redoLWM;
+ 
+ 		// we may be called to stop the database after a bad error, make sure
+@@ -1550,31 +1541,90 @@ protected boolean checkpointWithTran(RawTransaction cptran,
+ 
+ 		long approxLogLength;
+ 
++		boolean     proceed = true;
++        do
++        {
+ 		synchronized (this)
+ 		{
+-			// has someone else found a problem in the raw store?  
+ 			if (corrupt != null)
+             {
+-				throw StandardException.newException(SQLState.LOG_STORE_CORRUPT, corrupt);
++                    // someone else found a problem in the raw store.  
++
++                    throw StandardException.newException(
++                            SQLState.LOG_STORE_CORRUPT, corrupt);
+             }
+ 
+-			// if another checkpoint is in progress, don't do anything
+-			if (inCheckpoint == true)
+-				proceed = false;
+-			else
++                approxLogLength = endPosition; // current end position
++
++                if (!inCheckpoint)
++                {
++                    // no checkpoint in progress, change status to indicate
++                    // this code is doing the checkpoint.
+ 				inCheckpoint = true;
+ 
+-			approxLogLength = endPosition; // current end position
++                    // break out of loop and continue to execute checkpoint
++                    // in this routine.
++                    break;
++                }
++                else
++                {
++                    // There is a checkpoint in progress.
++
++                    if (wait)
++                    {
++                        // wait until the thread executing the checkpoint 
++                        // completes.
++
++
++                        // In some cases like backup and compress it is not 
++                        // enough that a checkpoint is in progress, the timing 
++                        // is important.
++                        // In the case of compress it is necessary that the 
++                        // redo low water mark be moved forward past all 
++                        // operations up to the current time, so that a redo of
++                        // the subsequent compress operation is guaranteed
++                        // to not encounter any log record on the container 
++                        // previous to the compress.  In this case the 'wait'
++                        // flag is passed in as 'true'.
++                        //
++                        // When wait is true and another thread is currently
++                        // executing the checkpoint, execution waits here until
++                        // the other thread which is actually doing the the 
++                        // checkpoint completes.  And then the code will loop
++                        // until this thread executes the checkpoint.
++ 
++                        while (inCheckpoint)
++                        {
++                            try
++                            {
++                                wait();
++                            }	
++                            catch (InterruptedException ie)
++                            {
++                                throw StandardException.interrupt(ie);
++                            }	
++                        }
++                    }
++                    else
++                    {
++                        // caller did not want to wait for already executing
++                        // checkpoint to finish.  Routine will return false
++                        // upon exiting the loop.
++                        proceed = false;
++                    }
++                }
+ 
+ 			// don't return from inside of a sync block
+ 		}
++        }
++        while (proceed);
+ 
+ 		if (!proceed)
+ 		{
+ 			return false;
+ 		}
+ 
+-		// needCPtran == true if we are not supplied with a pre-started transaction
++		// needCPtran == true if not supplied with a pre-started transaction
+ 		boolean needCPTran = (cptran == null);
+ 
+ 		if (SanityManager.DEBUG)
+@@ -1593,18 +1643,21 @@ protected boolean checkpointWithTran(RawTransaction cptran,
+ 			if (approxLogLength > logSwitchInterval)
+ 			{
+ 				switchLogFile();
++
+ 				//log switch is occuring in conjuction with the 
+-				//checkpoint, set the amount of log written from last checkpoint to zero.
++				//checkpoint, set the amount of log written from last 
++                //checkpoint to zero.
+ 				logWrittenFromLastCheckPoint = 0;
+-			}else
++			}
++            else
+ 			{
+ 				//checkpoint is happening without the log switch,
+ 				//in the middle of a log file. Amount of log written already for
+ 				//the current log file should not be included in caluculation 
+ 				//of when next check point is due. By assigning the negative
+-				//value of amount of log writtent for this file. Later it will
+-				//be subtracted when we switch the log file or while calculating whether 
+-				//we are due a for checkpoint a flush time.
++				//value of amount of log written for this file. Later it will
++				//be subtracted when we switch the log file or while 
++                //calculating whether we are due a for checkpoint at flush time.
+ 				logWrittenFromLastCheckPoint = -endPosition;
+ 			}
+ 

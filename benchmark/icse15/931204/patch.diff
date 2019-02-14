@@ -1,0 +1,570 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+index 6554785e..f2845a4b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -60,6 +60,14 @@ public static final String getCurrentName(int id)
+         return currentCfNames.get(id);
+     }
+     
++    public static final int getId(String table, String cfName)
++    {
++        Integer id = cfIdMap.get(new Pair<String, String>(table, cfName));
++        if (id == null)
++            throw new IllegalArgumentException(String.format("Illegal table/cf pair (%s.%s)", table, cfName));
++        return id;
++    }
++    
+     // this gets called after initialization to make sure that id generation happens properly.
+     public static final void fixMaxId()
+     {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
+index e816376d..1d0ddc95 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
+@@ -29,6 +29,7 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
++import org.apache.cassandra.config.CFMetaData;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -72,22 +73,25 @@ public static ColumnFamily create(String tableName, String cfName)
+         String columnType = DatabaseDescriptor.getColumnFamilyType(tableName, cfName);
+         AbstractType comparator = DatabaseDescriptor.getComparator(tableName, cfName);
+         AbstractType subcolumnComparator = DatabaseDescriptor.getSubComparator(tableName, cfName);
+-        return new ColumnFamily(cfName, columnType, comparator, subcolumnComparator);
++        int id = CFMetaData.getId(tableName, cfName);
++        return new ColumnFamily(cfName, columnType, comparator, subcolumnComparator, id);
+     }
+ 
+     private String name_;
++    private final int id_;
+ 
+     private transient ICompactSerializer2<IColumn> columnSerializer_;
+     AtomicLong markedForDeleteAt = new AtomicLong(Long.MIN_VALUE);
+     AtomicInteger localDeletionTime = new AtomicInteger(Integer.MIN_VALUE);
+     private ConcurrentSkipListMap<byte[], IColumn> columns_;
+ 
+-    public ColumnFamily(String cfName, String columnType, AbstractType comparator, AbstractType subcolumnComparator)
++    public ColumnFamily(String cfName, String columnType, AbstractType comparator, AbstractType subcolumnComparator, int id)
+     {
+         name_ = cfName;
+         type_ = columnType;
+         columnSerializer_ = columnType.equals("Standard") ? Column.serializer() : SuperColumn.serializer(subcolumnComparator);
+         columns_ = new ConcurrentSkipListMap<byte[], IColumn>(comparator);
++        id_ = id;
+     }
+     
+     /** called during CL recovery when it is determined that a CF name was changed. */
+@@ -98,7 +102,7 @@ public void rename(String newName)
+ 
+     public ColumnFamily cloneMeShallow()
+     {
+-        ColumnFamily cf = new ColumnFamily(name_, type_, getComparator(), getSubComparator());
++        ColumnFamily cf = new ColumnFamily(name_, type_, getComparator(), getSubComparator(), id_);
+         cf.markedForDeleteAt = markedForDeleteAt;
+         cf.localDeletionTime = localDeletionTime;
+         return cf;
+@@ -121,6 +125,11 @@ public String name()
+         return name_;
+     }
+ 
++    public int id()
++    {
++        return id_;
++    }
++
+     /*
+      *  We need to go through each column
+      *  in the column family and resolve it before adding
+@@ -264,7 +273,7 @@ public boolean isMarkedForDelete()
+      */
+     public ColumnFamily diff(ColumnFamily cfComposite)
+     {
+-    	ColumnFamily cfDiff = new ColumnFamily(cfComposite.name(), cfComposite.type_, getComparator(), getSubComparator());
++    	ColumnFamily cfDiff = new ColumnFamily(cfComposite.name(), cfComposite.type_, getComparator(), getSubComparator(), cfComposite.id());
+         if (cfComposite.getMarkedForDeleteAt() > getMarkedForDeleteAt())
+         {
+             cfDiff.delete(cfComposite.getLocalDeletionTime(), cfComposite.getMarkedForDeleteAt());
+@@ -314,9 +323,15 @@ int size()
+         return size;
+     }
+ 
++    private transient int hash_ = 0;
+     public int hashCode()
+     {
+-        return name().hashCode();
++        if (hash_ == 0)
++        {
++            int h = id_ * 7 + name().hashCode();
++            hash_ = h;
++        }
++        return hash_;
+     }
+ 
+     public boolean equals(Object o)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
+index fb2a4207..15d5a2fb 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilySerializer.java
+@@ -62,6 +62,7 @@ public void serialize(ColumnFamily columnFamily, DataOutput dos)
+             }
+ 
+             dos.writeUTF(columnFamily.name());
++            dos.writeInt(columnFamily.id());
+             dos.writeUTF(columnFamily.type_);
+             dos.writeUTF(columnFamily.getComparatorName());
+             dos.writeUTF(columnFamily.getSubComparatorName());
+@@ -104,7 +105,8 @@ public ColumnFamily deserialize(DataInput dis) throws IOException
+         String cfName = dis.readUTF();
+         if (cfName.isEmpty())
+             return null;
+-        ColumnFamily cf = deserializeFromSSTableNoColumns(cfName, dis.readUTF(), readComparator(dis), readComparator(dis), dis);
++        int id = dis.readInt();
++        ColumnFamily cf = deserializeFromSSTableNoColumns(cfName, dis.readUTF(), readComparator(dis), readComparator(dis), id, dis);
+         deserializeColumns(dis, cf);
+         return cf;
+     }
+@@ -141,9 +143,9 @@ private AbstractType readComparator(DataInput dis) throws IOException
+         }
+     }
+ 
+-    public ColumnFamily deserializeFromSSTableNoColumns(String name, String type, AbstractType comparator, AbstractType subComparator, DataInput input) throws IOException
++    private ColumnFamily deserializeFromSSTableNoColumns(String name, String type, AbstractType comparator, AbstractType subComparator, int id, DataInput input) throws IOException
+     {
+-        ColumnFamily cf = new ColumnFamily(name, type, comparator, subComparator);
++        ColumnFamily cf = new ColumnFamily(name, type, comparator, subComparator, id);
+         return deserializeFromSSTableNoColumns(cf, input);
+     }
+ 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index c5f85449..567aba16 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -23,13 +23,12 @@
+ import java.io.IOException;
+ import java.io.File;
+ import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ import java.util.concurrent.Future;
+ 
+ import com.google.common.base.Function;
+ import com.google.common.collect.Iterables;
++import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.db.commitlog.CommitLogSegment;
+@@ -41,7 +40,6 @@
+ import java.net.InetAddress;
+ 
+ import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.utils.*;
+ import org.apache.cassandra.db.filter.*;
+ import org.cliffc.high_scale_lib.NonBlockingHashMap;
+ 
+@@ -82,7 +80,9 @@
+     /* Table name. */
+     public final String name;
+     /* ColumnFamilyStore per column family */
+-    private final Map<String, ColumnFamilyStore> columnFamilyStores = new HashMap<String, ColumnFamilyStore>();
++    private final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>();
++    /* map to make it easier to look up cfs by name */
++    private final Map<String, Integer> cfNameMap = new HashMap<String, Integer>();
+     // cache application CFs since Range queries ask for them a _lot_
+     private SortedSet<String> applicationColumnFamilies;
+     private final TimerTask flushTask;
+@@ -120,7 +120,7 @@ public static Table clear(String table) throws IOException
+     
+     public Set<String> getColumnFamilies()
+     {
+-        return DatabaseDescriptor.getTableDefinition(name).cfMetaData().keySet();
++        return cfNameMap.keySet();
+     }
+ 
+     public Collection<ColumnFamilyStore> getColumnFamilyStores()
+@@ -130,7 +130,7 @@ public static Table clear(String table) throws IOException
+ 
+     public ColumnFamilyStore getColumnFamilyStore(String cfName)
+     {
+-        return columnFamilyStores.get(cfName);
++        return columnFamilyStores.get(cfNameMap.get(cfName));
+     }
+ 
+     /**
+@@ -141,14 +141,9 @@ public void forceCleanup()
+         if (name.equals(SYSTEM_TABLE))
+             throw new RuntimeException("Cleanup of the system table is neither necessary nor wise");
+ 
+-        Set<String> columnFamilies = getColumnFamilies();
+-        for ( String columnFamily : columnFamilies )
+-        {
+-            ColumnFamilyStore cfStore = columnFamilyStores.get( columnFamily );
+-            if ( cfStore != null )
++        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+                 cfStore.forceCleanup();
+         }   
+-    }
+     
+     
+     /**
+@@ -198,10 +193,8 @@ public void clearSnapshot() throws IOException
+     public List<SSTableReader> forceAntiCompaction(Collection<Range> ranges, InetAddress target)
+     {
+         List<SSTableReader> allResults = new ArrayList<SSTableReader>();
+-        Set<String> columnFamilies = getColumnFamilies();
+-        for ( String columnFamily : columnFamilies )
++        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+         {
+-            ColumnFamilyStore cfStore = columnFamilyStores.get( columnFamily );
+             try
+             {
+                 allResults.addAll(CompactionManager.instance.submitAnticompaction(cfStore, ranges, target).get());
+@@ -220,25 +213,15 @@ public void clearSnapshot() throws IOException
+     */
+     public void forceCompaction()
+     {
+-        Set<String> columnFamilies = getColumnFamilies();
+-        for ( String columnFamily : columnFamilies )
+-        {
+-            ColumnFamilyStore cfStore = columnFamilyStores.get( columnFamily );
+-            if ( cfStore != null )
++        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+                 CompactionManager.instance.submitMajor(cfStore);
+         }
+-    }
+ 
+     List<SSTableReader> getAllSSTablesOnDisk()
+     {
+         List<SSTableReader> list = new ArrayList<SSTableReader>();
+-        Set<String> columnFamilies = getColumnFamilies();
+-        for ( String columnFamily : columnFamilies )
+-        {
+-            ColumnFamilyStore cfStore = columnFamilyStores.get( columnFamily );
+-            if ( cfStore != null )
++        for (ColumnFamilyStore cfStore : columnFamilyStores.values())
+                 list.addAll(cfStore.getSSTables());
+-        }
+         return list;
+     }
+ 
+@@ -265,9 +248,10 @@ private Table(String table)
+             }
+         }
+       
+-        for (String columnFamily : getColumnFamilies())
++        for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
+         {
+-            columnFamilyStores.put(columnFamily, ColumnFamilyStore.createColumnFamilyStore(table, columnFamily));
++            columnFamilyStores.put(cfm.cfId, ColumnFamilyStore.createColumnFamilyStore(table, cfm.cfName));
++            cfNameMap.put(cfm.cfName, cfm.cfId);
+         }
+ 
+         // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+@@ -286,12 +270,13 @@ public void run()
+     }
+     
+     /** removes a cf from internal structures (doesn't change disk files). */
+-    public void dropCf(String cfName) throws IOException
++    public void dropCf(int cfId) throws IOException
+     {
+-        assert columnFamilyStores.containsKey(cfName);
+-        ColumnFamilyStore cfs = columnFamilyStores.remove(cfName);
++        assert columnFamilyStores.containsKey(cfId);
++        ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+         if (cfs != null)
+         {
++            cfNameMap.remove(cfs.getColumnFamilyName());
+             try
+             {
+                 cfs.forceBlockingFlush();
+@@ -308,33 +293,23 @@ public void dropCf(String cfName) throws IOException
+     }
+     
+     /** adds a cf to internal structures, ends up creating disk files). */
+-    public void addCf(String cfName)
++    public void initCf(int cfId, String cfName)
+     {
+-        assert !columnFamilyStores.containsKey(cfName) : cfName;
+-        columnFamilyStores.put(cfName, ColumnFamilyStore.createColumnFamilyStore(name, cfName));
++        assert !columnFamilyStores.containsKey(cfId) : cfId;
++        columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(name, cfName));
++        cfNameMap.put(cfName, cfId);
+     }
+     
+     /** basically a combined drop and add */
+-    public void renameCf(String oldName, String newName) throws IOException
+-    {
+-        dropCf(oldName);
+-        addCf(newName);
+-    }
+-
+-    /**
+-     * Selects the specified column family for the specified key.
+-    */
+-    @Deprecated // single CFs could be larger than memory
+-    public ColumnFamily get(String key, String cfName) throws IOException
++    public void renameCf(int cfId, String newName) throws IOException
+     {
+-        ColumnFamilyStore cfStore = columnFamilyStores.get(cfName);
+-        assert cfStore != null : "Column family " + cfName + " has not been defined";
+-        return cfStore.getColumnFamily(QueryFilter.getIdentityFilter(key, new QueryPath(cfName)));
++        dropCf(cfId);
++        initCf(cfId, newName);
+     }
+ 
+     public Row getRow(QueryFilter filter) throws IOException
+     {
+-        ColumnFamilyStore cfStore = columnFamilyStores.get(filter.getColumnFamilyName());
++        ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(filter.getColumnFamilyName()));
+         ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+         return new Row(filter.key, columnFamily);
+     }
+@@ -371,7 +346,7 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+             for (ColumnFamily columnFamily : mutation.getColumnFamilies())
+             {
+                 Memtable memtableToFlush;
+-                ColumnFamilyStore cfs = columnFamilyStores.get(columnFamily.name());
++                ColumnFamilyStore cfs = columnFamilyStores.get(columnFamily.id());
+                 if (cfs == null)
+                 {
+                     logger.error("Attempting to mutate non-existant column family " + columnFamily.name());
+@@ -400,9 +375,9 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+     public List<Future<?>> flush() throws IOException
+     {
+         List<Future<?>> futures = new ArrayList<Future<?>>();
+-        for (String cfName : columnFamilyStores.keySet())
++        for (Integer cfId : columnFamilyStores.keySet())
+         {
+-            Future<?> future = columnFamilyStores.get(cfName).forceFlush();
++            Future<?> future = columnFamilyStores.get(cfId).forceFlush();
+             if (future != null)
+                 futures.add(future);
+         }
+@@ -419,7 +394,7 @@ void load(RowMutation rowMutation) throws IOException
+             Collection<IColumn> columns = columnFamily.getSortedColumns();
+             for (IColumn column : columns)
+             {
+-                ColumnFamilyStore cfStore = columnFamilyStores.get(new String(column.name(), "UTF-8"));
++                ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(new String(column.name(), "UTF-8")));
+                 cfStore.applyBinary(key, column.value());
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 99a05df1..ecea049c 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -241,20 +241,18 @@ public void runMayThrow() throws IOException
+                         RowMutation newRm = new RowMutation(rm.getTable(), rm.key());
+                         
+                         // Rebuild the row mutation, omitting column families that a) have already been flushed,
+-                        // b) are part of a cf that was dropped. Keep in mind that a cf might have been renamed. (this
+-                        // is why the old RM is not used in the actual transaction.
++                        // b) are part of a cf that was dropped. Keep in mind that the cf.name() is suspect. do every
++                        // thing based on the cfid instead.
+                         for (ColumnFamily columnFamily : columnFamilies)
+                         {
+-                            Pair<String, String> key = new Pair<String, String>(table.name, columnFamily.name()); 
+-                            int id = cfIdMap.get(key);
+                             // make sure to use the current name of the cf (null means its been dropped).
+-                            String currentName = CFMetaData.getCurrentName(id);
++                            String currentName = CFMetaData.getCurrentName(columnFamily.id());
+                             if (currentName == null)
+                                 continue;
+                             else if (!currentName.equals(columnFamily.name()))
+                                 columnFamily.rename(currentName);
+                             
+-                            if (clHeader.isDirty(id) && entryLocation >= clHeader.getPosition(id))
++                            if (clHeader.isDirty(columnFamily.id()) && entryLocation >= clHeader.getPosition(columnFamily.id()))
+                                 newRm.add(columnFamily);
+                         }
+                         if (!newRm.isEmpty())
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/AddColumnFamily.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/AddColumnFamily.java
+index 982dbf31..83630391 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/AddColumnFamily.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/AddColumnFamily.java
+@@ -77,7 +77,7 @@ public void applyModels()
+         // reinitialize the table.
+         KSMetaData ksm = DatabaseDescriptor.getTableDefinition(cfm.tableName);
+         ksm = makeNewKeyspaceDefinition(ksm);
+-        Table.open(ksm.name).addCf(cfm.cfName);
++        Table.open(ksm.name).initCf(cfm.cfId, cfm.cfName);
+         DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+         
+         // force creation of a new commit log segment.
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+index dc75e3a7..d0cdea67 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+@@ -97,7 +97,7 @@ public void applyModels() throws IOException
+         KSMetaData ksm = makeNewKeyspaceDefinition(existing);
+         CFMetaData.purge(cfm);
+         DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+-        Table.open(ksm.name).dropCf(cfm.cfName);
++        Table.open(ksm.name).dropCf(cfm.cfId);
+         
+         // indicate that some files need to be deleted (eventually)
+         SystemTable.markForRemoval(cfm);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+index 949f41d2..f325186e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+@@ -80,7 +80,7 @@ public void applyModels() throws IOException
+         for (CFMetaData cfm : ksm.cfMetaData().values())
+         {
+             CFMetaData.purge(cfm);
+-            table.dropCf(cfm.cfName);
++            table.dropCf(cfm.cfId);
+             SystemTable.markForRemoval(cfm);
+         }
+                         
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/RenameColumnFamily.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/RenameColumnFamily.java
+index 346877c9..2323f21d 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/RenameColumnFamily.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/RenameColumnFamily.java
+@@ -47,6 +47,7 @@
+     private String tableName;
+     private String oldName;
+     private String newName;
++    private int cfId;
+     
+     RenameColumnFamily(DataInputStream din) throws IOException
+     {
+@@ -55,8 +56,11 @@
+         tableName = din.readUTF();
+         oldName = din.readUTF();
+         newName = din.readUTF();
++        cfId = din.readInt();
+     }
+     
++    // this this constructor sets the cfid, it can only be called form a node that is starting the migration. It cannot
++    // be called during deserialization of this migration.
+     public RenameColumnFamily(String tableName, String oldName, String newName) throws ConfigurationException, IOException
+     {
+         super(UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress()), DatabaseDescriptor.getDefsVersion());
+@@ -72,6 +76,8 @@ public RenameColumnFamily(String tableName, String oldName, String newName) thro
+         if (ksm.cfMetaData().containsKey(newName))
+             throw new ConfigurationException("CF is already defined in that keyspace.");
+         
++        cfId = ksm.cfMetaData().get(oldName).cfId;
++        
+         // clone the ksm, replacing cfm with the new one.
+         KSMetaData newKsm = makeNewKeyspaceDefinition(ksm);
+         rm = Migration.makeDefinitionMutation(newKsm, null, newVersion);
+@@ -104,7 +110,7 @@ public void applyModels() throws IOException
+         // reset defs.
+         KSMetaData ksm = makeNewKeyspaceDefinition(DatabaseDescriptor.getTableDefinition(tableName));
+         DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+-        Table.open(ksm.name).renameCf(oldName, newName);
++        Table.open(ksm.name).renameCf(cfId, newName);
+         
+         CommitLog.instance().forceNewSegment();
+     }
+@@ -142,6 +148,7 @@ public void serialize(RenameColumnFamily renameColumnFamily, DataOutputStream do
+             dos.writeUTF(renameColumnFamily.tableName);
+             dos.writeUTF(renameColumnFamily.oldName);
+             dos.writeUTF(renameColumnFamily.newName);
++            dos.writeInt(renameColumnFamily.cfId);
+         }
+ 
+         public RenameColumnFamily deserialize(DataInputStream dis) throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/Util.java b/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+index 0ca35e83..507932ef 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+@@ -27,6 +27,7 @@
+ import java.util.List;
+ import java.util.concurrent.ExecutionException;
+ 
++import org.apache.cassandra.db.filter.QueryFilter;
+ import org.apache.commons.lang.ArrayUtils;
+ 
+ import org.apache.cassandra.db.*;
+@@ -95,4 +96,11 @@ public static ColumnFamilyStore writeColumnFamily(List<RowMutation> rms) throws
+         store.forceBlockingFlush();
+         return store;
+     }
++    
++    public static ColumnFamily getColumnFamily(Table table, String key, String cfName) throws IOException
++    {
++        ColumnFamilyStore cfStore = table.getColumnFamilyStore(cfName);
++        assert cfStore != null : "Column family " + cfName + " has not been defined";
++        return cfStore.getColumnFamily(QueryFilter.getIdentityFilter(key, new QueryPath(cfName)));
++    }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/MultitableTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/MultitableTest.java
+index 89609a29..9093e66d 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/MultitableTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/MultitableTest.java
+@@ -24,6 +24,7 @@
+ import java.io.IOException;
+ import java.util.concurrent.ExecutionException;
+ 
++import org.apache.cassandra.Util;
+ import org.junit.Test;
+ 
+ import static org.apache.cassandra.db.TableTest.assertColumns;
+@@ -56,7 +57,7 @@ public void testSameCFs() throws IOException, ExecutionException, InterruptedExc
+         table1.getColumnFamilyStore("Standard1").forceBlockingFlush();
+         table2.getColumnFamilyStore("Standard1").forceBlockingFlush();
+ 
+-        assertColumns(table1.get("keymulti", "Standard1"), "col1");
+-        assertColumns(table2.get("keymulti", "Standard1"), "col2");
++        assertColumns(Util.getColumnFamily(table1, "keymulti", "Standard1"), "col1");
++        assertColumns(Util.getColumnFamily(table2, "keymulti", "Standard1"), "col2");
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/NameSortTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/NameSortTest.java
+index 1bb34b32..1ac0ccb9 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/NameSortTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/NameSortTest.java
+@@ -24,6 +24,7 @@
+ import java.util.Arrays;
+ import java.nio.ByteBuffer;
+ 
++import org.apache.cassandra.Util;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.CleanupHelper;
+@@ -101,7 +102,7 @@ private void validateNameSort(Table table, int N) throws IOException
+             String key = Integer.toString(i);
+             ColumnFamily cf;
+ 
+-            cf = table.get(key, "Standard1");
++            cf = Util.getColumnFamily(table, key, "Standard1");
+             Collection<IColumn> columns = cf.getSortedColumns();
+             for (IColumn column : columns)
+             {
+@@ -110,7 +111,7 @@ private void validateNameSort(Table table, int N) throws IOException
+                 assert Arrays.equals(bytes, column.value());
+             }
+ 
+-            cf = table.get(key, "Super1");
++            cf = Util.getColumnFamily(table, key, "Super1");
+             assert cf != null : "key " + key + " is missing!";
+             Collection<IColumn> superColumns = cf.getSortedColumns();
+             assert superColumns.size() == 8 : cf;
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+index 25a35fc0..112f23c7 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+@@ -21,6 +21,7 @@
+ import java.io.IOException;
+ import java.util.concurrent.ExecutionException;
+ 
++import org.apache.cassandra.Util;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.CleanupHelper;
+@@ -63,7 +64,7 @@ public void testOne() throws IOException, ExecutionException, InterruptedExcepti
+ 
+         CommitLog.recover();
+ 
+-        assertColumns(table1.get("keymulti", "Standard1"), "col1");
+-        assertColumns(table2.get("keymulti", "Standard3"), "col2");
++        assertColumns(Util.getColumnFamily(table1, "keymulti", "Standard1"), "col1");
++        assertColumns(Util.getColumnFamily(table2, "keymulti", "Standard3"), "col2");
+     }
+ }

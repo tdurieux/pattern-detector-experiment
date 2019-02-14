@@ -1,0 +1,355 @@
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/codecs/compressing/LZ4.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/codecs/compressing/LZ4.java
+index 022b5803..04a63ba9 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/codecs/compressing/LZ4.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/codecs/compressing/LZ4.java
+@@ -219,7 +219,7 @@ public static void compress(byte[] bytes, int off, int len, DataOutput out, Hash
+       final PackedInts.Mutable hashTable = ht.hashTable;
+ 
+       main:
+-      while (off < limit) {
++      while (off <= limit) {
+         // find a match
+         int ref;
+         while (true) {
+@@ -295,22 +295,23 @@ private void reset(int base) {
+     private int hashPointer(byte[] bytes, int off) {
+       final int v = readInt(bytes, off);
+       final int h = hashHC(v);
+-      return base + hashTable[h];
++      return hashTable[h];
+     }
+ 
+     private int next(int off) {
+-      return base + off - (chainTable[off & MASK] & 0xFFFF);
++      return off - (chainTable[off & MASK] & 0xFFFF);
+     }
+ 
+     private void addHash(byte[] bytes, int off) {
+       final int v = readInt(bytes, off);
+       final int h = hashHC(v);
+       int delta = off - hashTable[h];
++      assert delta > 0 : delta;
+       if (delta >= MAX_DISTANCE) {
+         delta = MAX_DISTANCE - 1;
+       }
+       chainTable[off & MASK] = (short) delta;
+-      hashTable[h] = off - base;
++      hashTable[h] = off;
+     }
+ 
+     void insert(int off, byte[] bytes) {
+@@ -322,12 +323,24 @@ void insert(int off, byte[] bytes) {
+     boolean insertAndFindBestMatch(byte[] buf, int off, int matchLimit, Match match) {
+       match.start = off;
+       match.len = 0;
++      int delta = 0;
++      int repl = 0;
+ 
+       insert(off, buf);
+ 
+       int ref = hashPointer(buf, off);
++
++      if (ref >= off - 4 && ref <= off && ref >= base) { // potential repetition
++        if (readIntEquals(buf, ref, off)) { // confirmed
++          delta = off - ref;
++          repl = match.len = MIN_MATCH + commonBytes(buf, ref + MIN_MATCH, off + MIN_MATCH, matchLimit);
++          match.ref = ref;
++        }
++        ref = next(ref);
++      }
++
+       for (int i = 0; i < MAX_ATTEMPTS; ++i) {
+-        if (ref < Math.max(base, off - MAX_DISTANCE + 1)) {
++        if (ref < Math.max(base, off - MAX_DISTANCE + 1) || ref > off) {
+           break;
+         }
+         if (buf[ref + match.len] == buf[off + match.len] && readIntEquals(buf, ref, off)) {
+@@ -340,6 +353,21 @@ boolean insertAndFindBestMatch(byte[] buf, int off, int matchLimit, Match match)
+         ref = next(ref);
+       }
+ 
++      if (repl != 0) {
++        int ptr = off;
++        final int end = off + repl - (MIN_MATCH - 1);
++        while (ptr < end - delta) {
++          chainTable[ptr & MASK] = (short) delta; // pre load
++          ++ptr;
++        }
++        do {
++          chainTable[ptr & MASK] = (short) delta;
++          hashTable[hashHC(readInt(buf, ptr))] = ptr;
++          ++ptr;
++        } while (ptr < end);
++        nextToUpdate = end;
++      }
++
+       return match.len != 0;
+     }
+ 
+@@ -351,7 +379,7 @@ boolean insertAndFindWiderMatch(byte[] buf, int off, int startLimit, int matchLi
+       final int delta = off - startLimit;
+       int ref = hashPointer(buf, off);
+       for (int i = 0; i < MAX_ATTEMPTS; ++i) {
+-        if (ref < Math.max(base, off - MAX_DISTANCE + 1)) {
++        if (ref < Math.max(base, off - MAX_DISTANCE + 1) || ref > off) {
+           break;
+         }
+         if (buf[ref - delta + match.len] == buf[startLimit + match.len]
+@@ -386,6 +414,7 @@ public static void compressHC(byte[] src, int srcOff, int srcLen, DataOutput out
+ 
+     final int srcEnd = srcOff + srcLen;
+     final int matchLimit = srcEnd - LAST_LITERALS;
++    final int mfLimit = matchLimit - MIN_MATCH;
+ 
+     int sOff = srcOff;
+     int anchor = sOff++;
+@@ -397,7 +426,7 @@ public static void compressHC(byte[] src, int srcOff, int srcLen, DataOutput out
+     final Match match3 = new Match();
+ 
+     main:
+-    while (sOff < matchLimit) {
++    while (sOff <= mfLimit) {
+       if (!ht.insertAndFindBestMatch(src, sOff, matchLimit, match1)) {
+         ++sOff;
+         continue;
+@@ -409,7 +438,7 @@ public static void compressHC(byte[] src, int srcOff, int srcLen, DataOutput out
+       search2:
+       while (true) {
+         assert match1.start >= anchor;
+-        if (match1.end() >= matchLimit
++        if (match1.end() >= mfLimit
+             || !ht.insertAndFindWiderMatch(src, match1.end() - 2, match1.start + 1, matchLimit, match1.len, match2)) {
+           // no better match
+           encodeSequence(src, anchor, match1.ref, match1.start, match1.len, out);
+@@ -445,25 +474,12 @@ public static void compressHC(byte[] src, int srcOff, int srcLen, DataOutput out
+             }
+           }
+ 
+-          if (match2.start + match2.len >= matchLimit
++          if (match2.start + match2.len >= mfLimit
+               || !ht.insertAndFindWiderMatch(src, match2.end() - 3, match2.start, matchLimit, match2.len, match3)) {
+             // no better match -> 2 sequences to encode
+             if (match2.start < match1.end()) {
+-              if (match2.start - match1.start < OPTIMAL_ML) {
+-                if (match1.len > OPTIMAL_ML) {
+-                  match1.len = OPTIMAL_ML;
+-                }
+-                if (match1.end() > match2.end() - MIN_MATCH) {
+-                  match1.len = match2.end() - match1.start - MIN_MATCH;
+-                }
+-                final int correction = match1.len - (match2.start - match1.start);
+-                if (correction > 0) {
+-                  match2.fix(correction);
+-                }
+-              } else {
+                 match1.len = match2.start - match1.start;
+               }
+-            }
+             // encode seq 1
+             encodeSequence(src, anchor, match1.ref, match1.start, match1.len, out);
+             anchor = sOff = match1.end();
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestCompressionMode.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestCompressionMode.java
+index d2b7a9f3..5ccbbdd5 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestCompressionMode.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestCompressionMode.java
+@@ -24,6 +24,7 @@
+ import org.apache.lucene.store.ByteArrayDataOutput;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
+ 
+ import com.carrotsearch.randomizedtesting.generators.RandomInts;
+ 
+@@ -49,15 +50,15 @@
+     return arr;
+   }
+ 
+-  byte[] compress(byte[] decompressed) throws IOException {
++  byte[] compress(byte[] decompressed, int off, int len) throws IOException {
+     Compressor compressor = mode.newCompressor();
+-    return compress(compressor, decompressed);
++    return compress(compressor, decompressed, off, len);
+   }
+ 
+-  static byte[] compress(Compressor compressor, byte[] decompressed) throws IOException {
+-    byte[] compressed = new byte[decompressed.length * 2 + 16]; // should be enough
++  static byte[] compress(Compressor compressor, byte[] decompressed, int off, int len) throws IOException {
++    byte[] compressed = new byte[len * 2 + 16]; // should be enough
+     ByteArrayDataOutput out = new ByteArrayDataOutput(compressed);
+-    compressor.compress(decompressed, 0, decompressed.length, out);
++    compressor.compress(decompressed, off, len, out);
+     final int compressedLen = out.getPosition();
+     return Arrays.copyOf(compressed, compressedLen);
+   }
+@@ -84,9 +85,11 @@ public void testDecompress() throws IOException {
+     final int iterations = atLeast(10);
+     for (int i = 0; i < iterations; ++i) {
+       final byte[] decompressed = randomArray();
+-      final byte[] compressed = compress(decompressed);
+-      final byte[] restored = decompress(compressed, decompressed.length);
+-      assertArrayEquals(decompressed, restored);
++      final int off = random().nextBoolean() ? 0 : _TestUtil.nextInt(random(), 0, decompressed.length);
++      final int len = random().nextBoolean() ? decompressed.length - off : _TestUtil.nextInt(random(), 0, decompressed.length - off);
++      final byte[] compressed = compress(decompressed, off, len);
++      final byte[] restored = decompress(compressed, len);
++      assertArrayEquals(Arrays.copyOfRange(decompressed, off, off+len), restored);
+     }
+   }
+ 
+@@ -94,7 +97,7 @@ public void testPartialDecompress() throws IOException {
+     final int iterations = atLeast(10);
+     for (int i = 0; i < iterations; ++i) {
+       final byte[] decompressed = randomArray();
+-      final byte[] compressed = compress(decompressed);
++      final byte[] compressed = compress(decompressed, 0, decompressed.length);
+       final int offset, length;
+       if (decompressed.length == 0) {
+         offset = length = 0;
+@@ -108,9 +111,13 @@ public void testPartialDecompress() throws IOException {
+   }
+ 
+   public byte[] test(byte[] decompressed) throws IOException {
+-    final byte[] compressed = compress(decompressed);
+-    final byte[] restored = decompress(compressed, decompressed.length);
+-    assertEquals(decompressed.length, restored.length);
++    return test(decompressed, 0, decompressed.length);
++  }
++
++  public byte[] test(byte[] decompressed, int off, int len) throws IOException {
++    final byte[] compressed = compress(decompressed, off, len);
++    final byte[] restored = decompress(compressed, len);
++    assertEquals(len, restored.length);
+     return compressed;
+   }
+ 
+@@ -130,4 +137,64 @@ public void testIncompressible() throws IOException {
+     test(decompressed);
+   }
+ 
++  public void testConstant() throws IOException {
++    final byte[] decompressed = new byte[_TestUtil.nextInt(random(), 1, 10000)];
++    Arrays.fill(decompressed, (byte) random().nextInt());
++    test(decompressed);
++  }
++
++  public void testLUCENE5201() throws IOException {
++    byte[] data = new byte[]{
++        14, 72, 14, 85, 3, 72, 14, 85, 3, 72, 14, 72, 14, 72, 14, 85, 3, 72, 14, 72, 14, 72, 14, 72, 14, 72, 14, 72, 14, 85, 3, 72,
++        14, 85, 3, 72, 14, 85, 3, 72, 14, 85, 3, 72, 14, 85, 3, 72, 14, 85, 3, 72, 14, 50, 64, 0, 46, -1, 0, 0, 0, 29, 3, 85,
++        8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3,
++        0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113,
++        0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113,
++        0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 50, 64, 0, 47, -105, 0, 0, 0, 30, 3, -97, 6, 0, 68, -113,
++        0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, 85,
++        8, -113, 0, 68, -97, 3, 0, 2, -97, 6, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97,
++        6, 0, 68, -113, 0, 120, 64, 0, 48, 4, 0, 0, 0, 31, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72,
++        33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72,
++        43, 72, 19, 72, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72,
++        28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72,
++        35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72,
++        41, 72, 32, 72, 18, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
++        0, 39, 24, 32, 34, 124, 0, 120, 64, 0, 48, 80, 0, 0, 0, 31, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72,
++        35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72,
++        41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72,
++        40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72,
++        31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72,
++        26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72,
++        37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72,
++        36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72,
++        20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72,
++        22, 72, 31, 72, 43, 72, 19, 72, 34, 72, 29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72,
++        38, 72, 26, 72, 28, 72, 42, 72, 24, 72, 27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 72, 34, 72,
++        29, 72, 37, 72, 35, 72, 45, 72, 23, 72, 46, 72, 20, 72, 40, 72, 33, 72, 25, 72, 39, 72, 38, 72, 26, 72, 28, 72, 42, 72, 24, 72,
++        27, 72, 36, 72, 41, 72, 32, 72, 18, 72, 30, 72, 22, 72, 31, 72, 43, 72, 19, 50, 64, 0, 49, 20, 0, 0, 0, 32, 3, -97, 6, 0,
++        68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97,
++        6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2,
++        3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2,
++        3, -97, 6, 0, 50, 64, 0, 50, 53, 0, 0, 0, 34, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -113, 0, 2, 3, -97,
++        6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3,
++        -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97,
++        3, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3,
++        85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0,
++        2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3,
++        -97, 6, 0, 50, 64, 0, 51, 85, 0, 0, 0, 36, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97,
++        6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, -97, 5, 0, 2, 3, 85, 8, -113, 0, 68,
++        -97, 3, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0,
++        68, -113, 0, 2, 3, -97, 6, 0, 50, -64, 0, 51, -45, 0, 0, 0, 37, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6,
++        0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, -97, 6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -113, 0, 2, 3, -97,
++        6, 0, 68, -113, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 2, 3, 85, 8, -113, 0, 68, -97, 3, 0, 120, 64, 0, 52, -88, 0, 0,
++        0, 39, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72,
++        13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 72, 13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85,
++        5, 72, 13, 85, 5, 72, 13, 72, 13, 72, 13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85,
++        5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85,
++        5, 72, 13, 85, 5, 72, 13, 72, 13, 72, 13, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 85, 5, 72, 13, 72, 13, 85, 5, 72, 13, 72,
++        13, 85, 5, 72, 13, 72, 13, 85, 5, 72, 13, -19, -24, -101, -35
++      };
++    test(data, 9, data.length - 9);
++  }
++
+ }
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestLZ4CompressionMode.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestLZ4CompressionMode.java
+index ea9994e5..b2e7532e 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestLZ4CompressionMode.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/AbstractTestLZ4CompressionMode.java
+@@ -105,4 +105,8 @@ public void testLongLiterals() throws IOException {
+     test(decompressed);
+   }
+ 
++  public void testMatchRightBeforeLastLiterals() throws IOException {
++    test(new byte[] {1,2,3,4, 1,2,3,4, 1,2,3,4,5});
++  }
++
+ }
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
+index 157b353a..f55ea6c0 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingStoredFieldsFormat.java
+@@ -32,8 +32,10 @@
+ import org.apache.lucene.store.Directory;
+ import org.junit.Test;
+ 
++import com.carrotsearch.randomizedtesting.annotations.Repeat;
+ import com.carrotsearch.randomizedtesting.generators.RandomInts;
+ 
++@Repeat(iterations=5) // give it a chance to test various compression modes with different chunk sizes
+ public class TestCompressingStoredFieldsFormat extends BaseStoredFieldsFormatTestCase {
+ 
+   @Override
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingTermVectorsFormat.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingTermVectorsFormat.java
+index 7294315a..70fc572b 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingTermVectorsFormat.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestCompressingTermVectorsFormat.java
+@@ -14,6 +14,8 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.util.BytesRef;
+ 
++import com.carrotsearch.randomizedtesting.annotations.Repeat;
++
+ /*
+  * Licensed to the Apache Software Foundation (ASF) under one or more
+  * contributor license agreements.  See the NOTICE file distributed with
+@@ -31,6 +33,7 @@
+  * limitations under the License.
+  */
+ 
++@Repeat(iterations=5) // give it a chance to test various compression modes with different chunk sizes
+ public class TestCompressingTermVectorsFormat extends BaseTermVectorsFormatTestCase {
+ 
+   @Override
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestFastDecompressionMode.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestFastDecompressionMode.java
+index 9ed7648d..de14013d 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestFastDecompressionMode.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/codecs/compressing/TestFastDecompressionMode.java
+@@ -28,9 +28,9 @@ public void setUp() throws Exception {
+   }
+ 
+   @Override
+-  public byte[] test(byte[] decompressed) throws IOException {
+-    final byte[] compressed = super.test(decompressed);
+-    final byte[] compressed2 = compress(CompressionMode.FAST.newCompressor(), decompressed);
++  public byte[] test(byte[] decompressed, int off, int len) throws IOException {
++    final byte[] compressed = super.test(decompressed, off, len);
++    final byte[] compressed2 = compress(CompressionMode.FAST.newCompressor(), decompressed, off, len);
+     // because of the way this compression mode works, its output is necessarily
+     // smaller than the output of CompressionMode.FAST
+     assertTrue(compressed.length <= compressed2.length);

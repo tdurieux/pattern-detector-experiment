@@ -1,0 +1,243 @@
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/IntegerArrayVTI.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/IntegerArrayVTI.java
+index 0fcede10..aa5022df 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/IntegerArrayVTI.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/IntegerArrayVTI.java
+@@ -40,6 +40,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+     private static String[] _lastProjection;
+     private static Restriction _lastRestriction;
++    private static int _lastQualifedRowCount;
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+@@ -102,6 +103,27 @@ public IntegerArrayVTI( String[] columnNames, Integer[][] rows )
+         return retval;
+     }
+     
++    ///////////////////////////////////////////////////////////////////////////////////
++    //
++    // ResultSet OVERRIDES
++    //
++    ///////////////////////////////////////////////////////////////////////////////////
++
++    public boolean next() throws SQLException
++    {
++        while ( true )
++        {
++            boolean anotherRow = super.next();
++            if ( !anotherRow ) { return false; }
++
++            if ( qualifyCurrentRow() )
++            {
++                _lastQualifedRowCount++;
++                return true;
++            }
++        }
++    }
++    
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // RestrictedVTI BEHAVIOR
+@@ -112,6 +134,62 @@ public void initScan( String[] columnNames, Restriction restriction ) throws SQL
+     {
+         _lastProjection = columnNames;
+         _lastRestriction = restriction;
++        _lastQualifedRowCount = 0;
++    }
++
++    // Return true if the qualification succeeds on the current row
++    private boolean qualifyCurrentRow() throws SQLException
++    {
++        if ( _lastRestriction == null ) { return true; }
++
++        return qualifyCurrentRow( _lastRestriction );
++    }
++    private boolean qualifyCurrentRow( Restriction restriction ) throws SQLException
++    {
++        if ( restriction instanceof Restriction.AND )
++        {
++            Restriction.AND and = (Restriction.AND) restriction;
++
++            return qualifyCurrentRow( and.getLeftChild() ) && qualifyCurrentRow( and.getRightChild() );
++        }
++        else if ( restriction instanceof Restriction.OR )
++        {
++            Restriction.OR or = (Restriction.OR) restriction;
++
++            return qualifyCurrentRow( or.getLeftChild() ) || qualifyCurrentRow( or.getRightChild() );
++        }
++        else if ( restriction instanceof Restriction.ColumnQualifier )
++        {
++            return applyColumnQualifier( (Restriction.ColumnQualifier) restriction );
++        }
++        else { throw new SQLException( "Unknown type of Restriction: " + restriction.getClass().getName() ); }
++    }
++    private boolean applyColumnQualifier( Restriction.ColumnQualifier qc ) throws SQLException
++    {
++        int operator = qc.getComparisonOperator();
++        int column = getInt( qc.getColumnName() );
++        boolean columnWasNull = wasNull();
++
++        if ( columnWasNull )
++        {
++            if ( operator == Restriction.ColumnQualifier.ORDER_OP_ISNULL ) { return true; }
++            else if ( operator == Restriction.ColumnQualifier.ORDER_OP_ISNOTNULL ) { return false; }
++            else { return false; }
++        }
++        else if ( operator == Restriction.ColumnQualifier.ORDER_OP_ISNULL ) { return false; }
++        else if ( operator == Restriction.ColumnQualifier.ORDER_OP_ISNOTNULL ) { return true; }
++
++        int constant = ((Integer) qc.getConstantOperand()).intValue();
++
++        switch ( operator )
++        {
++        case Restriction.ColumnQualifier.ORDER_OP_EQUALS: return ( column == constant );
++        case Restriction.ColumnQualifier.ORDER_OP_GREATEROREQUALS: return ( column >= constant );
++        case Restriction.ColumnQualifier.ORDER_OP_GREATERTHAN: return ( column > constant );
++        case Restriction.ColumnQualifier.ORDER_OP_LESSOREQUALS: return ( column <= constant );
++        case Restriction.ColumnQualifier.ORDER_OP_LESSTHAN: return ( column < constant );
++        default: throw new SQLException( "Unknown comparison operator: " + operator );
++        }
+     }
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+@@ -122,5 +200,6 @@ public void initScan( String[] columnNames, Restriction restriction ) throws SQL
+ 
+     public static String getLastProjection() { return ( (_lastProjection == null) ? null : Arrays.asList( _lastProjection ).toString() ); }
+     public static String getLastRestriction() { return ( ( _lastRestriction == null ) ? null : _lastRestriction.toSQL() ); }
++    public static int getLastQualifiedRowCount() { return _lastQualifedRowCount; }
+     
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RestrictedVTITest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RestrictedVTITest.java
+index 95d72a18..75a0cbd4 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RestrictedVTITest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RestrictedVTITest.java
+@@ -116,6 +116,18 @@ protected void    setUp()
+                  "external name 'org.apache.derbyTesting.functionTests.tests.lang.IntegerArrayVTI.getLastRestriction'\n"
+                  );
+         }
++        if ( !routineExists( conn, "GETCOUNT" ) )
++        {
++            goodStatement
++                (
++                 conn,
++                 "create function getCount\n" +
++                 "()\n" +
++                 "returns int\n" +
++                 "language java parameter style java no sql\n" +
++                 "external name 'org.apache.derbyTesting.functionTests.tests.lang.IntegerArrayVTI.getLastQualifiedRowCount'\n"
++                 );
++        }
+         if ( !routineExists( conn, "INTEGERLIST" ) )
+         {
+             goodStatement
+@@ -644,6 +656,74 @@ public void test_08_having() throws Exception
+                 );
+     }
+ 
++    /**
++     * Verify that attempts to create a trailing constant qualification do no
++     * cause the VTI to return the wrong rows.
++     * Tracked as DERBY-4651.
++     */
++    public void test_09_4651() throws Exception
++    {
++        Connection conn = getConnection();
++
++        assertPR
++            (
++             conn,
++             "select s_r, s_nr from table( integerList() ) s order by s_r\n",
++             new String[][]
++             {
++                 { "1" ,         "2"  },
++                 { "100" ,         "200"  },
++                 { "1000" ,         "2000"  },
++                 { "10000" ,         "20000"  },
++             },
++             "[S_R, S_NR, null, null]",
++             null,
++             4
++             );
++
++        assertPR
++            (
++             conn,
++             "select s_r, s_nr from table( integerList() ) s where s_r > 500 order by s_r\n",
++             new String[][]
++             {
++                 { "1000" ,         "2000"  },
++                 { "10000" ,         "20000"  },
++             },
++             "[S_R, S_NR, null, null]",
++             "\"S_R\" > 500",
++             2
++             );
++
++        assertPR
++            (
++             conn,
++             "select s_r, s_nr from table( integerList() ) s where s_r > 500 or 1=1 order by s_r\n",
++             new String[][]
++             {
++                 { "1" ,         "2"  },
++                 { "100" ,         "200"  },
++                 { "1000" ,         "2000"  },
++                 { "10000" ,         "20000"  },
++             },
++             "[S_R, S_NR, null, null]",
++             null,
++             4
++             );
++
++        assertPR
++            (
++             conn,
++             "select s_r, s_nr from table( integerList() ) s where s_r > 500 and 1 != 1 order by s_r\n",
++             new String[][]
++             {
++             },
++             "[S_R, S_NR, null, null]",
++             null,
++             4
++             );
++    }
++
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // SQL ROUTINES
+@@ -729,6 +809,34 @@ private boolean tableExists( Connection conn, String tableName ) throws Exceptio
+         return retval;
+     }
+ 
++    /**
++     * <p>
++     * Run a query against a RestrictedVTI, verify that the expected
++     * projection and restriction are pushed into the VTI, and verify
++     * that the VTI returns the expected number of rows.
++     * </p>
++     */
++    private void assertPR
++        (
++         Connection conn,
++         String query,
++         String[][] expectedResults,
++         String expectedProjection,
++         String expectedRestriction,
++         int expectedQualifiedRowCount
++         ) throws Exception
++    {
++        assertPR( conn, query, expectedResults, expectedProjection, expectedRestriction );
++        
++        assertResults
++            (
++             conn,
++             "values ( getCount() )\n",
++             new String[][] { { Integer.toString( expectedQualifiedRowCount ) } },
++             false
++             );
++    }
++
+     /**
+      * <p>
+      * Run a query against a RestrictedVTI and verify that the expected

@@ -1,0 +1,230 @@
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
+index 95a0e9b6..f779effd 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/index/CompoundFileWriter.java
+@@ -22,12 +22,13 @@
+ import org.apache.lucene.store.Directory;
+ import org.apache.lucene.store.IndexOutput;
+ import org.apache.lucene.store.IndexInput;
++import org.apache.lucene.util.IOUtils;
++
+ import java.util.LinkedList;
+ import java.util.HashSet;
+ 
+ import java.io.IOException;
+ 
+-
+ /**
+  * Combines multiple files into a single compound file.
+  * The file format:<br>
+@@ -144,20 +145,17 @@ public void addFile(String file) {
+      */
+     public void close() throws IOException {
+         if (merged)
+-            throw new IllegalStateException(
+-                "Merge already performed");
++            throw new IllegalStateException("Merge already performed");
+ 
+         if (entries.isEmpty())
+-            throw new IllegalStateException(
+-                "No entries to merge have been defined");
++            throw new IllegalStateException("No entries to merge have been defined");
+ 
+         merged = true;
+ 
+         // open the compound stream
+-        IndexOutput os = null;
++        IndexOutput os = directory.createOutput(fileName);
++        IOException priorException = null;
+         try {
+-            os = directory.createOutput(fileName);
+-
+             // Write the Version info - must be a VInt because CFR reads a VInt
+             // in older versions!
+             os.writeVInt(FORMAT_CURRENT);
+@@ -187,10 +185,9 @@ public void close() throws IOException {
+ 
+             // Open the files and copy their data into the stream.
+             // Remember the locations of each file's data section.
+-            byte buffer[] = new byte[16384];
+             for (FileEntry fe : entries) {
+                 fe.dataOffset = os.getFilePointer();
+-                copyFile(fe, os, buffer);
++                copyFile(fe, os);
+             }
+ 
+             // Write the data offsets into the directory of the compound stream
+@@ -208,56 +205,37 @@ public void close() throws IOException {
+             IndexOutput tmp = os;
+             os = null;
+             tmp.close();
+-
++        } catch (IOException e) {
++          priorException = e;
+         } finally {
+-            if (os != null) try { os.close(); } catch (IOException e) { }
++          IOUtils.closeSafely(priorException, os);
+         }
+     }
+ 
+-    /** Copy the contents of the file with specified extension into the
+-     *  provided output stream. Use the provided buffer for moving data
+-     *  to reduce memory allocation.
++  /**
++   * Copy the contents of the file with specified extension into the provided
++   * output stream.
+      */
+-    private void copyFile(FileEntry source, IndexOutput os, byte buffer[])
+-    throws IOException
+-    {
+-        IndexInput is = null;
++  private void copyFile(FileEntry source, IndexOutput os) throws IOException {
++    IndexInput is = directory.openInput(source.file);
+         try {
+             long startPtr = os.getFilePointer();
+-
+-            is = directory.openInput(source.file);
+             long length = is.length();
+-            long remainder = length;
+-            int chunk = buffer.length;
+-
+-            while(remainder > 0) {
+-                int len = (int) Math.min(chunk, remainder);
+-                is.readBytes(buffer, 0, len, false);
+-                os.writeBytes(buffer, len);
+-                remainder -= len;
+-                if (checkAbort != null)
+-                  // Roughly every 2 MB we will check if
+-                  // it's time to abort
+-                  checkAbort.work(80);
+-            }
++      os.copyBytes(is, length);
+ 
+-            // Verify that remainder is 0
+-            if (remainder != 0)
+-                throw new IOException(
+-                    "Non-zero remainder length after copying: " + remainder
+-                    + " (id: " + source.file + ", length: " + length
+-                    + ", buffer size: " + chunk + ")");
++      if (checkAbort != null) {
++        checkAbort.work(length);
++      }
+ 
+             // Verify that the output length diff is equal to original file
+             long endPtr = os.getFilePointer();
+             long diff = endPtr - startPtr;
+             if (diff != length)
+-                throw new IOException(
+-                    "Difference in the output file offsets " + diff
++        throw new IOException("Difference in the output file offsets " + diff
+                     + " does not match the original file length " + length);
+ 
+         } finally {
+-            if (is != null) is.close();
++      is.close();
+         }
+     }
+ }
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/FSDirectory.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/FSDirectory.java
+index 05d00f21..d6c1abc6 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/FSDirectory.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/FSDirectory.java
+@@ -37,6 +37,8 @@
+ import static java.util.Collections.synchronizedSet;
+ import java.util.HashSet;
+ import java.util.Set;
++
++import org.apache.lucene.store.SimpleFSDirectory.SimpleFSIndexInput;
+ import org.apache.lucene.util.IOUtils;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util.Constants;
+@@ -130,6 +132,12 @@
+   protected final Set<String> staleFiles = synchronizedSet(new HashSet<String>()); // Files written, but not yet sync'ed
+   private int chunkSize = DEFAULT_READ_CHUNK_SIZE; // LUCENE-1566
+ 
++  /**
++   * Chunk size used to read when using FileChannel API. If an attempt to read a
++   * large file is made without limiting the chunk size, an OOM may occur.
++   */
++  private static final long CHANNEL_CHUNK_SIZE = 1 << 21; // Use 2MB chunk size - LUCENE-2537
++
+   // returns the canonical version of the directory, creating it if it doesn't exist.
+   private static File getCanonicalPath(File file) throws IOException {
+     return new File(file.getCanonicalPath());
+@@ -445,7 +453,7 @@ public void copy(Directory to, String src, String dest) throws IOException {
+       try {
+         input = new FileInputStream(new File(directory, src)).getChannel();
+         output = new FileOutputStream(new File(target.directory, dest)).getChannel();
+-        output.transferFrom(input, 0, input.size());
++        copy(input, output, input.size());
+       } catch (IOException ioe) {
+         priorException = ioe;
+       } finally {
+@@ -456,6 +464,25 @@ public void copy(Directory to, String src, String dest) throws IOException {
+     }
+   }
+   
++  /**
++   * Copies the content of a given {@link FileChannel} to a destination one. The
++   * copy is done in chunks of 2MB because if transferFrom is used without a
++   * limit when copying a very large file, then an OOM may be thrown (depends on
++   * the state of the RAM in the machine, as well as the OS used). Performance
++   * measurements showed that chunk sizes larger than 2MB do not result in much
++   * faster file copy, therefore we limit the size to be safe with different
++   * file sizes and systems.
++   */
++  static void copy(FileChannel input, FileChannel output, long numBytes) throws IOException {
++    long pos = output.position();
++    long writeTo = numBytes + pos;
++    while (pos < writeTo) {
++      pos += output.transferFrom(input, pos, Math.min(CHANNEL_CHUNK_SIZE, writeTo - pos));
++    }
++    // transferFrom does not change the position of the channel. Need to change it manually
++    output.position(pos);
++  }
++  
+   protected static class FSIndexOutput extends BufferedIndexOutput {
+     private final FSDirectory parent;
+     private final String name;
+@@ -475,6 +502,28 @@ public void flushBuffer(byte[] b, int offset, int size) throws IOException {
+       file.write(b, offset, size);
+     }
+ 
++    @Override
++    public void copyBytes(DataInput input, long numBytes) throws IOException {
++      // Optimized copy only if the number of bytes to copy is larger than the
++      // buffer size, and the given IndexInput supports FileChannel copying ..
++      // NOTE: the below check relies on NIOIndexInput extending Simple. If that
++      // changes in the future, we should change the check as well.
++      if (numBytes > BUFFER_SIZE && input instanceof SimpleFSIndexInput) {
++        // flush any bytes in the buffer
++        flush();
++        // do the optimized copy
++        FileChannel in = ((SimpleFSIndexInput) input).file.getChannel();
++        FileChannel out = file.getChannel();
++        copy(in, out, numBytes);
++        // corrects the position in super (BufferedIndexOutput), so that calls
++        // to getFilePointer will return the correct pointer.
++        // Perhaps a specific method is better?
++        super.seek(out.position());
++      } else {
++        super.copyBytes(input, numBytes);
++      }
++    }
++    
+     @Override
+     public void close() throws IOException {
+       // only close the file if it has not been closed yet
+diff --git a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/SimpleFSDirectory.java b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/SimpleFSDirectory.java
+index ad09e1c1..8cc520eb 100644
+--- a/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/SimpleFSDirectory.java
++++ b/lucene/dev/trunk/lucene/src/java/org/apache/lucene/store/SimpleFSDirectory.java
+@@ -125,7 +125,7 @@ protected void readInternal(byte[] b, int offset, int len)
+           final OutOfMemoryError outOfMemoryError = new OutOfMemoryError(
+               "OutOfMemoryError likely caused by the Sun VM Bug described in "
+               + "https://issues.apache.org/jira/browse/LUCENE-1566; try calling FSDirectory.setReadChunkSize "
+-              + "with a a value smaller than the current chunks size (" + chunkSize + ")");
++              + "with a value smaller than the current chunks size (" + chunkSize + ")");
+           outOfMemoryError.initCause(e);
+           throw outOfMemoryError;
+         }

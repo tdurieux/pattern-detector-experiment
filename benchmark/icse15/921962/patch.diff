@@ -1,0 +1,517 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+index 0d8d8d6d..870bcb15 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -18,7 +18,8 @@
+ 
+ package org.apache.cassandra.config;
+ 
+-import com.google.common.collect.HashMultimap;
++import com.google.common.collect.ArrayListMultimap;
++import com.google.common.collect.ListMultimap;
+ import com.google.common.collect.Multimap;
+ import com.google.common.collect.Multimaps;
+ import org.apache.cassandra.db.marshal.AbstractType;
+@@ -44,6 +45,8 @@
+ 
+     private static final AtomicInteger idGen = new AtomicInteger(0);
+     
++    private static final Map<Integer, String> currentCfNames = new HashMap<Integer, String>();
++    
+     private static final Map<Pair<String, String>, Integer> cfIdMap = new HashMap<Pair<String, String>, Integer>();
+     
+     public static final Map<Pair<String, String>, Integer> getCfIdMap()
+@@ -51,6 +54,11 @@
+         return Collections.unmodifiableMap(cfIdMap);    
+     }
+     
++    public static final String getCurrentName(int id)
++    {
++        return currentCfNames.get(id);
++    }
++    
+     // this gets called after initialization to make sure that id generation happens properly.
+     public static final void fixMaxId()
+     {
+@@ -79,12 +87,20 @@ private CFMetaData(String tableName, String cfName, String columnType, AbstractT
+         this.rowCacheSize = rowCacheSize;
+         this.keyCacheSize = keyCacheSize;
+         this.cfId = cfId;
++        currentCfNames.put(cfId, cfName);
++        cfIdMap.put(new Pair<String, String>(tableName, cfName), cfId);
+     }
+     
+     public CFMetaData(String tableName, String cfName, String columnType, AbstractType comparator, AbstractType subcolumnComparator, String comment, double rowCacheSize, double keyCacheSize)
+     {
+         this(tableName, cfName, columnType, comparator, subcolumnComparator, comment, rowCacheSize, keyCacheSize, nextId());
+-        cfIdMap.put(new Pair<String, String>(tableName, cfName), cfId);
++    }
++    
++    /** clones an existing CFMetaData using the same id. */
++    public static CFMetaData rename(CFMetaData cfm, String newName)
++    {
++        purge(cfm);
++        return new CFMetaData(cfm.tableName, newName, cfm.columnType, cfm.comparator, cfm.subcolumnComparator, cfm.comment, cfm.rowCacheSize, cfm.keyCacheSize, cfm.cfId);
+     }
+     
+     /** used for evicting cf data out of static tracking collections. */
+@@ -125,7 +141,6 @@ public String pretty()
+ 
+     public static CFMetaData deserialize(InputStream in) throws IOException
+     {
+-
+         DataInputStream din = new DataInputStream(in);
+         String tableName = din.readUTF();
+         String cfName = din.readUTF();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
+index 2cc84bc5..8344c734 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamily.java
+@@ -89,6 +89,12 @@ public ColumnFamily(String cfName, String columnType, AbstractType comparator, A
+         columns_ = new ConcurrentSkipListMap<byte[], IColumn>(comparator);
+     }
+ 
++    /** called during CL recovery when it is determined that a CF name was changed. */
++    public void rename(String newName)
++    {
++        name_ = newName;
++    }
++
+     public ColumnFamily cloneMeShallow()
+     {
+         ColumnFamily cf = new ColumnFamily(name_, type_, getComparator(), getSubComparator());
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+index a5a5bbf1..28ba8f7a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+@@ -22,18 +22,21 @@
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.KSMetaData;
+ import org.apache.cassandra.db.commitlog.CommitLog;
+-import org.apache.cassandra.db.filter.NamesQueryFilter;
+ import org.apache.cassandra.db.filter.QueryPath;
+ import org.apache.cassandra.db.filter.SliceQueryFilter;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.utils.UUIDGen;
+ 
+ import static org.apache.cassandra.config.DatabaseDescriptor.ConfigurationException;
+ 
+ import java.io.ByteArrayInputStream;
++import java.io.File;
++import java.io.FileFilter;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
+@@ -70,7 +73,8 @@ else if (ksm.cfMetaData().containsKey(cfm.cfName))
+ 
+             // reinitialize the table.
+             DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+-            Table.reinitialize(ksm.name);
++            Table.close(ksm.name);
++            Table.open(ksm.name);
+             
+             // force creation of a new commit log segment.
+             CommitLog.instance().forceNewSegment();
+@@ -110,7 +114,8 @@ else if (!ksm.cfMetaData().containsKey(cfm.cfName))
+             // reinitialize the table.
+             CFMetaData.purge(cfm);
+             DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+-            Table.reinitialize(ksm.name);
++            Table.close(ksm.name);
++            Table.open(ksm.name);
+             
+             // indicate that some files need to be deleted (eventually)
+             SystemTable.markForRemoval(cfm);
+@@ -141,6 +146,61 @@ else if (!ksm.cfMetaData().containsKey(cfm.cfName))
+         }
+     }
+ 
++    public static synchronized void rename(CFMetaData oldCfm, String newName) throws IOException, ConfigurationException
++    {
++        Table.openLock.lock();
++        try
++        {
++            KSMetaData ksm = DatabaseDescriptor.getTableDefinition(oldCfm.tableName);
++            if (ksm == null)
++                throw new ConfigurationException("Keyspace does not already exist.");
++            if (!ksm.cfMetaData().containsKey(oldCfm.cfName))
++                throw new ConfigurationException("CF is not defined in that keyspace.");
++            if (ksm.cfMetaData().containsKey(newName))
++                throw new ConfigurationException("CF is already defined in that keyspace.");
++            
++            // clone the ksm, replacing cfm with the new one.
++            List<CFMetaData> newCfs = new ArrayList<CFMetaData>(ksm.cfMetaData().values());
++            newCfs.remove(oldCfm);
++            assert newCfs.size() == ksm.cfMetaData().size() - 1;
++            CFMetaData newCfm = CFMetaData.rename(oldCfm, newName);
++            newCfs.add(newCfm);
++            ksm = new KSMetaData(ksm.name, ksm.strategyClass, ksm.replicationFactor, ksm.snitch, newCfs.toArray(new CFMetaData[newCfs.size()]));
++            
++            // store it
++            UUID newVersion = UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress());
++            RowMutation rm = new RowMutation(Table.DEFINITIONS, newVersion.toString());
++            rm.add(new QueryPath(SCHEMA_CF, null, ksm.name.getBytes()), KSMetaData.serialize(ksm), System.currentTimeMillis());
++            rm.apply();
++            
++            // reset defs.
++            DatabaseDescriptor.setTableDefinition(ksm, newVersion);
++            Table.close(ksm.name);
++            
++            // rename the files.
++            try
++            {
++                renameStorageFiles(ksm.name, oldCfm.cfName, newCfm.cfName);
++            }
++            catch (IOException e)
++            {
++                // todo: is this a big enough problem to bring the entire node down?  For sure, it is something that needs to be addressed immediately.
++                ConfigurationException cex = new ConfigurationException("Critical: encountered IOException while attempting to rename CF storage files for " + oldCfm.cfName);
++                cex.initCause(e);
++                throw cex;
++            }
++            
++            
++            Table.open(ksm.name);
++            
++            CommitLog.instance().forceNewSegment();
++        }
++        finally
++        {
++            Table.openLock.unlock();
++        }
++    }
++
+     public static synchronized void dumpToStorage(UUID version) throws IOException
+     {
+         String versionKey = version.toString();
+@@ -169,4 +229,46 @@ public static synchronized void dumpToStorage(UUID version) throws IOException
+         }
+         return tables;
+     }
++    
++    static Collection<File> getFiles(String table, final String cf)
++    {
++        List<File> found = new ArrayList<File>();
++        for (String path : DatabaseDescriptor.getAllDataFileLocationsForTable(table))
++        {
++            File[] dbFiles = new File(path).listFiles(new FileFilter()
++            {
++                public boolean accept(File pathname)
++                {
++                    return pathname.getName().startsWith(cf + "-") && pathname.getName().endsWith(".db") && pathname.exists();
++                            
++                }
++            });
++            for (File f : dbFiles)
++                found.add(f);
++        }
++        return found;
++    }
++    
++    // if this errors out, we are in a world of hurt.
++    private static void renameStorageFiles(String table, String oldCfName, String newCfName) throws IOException
++    {
++        // complete as much of the job as possible.  Don't let errors long the way prevent as much renaming as possible
++        // from happening.
++        IOException mostRecentProblem = null;
++        for (File existing : getFiles(table, oldCfName))
++        {
++            try
++            {
++                String newFileName = existing.getName().replaceFirst("\\w+-", newCfName + "-");
++                FileUtils.renameWithConfirm(existing, new File(existing.getParent(), newFileName));
++            }
++            catch (IOException ex)
++            {
++                mostRecentProblem = ex;
++            }
++        }
++        if (mostRecentProblem != null)
++            throw new IOException("One or more IOExceptions encountered while renaming files. Most recent problem is included.", mostRecentProblem);
++        
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
+index d0659770..58babe75 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
+@@ -127,9 +127,9 @@ public void add(ColumnFamily columnFamily)
+     }
+ 
+     /** should only be called by commitlog replay code */
+-    public void removeColumnFamily(ColumnFamily columnFamily)
++    public void removeColumnFamily(String cfName)
+     {
+-        modifications_.remove(columnFamily.name());
++        modifications_.remove(cfName);
+     }
+     
+     public boolean isEmpty()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 58ecd345..b3408ad3 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -21,6 +21,7 @@
+ import java.util.*;
+ import java.io.IOException;
+ import java.io.File;
++import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+@@ -86,22 +87,6 @@
+     // this lock blocks other threads from opening a table during critical operations.
+     public static final Lock openLock = new ReentrantLock();
+ 
+-    public static void reinitialize(String table) throws IOException
+-    {
+-        // todo: should I acquire the flusherLock too to prevent writes during the switch?
+-        // or should there be a per/keyspace table modification lock?
+-        openLock.lock();
+-        try
+-        {
+-            instances.remove(table);
+-            open(table);
+-        }
+-        finally
+-        {
+-            openLock.unlock();
+-        }
+-    }
+-
+     public static Table open(String table) throws IOException
+     {
+         Table tableInstance = instances.get(table);
+@@ -127,6 +112,15 @@ public static Table open(String table) throws IOException
+         return tableInstance;
+     }
+         
++    // prepares a table to be replaced
++    public static void close(String table) throws IOException
++    {
++        // yes, I see the irony.
++        Table t = open(table);
++        if (t != null)
++            open(table).release();
++    }
++    
+     public Set<String> getColumnFamilies()
+     {
+         return DatabaseDescriptor.getTableDefinition(name).cfMetaData().keySet();
+@@ -281,6 +275,40 @@ public void run()
+         }, checkMs, checkMs);
+     }
+ 
++    // undoes the constructor.
++    private void release() throws IOException
++    {
++        openLock.lock();
++        try
++        {
++            instances.remove(name);
++            for (String cfName : getColumnFamilies())
++            {
++                // clear out memtables.
++                ColumnFamilyStore cfs = columnFamilyStores.remove(cfName);
++                if (cfs != null)
++                {
++                    try
++                    {
++                        cfs.forceBlockingFlush();
++                    }
++                    catch (ExecutionException e)
++                    {
++                        throw new IOException(e);
++                    }
++                    catch (InterruptedException e)
++                    {
++                        throw new IOException(e);
++                    }
++                }
++            }
++        }
++        finally 
++        {
++            openLock.unlock();
++        }
++    }
++
+     /**
+      * Selects the specified column family for the specified key.
+     */
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 384b46dc..a0ab2bd6 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -239,21 +239,28 @@ public static void recover(File[] clogs) throws IOException
+                     public void runMayThrow() throws IOException
+                     {
+                         KSMetaData ksm = DatabaseDescriptor.getTableDefinition(table.name);
++                        RowMutation newRm = new RowMutation(rm.getTable(), rm.key());
+                         
+-                        /* remove a) column families that have already been flushed before applying the rest, and
+-                        *  b) column families that have been dropped. */
++                        // Rebuild the row mutation, omitting column families that a) have already been flushed,
++                        // b) are part of a cf that was dropped. Keep in mind that a cf might have been renamed. (this
++                        // is why the old RM is not used in the actual transaction.
+                         for (ColumnFamily columnFamily : columnFamilies)
+                         {
+                             Pair<String, String> key = new Pair<String, String>(table.name, columnFamily.name()); 
+                             int id = cfIdMap.get(key);
+-                            if (!clHeader.isDirty(id) || entryLocation < clHeader.getPosition(id))
+-                            {
+-                                rm.removeColumnFamily(columnFamily);
+-                            }
++                            // make sure to use the current name of the cf (null means its been dropped).
++                            String currentName = CFMetaData.getCurrentName(id);
++                            if (currentName == null)
++                                continue;
++                            else if (!currentName.equals(columnFamily.name()))
++                                columnFamily.rename(currentName);
++                            
++                            if (clHeader.isDirty(id) && entryLocation >= clHeader.getPosition(id))
++                                newRm.add(columnFamily);
+                         }
+-                        if (!rm.isEmpty())
++                        if (!newRm.isEmpty())
+                         {
+-                            Table.open(rm.getTable()).apply(rm, null, false);
++                            Table.open(newRm.getTable()).apply(newRm, null, false);
+                         }
+                     }
+                 };
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileUtils.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileUtils.java
+index 36fef52b..f2e5cefa 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileUtils.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileUtils.java
+@@ -48,6 +48,15 @@ public static void deleteWithConfirm(File file) throws IOException
+         }
+     }
+ 
++    public static void renameWithConfirm(File from, File to) throws IOException
++    {
++        assert from.exists();
++        if (logger_.isDebugEnabled())
++            logger_.debug((String.format("Renaming %s to %s", from.getPath(), to.getPath())));
++        if (!from.renameTo(to))
++            throw new IOException(String.format("Failed to rename %s to %s", from.getPath(), to.getPath()));
++    }
++
+     public static class FileComparator implements Comparator<File>
+     {
+         public int compare(File f, File f2)
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+index ee600d82..38e232c8 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -26,19 +26,16 @@
+ import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.db.filter.NamesQueryFilter;
+ import org.apache.cassandra.db.filter.QueryPath;
+-import org.apache.cassandra.db.marshal.TimeUUIDType;
++import org.apache.cassandra.db.filter.SliceQueryFilter;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.db.marshal.UTF8Type;
+ import org.apache.cassandra.utils.UUIDGen;
+ import org.junit.Before;
+ import org.junit.Test;
+ 
+-import java.io.File;
+-import java.io.FileFilter;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+-import java.util.Collection;
+ import java.util.List;
+ import java.util.UUID;
+ import java.util.concurrent.ExecutionException;
+@@ -92,6 +89,7 @@ public void addNewCF() throws IOException, ConfigurationException, ExecutionExce
+         ColumnFamilyStore store = Table.open(ks).getColumnFamilyStore(cf);
+         assert store != null;
+         store.forceBlockingFlush();
++        
+         ColumnFamily cfam = store.getColumnFamily(new NamesQueryFilter("key0", new QueryPath(cf), "col0".getBytes()));
+         assert cfam.getColumn("col0".getBytes()) != null;
+         IColumn col = cfam.getColumn("col0".getBytes());
+@@ -116,7 +114,7 @@ public void removeCf() throws IOException, ConfigurationException, ExecutionExce
+         assert store != null;
+         store.forceBlockingFlush();
+         store.getFlushPath();
+-        assert getFiles(cfm.tableName, cfm.cfName).size() > 0;
++        assert DefsTable.getFiles(cfm.tableName, cfm.cfName).size() > 0;
+         
+         DefsTable.drop(cfm, true);
+         
+@@ -136,25 +134,51 @@ public void removeCf() throws IOException, ConfigurationException, ExecutionExce
+         }
+         
+         // verify that the files are gone.
+-        assert getFiles(cfm.tableName, cfm.cfName).size() == 0;
++        assert DefsTable.getFiles(cfm.tableName, cfm.cfName).size() == 0;
+     }
+     
+-    private static Collection<File> getFiles(String table, final String cf)
+-    {
+-        List<File> found = new ArrayList<File>();
+-        for (String path : DatabaseDescriptor.getAllDataFileLocationsForTable(table))
+-        {
+-            File[] dbFiles = new File(path).listFiles(new FileFilter()
+-            {
+-                public boolean accept(File pathname)
++    @Test
++    public void renameCf() throws IOException, ConfigurationException, ExecutionException, InterruptedException
+                 {
+-                    return pathname.getName().startsWith(cf + "-") && pathname.getName().endsWith(".db") && pathname.exists();
++        final KSMetaData ks = DatabaseDescriptor.getTableDefinition("Keyspace2");
++        assert ks != null;
++        final CFMetaData oldCfm = ks.cfMetaData().get("Standard1");
++        assert oldCfm != null;
+                             
+-                }
+-            });
+-            for (File f : dbFiles)
+-                found.add(f);
+-        }
+-        return found;
++        // write some data, force a flush, then verify that files exist on disk.
++        RowMutation rm = new RowMutation(ks.name, "key0");
++        for (int i = 0; i < 100; i++)
++            rm.add(new QueryPath(oldCfm.cfName, null, ("col" + i).getBytes()), "anyvalue".getBytes(), 1L);
++        rm.apply();
++        ColumnFamilyStore store = Table.open(oldCfm.tableName).getColumnFamilyStore(oldCfm.cfName);
++        assert store != null;
++        store.forceBlockingFlush();
++        int fileCount = DefsTable.getFiles(oldCfm.tableName, oldCfm.cfName).size();
++        assert fileCount > 0;
++        
++        final String newCfmName = "St4ndard1Replacement";
++        DefsTable.rename(oldCfm, newCfmName);
++        
++        assert !DatabaseDescriptor.getTableDefinition(ks.name).cfMetaData().containsKey(oldCfm.cfName);
++        assert DatabaseDescriptor.getTableDefinition(ks.name).cfMetaData().containsKey(newCfmName);
++        
++        // verify that new files are there.
++        assert DefsTable.getFiles(oldCfm.tableName, newCfmName).size() == fileCount;
++        
++        // do some reads.
++        store = Table.open(oldCfm.tableName).getColumnFamilyStore(newCfmName);
++        assert store != null;
++        ColumnFamily cfam = store.getColumnFamily(new SliceQueryFilter("key0", new QueryPath(newCfmName), "".getBytes(), "".getBytes(), false, 1000));
++        assert cfam.getSortedColumns().size() == 100; // should be good enough?
++        
++        // do some writes
++        rm = new RowMutation(ks.name, "key0");
++        rm.add(new QueryPath(newCfmName, null, "col5".getBytes()), "updated".getBytes(), 2L);
++        rm.apply();
++        store.forceBlockingFlush();
++        
++        cfam = store.getColumnFamily(new NamesQueryFilter("key0", new QueryPath(newCfmName), "col5".getBytes()));
++        assert cfam.getColumnCount() == 1;
++        assert Arrays.equals(cfam.getColumn("col5".getBytes()).value(), "updated".getBytes());
+     }
+ }

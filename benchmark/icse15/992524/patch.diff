@@ -1,0 +1,497 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+index 895350ec..ce1f130d 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -39,7 +39,6 @@
+ import org.apache.cassandra.db.clock.TimestampReconciler;
+ import org.apache.cassandra.db.HintedHandOffManager;
+ import org.apache.cassandra.db.SystemTable;
+-import org.apache.cassandra.db.StatisticsTable;
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.db.marshal.AbstractType;
+ import org.apache.cassandra.db.marshal.BytesType;
+@@ -65,7 +64,6 @@
+     public static final CFMetaData HintsCf = newSystemTable(HintedHandOffManager.HINTS_CF, 1, "hinted handoff data", BytesType.instance, BytesType.instance);
+     public static final CFMetaData MigrationsCf = newSystemTable(Migration.MIGRATIONS_CF, 2, "individual schema mutations", TimeUUIDType.instance, null);
+     public static final CFMetaData SchemaCf = newSystemTable(Migration.SCHEMA_CF, 3, "current state of the schema", UTF8Type.instance, null);
+-    public static final CFMetaData StatisticsCf = newSystemTable(StatisticsTable.STATISTICS_CF, 4, "persistent CF statistics for the local node", UTF8Type.instance, BytesType.instance);
+ 
+     private static CFMetaData newSystemTable(String cfName, int cfId, String comment, AbstractType comparator, AbstractType subComparator)
+     {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 5439e12e..7150258e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -355,13 +355,11 @@ else if (conf.memtable_flush_writers == null)
+                                                                     CFMetaData.HintsCf,
+                                                                     CFMetaData.MigrationsCf,
+                                                                     CFMetaData.SchemaCf,
+-                                                                    CFMetaData.StatisticsCf
+             });
+             CFMetaData.map(CFMetaData.StatusCf);
+             CFMetaData.map(CFMetaData.HintsCf);
+             CFMetaData.map(CFMetaData.MigrationsCf);
+             CFMetaData.map(CFMetaData.SchemaCf);
+-            CFMetaData.map(CFMetaData.StatisticsCf);
+             tables.put(Table.SYSTEM_TABLE, systemMeta);
+             
+             /* Load the seeds for node contact points */
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 4fc781d1..0a718334 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -382,37 +382,6 @@ else if (((file.length() == 0 && !filename.endsWith("-Compacted")) || (filename.
+         }
+     }
+     
+-    // returns runnables that need to update the system table.
+-    static Collection<Runnable> deleteCompactedFiles(String table, String columnFamily)
+-    {
+-        Collection<Runnable> runnables = new ArrayList<Runnable>();
+-        for (File file : files(table, columnFamily))
+-        {
+-            if (file.getName().contains("-Data.db"))
+-            {
+-                final String delPath = file.getAbsolutePath();
+-                if (SSTable.deleteIfCompacted(delPath))
+-                {
+-                    runnables.add(new Runnable()
+-                    {
+-                        public void run()
+-                        {
+-                            try
+-                            {
+-                                StatisticsTable.deleteSSTableStatistics(delPath);
+-                            }
+-                            catch (IOException ex)
+-                            {
+-                                throw new RuntimeException(ex);
+-                            }
+-                        }
+-                    });
+-                }
+-            }
+-        }
+-        return runnables;
+-    }
+-
+     private static Set<File> files(String table, String columnFamily)
+     {
+         assert table != null;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/StatisticsTable.java b/cassandra/trunk/src/java/org/apache/cassandra/db/StatisticsTable.java
+index 8d94197a..e69de29b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/StatisticsTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/StatisticsTable.java
+@@ -1,129 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.db;
+-
+-import java.io.IOException;
+-import java.nio.ByteBuffer;
+-import java.util.Collection;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-
+-import org.apache.cassandra.db.filter.QueryPath;
+-import org.apache.cassandra.db.filter.QueryFilter;
+-import org.apache.cassandra.io.sstable.SSTable;
+-import org.apache.cassandra.io.sstable.Descriptor;
+-import org.apache.cassandra.utils.FBUtilities;
+-import org.apache.cassandra.utils.EstimatedHistogram;
+-import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.service.StorageService;
+-
+-import static com.google.common.base.Charsets.UTF_8;
+-
+-public class StatisticsTable
+-{
+-    private static Logger logger = LoggerFactory.getLogger(StatisticsTable.class);
+-    public static final String STATISTICS_CF = "Statistics";
+-    public static final byte[] ROWSIZE_SC = "RowSize".getBytes(UTF_8);
+-    public static final byte[] COLUMNCOUNT_SC = "ColumnCount".getBytes(UTF_8);
+-
+-    private static DecoratedKey decorate(byte[] key)
+-    {
+-        return StorageService.getPartitioner().decorateKey(key);
+-    }
+-
+-    public static void persistSSTableStatistics(Descriptor desc, EstimatedHistogram rowsizes, EstimatedHistogram columncounts) throws IOException
+-    {
+-        String filename = getRelativePath(desc.filenameFor(SSTable.COMPONENT_DATA));
+-        if (isTemporary(filename) || desc.ksname.equals(Table.SYSTEM_TABLE))
+-            return;
+-        long[] rowbuckets = rowsizes.getBucketOffsets();
+-        long[] rowvalues = rowsizes.get(false);
+-        long[] columnbuckets = columncounts.getBucketOffsets();
+-        long[] columnvalues = columncounts.get(false);
+-        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, filename.getBytes(UTF_8));
+-        for (int i=0; i<rowbuckets.length; i++)
+-        {
+-            QueryPath path = new QueryPath(STATISTICS_CF, ROWSIZE_SC, FBUtilities.toByteArray(rowbuckets[i]));
+-            rm.add(path, FBUtilities.toByteArray(rowvalues[i]), new TimestampClock(System.currentTimeMillis()));
+-        }
+-        for (int i=0; i<columnbuckets.length; i++)
+-        {
+-            QueryPath path = new QueryPath(STATISTICS_CF, COLUMNCOUNT_SC, FBUtilities.toByteArray(columnbuckets[i]));
+-            rm.add(path, FBUtilities.toByteArray(columnvalues[i]), new TimestampClock(System.currentTimeMillis()));
+-        }
+-        rm.apply();
+-        if (logger.isDebugEnabled())
+-            logger.debug("Recorded SSTable statistics for " + filename);
+-    }
+-
+-    public static void deleteSSTableStatistics(String filepath) throws IOException
+-    {
+-        String filename = getRelativePath(filepath);
+-        RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, filename.getBytes(UTF_8));
+-        QueryPath path = new QueryPath(STATISTICS_CF);
+-        rm.delete(path, new TimestampClock(System.currentTimeMillis()));
+-        rm.apply();
+-        if (logger.isDebugEnabled())
+-            logger.debug("Deleted SSTable statistics for " + filename);
+-    }
+-
+-    private static long[] getSSTableStatistics(String filepath, byte[] superCol) throws IOException
+-    {
+-        long[] rv;
+-        String filename = getRelativePath(filepath);
+-        QueryPath path = new QueryPath(STATISTICS_CF);
+-        QueryFilter filter = QueryFilter.getNamesFilter(decorate(filename.getBytes(UTF_8)), path, superCol);
+-        ColumnFamily cf = Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(STATISTICS_CF).getColumnFamily(filter);
+-        if (cf == null)
+-            return new long[0];
+-        IColumn scolumn = cf.getColumn(superCol);
+-        rv = new long[scolumn.getSubColumns().size()];
+-        int i = 0;
+-        for (IColumn col : scolumn.getSubColumns()) {
+-            rv[i] = ByteBuffer.wrap(col.value()).getLong();
+-            i++;
+-        }
+-        return rv;
+-    }
+-
+-    public static long [] getSSTableRowSizeStatistics(String filename) throws IOException
+-    {
+-        return getSSTableStatistics(filename, ROWSIZE_SC);
+-    }
+-
+-    public static long [] getSSTableColumnCountStatistics(String filename) throws IOException
+-    {
+-        return getSSTableStatistics(filename, COLUMNCOUNT_SC);
+-    }
+-
+-    private static String getRelativePath(String filename)
+-    {
+-        for (String prefix : DatabaseDescriptor.getAllDataFileLocations())
+-        {
+-            if (filename.startsWith(prefix))
+-               return filename.substring(prefix.length());
+-        }
+-        return filename;
+-    }
+-
+-    private static boolean isTemporary(String filename)
+-    {
+-        return filename.contains("-" + SSTable.TEMPFILE_MARKER);
+-    }
+-}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 4aefe8f5..97662605 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -97,17 +97,12 @@ public static Table open(String table)
+                 if (tableInstance == null)
+                 {
+                     // do some housekeeping on the column families.
+-                    Collection<Runnable> systemTableUpdates = new ArrayList<Runnable>();
+                     for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
+                     {
+                         ColumnFamilyStore.scrubDataDirectories(table, cfm.cfName);
+-                        systemTableUpdates.addAll(ColumnFamilyStore.deleteCompactedFiles(table, cfm.cfName)); 
+                     }
+                     tableInstance = new Table(table);
+                     instances.put(table, tableInstance);
+-                    
+-                    for (Runnable r : systemTableUpdates)
+-                        r.run();
+                 }
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+index 86b5592f..5f9ceed4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+@@ -32,7 +32,6 @@
+ import org.apache.cassandra.config.CFMetaData;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.io.util.FileUtils;
+-import org.apache.cassandra.db.StatisticsTable;
+ import org.apache.cassandra.utils.EstimatedHistogram;
+ 
+ /**
+@@ -54,6 +53,7 @@
+     public static final String COMPONENT_DATA = "Data.db";
+     public static final String COMPONENT_INDEX = "Index.db";
+     public static final String COMPONENT_FILTER = "Filter.db";
++    public static final String COMPONENT_STATS = "Statistics.db";
+ 
+     public static final String COMPONENT_COMPACTED = "Compacted";
+ 
+@@ -63,7 +63,7 @@
+ 
+     public static final String TEMPFILE_MARKER = "tmp";
+ 
+-    public static List<String> components = Collections.unmodifiableList(Arrays.asList(COMPONENT_FILTER, COMPONENT_INDEX, COMPONENT_DATA));
++    public static List<String> components = Collections.unmodifiableList(Arrays.asList(COMPONENT_FILTER, COMPONENT_INDEX, COMPONENT_DATA, COMPONENT_STATS));
+     protected EstimatedHistogram estimatedRowSize = new EstimatedHistogram(150);
+     protected EstimatedHistogram estimatedColumnCount = new EstimatedHistogram(114);
+ 
+@@ -132,6 +132,7 @@ public static boolean deleteIfCompacted(String dataFilename)
+                 FileUtils.deleteWithConfirm(new File(dataFilename));
+                 FileUtils.deleteWithConfirm(new File(SSTable.indexFilename(dataFilename)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.filterFilename(dataFilename)));
++                FileUtils.deleteWithConfirm(new File(SSTable.statisticsFilename(dataFilename)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.compactedFilename(dataFilename)));
+             }
+             catch (IOException e)
+@@ -154,11 +155,21 @@ protected static String filterFilename(String dataFile)
+         return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_FILTER);
+     }
+ 
++    protected static String statisticsFilename(String dataFile)
++    {
++        return Descriptor.fromFilename(dataFile).filenameFor(COMPONENT_STATS);
++    }
++
+     public String filterFilename()
+     {
+         return desc.filenameFor(COMPONENT_FILTER);
+     }
+ 
++    public String statisticsFilename()
++    {
++        return desc.filenameFor(COMPONENT_STATS);
++    }
++
+     public String getFilename()
+     {
+         return desc.filenameFor(COMPONENT_DATA);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableDeletingReference.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableDeletingReference.java
+index d4dff520..ecf71f2e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableDeletingReference.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableDeletingReference.java
+@@ -30,7 +30,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import org.apache.cassandra.db.StatisticsTable;
+ import org.apache.cassandra.io.DeletionService;
+ import org.apache.cassandra.io.util.FileUtils;
+ 
+@@ -95,8 +94,8 @@ public void run()
+             {
+                 FileUtils.deleteWithConfirm(new File(SSTable.indexFilename(path)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.filterFilename(path)));
++                FileUtils.deleteWithConfirm(new File(SSTable.statisticsFilename(path)));
+                 FileUtils.deleteWithConfirm(new File(SSTable.compactedFilename(path)));
+-                StatisticsTable.deleteSSTableStatistics(datafile.getAbsolutePath());
+             }
+             catch (IOException e)
+             {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableReader.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+index a7c6f60c..2cfe8a06 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+@@ -143,18 +143,14 @@ public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
+ 
+     private void loadStatistics(Descriptor desc) throws IOException
+     {
+-        // skip loading stats for the system table, or we will infinitely recurse
+-        if (desc.ksname.equals(Table.SYSTEM_TABLE))
++        if (!new File(desc.filenameFor(SSTable.COMPONENT_STATS)).exists())
+             return;
+         if (logger.isDebugEnabled())
+             logger.debug("Load statistics for " + desc);
+-        long[] rowsizes = StatisticsTable.getSSTableRowSizeStatistics(desc.filenameFor(SSTable.COMPONENT_DATA));
+-        long[] colcounts = StatisticsTable.getSSTableColumnCountStatistics(desc.filenameFor(SSTable.COMPONENT_DATA));
+-        if (rowsizes.length > 0)
+-        {
+-            estimatedRowSize = new EstimatedHistogram(rowsizes);
+-            estimatedColumnCount = new EstimatedHistogram(colcounts);
+-        }
++        DataInputStream dis = new DataInputStream(new FileInputStream(desc.filenameFor(SSTable.COMPONENT_STATS)));
++        estimatedRowSize = EstimatedHistogram.serializer.deserialize(dis);
++        estimatedColumnCount = EstimatedHistogram.serializer.deserialize(dis);
++        dis.close();
+     }
+ 
+     public static SSTableReader open(Descriptor desc) throws IOException
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+index b8e290c1..182c764b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+@@ -37,7 +37,7 @@
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.utils.FBUtilities;
+-import org.apache.cassandra.utils.WrappedRunnable;
++import org.apache.cassandra.utils.EstimatedHistogram;
+ 
+ public class SSTableWriter extends SSTable
+ {
+@@ -140,17 +140,12 @@ public SSTableReader closeAndOpenReader(long maxDataAge) throws IOException
+         // main data
+         dataFile.close(); // calls force
+ 
++        // write sstable statistics
++        writeStatistics(desc);
++
+         // remove the 'tmp' marker from all components
+         final Descriptor newdesc = rename(desc);
+ 
+-        Runnable runnable = new WrappedRunnable()
+-        {
+-            protected void runMayThrow() throws IOException
+-            {
+-                StatisticsTable.persistSSTableStatistics(newdesc, estimatedRowSize, estimatedColumnCount);
+-            }
+-        };
+-        ColumnFamilyStore.submitPostFlush(runnable);
+ 
+         // finalize in-memory state for the reader
+         SegmentedFile ifile = iwriter.builder.complete(newdesc.filenameFor(SSTable.COMPONENT_INDEX));
+@@ -161,6 +156,14 @@ protected void runMayThrow() throws IOException
+         return sstable;
+     }
+ 
++    private void writeStatistics(Descriptor desc) throws IOException
++    {
++        DataOutputStream dos = new DataOutputStream(new FileOutputStream(desc.filenameFor(SSTable.COMPONENT_STATS)));
++        EstimatedHistogram.serializer.serialize(estimatedRowSize, dos);
++        EstimatedHistogram.serializer.serialize(estimatedColumnCount, dos);
++        dos.close();
++    }
++
+     static Descriptor rename(Descriptor tmpdesc)
+     {
+         Descriptor newdesc = tmpdesc.asTemporary(false);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/EstimatedHistogram.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/EstimatedHistogram.java
+index bb36059d..53a9bc8a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/EstimatedHistogram.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/EstimatedHistogram.java
+@@ -18,8 +18,13 @@
+ */
+ package org.apache.cassandra.utils;
+ 
++import java.io.IOException;
+ import java.util.concurrent.atomic.AtomicLongArray;
+ import java.util.Arrays;
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++
++import org.apache.cassandra.io.ICompactSerializer;
+ 
+ public class EstimatedHistogram
+ {
+@@ -38,6 +43,8 @@
+ 
+     final AtomicLongArray buckets;
+ 
++    public static EstimatedHistogramSerializer serializer = new EstimatedHistogramSerializer();
++
+     public EstimatedHistogram()
+     {
+         this(90);
+@@ -55,6 +62,14 @@ public EstimatedHistogram(long[] bucketData)
+         buckets = new AtomicLongArray(bucketData);
+     }
+ 
++    public EstimatedHistogram(long[] offsets, long[] bucketData)
++    {
++        assert bucketData.length == offsets.length +1;
++        bucketOffsets = offsets;
++        buckets = new AtomicLongArray(bucketData);
++        numBuckets = bucketData.length;
++    }
++
+     private void makeOffsets(int size)
+     {
+         bucketOffsets = new long[size];
+@@ -144,4 +159,32 @@ public long median()
+         }
+         return median;
+     }
++
++    public static class EstimatedHistogramSerializer implements ICompactSerializer<EstimatedHistogram>
++    {
++        public void serialize(EstimatedHistogram eh, DataOutputStream dos) throws IOException
++        {
++            long[] offsets = eh.getBucketOffsets();
++            long[] buckets = eh.get(false);
++            dos.writeInt(buckets.length);
++            for (int i = 0; i < buckets.length; i++)
++            {
++                dos.writeLong(offsets[i == 0 ? 0 : i - 1]);
++                dos.writeLong(buckets[i]);
++            }
++        }
++
++        public EstimatedHistogram deserialize(DataInputStream dis) throws IOException
++        {
++            int size = dis.readInt();
++            long[] offsets = new long[size - 1];
++            long[] buckets = new long[size];
++
++            for (int i = 0; i < size; i++) {
++                offsets[i == 0 ? 0 : i - 1] = dis.readLong();
++                buckets[i] = dis.readLong();
++            }
++            return new EstimatedHistogram(offsets, buckets);
++        }
++    }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+index 47cb875c..7d015dea 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -51,7 +51,6 @@ public void ensureStaticCFMIdsAreLessThan1000()
+         assert CFMetaData.HintsCf.cfId == 1;    
+         assert CFMetaData.MigrationsCf.cfId == 2;    
+         assert CFMetaData.SchemaCf.cfId == 3;    
+-        assert CFMetaData.StatisticsCf.cfId == 4;    
+     }
+     
+     @Test
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
+index 94bee64d..2b0ef1f4 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
+@@ -48,11 +48,6 @@ public void testWithFlush() throws Exception
+         ColumnFamilyStore cfs = table1.getColumnFamilyStore("Standard1");
+         cfs.forceBlockingFlush();
+ 
+-        // forceBlockingFlush above adds persistent stats to the current commit log segment
+-        // it ends up in the same segment as key99 meaning that segment still has unwritten data
+-        // thus the commit log replays it when recover is called below
+-        Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(StatisticsTable.STATISTICS_CF).forceBlockingFlush();
+-
+         // remove all SSTable/MemTables
+         cfs.clearUnsafe();
+ 

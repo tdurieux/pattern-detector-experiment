@@ -1,0 +1,172 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/Context.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/Context.java
+index bb349945..450dea6c 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/Context.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/Context.java
+@@ -87,6 +87,13 @@ Implementing equals is useful for Contexts used in notifyAllThreads() that
+ 	 * context manager. If there are no other references
+ 	 * to the context, removing itself from the manager
+ 	 * equates to freeing it.
++     * <BR>
++     * On an exception that is session severity or greater
++     * the Context must push itself off the stack. This is
++     * to ensure that after a session has been closed there
++     * are no Contexts on the stack that potentially hold
++     * references to objects, thus delaying their garbage
++     * collection.
+ 	 * <p>
+ 	 * Contexts must release all their resources before
+ 	 * removing themselves from their context manager.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/SystemContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/SystemContext.java
+index 52e3a449..de374636 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/SystemContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/SystemContext.java
+@@ -43,6 +43,8 @@ public void cleanupOnError(Throwable t) {
+ 			if (severity < ExceptionSeverity.SESSION_SEVERITY)
+ 				return;
+ 
++            popMe();
++
+ 			if (severity >= ExceptionSeverity.SYSTEM_SEVERITY)
+ 				doShutdown = true;
+ 		} else if (t instanceof ShutdownException) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/loader/ClassFactoryContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/loader/ClassFactoryContext.java
+index d8ff3f9f..c6cbc273 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/loader/ClassFactoryContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/loader/ClassFactoryContext.java
+@@ -23,29 +23,42 @@
+ import org.apache.derby.iapi.services.context.ContextImpl;
+ import org.apache.derby.iapi.services.context.ContextManager;
+ import org.apache.derby.iapi.services.property.PersistentSet;
++import org.apache.derby.iapi.error.ExceptionSeverity;
+ import org.apache.derby.iapi.error.StandardException;
++
+ /**
++ * Context that provides the correct ClassFactory for the
++ * current service. Allows stateless code to obtain the
++ * correct class loading scheme.
+ */
+-
+ public abstract class ClassFactoryContext extends ContextImpl {
+ 
+ 	public static final String CONTEXT_ID = "ClassFactoryContext";
+ 
+ 	private final ClassFactory cf;
+ 
+-	public ClassFactoryContext(ContextManager cm, ClassFactory cf) {
++	protected ClassFactoryContext(ContextManager cm, ClassFactory cf) {
+ 
+ 		super(cm, CONTEXT_ID);
+ 
+ 		this.cf = cf;
+ 	}
+ 
+-	public ClassFactory getClassFactory() {
++	public final ClassFactory getClassFactory() {
+ 		return cf;
+ 	}
+ 
++    /**
++     * Get the lock compatibility space to use for the
++     * transactional nature of the class loading lock.
++     * Used when the classpath changes or a database
++     * jar file is installed, removed or replaced.
++     */
+ 	public abstract Object getLockSpace() throws StandardException;
+ 
++    /**
++     * Get the set of properties stored with this service.
++    */
+ 	public abstract PersistentSet getPersistentSet() throws StandardException;
+ 
+ 	/**
+@@ -54,5 +67,17 @@ public ClassFactory getClassFactory() {
+ 	*/
+ 	public abstract JarReader getJarReader();
+ 
+-	public void cleanupOnError(Throwable error) {}
++    /**
++     * Handle any errors. Only work here is to pop myself
++     * on a session or greater severity error.
++     */
++	public final void cleanupOnError(Throwable error) {
++        if (error instanceof StandardException) {
++
++            StandardException se = (StandardException) error;
++            
++            if (se.getSeverity() >= ExceptionSeverity.SESSION_SEVERITY)
++                popMe();
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/DatabaseContextImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/DatabaseContextImpl.java
+index 51fdc8b2..16cb3be4 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/DatabaseContextImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/DatabaseContextImpl.java
+@@ -33,7 +33,7 @@
+ /**
+ 	A context that shutdowns down the database on a databsae exception.
+ */
+-class DatabaseContextImpl extends ContextImpl implements DatabaseContext
++final class DatabaseContextImpl extends ContextImpl implements DatabaseContext
+ {
+ 
+ 	private final Database	db;
+@@ -46,11 +46,19 @@
+ 	public void cleanupOnError(Throwable t) {
+ 		if (!(t instanceof StandardException)) return;
+ 		StandardException se = (StandardException)t;
+-		if (se.getSeverity() != ExceptionSeverity.DATABASE_SEVERITY) return;
++
++        // Ensure the context is popped if the session is
++        // going away.
++        if (se.getSeverity() < ExceptionSeverity.SESSION_SEVERITY)
++            return;
++
+ 		popMe();
++        
++        if (se.getSeverity() == ExceptionSeverity.DATABASE_SEVERITY) {
+ 		ContextService.getFactory().notifyAllActiveThreads(this);
+ 		Monitor.getMonitor().shutdown(db);
+ 	}
++	}
+ 
+ 	public boolean equals(Object other) {
+ 		if (other instanceof DatabaseContext) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericExecutionContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericExecutionContext.java
+index 8c7c540a..df29aba3 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericExecutionContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericExecutionContext.java
+@@ -160,8 +160,16 @@ public void cleanupOnError(Throwable error) throws StandardException {
+ 		if (error instanceof StandardException) {
+ 
+ 			StandardException se = (StandardException) error;
+-			if (se.getSeverity() > ExceptionSeverity.STATEMENT_SEVERITY)
++            int severity = se.getSeverity();
++            if (severity >= ExceptionSeverity.SESSION_SEVERITY)
++            {
++               popMe();
+ 				return;
++            }
++			if (severity > ExceptionSeverity.STATEMENT_SEVERITY)
++            {
++ 				return;
++            }
+ 
+ 
+ 			if (sourceRS != null)
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
+index c95eabce..c6fa65c7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
+@@ -89,6 +89,11 @@ public void cleanupOnError(Throwable t) {
+ 
+ 			StandardException se = (StandardException) t;
+ 
++            if (se.getSeverity() >= ExceptionSeverity.SESSION_SEVERITY) {
++                popMe();
++                return;
++            }
++
+ 			if (se.getSeverity() == ExceptionSeverity.TRANSACTION_SEVERITY) {
+ 
+ 				synchronized (this) {

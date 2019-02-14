@@ -1,0 +1,153 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/core/SolrCore.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index 210bf5df..5d5fe531 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -1332,6 +1332,10 @@ public UpdateHandler getUpdateHandler() {
+    * This method acquires openSearcherLock - do not call with searckLock held!
+    */
+   public RefCounted<SolrIndexSearcher>  openNewSearcher(boolean updateHandlerReopens, boolean realtime) {
++    if (isClosed()) { // catch some errors quicker
++      throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "openNewSearcher called on closed core");
++    }
++
+     SolrIndexSearcher tmp;
+     RefCounted<SolrIndexSearcher> newestSearcher = null;
+     boolean nrt = solrConfig.reopenReaders && updateHandlerReopens;
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index baf8b57f..12f927b9 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -107,6 +107,8 @@ public DirectUpdateHandler2(SolrCore core) {
+     softCommitTracker = new CommitTracker("Soft", core, softCommitDocsUpperBound, softCommitTimeUpperBound, true, true);
+     
+     commitWithinSoftCommit = updateHandlerInfo.commitWithinSoftCommit;
++
++
+   }
+   
+   public DirectUpdateHandler2(SolrCore core, UpdateHandler updateHandler) {
+@@ -124,6 +126,13 @@ public DirectUpdateHandler2(SolrCore core, UpdateHandler updateHandler) {
+     softCommitTracker = new CommitTracker("Soft", core, softCommitDocsUpperBound, softCommitTimeUpperBound, updateHandlerInfo.openSearcher, true);
+     
+     commitWithinSoftCommit = updateHandlerInfo.commitWithinSoftCommit;
++
++    UpdateLog existingLog = updateHandler.getUpdateLog();
++    if (this.ulog != null && this.ulog == existingLog) {
++      // If we are reusing the existing update log, inform the log that it's update handler has changed.
++      // We do this as late as possible.
++      this.ulog.init(this, core);
++    }
+   }
+ 
+   private void deleteAll() throws IOException {
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateHandler.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+index ad841342..f1899106 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+@@ -54,7 +54,7 @@
+   protected Vector<SolrEventListener> softCommitCallbacks = new Vector<SolrEventListener>();
+   protected Vector<SolrEventListener> optimizeCallbacks = new Vector<SolrEventListener>();
+ 
+-  protected volatile UpdateLog ulog;
++  protected UpdateLog ulog;
+ 
+   private void parseEventListeners() {
+     final Class<SolrEventListener> clazz = SolrEventListener.class;
+@@ -74,13 +74,15 @@ private void parseEventListeners() {
+   }
+ 
+ 
+-  private void initLog(PluginInfo ulogPluginInfo) {
+-    if (ulogPluginInfo != null && ulogPluginInfo.isEnabled()) {
++  private void initLog(PluginInfo ulogPluginInfo, UpdateLog existingUpdateLog) {
++    ulog = existingUpdateLog;
++    if (ulog == null && ulogPluginInfo != null && ulogPluginInfo.isEnabled()) {
+       ulog = new UpdateLog();
+       ulog.init(ulogPluginInfo);
+       // ulog = core.createInitInstance(ulogPluginInfo, UpdateLog.class, "update log", "solr.NullUpdateLog");
+       ulog.init(this, core);
+     }
++    // ulog.init() when reusing an existing log is deferred (currently at the end of the DUH2 constructor
+   }
+ 
+   // not thread safe - for startup
+@@ -133,11 +135,7 @@ public UpdateHandler(SolrCore core, UpdateLog updateLog)  {
+     if (!core.isReloaded() && !core.getDirectoryFactory().isPersistent()) {
+       clearLog(ulogPluginInfo);
+     }
+-    if (updateLog == null) {
+-      initLog(ulogPluginInfo);
+-    } else {
+-      this.ulog = updateLog;
+-    }
++    initLog(ulogPluginInfo, updateLog);
+   }
+ 
+   /**
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+index 989f3a06..c7c55304 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+@@ -189,6 +189,10 @@ public void init(PluginInfo info) {
+     defaultSyncLevel = SyncLevel.getSyncLevel((String)info.initArgs.get("syncLevel"));
+   }
+ 
++  /* Note, when this is called, uhandler is not completely constructed.
++   * This must be called when a new log is created, or
++   * for an existing log whenever the core or update handler changes.
++   */
+   public void init(UpdateHandler uhandler, SolrCore core) {
+     // ulogDir from CoreDescriptor overrides
+     String ulogDir = core.getCoreDescriptor().getUlogDir();
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/test/org/apache/solr/search/TestRecovery.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/test/org/apache/solr/search/TestRecovery.java
+index 32101028..b2d6077a 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/test/org/apache/solr/search/TestRecovery.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/test/org/apache/solr/search/TestRecovery.java
+@@ -20,6 +20,7 @@
+ package org.apache.solr.search;
+ 
+ 
++import org.apache.solr.common.SolrException;
+ import org.noggit.ObjectBuilder;
+ import org.apache.solr.SolrTestCaseJ4;
+ import org.apache.solr.request.SolrQueryRequest;
+@@ -490,6 +491,39 @@ public void run() {
+   }
+ 
+ 
++
++  // we need to make sure that the log is informed of a core reload
++  @Test
++  public void testReload() throws Exception {
++    long version = addAndGetVersion(sdoc("id","reload1") , null);
++
++    h.reload();
++
++    version = addAndGetVersion(sdoc("id","reload1", "_version_", Long.toString(version)), null);
++
++    assertU(commit());
++
++    // if we try the optimistic concurrency again, the tlog lookup maps should be clear
++    // and we should go to the index to check the version.  This indirectly tests that
++    // the update log was informed of the reload.  See SOLR-4858
++
++    version = addAndGetVersion(sdoc("id","reload1", "_version_", Long.toString(version)), null);
++
++    // a deleteByQuery currently forces open a new realtime reader via the update log.
++    // This also tests that the update log was informed of the new udpate handler.
++
++    deleteByQueryAndGetVersion("foo_t:hownowbrowncow", null);
++
++    version = addAndGetVersion(sdoc("id","reload1", "_version_", Long.toString(version)), null);
++
++    // if the update log was not informed of the new update handler, then the old core will
++    // incorrectly be used for some of the operations above and opened searchers
++    // will never be closed.  This used to cause the test framework to fail because of unclosed directory checks.
++    // SolrCore.openNewSearcher was modified to throw an error if the core is closed, resulting in
++    // a faster fail.
++  }
++
++
+   @Test
+   public void testBufferingFlags() throws Exception {
+ 

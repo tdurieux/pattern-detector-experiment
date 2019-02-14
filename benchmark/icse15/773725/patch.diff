@@ -1,0 +1,233 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 3690d07f..30ecf86e 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -806,22 +806,23 @@ void storeLocation(String filename, BloomFilter bf)
+         return buckets.keySet();
+     }
+ 
+-    public void doCompaction() throws IOException
++    public int doCompaction() throws IOException
+     {
+-        doCompaction(COMPACTION_THRESHOLD);
++        return doCompaction(COMPACTION_THRESHOLD);
+     }
+ 
+     /*
+      * Break the files into buckets and then compact.
+      */
+-    public void doCompaction(int threshold) throws IOException
++    public int doCompaction(int threshold) throws IOException
+     {
+         isCompacting_.set(true);
+         List<String> files = new ArrayList<String>(ssTables_);
++        int filesCompacted = 0;
+         try
+         {
+-            int count;
+-            for (List<String> fileList : getCompactionBuckets(files, 50L * 1024L * 1024L))
++            Set<List<String>> buckets = getCompactionBuckets(files, 50L * 1024L * 1024L);
++            for (List<String> fileList : buckets)
+             {
+                 Collections.sort(fileList, new FileNameComparator(FileNameComparator.Ascending));
+                 if (fileList.size() < threshold)
+@@ -831,14 +832,14 @@ public void doCompaction(int threshold) throws IOException
+                 // For each bucket if it has crossed the threshhold do the compaction
+                 // In case of range  compaction merge the counting bloom filters also.
+                 files.clear();
+-                count = 0;
++                int count = 0;
+                 for (String file : fileList)
+                 {
+                     files.add(file);
+                     count++;
+                     if (count == threshold)
+                     {
+-                        doFileCompaction(files, BUFSIZE);
++                        filesCompacted += doFileCompaction(files, BUFSIZE);
+                         break;
+                     }
+                 }
+@@ -848,6 +849,7 @@ public void doCompaction(int threshold) throws IOException
+         {
+             isCompacting_.set(false);
+         }
++        return filesCompacted;
+     }
+ 
+     void doMajorCompaction(long skip)
+@@ -1237,7 +1239,7 @@ private void doFill(BloomFilter bf, String decoratedKey)
+      * to get the latest data.
+      *
+      */
+-    private void doFileCompaction(List<String> files,  int minBufferSize) throws IOException
++    private int doFileCompaction(List<String> files,  int minBufferSize) throws IOException
+     {
+         String compactionFileLocation = DatabaseDescriptor.getCompactionFileLocation(getExpectedCompactedFileSize(files));
+         // If the compaction file path is null that means we have no space left for this compaction.
+@@ -1246,8 +1248,7 @@ private void doFileCompaction(List<String> files,  int minBufferSize) throws IOE
+         {
+             String maxFile = getMaxSizeFile( files );
+             files.remove( maxFile );
+-            doFileCompaction(files , minBufferSize);
+-            return;
++            return doFileCompaction(files , minBufferSize);
+         }
+ 
+         String newfile = null;
+@@ -1412,6 +1413,7 @@ private void doFileCompaction(List<String> files,  int minBufferSize) throws IOE
+         String format = "Compacted [%s] to %s.  %d/%d bytes for %d/%d keys read/written.  Time: %dms.";
+         long dTime = System.currentTimeMillis() - startTime;
+         logger_.info(String.format(format, StringUtils.join(files, ", "), newfile, totalBytesRead, totalBytesWritten, totalkeysRead, totalkeysWritten, dTime));
++        return files.size();
+     }
+ 
+     public boolean isSuper()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
+index ccd7bd59..c9b141af 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
+@@ -66,7 +66,7 @@ public static MinorCompactionManager instance()
+         return instance_;
+     }
+ 
+-    class FileCompactor implements Runnable
++    class FileCompactor implements Callable<Integer>
+     {
+         private ColumnFamilyStore columnFamilyStore_;
+ 
+@@ -75,20 +75,23 @@ public static MinorCompactionManager instance()
+             columnFamilyStore_ = columnFamilyStore;
+         }
+ 
+-        public void run()
++        public Integer call()
+         {
+             logger_.debug("Started compaction ..." + columnFamilyStore_.columnFamily_);
+             try
+             {
+-                columnFamilyStore_.doCompaction();
++                return columnFamilyStore_.doCompaction();
+             }
+             catch (IOException e)
+             {
+                 throw new RuntimeException(e);
+             }
++            finally
++            {
+             logger_.debug("Finished compaction ..." + columnFamilyStore_.columnFamily_);
+         }
+     }
++    }
+ 
+     class FileCompactor2 implements Callable<Boolean>
+     {
+@@ -164,13 +167,20 @@ public void shutdown()
+     	compactor_.shutdownNow();
+     }
+ 
+-    public void submitPeriodicCompaction(ColumnFamilyStore columnFamilyStore)
++    public void submitPeriodicCompaction(final ColumnFamilyStore columnFamilyStore)
+     {        
+-    	compactor_.scheduleWithFixedDelay(new FileCompactor(columnFamilyStore), MinorCompactionManager.intervalInMins_,
++        Runnable runnable = new Runnable() // having to wrap Callable in Runnable is retarded but that's what the API insists on.
++        {
++            public void run()
++            {
++                new FileCompactor(columnFamilyStore).call();
++            }
++        };
++    	compactor_.scheduleWithFixedDelay(runnable, MinorCompactionManager.intervalInMins_,
+     			MinorCompactionManager.intervalInMins_, TimeUnit.MINUTES);       
+     }
+ 
+-    public Future submit(ColumnFamilyStore columnFamilyStore)
++    public Future<Integer> submit(ColumnFamilyStore columnFamilyStore)
+     {
+         return compactor_.submit(new FileCompactor(columnFamilyStore));
+     }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+index ed5efb5b..e6d19740 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+@@ -3,14 +3,7 @@
+ import java.io.File;
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.Random;
+-import java.util.Set;
+-import java.util.SortedSet;
++import java.util.*;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ 
+@@ -393,23 +386,56 @@ private String createFile(int nBytes) throws IOException
+     }
+ 
+     @Test
+-    public void testCompaction() throws IOException, ExecutionException, InterruptedException
++    public void testOneCompaction() throws IOException, ExecutionException, InterruptedException
+     {
+         Table table = Table.open("Table1");
+         ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
+ 
+-        for (int j = 0; j < 5; j++) {
+-            for (int i = 0; i < 10; i++) {
+-                long epoch = System.currentTimeMillis()  /  1000;
+-                String key = String.format("%s.%s.%s",  epoch,  1,  i);
++        Set<String> inserted = new HashSet<String>();
++        for (int j = 0; j < 2; j++) {
++            String key = "0";
+                 RowMutation rm = new RowMutation("Table1", key);
+-                rm.add("Standard1:A", new byte[0], epoch);
++            rm.add("Standard1:0", new byte[0], j);
+                 rm.apply();
++            inserted.add(key);
++            store.forceBlockingFlush();
++            assertEquals(table.getKeyRange("", "", 10000).size(), inserted.size());
++        }
++        store.doCompaction(2);
++        assertEquals(table.getKeyRange("", "", 10000).size(), inserted.size());
++    }
++
++    @Test
++    public void testCompactions() throws IOException, ExecutionException, InterruptedException
++    {
++        // this test does enough rows to force multiple block indexes to be used
++        Table table = Table.open("Table1");
++        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
++
++        final int ROWS_PER_SSTABLE = 10;
++        Set<String> inserted = new HashSet<String>();
++        for (int j = 0; j < (SSTable.indexInterval() * 3) / ROWS_PER_SSTABLE; j++) {
++            for (int i = 0; i < ROWS_PER_SSTABLE; i++) {
++                String key = String.valueOf(i % 2);
++                RowMutation rm = new RowMutation("Table1", key);
++                rm.add("Standard1:" + (i / 2), new byte[0], j * ROWS_PER_SSTABLE + i);
++                rm.apply();
++                inserted.add(key);
+             }
+             store.forceBlockingFlush();
++            assertEquals(table.getKeyRange("", "", 10000).size(), inserted.size());
++        }
++        while (true)
++        {
++            Future<Integer> ft = MinorCompactionManager.instance().submit(store);
++            if (ft.get() == 0)
++                break;
++        }
++        if (store.getSSTableFilenames().size() > 1)
++        {
++            store.doCompaction(store.getSSTableFilenames().size());
+         }
+-        Future ft = MinorCompactionManager.instance().submit(store);
+-        ft.get();
++        assertEquals(table.getKeyRange("", "", 10000).size(), inserted.size());
+     }
+     
+     @Test

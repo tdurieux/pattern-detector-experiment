@@ -1,0 +1,321 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
+index e8630066..b730c9f7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
+@@ -324,6 +324,9 @@ CostEstimate estimateCost(OptimizablePredicateList predList,
+ 	/** Tell whether this Optimizable can be instantiated multiple times */
+ 	boolean supportsMultipleInstantiations();
+ 
++    /** Tell whether this Optimizable has any large object (LOB) columns. */
++    boolean hasLargeObjectColumns();
++
+ 	/** Get this Optimizable's result set number */
+ 	int getResultSetNumber();
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
+index 6baaac72..520d8986 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/execute/ResultSetFactory.java
+@@ -969,6 +969,8 @@ NoPutResultSet getTableScanResultSet(
+ 								(in sys.systables)
+ 		@param isolationLevel	Isolation level (specified or not) to use on scans
+ 		@param rowsPerRead		The number of rows to read per fetch.
++        @param disableForHoldable Whether or not bulk fetch should be disabled
++                                  at runtime if the cursor is holdable.
+ 		@param oneRowScan		Whether or not this is a 1 row scan.
+ 		@param optimizerEstimatedRowCount	Estimated total # of rows by
+ 											optimizer
+@@ -1001,6 +1003,7 @@ NoPutResultSet getBulkTableScanResultSet(
+ 								boolean tableLocked,
+ 								int isolationLevel,
+ 								int rowsPerRead,
++                                boolean disableForHoldable,
+ 								boolean oneRowScan,
+ 								double optimizerEstimatedRowCount,
+ 								double optimizerEstimatedCost)
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/BaseJoinStrategy.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/BaseJoinStrategy.java
+index 633e2bb7..0a72007f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/BaseJoinStrategy.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/BaseJoinStrategy.java
+@@ -176,6 +176,10 @@ final void fillInScanArgs2(MethodBuilder mb,
+ 
+ 		if (bulkFetch > 0) {
+ 			mb.push(bulkFetch);
++            // If the table references LOBs, we want to disable bulk fetching
++            // when the cursor is holdable. Otherwise, a commit could close
++            // LOBs before they have been returned to the user.
++            mb.push(innerTable.hasLargeObjectColumns());
+ 		}
+ 
+ 		/* 1 row scans (avoiding 2nd next()) are
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
+index 7eaa7a50..74c61bd1 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
+@@ -742,6 +742,26 @@ public boolean isBaseTable()
+ 		return false;
+ 	}
+ 
++    /**
++     * Check if any columns containing large objects (BLOBs or CLOBs) are
++     * referenced in this table.
++     *
++     * @return {@code true} if at least one large object column is referenced,
++     * {@code false} otherwise
++     */
++    public boolean hasLargeObjectColumns() {
++        for (int i = 0; i < resultColumns.size(); i++) {
++            ResultColumn rc = (ResultColumn) resultColumns.elementAt(i);
++            if (rc.isReferenced()) {
++                DataTypeDescriptor type = rc.getType();
++                if (type != null && type.getTypeId().isLOBTypeId()) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
++
+ 	/** @see Optimizable#isMaterializable 
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
+index 0da6ef59..a43f7c06 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
+@@ -238,7 +238,11 @@ public int getScanArgs(
+ 		}
+ 		else if (bulkFetch > 1)
+ 		{
+-			numArgs = 25;
++            // Bulk-fetch uses TableScanResultSet arguments plus two
++            // additional arguments: 1) bulk fetch size, and 2) whether the
++            // table contains LOB columns (used at runtime to decide if
++            // bulk fetch is safe DERBY-1511).
++            numArgs = 26;
+ 		}
+ 		else
+ 		{
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/BulkTableScanResultSet.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/BulkTableScanResultSet.java
+index 092dfdf2..298d70d7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/BulkTableScanResultSet.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/BulkTableScanResultSet.java
+@@ -102,6 +102,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		boolean tableLocked,
+ 		int isolationLevel,
+ 		int rowsPerRead,
++        boolean disableForHoldable,
+ 		boolean oneRowScan,
+ 		double optimizerEstimatedRowCount,
+ 		double optimizerEstimatedCost)
+@@ -128,7 +129,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 			lockMode,
+ 			tableLocked,
+ 			isolationLevel,
+-			rowsPerRead,
++            adjustBulkFetchSize(activation, rowsPerRead, disableForHoldable),
+ 			oneRowScan,
+ 			optimizerEstimatedRowCount,
+ 			optimizerEstimatedCost);
+@@ -155,6 +156,31 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		}
+     }
+ 
++    /**
++     * Adjust the bulk fetch size according to the parameters. Bulk fetch may
++     * be disabled by returning 1 from this method. Disabling of bulk fetch
++     * may happen if the cursor is holdable and it contains LOB columns
++     * (DERBY-1511) because
++     *
++     * @param activation the activation for the executing statement
++     * @param rowsPerRead how many rows to read in each chunk if a bulk fetch
++     * is OK to use
++     * @param disableForHoldable whether or not bulk fetch should be disabled
++     * for holdable cursors
++     * @return the bulk fetch size to use
++     */
++    private static int adjustBulkFetchSize(
++            Activation activation, int rowsPerRead, boolean disableForHoldable)
++    {
++        if (disableForHoldable && activation.getResultSetHoldability()) {
++            // We have a holdable cursor, and we've been requested to disable
++            // bulk fetch if the cursor is holdable, so change bulk size to 1.
++            return 1;
++        } else {
++            return rowsPerRead;
++        }
++    }
++
+     /**
+  	 * Open the scan controller
+ 	 *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
+index 62b9d002..3bb79af8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericResultSetFactory.java
+@@ -679,6 +679,7 @@ public NoPutResultSet getBulkTableScanResultSet(
+ 									boolean tableLocked,
+ 									int isolationLevel,
+ 									int rowsPerRead,
++                                    boolean disableForHoldable,
+ 									boolean oneRowScan,
+ 									double optimizerEstimatedRowCount,
+ 									double optimizerEstimatedCost)
+@@ -716,6 +717,7 @@ public NoPutResultSet getBulkTableScanResultSet(
+ 								tableLocked,
+ 								isolationLevel,
+ 								rowsPerRead,
++                                disableForHoldable,
+ 								oneRowScan,
+ 								optimizerEstimatedRowCount,
+ 								optimizerEstimatedCost);
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
+index aeb981ca..0c3466ae 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
+@@ -2426,6 +2426,7 @@ private void emptyIndexes(long newHeapConglom,
+                     true,					// table locked
+                     tc.ISOLATION_READ_COMMITTED,
+                     LanguageProperties.BULK_FETCH_DEFAULT_INT,	// rows per read
++                    false,                  // never disable bulk fetch
+                     false,					// not a 1 row per scan
+                     0d,						// estimated rows
+                     0d 					// estimated cost
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+index 4faf6cd8..b41f5159 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+@@ -680,6 +680,45 @@ private void actionTypesCompareMainToAction(
+         s2.close();
+     }
+ 
++    /**
++     * Regression test case for DERBY-1511. Scans of tables with large objects
++     * used to fail if commits were issued during the scans.
++     */
++    public void testDerby1511() throws Exception {
++        setAutoCommit(false);
++
++        Statement s = createStatement();
++        s.executeUpdate("create table derby1511(b blob)");
++
++        PreparedStatement insert = prepareStatement(
++                "insert into derby1511(b) values (?)");
++
++        int rows = 20;
++        int length = 40000; // LOB size should be > 32 KB to expose the bug
++                            // (otherwise, materialization happens and a
++                            // different code path is taken)
++
++        for (int i = 0; i < rows; i++) {
++            insert.setBinaryStream(
++                    1, new LoopingAlphabetStream(length), length);
++            insert.executeUpdate();
++        }
++
++        commit();
++
++        ResultSet rs = s.executeQuery("select b from derby1511");
++        for (int i = 0; i < rows; i++) {
++            assertTrue("Too few rows", rs.next());
++            // Second time this was called we used to get an error saying
++            // container has been closed.
++            assertEquals(new LoopingAlphabetStream(length),
++                         rs.getBinaryStream(1));
++            commit();
++        }
++
++        assertFalse("Too many rows", rs.next());
++        rs.close();
++    }
+ 
+     /**
+      * Verifies that the table has row with column val=newVal
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
+index 5efd54e2..6e072ed7 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
+@@ -2933,6 +2933,10 @@ public void testSelfDestructiveClob2() throws Exception {
+      * is thrown instead of an NPE.
+      * Basically per the spec, getBlob is valid only for the duration of
+      * the transaction it was created in
++     * Updated for DERBY-1511: The test case wasn't supposed to fail in the
++     * first place (neither with NPE nor with "proper user error") since none
++     * of the BLOBs are accessed after the transaction that created them was
++     * completed.
+      * @throws Exception
+      * @throws FileNotFoundException
+      * @throws IOException
+@@ -2967,18 +2971,14 @@ public void testNegativeTestDerby265Blob() throws Exception {
+         rs1.next();
+         Blob b1 = rs1.getBlob(2);
+         rs1.close();
+-        try {
+-            rs2.next();
+-            rs2.getBlob(2);
+-            fail("FAIL - can not access blob after implicit commit");
+-        } catch (SQLException sqle) {
+-            checkException(BLOB_ACCESSED_AFTER_COMMIT, sqle);
+-        } finally {
++
++        // DERBY-1511: Fetching the next BLOB here used to fail because it
++        // had been pre-fetched before the commit and was closed in the commit.
++        // Now, we don't pre-fetch BLOBs anymore, so expect to get a working
++        // object here.
++        assertTrue(rs2.next());
++        assertNotNull(rs2.getBlob(2));
+             rs2.close();
+-            s2.close();
+-            s.close();
+-            ps.close();
+-        }
+     }
+ 
+     /**
+@@ -2988,6 +2988,10 @@ public void testNegativeTestDerby265Blob() throws Exception {
+      * is thrown instead of an NPE.
+      * Basically per the spec, getClob is valid only for the duration of
+      * the transaction in it was created in
++     * Updated for DERBY-1511: The test case wasn't supposed to fail in the
++     * first place (neither with NPE nor with "proper user error") since none
++     * of the CLOBs are accessed after the transaction that created them was
++     * completed.
+      * @throws Exception
+      */
+     public void testNegativeTestDerby265Clob() throws Exception {
+@@ -3021,18 +3025,14 @@ public void testNegativeTestDerby265Clob() throws Exception {
+         rs1.next();
+         Clob b1 = rs1.getClob(2);
+         rs1.close();
+-        try {
+-            rs2.next();
+-            rs2.getClob(2);
+-            fail("FAIL - can not access blob after implicit commit");
+-        } catch (SQLException sqle) {
+-            checkException(BLOB_ACCESSED_AFTER_COMMIT, sqle);
+-        } finally {
++
++        // DERBY-1511: Fetching the next CLOB here used to fail because it
++        // had been pre-fetched before the commit and was closed in the commit.
++        // Now, we don't pre-fetch CLOBs anymore, so expect to get a working
++        // object here.
++        assertTrue(rs2.next());
++        assertNotNull(rs2.getClob(2));
+             rs2.close();
+-            s2.close();
+-            s.close();
+-            ps.close();
+-        }
+     }
+ 
+     public static Test suite() {
+@@ -3518,9 +3518,7 @@ public void testRetrieveMoreThan32KLobs() throws SQLException
+     private static final String LANG_DATA_TYPE_GET_MISMATCH = "22005";
+     private static final String BLOB_NULL_PATTERN_OR_SEARCH_STR = "XJ072";
+     private static final String LOCK_TIMEOUT = "40XL1";
+-    private static final String BLOB_ACCESSED_AFTER_COMMIT = "XJ073";
+     private static final String NO_CURRENT_CONNECTION = "08003";
+     private static final String INVALID_LOB = "XJ215";
+-    private static final String INVALID_LOCATOR = "XJ217";
+ 
+ }

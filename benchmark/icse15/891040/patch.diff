@@ -1,0 +1,496 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+index df5edd6f..aabd31d0 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+@@ -311,15 +311,16 @@ else if (StorageService.instance().getTokenMetadata().sortedTokens().size()  < 1
+         public final InetAddress initiator;
+         public final MerkleTree tree;
+ 
+-        private transient final List<MerkleTree.RowHash> rows;
+         // the minimum token sorts first, but falls into the last range
+         private transient List<MerkleTree.RowHash> minrows;
+         // null when all rows with the min token have been consumed
+         private transient Token mintoken;
+         private transient long validated;
++        private transient MerkleTree.TreeRange range;
+         private transient MerkleTree.TreeRangeIterator ranges;
+ 
+         public final static Predicate<DecoratedKey> DKPRED = Predicates.alwaysTrue();
++        public final static MerkleTree.RowHash EMPTY_ROW = new MerkleTree.RowHash(null, new byte[0]);
+         
+         Validator(CFTuple cf, InetAddress initiator)
+         {
+@@ -336,10 +337,10 @@ else if (StorageService.instance().getTokenMetadata().sortedTokens().size()  < 1
+             this.cf = cf;
+             this.initiator = initiator;
+             this.tree = tree;
+-            rows = new ArrayList<MerkleTree.RowHash>();
+             minrows = new ArrayList<MerkleTree.RowHash>();
+             mintoken = null;
+             validated = 0;
++            range = null;
+             ranges = null;
+         }
+         
+@@ -380,10 +381,14 @@ public boolean apply(SSTable ss)
+          * Called (in order) for every row present in the CF.
+          * Hashes the row, and adds it to the tree being built.
+          *
+-         * There are three possible cases:
++         * There are four possible cases:
+          *  1. Token is greater than range.right (we haven't generated a range for it yet),
+          *  2. Token is less than/equal to range.left (the range was valid),
+-         *  3. Token is contained in the range (the range is in progress).
++         *  3. Token is contained in the range (the range is in progress),
++         *  4. No more invalid ranges exist.
++         *
++         * TODO: Because we only validate completely empty trees at the moment, we
++         * do not both dealing with case 2 and case 4 should result in an error.
+          *
+          * Additionally, there is a special case for the minimum token, because
+          * although it sorts first, it is contained in the last possible range.
+@@ -401,42 +406,31 @@ public void add(CompactedRow row)
+                 {
+                     // and store it to be appended when we complete
+                     minrows.add(rowHash(row));
+-                    validated++;
+                     return;
+                 }
+                 mintoken = null;
+             }
+ 
+-            if (!ranges.hasNext())
+-                return;
++            if (range == null)
++                range = ranges.next();
+ 
+-            MerkleTree.TreeRange range = ranges.peek();
+             // generate new ranges as long as case 1 is true
+-            while (range.right().compareTo(row.key.token) < 0)
++            while (!range.contains(row.key.token))
+             {
+-                // token is past the current range: finalize
+-                range.validate(rows);
+-                rows.clear();
+-
+-                // and generate a new range
+-                ranges.next();
+-                if (!ranges.hasNext())
+-                    return;
+-                range = ranges.peek();
++                // add the empty hash, and move to the next range
++                range.addHash(EMPTY_ROW);
++                range = ranges.next();
+             }
+ 
+-            // if case 2 is true, ignore the token
+-            if (row.key.token.compareTo(range.left()) <= 0)
+-                return;
+-            
+-            // case 3 must be true: buffer the hashed row
+-            rows.add(rowHash(row));
+-            validated++;
++            // case 3 must be true: mix in the hashed row
++            range.addHash(rowHash(row));
+         }
+ 
+         private MerkleTree.RowHash rowHash(CompactedRow row)
+         {
+-            byte[] rowhash = FBUtilities.hash("MD5", row.key.key.getBytes(), row.buffer.getData());
++            validated++;
++            // MerkleTree uses XOR internally, so we want lots of output bits here
++            byte[] rowhash = FBUtilities.hash("SHA-256", row.key.key.getBytes(), row.buffer.getData());
+             return new MerkleTree.RowHash(row.key.token, rowhash);
+         }
+ 
+@@ -448,20 +442,17 @@ public void complete()
+         {
+             assert ranges != null : "Validator was not prepared()";
+ 
+-            // finish validating remaining rows
++            if (range != null)
++                range.addHash(EMPTY_ROW);
+             while (ranges.hasNext())
+             {
+-                MerkleTree.TreeRange range = ranges.next();
+-                if (!ranges.hasNext() && !minrows.isEmpty() && range.contains(tree.partitioner().getMinimumToken()))
+-                {
+-                    // append rows with the minimum token into the last range
+-                    rows.addAll(minrows);
+-                    minrows.clear();
+-                }
+-                range.validate(rows);
+-                rows.clear();
++                range = ranges.next();
++                range.addHash(EMPTY_ROW);
+             }
+-            assert rows.isEmpty() && minrows.isEmpty();
++            // add rows with the minimum token to the final range
++            if (!minrows.isEmpty())
++                for (MerkleTree.RowHash minrow : minrows)
++                    range.addHash(minrow);
+ 
+             StageManager.getStage(AE_SERVICE_STAGE).execute(this);
+             logger.debug("Validated " + validated + " rows into AEService tree for " + cf);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
+index a79419fe..ef8af7bd 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
+@@ -38,39 +38,28 @@
+  * which contain the computed values of the nodes that would be below them if
+  * the tree were perfect.
+  *
+- * All nodes of the perfect tree are calculated using a MD5 hash: leaves are
+- * sequential hashes of the rows that fall into the range they represent, and
+- * inner nodes are a binary hash of their children.
++ * Inputs passed to TreeRange.validate should be calculated using a very secure hash,
++ * because all hashing internal to the tree is accomplished using XOR.
+  *
+  * If two MerkleTrees have the same hashdepth, they represent a perfect tree
+  * of the same depth, and can always be compared, regardless of size or splits.
+  */
+ public class MerkleTree implements Serializable
+ {
+-    private static final long serialVersionUID = 1L;
++    private static final long serialVersionUID = 2L;
+ 
+-    public static final byte RECOMMENDED_DEPTH = (byte)64;
++    public static final byte RECOMMENDED_DEPTH = Byte.MAX_VALUE;
+ 
+     public static final int CONSISTENT = 0;
+     public static final int FULLY_INCONSISTENT = 1;
+     public static final int PARTIALLY_INCONSISTENT = 2;
+ 
+-    // cache of empty hash trees up to the maximum depth (0 to 127)
+-    public static final byte[][] EMPTIES = new byte[Byte.MAX_VALUE][];
+-    static {
+-        EMPTIES[0] = new byte[0];
+-        for (int i = 1; i < EMPTIES.length; i++)
+-        {
+-            EMPTIES[i] = Hashable.binaryHash(EMPTIES[i-1], EMPTIES[i-1]);
+-        }
+-    }
+-
+     public final byte hashdepth;
+ 
+     private transient IPartitioner partitioner;
+ 
+-    private int maxsize;
+-    private int size;
++    private long maxsize;
++    private long size;
+     private Hashable root;
+ 
+     /**
+@@ -79,7 +68,7 @@
+      *        of the key space covered by each subrange of a fully populated tree.
+      * @param maxsize The maximum number of subranges in the tree.
+      */
+-    public MerkleTree(IPartitioner partitioner, byte hashdepth, int maxsize)
++    public MerkleTree(IPartitioner partitioner, byte hashdepth, long maxsize)
+     {
+         this.partitioner = partitioner;
+         this.hashdepth = hashdepth;
+@@ -96,32 +85,31 @@ static byte inc(byte in)
+     }
+ 
+     /**
+-     * Initializes this tree by splitting it into maxsize ranges, or
+-     * until hashdepth is reached.
+-     *
+-     * TODO: could be optimized as breadth first generation of nodes.
++     * Initializes this tree by splitting it until hashdepth is reached,
++     * or until an additional level of splits would violate maxsize.
+      *
+-     * NB: asserts that the tree is of size 1.
++     * NB: Replaces all nodes in the tree.
+      */
+     public void init()
+     {
+-        assert size() == 1;
++        // determine the depth to which we can safely split the tree
++        byte sizedepth = (byte)(Math.log10(maxsize) / Math.log10(2));
++        byte depth = (byte)Math.min(sizedepth, hashdepth);
+ 
+-        Queue<Range> ranges = new ArrayDeque<Range>();
+-        ranges.add(new Range(partitioner.getMinimumToken(),
+-                             partitioner.getMinimumToken()));
+-        while (true)
+-        {
+-            Range range = ranges.remove();
+-            Token mid = partitioner.midpoint(range.left(),
+-                                                   range.right());
+-            if (!split(mid))
+-                // we've reached maxsize or hashdepth
+-                return;
+-
+-            ranges.add(new Range(range.left(), mid));
+-            ranges.add(new Range(mid, range.right()));
++        Token mintoken = partitioner.getMinimumToken();
++        root = initHelper(mintoken, mintoken, (byte)0, depth);
++        size = (long)Math.pow(2, depth);
+         }
++
++    private Hashable initHelper(Token left, Token right, byte depth, byte max)
++    {
++        if (depth == max)
++            // we've reached the leaves
++            return new Leaf();
++        Token midpoint = partitioner.midpoint(left, right);
++        Hashable lchild = initHelper(left, midpoint, inc(depth), max);
++        Hashable rchild = initHelper(midpoint, right, inc(depth), max);
++        return new Inner(midpoint, lchild, rchild);
+     }
+ 
+     Hashable root()
+@@ -138,17 +126,17 @@ public IPartitioner partitioner()
+      * The number of distinct ranges contained in this tree. This is a reasonable
+      * measure of the memory usage of the tree (assuming 'this.order' is significant).
+      */
+-    public int size()
++    public long size()
+     {
+         return size;
+     }
+ 
+-    public int maxsize()
++    public long maxsize()
+     {
+         return maxsize;
+     }
+ 
+-    public void maxsize(int maxsize)
++    public void maxsize(long maxsize)
+     {
+         this.maxsize = maxsize;
+     }
+@@ -475,7 +463,7 @@ public String toString()
+         public static final long serialVersionUID = 1L;
+         private final MerkleTree tree;
+         public final byte depth;
+-        public final Hashable hashable;
++        private final Hashable hashable;
+ 
+         TreeRange(MerkleTree tree, Token left, Token right, byte depth, Hashable hashable)
+         {
+@@ -497,89 +485,20 @@ public void hash(byte[] hash)
+         }
+ 
+         /**
+-         * Consumes a collection of entries within this range.
++         * @param entry Row to mix into the hash for this range.
+          */
+-        public void validate(Collection<RowHash> entries)
+-        {
+-            PeekingIterator<RowHash> iter = Iterators.peekingIterator(entries.iterator());
+-            validate(iter);
+-        }
+-
+-        /**
+-         * Consumes an iterator over entries within this range, setting the
+-         * value of this range's Leaf to the computed value.
+-         */
+-        public void validate(PeekingIterator<RowHash> entries)
++        public void addHash(RowHash entry)
+         {
+             assert tree != null : "Not intended for modification!";
+             assert hashable instanceof Leaf;
+-            byte[] roothash;
+-            try
+-            {
+-                roothash = validateHelper(left(), right(), depth, entries);
+-            }
+-            catch (StopRecursion e)
+-            {
+-                throw new RuntimeException("Iterator contained invalid entry!");
+-            }
+-
+-            // check that all values were consumed from the iterator, and that
+-            // a valid hash could be generated 
+-            if (entries.hasNext() || roothash == null)
+-                throw new RuntimeException("Bad iterator for " + this + "!");
+-            hashable.hash(roothash);
+-        }
+ 
+-        /**
+-         * Collects values from the given iterator that fall into the
+-         * range represented by left and right. Recurses until we reach
+-         * hashdepth, where hashes are added sequentially, and then binary
+-         * hashes the results back to the root.
+-         *
+-         * @param left The left token of the active range.
+-         * @param right The right token of the active range.
+-         * @param depth The depth of the active range.
+-         * @param entries A peek()able iterator.
+-         */
+-        private byte[] validateHelper(Token left, Token right, byte depth, PeekingIterator<RowHash> entries) throws StopRecursion.InvalidHash
+-        {
+-            if (entries.hasNext() && Range.contains(left, right, entries.peek().token))
+-            {
+-                // see if we can recurse deeper
+-                if (depth < tree.hashdepth)
+-                {
+-                    Token midpoint = tree.partitioner().midpoint(left, right);
+-                    if (left.compareTo(midpoint) < 0 && midpoint.compareTo(right) < 0)
+-                    {
+-                        // we can recurse deeper
+-                        byte[] lhash = validateHelper(left, midpoint, inc(depth), entries);
+-                        byte[] rhash = validateHelper(midpoint, right, inc(depth), entries);
+-                        return Hashable.binaryHash(lhash, rhash);
+-                    }
+-                    // else: the Token impl. cannot provide more resolution for this range
+-                }
+-
+-                // hash relevant values from the iterator, and add to the context
+-                return consume(left, right, entries);
+-            }
+-            else
+-            {
+-                // this range is empty: return static hash value:
+-                // the hash is the one generated by a binary tree of depth (tree.hashdepth-depth)
+-                return EMPTIES[tree.hashdepth-depth];
+-            }
++            hashable.addHash(entry.hash);
+         }
+ 
+-        /**
+-         * Consumes and sequentially hashes values from the iterator that fall into the active
+-         * range. Should be called with an iterator that contains at least one matching entry.
+-         */
+-        private byte[] consume(Token left, Token right, PeekingIterator<RowHash> entries)
++        public void addAll(Iterator<RowHash> entries)
+         {
+-            byte[] sequentialHash = entries.next().hash;
+-            while (entries.hasNext() && Range.contains(left, right, entries.peek().token))
+-                sequentialHash = Hashable.binaryHash(sequentialHash, entries.next().hash);
+-            return sequentialHash;
++            while (entries.hasNext())
++                addHash(entries.next());
+         }
+ 
+         @Override
+@@ -777,7 +696,8 @@ public String toString()
+ 
+     /**
+      * Hash value representing a row, to be used to pass hashes to the MerkleTree.
+-     * The byte[] hash value should contain a digest of the key and value of the row.
++     * The byte[] hash value should contain a digest of the key and value of the row
++     * created using a very strong hash function.
+      */
+     public static class RowHash
+     {
+@@ -830,16 +750,25 @@ void hash(byte[] lefthash, byte[] righthash)
+             hash = binaryHash(lefthash, righthash);
+         }
+ 
++        /**
++         * Mixes the given value into our hash. If our hash is null,
++         * our hash will become the given value.
++         */
++        void addHash(byte[] righthash)
++        {
++            if (hash == null)
++                hash = righthash;
++            else
++                hash = binaryHash(hash, righthash);
++        }
++
+         /**
+          * The primitive with which all hashing should be accomplished: hashes
+          * a left and right value together.
+          */
+         static byte[] binaryHash(final byte[] left, final byte[] right)
+         {
+-            if (left == null || right == null)
+-                return null;
+-            else
+-                return FBUtilities.hash("MD5", left, right);
++            return FBUtilities.xor(left, right);
+         }
+ 
+         public abstract void toString(StringBuilder buff, int maxdepth);
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/utils/MerkleTreeTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/utils/MerkleTreeTest.java
+index 4c9aedd5..f4060a43 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/utils/MerkleTreeTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/utils/MerkleTreeTest.java
+@@ -405,7 +405,7 @@ public void testHashRandom()
+         // validate the tree
+         TreeRangeIterator ranges = mt.invalids(new Range(tok(0), tok(0)));
+         for (TreeRange range : ranges)
+-            range.validate(new HIterator(/*empty*/ new int[0]));
++            range.addHash(new RowHash(range.right(), new byte[0]));
+ 
+         assert null != mt.hash(new Range(tok(0), tok(0))) :
+             "Could not hash tree " + mt;
+@@ -433,12 +433,12 @@ public void testValidateTree()
+         mt.split(tok(10));
+         
+         ranges = mt.invalids(full);
+-        ranges.next().validate(new HIterator(2, 4)); // (0,4]: depth 2
+-        ranges.next().validate(new HIterator(6)); // (4,6]
+-        ranges.next().validate(new HIterator(8)); // (6,8]
+-        ranges.next().validate(new HIterator(/*empty*/ new int[0])); // (8,10]
+-        ranges.next().validate(new HIterator(12)); // (10,12]
+-        ranges.next().validate(new HIterator(14, 0)); // (12,0]: depth 2
++        ranges.next().addAll(new HIterator(2, 4)); // (0,4]: depth 2
++        ranges.next().addAll(new HIterator(6)); // (4,6]
++        ranges.next().addAll(new HIterator(8)); // (6,8]
++        ranges.next().addAll(new HIterator(/*empty*/ new int[0])); // (8,10]
++        ranges.next().addAll(new HIterator(12)); // (10,12]
++        ranges.next().addAll(new HIterator(14, 0)); // (12,0]: depth 2
+ 
+ 
+         mt2.split(tok(8));
+@@ -450,14 +450,14 @@ public void testValidateTree()
+         mt2.split(tok(11));
+ 
+         ranges = mt2.invalids(full);
+-        ranges.next().validate(new HIterator(2)); // (0,2]
+-        ranges.next().validate(new HIterator(4)); // (2,4]
+-        ranges.next().validate(new HIterator(6, 8)); // (4,8]: depth 2
+-        ranges.next().validate(new HIterator(/*empty*/ new int[0])); // (8,9]
+-        ranges.next().validate(new HIterator(/*empty*/ new int[0])); // (9,10]
+-        ranges.next().validate(new HIterator(/*empty*/ new int[0])); // (10,11]: depth 4
+-        ranges.next().validate(new HIterator(12)); // (11,12]: depth 4
+-        ranges.next().validate(new HIterator(14, 0)); // (12,0]: depth 2
++        ranges.next().addAll(new HIterator(2)); // (0,2]
++        ranges.next().addAll(new HIterator(4)); // (2,4]
++        ranges.next().addAll(new HIterator(6, 8)); // (4,8]: depth 2
++        ranges.next().addAll(new HIterator(/*empty*/ new int[0])); // (8,9]
++        ranges.next().addAll(new HIterator(/*empty*/ new int[0])); // (9,10]
++        ranges.next().addAll(new HIterator(/*empty*/ new int[0])); // (10,11]: depth 4
++        ranges.next().addAll(new HIterator(12)); // (11,12]: depth 4
++        ranges.next().addAll(new HIterator(14, 0)); // (12,0]: depth 2
+ 
+         byte[] mthash = mt.hash(full);
+         byte[] mt2hash = mt2.hash(full);
+@@ -475,7 +475,7 @@ public void testSerialization() throws Exception
+         mt.maxsize(256);
+         mt.init();
+         for (TreeRange range : mt.invalids(full))
+-            range.validate(new HIterator(range.right()));
++            range.addAll(new HIterator(range.right()));
+ 
+         byte[] initialhash = mt.hash(full);
+         oout.writeObject(mt);
+@@ -522,9 +522,9 @@ public void testDifference()
+ 
+         // add dummy hashes to the rest of both trees
+         for (TreeRange range : mt.invalids(full))
+-            range.validate(new HIterator(range.right()));
++            range.addAll(new HIterator(range.right()));
+         for (TreeRange range : mt2.invalids(full))
+-            range.validate(new HIterator(range.right()));
++            range.addAll(new HIterator(range.right()));
+         
+         // trees should disagree for leftmost, (middle.left, rightmost.right]
+         List<TreeRange> diffs = MerkleTree.difference(mt, mt2);
+@@ -564,7 +564,7 @@ public void testDifference()
+         return hstack.pop();
+     }
+ 
+-    static class HIterator extends AbstractIterator<RowHash> implements PeekingIterator<RowHash>
++    static class HIterator extends AbstractIterator<RowHash>
+     {
+         private Iterator<Token> tokens;
+ 

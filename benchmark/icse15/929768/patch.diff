@@ -1,0 +1,176 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ReadVerbHandler.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ReadVerbHandler.java
+index 729663fe..2012192d 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ReadVerbHandler.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ReadVerbHandler.java
+@@ -97,9 +97,7 @@ public void doVerb(Message message)
+             if (message.getHeader(ReadCommand.DO_REPAIR) != null)
+             {
+                 List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+-                /* Remove the local storage endpoint from the list. */
+-                endpoints.remove(FBUtilities.getLocalAddress());
+-                if (endpoints.size() > 0)
++                if (endpoints.size() > 1)
+                     StorageService.instance.doConsistencyCheck(row, endpoints, command);
+             }
+         }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ConsistencyChecker.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ConsistencyChecker.java
+index 4a6b7674..3db67148 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ConsistencyChecker.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ConsistencyChecker.java
+@@ -31,10 +31,13 @@
+ import org.apache.commons.lang.StringUtils;
+ 
+ import org.apache.cassandra.cache.ICacheExpungeHook;
++import org.apache.cassandra.concurrent.StageManager;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.ReadCommand;
+ import org.apache.cassandra.db.ReadResponse;
+ import org.apache.cassandra.db.Row;
++import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.net.IAsyncCallback;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+@@ -45,19 +48,18 @@
+ class ConsistencyChecker implements Runnable
+ {
+ 	private static Logger logger_ = Logger.getLogger(ConsistencyChecker.class);
+-    private static long scheduledTimeMillis_ = 600;
+-    private static ExpiringMap<String, String> readRepairTable_ = new ExpiringMap<String, String>(scheduledTimeMillis_);
++    private static ExpiringMap<String, String> readRepairTable_ = new ExpiringMap<String, String>(DatabaseDescriptor.getRpcTimeout());
+ 
+     private final String table_;
+     private final Row row_;
+     protected final List<InetAddress> replicas_;
+     private final ReadCommand readCommand_;
+ 
+-    public ConsistencyChecker(String table, Row row, List<InetAddress> replicas, ReadCommand readCommand)
++    public ConsistencyChecker(String table, Row row, List<InetAddress> endpoints, ReadCommand readCommand)
+     {
+         table_ = table;
+         row_ = row;
+-        replicas_ = replicas;
++        replicas_ = endpoints;
+         readCommand_ = readCommand;
+     }
+ 
+@@ -69,7 +71,13 @@ public void run()
+ 			Message message = readCommandDigestOnly.makeReadMessage();
+             if (logger_.isDebugEnabled())
+               logger_.debug("Reading consistency digest for " + readCommand_.key + " from " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
+-            MessagingService.instance.sendRR(message, replicas_.toArray(new InetAddress[replicas_.size()]), new DigestResponseHandler());
++
++            MessagingService.instance.addCallback(new DigestResponseHandler(), message.getMessageId());
++            for (InetAddress endpoint : replicas_)
++            {
++                if (!endpoint.equals(FBUtilities.getLocalAddress()))
++                    MessagingService.instance.sendOneWay(message, endpoint);
++            }
+ 		}
+ 		catch (IOException ex)
+ 		{
+@@ -86,27 +94,41 @@ private ReadCommand constructReadMessage(boolean isDigestQuery)
+ 
+     class DigestResponseHandler implements IAsyncCallback
+ 	{
+-		Collection<Message> responses_ = new LinkedBlockingQueue<Message>();
++        private boolean repairInvoked;
+ 
+-        // syncronized so "size() == " works
+-		public synchronized void response(Message msg)
++		public synchronized void response(Message response)
+ 		{
+-			responses_.add(msg);
+-            if (responses_.size() != ConsistencyChecker.this.replicas_.size())
++            if (repairInvoked)
+                 return;
+ 
+-            for (Message response : responses_)
+-            {
+                 try
+                 {
+                     byte[] body = response.getMessageBody();
+                     ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+                     ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
+                     byte[] digest = result.digest();
++
+                     if (!Arrays.equals(ColumnFamily.digest(row_.cf), digest))
+                     {
+-                        doReadRepair();
+-                        break;
++                    IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, replicas_.size());
++                    IAsyncCallback responseHandler;
++                    if (replicas_.contains(FBUtilities.getLocalAddress()))
++                        responseHandler = new DataRepairHandler(row_, replicas_.size(), readResponseResolver);
++                    else
++                        responseHandler = new DataRepairHandler(replicas_.size(), readResponseResolver);
++
++                    ReadCommand readCommand = constructReadMessage(false);
++                    Message message = readCommand.makeReadMessage();
++                    if (logger_.isDebugEnabled())
++                      logger_.debug("Performing read repair for " + readCommand_.key + " to " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
++                    MessagingService.instance.addCallback(responseHandler, message.getMessageId());
++                    for (InetAddress endpoint : replicas_)
++                    {
++                        if (!endpoint.equals(FBUtilities.getLocalAddress()))
++                            MessagingService.instance.sendOneWay(message, endpoint);
++                    }
++
++                    repairInvoked = true;
+                     }
+                 }
+                 catch (Exception e)
+@@ -116,19 +138,6 @@ public synchronized void response(Message msg)
+             }
+         }
+ 
+-        private void doReadRepair() throws IOException
+-		{
+-            replicas_.add(FBUtilities.getLocalAddress());
+-            IResponseResolver<Row> readResponseResolver = new ReadResponseResolver(table_, replicas_.size());
+-            IAsyncCallback responseHandler = new DataRepairHandler(replicas_.size(), readResponseResolver);
+-            ReadCommand readCommand = constructReadMessage(false);
+-            Message message = readCommand.makeReadMessage();
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Performing read repair for " + readCommand_.key + " to " + message.getMessageId() + "@[" + StringUtils.join(replicas_, ", ") + "]");
+-            MessagingService.instance.sendRR(message, replicas_.toArray(new InetAddress[replicas_.size()]), responseHandler);
+-		}
+-	}
+-
+ 	static class DataRepairHandler implements IAsyncCallback, ICacheExpungeHook<String, String>
+ 	{
+ 		private final Collection<Message> responses_ = new LinkedBlockingQueue<Message>();
+@@ -141,6 +150,18 @@ private void doReadRepair() throws IOException
+ 			majority_ = (responseCount / 2) + 1;  
+ 		}
+ 
++        public DataRepairHandler(Row localRow, int responseCount, IResponseResolver<Row> readResponseResolver) throws IOException
++        {
++            this(responseCount, readResponseResolver);
++            // wrap localRow in a response Message so it doesn't need to be special-cased in the resolver
++            ReadResponse readResponse = new ReadResponse(localRow);
++            DataOutputBuffer out = new DataOutputBuffer();
++            ReadResponse.serializer().serialize(readResponse, out);
++            byte[] bytes = new byte[out.getLength()];
++            System.arraycopy(out.getData(), 0, bytes, 0, bytes.length);
++            responses_.add(new Message(FBUtilities.getLocalAddress(), StageManager.RESPONSE_STAGE, StorageService.Verb.READ_RESPONSE, bytes));
++        }
++
+         // synchronized so the " == majority" is safe
+ 		public synchronized void response(Message message)
+ 		{
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
+index d84ae18b..dcce631a 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -763,9 +763,7 @@ public Object call() throws IOException
+             if (DatabaseDescriptor.getConsistencyCheck())
+             {
+                 List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.table, command.key);
+-                /* Remove the local storage endpoint from the list. */
+-                endpoints.remove(FBUtilities.getLocalAddress());
+-                if (endpoints.size() > 0)
++                if (endpoints.size() > 1)
+                     StorageService.instance.doConsistencyCheck(row, endpoints, command);
+             }
+ 

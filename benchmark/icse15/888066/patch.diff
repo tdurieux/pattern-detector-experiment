@@ -1,0 +1,272 @@
+diff --git a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/DeltaBytesReader.java b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/DeltaBytesReader.java
+index d0625c53..4b808421 100644
+--- a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/DeltaBytesReader.java
++++ b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/DeltaBytesReader.java
+@@ -26,7 +26,6 @@
+ final class DeltaBytesReader {
+   final TermRef term = new TermRef();
+   final IndexInput in;
+-  boolean started;
+ 
+   DeltaBytesReader(IndexInput in) {
+     this.in = in;
+diff --git a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java
+index 7645ccbe..940d63a5 100644
+--- a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java
++++ b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/SimpleStandardTermsIndexReader.java
+@@ -232,8 +232,17 @@ public void loadTermsIndex() throws IOException {
+     }
+ 
+     @Override
+-    public boolean isIndexTerm(int position, int docFreq) {
+-      return position % totalIndexInterval == 0;
++    public boolean isIndexTerm(long ord, int docFreq) {
++      return ord % totalIndexInterval == 0;
++    }
++
++    @Override
++    public boolean nextIndexTerm(long ord, TermsIndexResult result) throws IOException {
++      if (coreIndex == null) {
++        throw new IllegalStateException("terms index was not loaded");
++      } else {
++        return coreIndex.nextIndexTerm(ord, result);
++      }
+     }
+ 
+     @Override
+@@ -275,6 +284,9 @@ public final void getIndexOffset(long ord, TermsIndexResult result) throws IOExc
+       // sufficient?  have to use negative space?
+       // TODO: used packed ints here: we know max term
+       // length; often its small
++
++      // TODO: can we inline this w/ the bytes?  like
++      // DW.  vast majority of terms only need 1 byte, not 2
+       final short[] termLength;
+ 
+       final int numIndexTerms;
+@@ -410,6 +422,25 @@ public final void getIndexOffset(long ord, TermsIndexResult result) throws IOExc
+         }
+       }
+ 
++      public final boolean nextIndexTerm(long ord, TermsIndexResult result) throws IOException {
++        int idx = 1 + (int) (ord / totalIndexInterval);
++        if (idx < numIndexTerms) {
++          fillResult(idx, result);
++          return true;
++        } else {
++          return false;
++        }
++      }
++
++      private final void fillResult(int idx, TermsIndexResult result) {
++        final long loc = blockPointer[idx];
++        result.term.bytes = blocks[(int) (loc >> BYTE_BLOCK_SHIFT)];
++        result.term.offset = (int) (loc & BYTE_BLOCK_MASK);
++        result.term.length = termLength[idx];
++        result.position = idx * totalIndexInterval;
++        result.offset = fileOffset[idx];
++      }
++
+       public final void getIndexOffset(TermRef term, TermsIndexResult result) throws IOException {
+ 
+         if (Codec.DEBUG) {
+@@ -459,13 +490,7 @@ public final void getIndexOffset(long ord, TermsIndexResult result) throws IOExc
+         int idx = (int) (ord / totalIndexInterval);
+         // caller must ensure ord is in bounds
+         assert idx < numIndexTerms;
+-
+-        final long loc = blockPointer[idx];
+-        result.term.bytes = blocks[(int) (loc >> BYTE_BLOCK_SHIFT)];
+-        result.term.offset = (int) (loc & BYTE_BLOCK_MASK);
+-        result.term.length = termLength[idx];
+-        result.position = idx * totalIndexInterval;
+-        result.offset = fileOffset[idx];
++        fillResult(idx, result);
+       }
+     }
+   }
+diff --git a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java
+index 71aeac9d..1f587937 100644
+--- a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java
++++ b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsDictReader.java
+@@ -293,7 +293,7 @@ public long getUniqueTermCount() {
+       private final IndexInput in;
+       private final DeltaBytesReader bytesReader;
+       // nocommit: long?
+-      private int termUpto;
++      private int termUpto = -1;
+       private final StandardDocsProducer.Reader docs;
+       private int docFreq;
+       private final StandardTermsIndexReader.TermsIndexResult indexResult = new StandardTermsIndexReader.TermsIndexResult();
+@@ -344,27 +344,43 @@ public SeekStatus seek(TermRef term) throws IOException {
+           System.out.println(Thread.currentThread().getName() + ":stdr.seek(text=" + fieldInfo.name + ":" + term + ") seg=" + segment);
+         }
+ 
+-        // nocommit -- test if this is really
+-        // helping/necessary -- that compareTerm isn't that
+-        // cheap, and, how often do callers really seek to
+-        // the term they are already on (it's silly to do
+-        // so) -- I'd prefer such silly apps take the hit,
+-        // not well behaved apps?
++        boolean doSeek = true;
+ 
+-        if (bytesReader.started && termUpto < numTerms && bytesReader.term.termEquals(term)) {
++        if (termUpto != -1 && termUpto < numTerms) {
++
++          final int cmp = termComp.compare(bytesReader.term, term);
++
++          if (cmp == 0) {
++            // nocommit -- should we really bother special
++            // casing this?  how often does it really
++            // happen?
++            // We are already on the requested term
+           // nocommit -- not right if text is ""?
+-          // mxx
+           if (Codec.DEBUG) {
+             System.out.println(Thread.currentThread().getName() + ":  already here!");
+           }
+-          // nocommit -- cache this
++
++            // nocommit -- cache this?
+           return SeekStatus.FOUND;
+         }
+ 
+-        // nocommit -- carry over logic from TermInfosReader,
+-        // here, that avoids the binary search if the seek
+-        // is w/in the current index block
++          if (cmp < 0) {
++
++            // Requested term is after our current term --
++            // read next index term:
++            if (indexReader.nextIndexTerm(termUpto, indexResult)) {
++              final int cmpNext = termComp.compare(indexResult.term, term);
+ 
++              if (cmpNext > 0) {
++                // Requested term is within the same index
++                // block we are in; skip seeking
++                doSeek = false;
++              }
++            }
++          }
++        }
++
++        if (doSeek) {
+         // nocommit -- also, not sure it'll help, but, we
+         // can bound this binary search, since we know the
+         // term ord we are now on, and we can compare how
+@@ -385,14 +401,18 @@ public SeekStatus seek(TermRef term) throws IOException {
+         // bytes into the buffer
+         bytesReader.reset(indexResult.term);
+ 
+-        termUpto = indexResult.position;
+-        assert termUpto>=0: "termUpto=" + termUpto;
++          termUpto = (int) indexResult.position-1;
++          assert termUpto >= -1: "termUpto=" + termUpto;
+ 
+         // mxx
+         if (Codec.DEBUG) {
+           System.out.println(Thread.currentThread().getName() + ":  set termUpto=" + termUpto);
+         }
+ 
++        } else if (Codec.DEBUG) {
++          System.out.println(Thread.currentThread().getName() + ": use scanning only (no seek)");
++        }
++
+         // Now, scan:
+ 
+         //int indexCount = 0;
+@@ -412,7 +432,9 @@ public SeekStatus seek(TermRef term) throws IOException {
+             // NOT_FOUND is then sent back here?  silly for
+             // apps to do so... but we should see if Lucene
+             // does 
+-            if (docs.canCaptureState()) {
++            // nocommit -- maybe we sometimes want to cache,
++            // with doSeek?
++            if (docs.canCaptureState() && doSeek) {
+               // Store in cache
+               entry = docs.captureState();
+               entryKey = (TermRef) bytesReader.term.clone();
+@@ -464,11 +486,11 @@ public SeekStatus seek(long pos) throws IOException {
+         // bytes into the buffer
+         bytesReader.reset(indexResult.term);
+ 
+-        termUpto = indexResult.position;
+-        assert termUpto>=0: "termUpto=" + termUpto;
++        termUpto = (int) indexResult.position-1;
++        assert termUpto >= -1: "termUpto=" + termUpto;
+ 
+         // Now, scan:
+-        int left = (int) (1 + pos - termUpto);
++        int left = (int) (pos - termUpto);
+         while(left > 0) {
+           TermRef term = next();
+           assert term != null;
+@@ -491,7 +513,7 @@ public long ord() {
+ 
+       @Override
+       public TermRef next() throws IOException {
+-        if (termUpto >= numTerms) {
++        if (termUpto >= numTerms-1) {
+           return null;
+         }
+         if (Codec.DEBUG) {
+@@ -509,7 +531,7 @@ public TermRef next() throws IOException {
+         // possibly store a "how many terms until next index
+         // entry" in each index entry, but that'd require
+         // some tricky lookahead work when writing the index
+-        final boolean isIndex = indexReader.isIndexTerm(termUpto, docFreq);
++        final boolean isIndex = indexReader.isIndexTerm(1+termUpto, docFreq);
+ 
+         // mxx
+         // System.out.println(Thread.currentThread().getName() + ": isIndex=" + isIndex);
+diff --git a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexReader.java b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexReader.java
+index 9b11120b..8cfbcda1 100644
+--- a/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexReader.java
++++ b/lucene/java/branches/flex_1458/src/java/org/apache/lucene/index/codecs/standard/StandardTermsIndexReader.java
+@@ -40,7 +40,7 @@
+ public abstract class StandardTermsIndexReader {
+ 
+   static class TermsIndexResult {
+-    int position;
++    long position;
+     final TermRef term = new TermRef();
+     long offset;
+   };
+@@ -58,7 +58,11 @@
+ 
+     /** Call this sequentially for each term encoutered,
+      *  after calling {@link #getIndexOffset}. */
+-    public abstract boolean isIndexTerm(int position, int docFreq) throws IOException;
++    public abstract boolean isIndexTerm(long ord, int docFreq) throws IOException;
++
++    /** Finds the next index term, after the specified
++     *  ord.  Returns true if one exists.  */
++    public abstract boolean nextIndexTerm(long ord, TermsIndexResult result) throws IOException;
+   }
+ 
+   public abstract FieldReader getField(FieldInfo fieldInfo);
+diff --git a/lucene/java/branches/flex_1458/src/test/org/apache/lucene/index/TestFlex.java b/lucene/java/branches/flex_1458/src/test/org/apache/lucene/index/TestFlex.java
+index 38f779e5..3d3042ca 100644
+--- a/lucene/java/branches/flex_1458/src/test/org/apache/lucene/index/TestFlex.java
++++ b/lucene/java/branches/flex_1458/src/test/org/apache/lucene/index/TestFlex.java
+@@ -56,5 +56,20 @@ public void testNonFlex() throws Exception {
+     w.close();
+     d.close();
+   }
++
++  public void testTermOrd() throws Exception {
++    Directory d = new MockRAMDirectory();
++    IndexWriter w = new IndexWriter(d, new WhitespaceAnalyzer(), IndexWriter.MaxFieldLength.UNLIMITED);
++    Document doc = new Document();
++    doc.add(new Field("f", "a b c", Field.Store.NO, Field.Index.ANALYZED));
++    w.addDocument(doc);
++    IndexReader r = w.getReader();
++    TermsEnum terms = r.getSequentialSubReaders()[0].fields().terms("f").iterator();
++    assertTrue(terms.next() != null);
++    assertEquals(0, terms.ord());
++    r.close();
++    w.close();
++    d.close();
++  }
+ }
+ 

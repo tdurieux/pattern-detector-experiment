@@ -1,0 +1,230 @@
+diff --git a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DDMWriter.java b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DDMWriter.java
+index 72b6e4de..9e2baa3f 100644
+--- a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DDMWriter.java
++++ b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DDMWriter.java
+@@ -1433,6 +1433,54 @@ private void finalizeDssLength ()
+ 			ensureLength (shiftSize);
+ 			offset += shiftSize;
+ 
++			// Notes on the behavior of the Layer B segmenting loop below:
++			//
++			// We start with the right most chunk. For a 3-segment object we'd
++			// shift 2 segments: shift the first (rightmost) one 4 bytes and 
++			// the second one 2. Note that by 'first' we mean 'first time
++			// through the loop', but that is actually the last segment
++			// of data since we are moving right-to-left. For an object
++			// of K segments we will pass through this loop K-1 times.
++			// The 0th (leftmost) segment is not shifted, as it is
++			// already in the right place. When we are done, we will
++			// have made room in each segment for an additional
++			// 2 bytes for the continuation header. Thus, each
++			// segment K is shifted K*2 bytes to the right.
++			//
++			// Each time through the loop, "dataByte" points to the
++			// last byte in the segment; "dataToShift" is the amount of
++			// data that we need to shift, and "shiftSize" is the
++			// distance that we need to shift it. Since dataByte points
++			// at the last byte, not one byte beyond it (as with the
++			// "offset" variable used elsewhere in DDMWriter), the start
++			// of the segement is actually at (dataByte-dataToShift+1).
++			//
++			// After we have shifted the segment, we move back to the
++			// start of the segment and set the value of the 2-byte DSS
++			// continuation header, which needs to hold the length of
++			// this segment's data, together with the continuation flag
++			// if this is not the rightmost (passOne) segment.
++			//
++			// In general, each segment except the rightmost will contain
++			// 32765 bytes of data, plus the 2-byte header, and its
++			// continuation flag will be set, so the header value will
++			// be 0xFFFF. The rightmost segment will not have the
++			// continuation flag set, so its value may be anything from
++			// 0x0001 to 0x7FFF, depending on the amount of data in that
++			// segment.
++			//
++			// Note that the 0th (leftmost) segment also has a 2-byte
++			// DSS header, which needs to have its continuation flag set.
++			// This is done by resetting the "totalSize" variable below,
++			// at which point that variable no longer holds the total size
++			// of the object, but rather just the length of segment 0. The
++			// total size of the object was written using extended length
++			// bytes by the endDdm() method earlier.
++			//
++			// Additional information about this routine is available in the
++			// bug notes for DERBY-125:
++			// http://issues.apache.org/jira/browse/DERBY-125
++			
+ 			// mark passOne to help with calculating the length of the final (first or
+ 			// rightmost) continuation header.
+ 			boolean passOne = true;
+@@ -1441,12 +1489,7 @@ private void finalizeDssLength ()
+ 				int dataToShift = bytesRequiringContDssHeader % 32765;
+ 				if (dataToShift == 0)
+ 					dataToShift = 32765;
+-				// We start with the right most chunk. If we had to copy two
+-				// chunks we would shift the first one 4 bytes and then 
+-				// the second one
+-				// 2 when we come back on the next loop so they would each have
+-				// 2 bytes for the continuation header
+-				int startOfCopyData = dataByte - dataToShift;
++				int startOfCopyData = dataByte - dataToShift + 1;
+ 				System.arraycopy(bytes,startOfCopyData, bytes, 
+ 								 startOfCopyData + shiftSize, dataToShift);
+ 				dataByte -= dataToShift;
+@@ -1462,7 +1505,9 @@ private void finalizeDssLength ()
+ 				else
+ 				{
+ 					if (twoByteContDssHeader == DssConstants.MAX_DSS_LENGTH)
+-				    	twoByteContDssHeader = DssConstants.CONTINUATION_BIT;
++					twoByteContDssHeader = (twoByteContDssHeader |
++						DssConstants.CONTINUATION_BIT);
++
+ 				}
+ 
+ 				// insert the header's length bytes
+@@ -1481,7 +1526,9 @@ private void finalizeDssLength ()
+ 			while (bytesRequiringContDssHeader > 0);
+ 
+ 			// set the continuation dss header flag on for the first header
+-			totalSize = DssConstants.CONTINUATION_BIT;
++			totalSize = (DssConstants.MAX_DSS_LENGTH |
++					DssConstants.CONTINUATION_BIT);
++
+ 
+ 		}
+ 
+diff --git a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/prepStmt.java b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/prepStmt.java
+index 51840d37..7404b4f5 100644
+--- a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/prepStmt.java
++++ b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/prepStmt.java
+@@ -304,6 +304,7 @@ else if (ts.before(temp))
+ 			jira614Test(conn);
+ 			jira614Test_a(conn);
+ 			jira170Test(conn);
++			jira125Test(conn);
+ 			conn.close();
+ 			System.out.println("prepStmt Test Ends");
+         }
+@@ -818,5 +819,121 @@ private static void jira170Test(Connection conn)
+                 e.printStackTrace();
+         }
+     }
+-}
++	/**
++	 * Jira-125 has to do with proper use of continuation headers 
++	 * for very large reply messages, such as the SQLDARD which is
++	 * returned for a prepared statement with an enormous number of
++	 * parameter markers. This test generates a multi-segment SQLDARD
++	 * response message from the server, to verify that the code in
++	 * DDMWriter.finalizeDSSLength is executed.
++	 *
++	 * Repro for DERBY-125 off-by-one error.  This repro runs in
++	 * two iterations.  The first iteration, we use a table name
++	 * and a column name that are extra long, so that the server-
++	 * side buffer has more data in it.  The second iteration, we
++	 * use simpler names for the table and column, which take up
++	 * less space in the server buffer.  Then, since the server-
++	 * side bytes array was previously used for a larger amount of
++	 * data, then the unused bytes contain old data.  Since we
++	 * intentionally put the "larger amount of data" into the buffer
++	 * during the first iteration, we know what the old data bytes
++	 * are going to be.  Thus, by using specific lengths for the 
++	 * table and column names, we can 'shift' the old data until we
++	 * reach a point where the off-by-one error manifests itself:
++	 * namely, we end up incorrectly leaving a non-zero data byte
++	 * in the last position of the current server buffer, which
++	 * is wrong.
++	 */
++
++    private static void jira125Test(Connection conn)
++        throws Exception
++    {
++		jira125Test_a(conn);
++		jira125Test_b(conn);
++    }
++
++    private static void jira125Test_b(Connection conn)
++	    throws Exception
++    {
++	    Statement stmt = conn.createStatement();
++        PreparedStatement ps ;
++	    try {
++		    stmt.execute("drop table jira125");
++	    } catch (Throwable t) { }
++		try {
++	        stmt.execute("create table jira125 (id integer)");
++			stmt.execute("insert into jira125 values 1, 2, 3");
++		} catch (Throwable t) { }
++        StringBuffer buf = new StringBuffer();
++        buf.append("SELECT id FROM jira125 WHERE id IN ( ");
++
++		// Must have at least 551 columns here, in order to force
++		// server buffer beyond 32k.  NOTE: Changing this number
++		// could cause the test to "pass" even if a regression
++		// occurs--so only change it if needed!
++        int nCols = 556;
++        for (int i = 0; i < nCols; i++) buf.append("?,");
++        buf.append("?)");
++        ps = conn.prepareStatement(buf.toString());
++        // Note that we actually have nCols+1 parameter markers
++        for (int i = 0; i <= nCols; i++) ps.setInt(i+1, 1);
++        ResultSet rs = ps.executeQuery();
++        while (rs.next());
++        System.out.println("Test jira125 successful: " + (nCols + 1) +
++			" parameter markers successfully prepared and executed.");
++    }
++
++    private static void jira125Test_a(Connection conn)
++	    throws Exception
++    {
++	    Statement stmt = conn.createStatement();
++
++		// Build a column name that is 99 characters long;
++		// the length of the column name and the length of
++		// the table name are important to the repro--so
++		// do not change these unless you can confirm that
++		// the new values will behave in the same way.
++		StringBuffer id = new StringBuffer();
++		for (int i = 0; i < 49; i++)
++			id.append("id");
++		id.append("i");
++
++		// Build a table name that is 97 characters long;
++		// the length of the column name and the length of
++		// the table name are important to the repro--so
++		// do not change these unless you can confirm that
++		// the new values will behave in the same way.
++		StringBuffer tabName = new StringBuffer("jira");
++		for (int i = 0; i < 31; i++)
++			tabName.append("125");
+ 
++	    try {
++		    stmt.execute("drop table " + tabName.toString());
++	    } catch (Throwable t) { }
++		try {
++	        stmt.execute("create table " + tabName.toString() + " (" +
++				id.toString() + " integer)");
++			stmt.execute("insert into " + tabName.toString() + " values 1, 2, 3");
++		} catch (Throwable t) { }
++
++        PreparedStatement ps;
++        StringBuffer buf = new StringBuffer();
++        buf.append("SELECT " + id.toString() + " FROM " +
++			tabName.toString() + " WHERE " + id.toString() + " IN ( ");
++
++		// Must have at least 551 columns here, in order to force
++		// server buffer beyond 32k.  NOTE: Changing this number
++		// could cause the test to "pass" even if a regression
++		// occurs--so only change it if needed!
++        int nCols = 554;
++        for (int i = 0; i < nCols; i++) buf.append("?,");
++        buf.append("?)");
++        ps = conn.prepareStatement(buf.toString());
++        // Note that we actually have nCols+1 parameter markers
++        for (int i = 0; i <= nCols; i++) ps.setInt(i+1, 1);
++        ResultSet rs = ps.executeQuery();
++        while (rs.next());
++        System.out.println("Iteration 1 successful: " + (nCols + 1) +
++			" parameter markers successfully prepared and executed.");
++    }
++}

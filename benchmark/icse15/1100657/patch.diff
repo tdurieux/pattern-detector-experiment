@@ -1,0 +1,146 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/QueryProcessor.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/QueryProcessor.java
+index 217eb5eb..008567d4 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/QueryProcessor.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/QueryProcessor.java
+@@ -76,7 +76,7 @@
+     private static List<org.apache.cassandra.db.Row> getSlice(String keyspace, SelectStatement select)
+     throws InvalidRequestException, TimedOutException, UnavailableException
+     {
+-        List<org.apache.cassandra.db.Row> rows = null;
++        List<org.apache.cassandra.db.Row> rows;
+         QueryPath queryPath = new QueryPath(select.getColumnFamily());
+         AbstractType<?> comparator = select.getComparator(keyspace);
+         List<ReadCommand> commands = new ArrayList<ReadCommand>();
+@@ -132,13 +132,20 @@
+     private static List<org.apache.cassandra.db.Row> multiRangeSlice(String keyspace, SelectStatement select)
+     throws TimedOutException, UnavailableException, InvalidRequestException
+     {
+-        List<org.apache.cassandra.db.Row> rows = null;
++        List<org.apache.cassandra.db.Row> rows;
++        IPartitioner<?> p = StorageService.getPartitioner();
+         
+         AbstractType<?> keyType = DatabaseDescriptor.getCFMetaData(keyspace,
+                                                                    select.getColumnFamily()).getKeyValidator();
+-        ByteBuffer startKey = (select.getKeyStart() != null) ? select.getKeyStart().getByteBuffer(keyType) : (new Term()).getByteBuffer();
+-        ByteBuffer finishKey = (select.getKeyFinish() != null) ? select.getKeyFinish().getByteBuffer(keyType) : (new Term()).getByteBuffer();
+-        IPartitioner<?> p = StorageService.getPartitioner();
++
++        ByteBuffer startKey = (select.getKeyStart() != null)
++                               ? select.getKeyStart().getByteBuffer(keyType)
++                               : (new Term()).getByteBuffer();
++
++        ByteBuffer finishKey = (select.getKeyFinish() != null)
++                                ? select.getKeyFinish().getByteBuffer(keyType)
++                                : (new Term()).getByteBuffer();
++
+         AbstractBounds bounds = new Bounds(p.getToken(startKey), p.getToken(finishKey));
+         
+         CFMetaData metadata = validateColumnFamily(keyspace, select.getColumnFamily(), false);
+@@ -147,6 +154,10 @@
+         SlicePredicate thriftSlicePredicate = slicePredicateFromSelect(select, comparator);
+         validateSlicePredicate(metadata, thriftSlicePredicate);
+ 
++        int limit = select.isKeyRange() && select.getKeyStart() != null
++                  ? select.getNumRecords() + 1
++                  : select.getNumRecords();
++
+         try
+         {
+             rows = StorageProxy.getRangeSlice(new RangeSliceCommand(keyspace,
+@@ -154,7 +165,7 @@
+                                                                     null,
+                                                                     thriftSlicePredicate,
+                                                                     bounds,
+-                                                                    select.getNumRecords()),
++                                                                    limit),
+                                               select.getConsistencyLevel());
+         }
+         catch (IOException e)
+@@ -170,7 +181,22 @@
+             throw new TimedOutException();
+         }
+         
+-        return rows;
++        // if start key was set and relation was "greater than"
++        if (select.getKeyStart() != null && !select.includeStartKey())
++        {
++            if (rows.get(0).key.key.equals(startKey))
++                rows.remove(0);
++        }
++
++        // if finish key was set and relation was "less than"
++        if (select.getKeyFinish() != null && !select.includeFinishKey())
++        {
++            int lastIndex = rows.size() - 1;
++            if (rows.get(lastIndex).key.key.equals(finishKey))
++                rows.remove(lastIndex);
++        }
++
++        return rows.subList(0, select.getNumRecords() < rows.size() ? select.getNumRecords() : rows.size());
+     }
+     
+     private static List<org.apache.cassandra.db.Row> getIndexedSlices(String keyspace, SelectStatement select)
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/SelectStatement.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/SelectStatement.java
+index bc49ca9a..096de5d7 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/SelectStatement.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/SelectStatement.java
+@@ -127,6 +127,16 @@ public boolean isCountOperation()
+         return isCountOper;
+     }
+     
++    public boolean includeStartKey()
++    {
++        return clause.includeStartKey();
++    }
++
++    public boolean includeFinishKey()
++    {
++        return clause.includeFinishKey();
++    }
++
+     public AbstractType getComparator(String keyspace)
+     {
+         return DatabaseDescriptor.getComparator(keyspace, columnFamily);
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/WhereClause.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/WhereClause.java
+index 108de747..a3502e6a 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/WhereClause.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/cql/WhereClause.java
+@@ -33,6 +33,7 @@
+     private List<Term> keys = new ArrayList<Term>();
+     private Term startKey, finishKey;
+     private List<Relation> columns = new ArrayList<Relation>();
++    private boolean includeStartKey = false, includeFinishKey = false;
+     
+     /**
+      * Create a new WhereClause with the first parsed relation.
+@@ -61,9 +62,15 @@ public void and(Relation relation)
+             if (relation.operator().equals(RelationType.EQ))
+                 keys.add(relation.getValue());
+             else if ((relation.operator().equals(RelationType.GT) || relation.operator().equals(RelationType.GTE)))
++            {
+                 startKey = relation.getValue();
++                includeStartKey = relation.operator().equals(RelationType.GTE);
++            }
+             else if ((relation.operator().equals(RelationType.LT) || relation.operator().equals(RelationType.LTE)))
++            {
+                 finishKey = relation.getValue();
++                includeFinishKey = relation.operator().equals(RelationType.LTE);
++            }
+             
+         }
+         else
+@@ -99,4 +106,14 @@ public Term getFinishKey()
+     {
+         return keys;
+     }
++
++    public boolean includeStartKey()
++    {
++        return includeStartKey;
++    }
++
++    public boolean includeFinishKey()
++    {
++        return includeFinishKey;
++    }
+ }

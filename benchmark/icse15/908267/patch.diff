@@ -1,0 +1,135 @@
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
+index df1c1a9a..a6fb2fd3 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
+@@ -51,7 +51,7 @@
+ {
+     private static Logger logger = Logger.getLogger(Streaming.class);
+     private static String TABLE_NAME = "STREAMING-TABLE-NAME";
+-    public static final long RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
++    public static final int RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
+ 
+     /**
+      * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageLoadBalancer.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+index 9ddb1d31..2f11d9a0 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+@@ -167,7 +167,7 @@ public void doVerb(Message message)
+         }
+     }
+ 
+-    private static final long BROADCAST_INTERVAL = 5 * 60 * 1000L;
++    private static final int BROADCAST_INTERVAL = 5 * 60 * 1000;
+ 
+     private static StorageLoadBalancer instance_;
+ 
+@@ -367,18 +367,17 @@ public void startBroadcasting()
+         loadTimer_.schedule(new LoadDisseminator(), 2 * Gossiper.intervalInMillis_, BROADCAST_INTERVAL);
+     }
+ 
+-    /** wait for node information to be available.  if the rest of the cluster just came up,
+-        this could be up to threshold_ ms (currently 5 minutes). */
++    /**
++     * Wait for at least BROADCAST_INTERVAL ms, to give all nodes enough time to
++     * report in.
++     */
+     public void waitForLoadInfo()
+     {
++        int duration = BROADCAST_INTERVAL + Streaming.RING_DELAY;
+         try
+         {
+-            while (loadInfo_.isEmpty())
+-            {
+-                Thread.sleep(100);
+-            }
+-            // one more sleep in case there are some stragglers
+-            Thread.sleep(Streaming.RING_DELAY);
++            logger_.info("Sleeping " + duration + " ms to wait for load information...");
++            Thread.sleep(duration);
+         }
+         catch (InterruptedException e)
+         {
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
+index d3cc67ad..568203f3 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
+@@ -300,7 +300,7 @@ public void initServer() throws IOException
+         if (DatabaseDescriptor.isAutoBootstrap()
+             && !(DatabaseDescriptor.getSeeds().contains(FBUtilities.getLocalAddress()) || SystemTable.isBootstrapped()))
+         {
+-            logger_.info("Starting in bootstrap mode (first, sleeping to get load information)");
++            logger_.info("Starting in bootstrap mode");
+             StorageLoadBalancer.instance().waitForLoadInfo();
+             logger_.info("... got load info");
+             if (tokenMetadata_.isMember(FBUtilities.getLocalAddress()))
+@@ -1276,6 +1276,7 @@ public void decommission() throws InterruptedException
+         if (tokenMetadata_.getPendingRanges(FBUtilities.getLocalAddress()).size() > 0)
+             throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
+ 
++        // leave the ring
+         logger_.info("DECOMMISSIONING");
+         startLeaving();
+         logger_.info("decommission sleeping " + Streaming.RING_DELAY);
+@@ -1355,7 +1356,7 @@ public void run()
+         }
+     }
+ 
+-    public void move(String newToken) throws InterruptedException
++    public void move(String newToken) throws IOException, InterruptedException
+     {
+         move(partitioner_.getTokenFactory().fromString(newToken));
+     }
+@@ -1370,11 +1371,14 @@ public void loadBalance() throws IOException, InterruptedException
+      *
+      * @param token new token to boot to, or if null, find balanced token to boot to
+      */
+-    private void move(final Token token) throws InterruptedException
++    private void move(final Token token) throws IOException, InterruptedException
+     {
+         if (tokenMetadata_.getPendingRanges(FBUtilities.getLocalAddress()).size() > 0)
+             throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
++        if (token != null && tokenMetadata_.sortedTokens().contains(token))
++            throw new IOException("target token " + token + " is already owned by another node");
+ 
++        // leave the ring
+         logger_.info("starting move. leaving token " + getLocalToken());
+         startLeaving();
+         logger_.info("move sleeping " + Streaming.RING_DELAY);
+@@ -1388,7 +1392,10 @@ public void run()
+                 {
+                     Token bootstrapToken = token;
+                     if (bootstrapToken == null)
++                    {
++                        StorageLoadBalancer.instance().waitForLoadInfo();
+                         bootstrapToken = BootStrapper.getBalancedToken(tokenMetadata_, StorageLoadBalancer.instance().getLoadInfo());
++                    }
+                     logger_.info("re-bootstrapping to new token " + bootstrapToken);
+                     startBootstrap(bootstrapToken);
+                 }
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index f4404fb9..396ecd64 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -132,7 +132,7 @@
+      * @param newToken token to move this node to.
+      * This node will unload its data onto its neighbors, and bootstrap to the new token.
+      */
+-    public void move(String newToken) throws InterruptedException;
++    public void move(String newToken) throws IOException, InterruptedException;
+ 
+     /**
+      * This node will unload its data onto its neighbors, and bootstrap to share the range
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/tools/NodeProbe.java
+index e4d45043..02acdf60 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -392,7 +392,7 @@ public void loadBalance() throws IOException, InterruptedException
+         ssProxy.loadBalance();
+     }
+ 
+-    public void move(String newToken) throws InterruptedException
++    public void move(String newToken) throws IOException, InterruptedException
+     {
+         ssProxy.move(newToken);
+     }

@@ -1,0 +1,171 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java b/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
+index a314322c..426b6ca6 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutation.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.DataInputStream;
+ import java.io.DataOutputStream;
+@@ -45,7 +46,7 @@
+ 
+ public class RowMutation
+ {
+-    private static ICompactSerializer<RowMutation> serializer_;
++    private static RowMutationSerializer serializer_;
+     public static final String HINT = "HINT";
+ 
+     static
+@@ -195,7 +196,7 @@ else if (path.columnName == null)
+     */
+     public void apply() throws IOException
+     {
+-        Table.open(table_).apply(this, getSerializedBuffer(), true);
++        Table.open(table_).apply(this, true);
+     }
+ 
+     /*
+@@ -238,7 +239,7 @@ public static RowMutation getRowMutationFromMutations(String keyspace, ByteBuffe
+         return rm;
+     }
+     
+-    private synchronized byte[] getSerializedBuffer() throws IOException
++    public synchronized byte[] getSerializedBuffer() throws IOException
+     {
+         if (preserializedBuffer == null)
+         {
+@@ -309,6 +310,13 @@ private static void deleteColumnOrSuperColumnToRowMutation(RowMutation rm, Strin
+             rm.delete(new QueryPath(cfName, del.super_column), del.timestamp);
+         }
+     }
++    
++    static RowMutation fromBytes(byte[] raw) throws IOException
++    {
++        RowMutation rm = serializer_.deserialize(new DataInputStream(new ByteArrayInputStream(raw)));
++        rm.preserializedBuffer = raw;
++        return rm;
++    }
+ }
+ 
+ class RowMutationSerializer implements ICompactSerializer<RowMutation>
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutationVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutationVerbHandler.java
+index bd6d8f29..f2834050 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutationVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/RowMutationVerbHandler.java
+@@ -44,12 +44,9 @@
+ 
+     public void doVerb(Message message)
+     {
+-        byte[] bytes = message.getMessageBody();
+-        ByteArrayInputStream buffer = new ByteArrayInputStream(bytes);
+-
+         try
+         {
+-            RowMutation rm = RowMutation.serializer().deserialize(new DataInputStream(buffer));
++            RowMutation rm = RowMutation.fromBytes(message.getMessageBody());
+             if (logger_.isDebugEnabled())
+               logger_.debug("Applying " + rm);
+ 
+@@ -70,7 +67,7 @@ public void doVerb(Message message)
+                 }
+             }
+ 
+-            Table.open(rm.getTable()).apply(rm, bytes, true);
++            Table.open(rm.getTable()).apply(rm, true);
+ 
+             WriteResponse response = new WriteResponse(rm.getTable(), rm.key(), true);
+             Message responseMessage = WriteResponse.makeWriteResponseMessage(message, response);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index a915e876..10873db8 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -379,7 +379,7 @@ public Row getRow(QueryFilter filter) throws IOException
+      * Once this happens the data associated with the individual column families
+      * is also written to the column family store's memtable.
+     */
+-    public void apply(RowMutation mutation, byte[] serializedMutation, boolean writeCommitLog) throws IOException
++    public void apply(RowMutation mutation, boolean writeCommitLog) throws IOException
+     {
+         List<Memtable> memtablesToFlush = Collections.emptyList();
+         if (logger.isDebugEnabled())
+@@ -390,7 +390,7 @@ public void apply(RowMutation mutation, byte[] serializedMutation, boolean write
+         try
+         {
+             if (writeCommitLog)
+-                CommitLog.instance.add(mutation, serializedMutation);
++                CommitLog.instance.add(mutation);
+         
+             DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+             for (ColumnFamily cf : mutation.getColumnFamilies())
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 27b6f84b..b0e54a64 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -325,7 +325,7 @@ public void runMayThrow() throws IOException
+                             }
+                             if (!newRm.isEmpty())
+                             {
+-                                Table.open(newRm.getTable()).apply(newRm, null, false);
++                                Table.open(newRm.getTable()).apply(newRm, false);
+                             }
+                         }
+                     };
+@@ -392,9 +392,9 @@ private CommitLogSegment currentSegment()
+      * of any problems. This way we can assume that the subsequent commit log
+      * entry will override the garbage left over by the previous write.
+     */
+-    public void add(RowMutation rowMutation, byte[] serializedRow) throws IOException
++    public void add(RowMutation rowMutation) throws IOException
+     {
+-        executor.add(new LogRecordAdder(rowMutation, serializedRow));
++        executor.add(new LogRecordAdder(rowMutation));
+     }
+ 
+     /*
+@@ -494,19 +494,17 @@ void sync() throws IOException
+     class LogRecordAdder implements Callable, Runnable
+     {
+         final RowMutation rowMutation;
+-        final byte[] serializedRow;
+ 
+-        LogRecordAdder(RowMutation rm, byte[] serializedRow)
++        LogRecordAdder(RowMutation rm)
+         {
+             this.rowMutation = rm;
+-            this.serializedRow = serializedRow;
+         }
+ 
+         public void run()
+         {
+             try
+             {
+-                currentSegment().write(rowMutation, serializedRow);
++                currentSegment().write(rowMutation);
+                 // roll log if necessary
+                 if (currentSegment().length() >= SEGMENT_SIZE)
+                 {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+index ee80e674..eca22a91 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+@@ -75,7 +75,7 @@ private static BufferedRandomAccessFile createWriter(String file) throws IOExcep
+         return new BufferedRandomAccessFile(file, "rw", 128 * 1024);
+     }
+ 
+-    public CommitLogSegment.CommitLogContext write(RowMutation rowMutation, byte[] serializedRow) throws IOException
++    public CommitLogSegment.CommitLogContext write(RowMutation rowMutation) throws IOException
+     {
+         long currentPosition = -1L;
+         try
+@@ -107,7 +107,7 @@ private static BufferedRandomAccessFile createWriter(String file) throws IOExcep
+ 
+             // write mutation, w/ checksum on the size and data
+             Checksum checksum = new CRC32();
+-
++            byte[] serializedRow = rowMutation.getSerializedBuffer();
+             checksum.update(serializedRow.length);
+             logWriter.writeInt(serializedRow.length);
+             logWriter.writeLong(checksum.getValue());

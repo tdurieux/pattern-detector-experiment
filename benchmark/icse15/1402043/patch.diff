@@ -1,0 +1,275 @@
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DeadlockDetectionTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DeadlockDetectionTest.java
+index ec2b4da4..804172e7 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DeadlockDetectionTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DeadlockDetectionTest.java
+@@ -28,6 +28,7 @@
+ import java.util.Iterator;
+ import java.util.List;
+ import junit.framework.Test;
++import org.apache.derbyTesting.functionTests.util.Barrier;
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+ import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+ import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+@@ -239,38 +240,4 @@ public void run() {
+         // picked as victim, the other ones should be able to complete.)
+         assertEquals("Number of victims", 1, exceptions.size());
+     }
+-
+-    /**
+-     * In the absence of java.util.concurrent.CyclicBarrier on many of the
+-     * platforms we test, create our own barrier class. This class allows
+-     * threads to wait for one another on specific locations, so that they
+-     * know they're all in the expected state.
+-     */
+-    private static class Barrier {
+-        /** Number of threads to wait for at the barrier. */
+-        int numThreads;
+-
+-        /** Create a barrier for the specified number of threads. */
+-        Barrier(int numThreads) {
+-            this.numThreads = numThreads;
+-        }
+-
+-        /**
+-         * Wait until {@code numThreads} have called {@code await()} on this
+-         * barrier, then proceed.
+-         */
+-        synchronized void await() throws InterruptedException {
+-            assertTrue("Too many threads reached the barrier", numThreads > 0);
+-
+-            if (--numThreads <= 0) {
+-                // All threads have reached the barrier. Go ahead!
+-                notifyAll();
+-            }
+-
+-            // Some threads haven't reached the barrier yet. Let's wait.
+-            while (numThreads > 0) {
+-                wait();
+-            }
+-        }
+-    }
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorMessageTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorMessageTest.java
+index 2366c892..dcffdc94 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorMessageTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorMessageTest.java
+@@ -23,6 +23,7 @@
+ package org.apache.derbyTesting.functionTests.tests.lang;
+ 
+ import java.sql.Connection;
++import java.sql.PreparedStatement;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ import java.util.Properties;
+@@ -30,6 +31,7 @@
+ import java.util.regex.Pattern;
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
++import org.apache.derbyTesting.functionTests.util.Barrier;
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+ import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+ import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+@@ -131,43 +133,75 @@ public void testWaitTimeout() throws SQLException {
+      */
+     public void testDeadlockTimeout()
+             throws SQLException, InterruptedException {
+-        getConnection().setAutoCommit(false);
++        setAutoCommit(false);
++
++        // Make the main transaction (T1) lock row 1 exclusively
+         Statement s = createStatement();
+         assertUpdateCount(s, 1, "update t set text='xxx' where id=1");
+ 
+-        // start another transaction that needs to wait for the first one
++        // Start another transaction (T2) that locks row 2 exclusively
+         Connection c2 = openDefaultConnection();
+         c2.setAutoCommit(false);
+-        final Statement s2 = c2.createStatement();
++        Statement s2 = c2.createStatement();
+         assertUpdateCount(s2, 1, "update t set text='yyy' where id=2");
++
++        // Prepare statements for T1 to lock row 2 (shared), and for T2 to
++        // lock row 1 (shared).
++        PreparedStatement ps1 = prepareStatement("select * from t where id=2");
++        final PreparedStatement ps2 =
++                c2.prepareStatement("select * from t where id=1");
++
++        // Create a barrier for the two threads to synchronize.
++        final Barrier barrier = new Barrier(2);
++
+         final SQLException[] holder = new SQLException[2];
++        final Throwable[] unexpected = new Throwable[1];
+         Thread t = new Thread(new Runnable() {
+                 public void run() {
+                     try {
+-                        // will wait since the other transaction has locked the
+-                        // row exclusively
+-                        JDBC.assertDrainResults(
+-                            s2.executeQuery("select * from t where id=1"));
++                        // Let the main thread know the helper thread has
++                        // started. The race for the locks can start.
++                        barrier.await();
++
++                        // This statement will be blocked because T1 holds
++                        // an exclusive lock on the row we want.
++                        JDBC.assertDrainResults(ps2.executeQuery());
+                     } catch (SQLException e) {
+                         holder[0] = e;
++                    } catch (Throwable t) {
++                        unexpected[0] = t;
+                     }
+                 }
+             });
+         t.start();
+ 
+-        // Execute a query that needs to wait for c2 to finish. Now, c1 is
+-        // waiting for c2, and c2 is waiting for c1.
++        // Wait until the helper thread has started. Once the call returns,
++        // both threads are ready, and the race for the locks can start.
++        barrier.await();
++
++        // This statement will be blocked because T2 holds an exclusive lock
++        // on the row we want. So now we have T1 waiting for T2, and T2 waiting
++        // for T1, and one of the transactions should be terminated because of
++        // the deadlock.
+         try {
+-            JDBC.assertDrainResults(
+-                s.executeQuery("select * from t where id=2"));
++            JDBC.assertDrainResults(ps1.executeQuery());
+         } catch (SQLException e) {
+             holder[1] = e;
+         }
+ 
++        // Wait for the helper thread to complete.
+         t.join();
+ 
++        // If the helper thread failed with something other than an
++        // SQLException, report it.
++        if (unexpected[0] != null) {
++            fail("Helper thread failed unexpectedly", unexpected[0]);
++        }
++
++        // Check that exactly one of the threads failed, and that the failure
++        // was caused by a deadlock. It is not deterministic which of the two
++        // threads will be terminated.
+         String msg;
+-        // check that only one of the transactions failed
+         if (holder[0] != null) {
+             assertSQLState("Not a deadlock", "40001", holder[0]);
+             assertNull("Only one of the waiters should be aborted", holder[1]);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/IndexSplitDeadlockTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/IndexSplitDeadlockTest.java
+index 55aa4857..5157edd7 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/IndexSplitDeadlockTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/IndexSplitDeadlockTest.java
+@@ -28,6 +28,7 @@
+ import java.util.Iterator;
+ import java.util.List;
+ import junit.framework.Test;
++import org.apache.derbyTesting.functionTests.util.Barrier;
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+ import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+ import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+@@ -834,38 +835,4 @@ void waitFor() throws Exception {
+             }
+         }
+     }
+-
+-    /**
+-     * A poor man's substitute for java.util.concurrent.CyclicBarrier.
+-     */
+-    private static class Barrier {
+-        /** The number of parties that still haven't reached the barrier. */
+-        private int n;
+-
+-        /**
+-         * Create a barrier that blocks until the specified number of threads
+-         * have reached the barrier point.
+-         *
+-         * @param parties the number of parties to wait for at the barrier
+-         */
+-        Barrier(int parties) {
+-            n = parties;
+-        }
+-
+-        /**
+-         * Wait until all parties have reached the barrier.
+-         *
+-         * @throws InterruptedException if the thread is interrupted
+-         */
+-        synchronized void await() throws InterruptedException {
+-            assertTrue("Too many parties at barrier", n > 0);
+-
+-            n--;
+-            notifyAll();
+-
+-            while (n > 0) {
+-                wait();
+-            }
+-        }
+-    }
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/util/Barrier.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/util/Barrier.java
+index e69de29b..b2c69fa1 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/util/Barrier.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/util/Barrier.java
+@@ -0,0 +1,60 @@
++/*
++ * Derby - Class org.apache.derbyTesting.functionTests.util.Barrier
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ */
++
++package org.apache.derbyTesting.functionTests.util;
++
++import junit.framework.Assert;
++
++/**
++ * In the absence of java.util.concurrent.CyclicBarrier on some of the
++ * platforms we test, create our own barrier class. This class allows
++ * threads to wait for one another on specific locations, so that they
++ * know they're all in the expected state.
++ */
++public class Barrier {
++    /** Number of threads to wait for at the barrier. */
++    private int numThreads;
++
++    /** Create a barrier for the specified number of threads. */
++    public Barrier(int numThreads) {
++        this.numThreads = numThreads;
++    }
++
++    /**
++     * Wait until {@code numThreads} have called {@code await()} on this
++     * barrier, then proceed.
++     *
++     * @throws InterruptedException if the thread is interrupted while
++     * waiting for the other threads to reach the barrier.
++     */
++    public synchronized void await() throws InterruptedException {
++        Assert.assertTrue(
++                "Too many threads reached the barrier", numThreads > 0);
++
++        if (--numThreads <= 0) {
++            // All threads have reached the barrier. Go ahead!
++            notifyAll();
++        }
++
++        // Some threads haven't reached the barrier yet. Let's wait.
++        while (numThreads > 0) {
++            wait();
++        }
++    }
++}

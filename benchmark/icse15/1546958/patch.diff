@@ -1,0 +1,183 @@
+diff --git a/lucene/dev/branches/lucene_solr_3_6/solr/contrib/velocity/src/java/org/apache/solr/response/VelocityResponseWriter.java b/lucene/dev/branches/lucene_solr_3_6/solr/contrib/velocity/src/java/org/apache/solr/response/VelocityResponseWriter.java
+index cfb0bc6a..f05dbda6 100644
+--- a/lucene/dev/branches/lucene_solr_3_6/solr/contrib/velocity/src/java/org/apache/solr/response/VelocityResponseWriter.java
++++ b/lucene/dev/branches/lucene_solr_3_6/solr/contrib/velocity/src/java/org/apache/solr/response/VelocityResponseWriter.java
+@@ -64,7 +64,6 @@ public void write(Writer writer, SolrQueryRequest request, SolrQueryResponse res
+     } catch (ClassCastException e) {
+       // known edge case where QueryResponse's extraction assumes "response" is a SolrDocumentList
+       // (AnalysisRequestHandler emits a "response")
+-      e.printStackTrace();
+       rsp = new SolrResponseBase();
+       rsp.setResponse(parsedResponse);
+     }
+@@ -123,6 +122,7 @@ private VelocityEngine getEngine(SolrQueryRequest request) {
+     SolrVelocityResourceLoader resourceLoader =
+         new SolrVelocityResourceLoader(request.getCore().getSolrConfig().getResourceLoader());
+     engine.setProperty("solr.resource.loader.instance", resourceLoader);
++    engine.setProperty(RuntimeConstants.RESOURCE_LOADER, "params,solr");
+ 
+     // TODO: Externalize Velocity properties
+     engine.setProperty(RuntimeConstants.RESOURCE_LOADER, "params,file,solr");
+diff --git a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/java/org/apache/solr/core/SolrResourceLoader.java b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/java/org/apache/solr/core/SolrResourceLoader.java
+index de3482f4..c80c5c44 100644
+--- a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/java/org/apache/solr/core/SolrResourceLoader.java
++++ b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/java/org/apache/solr/core/SolrResourceLoader.java
+@@ -25,6 +25,7 @@
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.net.MalformedURLException;
++import java.net.URI;
+ import java.net.URL;
+ import java.net.URLClassLoader;
+ import java.util.*;
+@@ -212,7 +213,7 @@ public  static String normalizeDir(String path) {
+   }
+ 
+   public String getConfigDir() {
+-    return instanceDir + "conf/";
++    return instanceDir + "conf" + File.separator;
+   }
+   
+   public String getDataDir()    {
+@@ -250,27 +251,46 @@ public InputStream openConfig(String name) {
+   public InputStream openResource(String resource) {
+     InputStream is=null;
+     try {
+-      File f0 = new File(resource);
+-      File f = f0;
++      File f0 = new File(resource), f = f0;
+       if (!f.isAbsolute()) {
+         // try $CWD/$configDir/$resource
+-        f = new File(getConfigDir() + resource);
++        f = new File(getConfigDir() + resource).getAbsoluteFile();
+       }
+-      if (f.isFile() && f.canRead()) {
++      boolean found = f.isFile() && f.canRead();
++      if (!found) { // no success with $CWD/$configDir/$resource
++        f = f0.getAbsoluteFile();
++        found = f.isFile() && f.canRead();
++      }
++      // check that we don't escape instance dir
++      if (found) {
++        if (!Boolean.parseBoolean(System.getProperty("solr.allow.unsafe.resourceloading", "false"))) {
++          final URI instanceURI = new File(getInstanceDir()).getAbsoluteFile().toURI().normalize();
++          final URI fileURI = f.toURI().normalize();
++          if (instanceURI.relativize(fileURI) == fileURI) {
++            // no URI relativize possible, so they don't share same base folder
++            throw new RuntimeException("For security reasons, SolrResourceLoader cannot load files from outside the instance's directory: " + f +
++                "; if you want to override this safety feature and you are sure about the consequences, you can pass the system property "+
++                "-Dsolr.allow.unsafe.resourceloading=true to your JVM");
++          }
++        }
++        // relativize() returned a relative, new URI, so we are fine!
+         return new FileInputStream(f);
+-      } else if (f != f0) { // no success with $CWD/$configDir/$resource
+-        if (f0.isFile() && f0.canRead())
+-          return new FileInputStream(f0);
+       }
+-      // delegate to the class loader (looking into $INSTANCE_DIR/lib jars)
+-      is = classLoader.getResourceAsStream(resource);
+-      if (is == null)
+-        is = classLoader.getResourceAsStream(getConfigDir() + resource);
++      // Delegate to the class loader (looking into $INSTANCE_DIR/lib jars).
++      // We need a ClassLoader-compatible (forward-slashes) path here!
++      is = classLoader.getResourceAsStream(resource.replace(File.separatorChar, '/'));
++      // This is a hack just for tests (it is not done in ZKResourceLoader)!
++      // -> the getConfigDir's path must not be absolute!
++      if (is == null && System.getProperty("jetty.testMode") != null && !new File(getConfigDir()).isAbsolute()) {
++        is = classLoader.getResourceAsStream((getConfigDir() + resource).replace(File.separatorChar, '/'));
++      }
++    } catch (RuntimeException re) {
++      throw re; // preserve original Exception
+     } catch (Exception e) {
+       throw new RuntimeException("Error opening " + resource, e);
+     }
+     if (is==null) {
+-      throw new RuntimeException("Can't find resource '" + resource + "' in classpath or '" + getConfigDir() + "', cwd="+System.getProperty("user.dir"));
++      throw new RuntimeException("Can't find resource '" + resource + "' in classpath or '" + new File(getConfigDir()).getAbsolutePath() + "'");
+     }
+     return is;
+   }
+diff --git a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/core/ResourceLoaderTest.java b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/core/ResourceLoaderTest.java
+index c5aa373b..d685d97f 100644
+--- a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/core/ResourceLoaderTest.java
++++ b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/core/ResourceLoaderTest.java
+@@ -21,9 +21,10 @@
+ 
+ import junit.framework.Assert;
+ 
+-import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
+ import org.apache.solr.analysis.KeywordTokenizerFactory;
+ import org.apache.solr.analysis.NGramFilterFactory;
++import org.apache.solr.SolrTestCaseJ4;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.handler.admin.LukeRequestHandler;
+ import org.apache.solr.handler.component.FacetComponent;
+@@ -32,12 +33,13 @@
+ import org.apache.solr.util.plugin.SolrCoreAware;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.charset.CharacterCodingException;
+ import java.util.Arrays;
+ import java.util.List;
+ 
+-public class ResourceLoaderTest extends LuceneTestCase 
++public class ResourceLoaderTest extends SolrTestCaseJ4 
+ {
+   public void testInstanceDir() throws Exception {
+     SolrResourceLoader loader = new SolrResourceLoader(null);
+@@ -49,7 +51,27 @@ public void testInstanceDir() throws Exception {
+     assertTrue(instDir + " is not equal to " + "solr/", instDir.equals("solr" + File.separator) == true);
+   }
+ 
+-  public void testAwareCompatibility() 
++  public void testEscapeInstanceDir() throws Exception {
++    File temp = _TestUtil.getTempDir("testEscapeInstanceDir");
++    try {
++      temp.mkdirs();
++      new File(temp, "dummy.txt").createNewFile();
++      File instanceDir = new File(temp, "instance");
++      instanceDir.mkdir();
++      new File(instanceDir, "conf").mkdir();
++      SolrResourceLoader loader = new SolrResourceLoader(instanceDir.getAbsolutePath());
++      try {
++        loader.openResource("../../dummy.txt").close();
++        fail();
++      } catch (RuntimeException re) {
++        assertTrue(re.getMessage().startsWith("For security reasons, SolrResourceLoader"));
++      }
++    } finally {
++      _TestUtil.rmDir(temp);
++    }
++  }
++
++  public void testAwareCompatibility() throws Exception
+   {
+     SolrResourceLoader loader = new SolrResourceLoader( "." );
+     
+diff --git a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/schema/PrimitiveFieldTypeTest.java b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/schema/PrimitiveFieldTypeTest.java
+index 16136d86..f4517c9a 100644
+--- a/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/schema/PrimitiveFieldTypeTest.java
++++ b/lucene/dev/branches/lucene_solr_3_6/solr/core/src/test/org/apache/solr/schema/PrimitiveFieldTypeTest.java
+@@ -41,11 +41,18 @@ public void setUp()  throws Exception {
+     // set some system properties for use by tests
+     System.setProperty("solr.test.sys.prop1", "propone");
+     System.setProperty("solr.test.sys.prop2", "proptwo");
++    System.setProperty("solr.allow.unsafe.resourceloading", "true");
+ 
+     initMap = new HashMap<String,String>();
+     config = new SolrConfig(testConfHome + "solrconfig.xml");
+   }
+ 
++  @Override
++  public void tearDown() throws Exception {
++    System.clearProperty("solr.allow.unsafe.resourceloading");
++    super.tearDown();
++  }
++
+   @SuppressWarnings("deprecation")
+   @Test
+   public void testDefaultOmitNorms() throws Exception {

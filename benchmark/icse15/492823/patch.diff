@@ -1,0 +1,222 @@
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/CoreParser.java b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/CoreParser.java
+index 6b066012..5f171d1a 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/CoreParser.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/CoreParser.java
+@@ -12,6 +12,7 @@
+ import org.apache.lucene.xmlparser.builders.ConstantScoreQueryBuilder;
+ import org.apache.lucene.xmlparser.builders.FilteredQueryBuilder;
+ import org.apache.lucene.xmlparser.builders.MatchAllDocsQueryBuilder;
++import org.apache.lucene.xmlparser.builders.CachedFilterBuilder;
+ import org.apache.lucene.xmlparser.builders.RangeFilterBuilder;
+ import org.apache.lucene.xmlparser.builders.SpanFirstBuilder;
+ import org.apache.lucene.xmlparser.builders.SpanNearBuilder;
+@@ -38,6 +39,9 @@
+ 	protected QueryParser parser;
+ 	protected QueryBuilderFactory queryFactory;
+ 	protected FilterBuilderFactory filterFactory;
++	//Controls the max size of the LRU cache used for QueryFilter objects parsed.
++	public static int maxNumCachedFilters=20;
++
+ 
+ 	public CoreParser(Analyzer analyzer, QueryParser parser)
+ 	{
+@@ -56,6 +60,10 @@ public CoreParser(Analyzer analyzer, QueryParser parser)
+ 		queryFactory.addBuilder("FilteredQuery",new FilteredQueryBuilder(filterFactory,queryFactory));
+ 		queryFactory.addBuilder("ConstantScoreQuery",new ConstantScoreQueryBuilder(filterFactory));
+ 		
++		filterFactory.addBuilder("CachedFilter",new CachedFilterBuilder(queryFactory,
++							filterFactory, maxNumCachedFilters));
++		
++		
+ 		SpanQueryBuilderFactory sqof=new SpanQueryBuilderFactory();
+ 
+ 		SpanNearBuilder snb=new SpanNearBuilder(sqof);
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/DOMUtils.java b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/DOMUtils.java
+index b55a6a43..43c52c98 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/DOMUtils.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/DOMUtils.java
+@@ -99,8 +99,12 @@ public static String getAttributeWithInheritance(Element element, String attribu
+ 			{
+ 				return null;
+ 			}
++			if(n instanceof Element)
++			{
+ 			Element parent=(Element) n;
+ 			return getAttributeWithInheritance(parent,attributeName);
++		}
++			return null; //we reached the top level of the document without finding attribute
+ 		}
+ 		return result;		
+ 	}
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/FilterBuilderFactory.java b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/FilterBuilderFactory.java
+index 488c745d..98f020a8 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/FilterBuilderFactory.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/FilterBuilderFactory.java
+@@ -27,5 +27,8 @@ public void addBuilder(String nodeName,FilterBuilder builder)
+ 	{
+ 		builders.put(nodeName,builder);
+ 	}
+-	
++	public FilterBuilder getFilterBuilder(String nodeName)
++	{
++		return (FilterBuilder) builders.get(nodeName);		
++	}	
+ }
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/QueryBuilderFactory.java b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/QueryBuilderFactory.java
+index 39c2afff..2f929240 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/QueryBuilderFactory.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/QueryBuilderFactory.java
+@@ -27,5 +27,9 @@ public void addBuilder(String nodeName,QueryBuilder builder)
+ 	{
+ 		builders.put(nodeName,builder);
+ 	}
++	public QueryBuilder getQueryBuilder(String nodeName)
++	{
++		return (QueryBuilder) builders.get(nodeName);		
++	}
+ 
+ }
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/builders/CachedFilterBuilder.java b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/builders/CachedFilterBuilder.java
+index e69de29b..6a9e199c 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/builders/CachedFilterBuilder.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/java/org/apache/lucene/xmlparser/builders/CachedFilterBuilder.java
+@@ -0,0 +1,123 @@
++/*
++ * Created on 25-Jan-2006
++ */
++package org.apache.lucene.xmlparser.builders;
++
++import java.util.Map.Entry;
++
++import org.apache.lucene.search.CachingWrapperFilter;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.QueryFilter;
++import org.apache.lucene.xmlparser.DOMUtils;
++import org.apache.lucene.xmlparser.FilterBuilder;
++import org.apache.lucene.xmlparser.FilterBuilderFactory;
++import org.apache.lucene.xmlparser.ParserException;
++import org.apache.lucene.xmlparser.QueryBuilder;
++import org.apache.lucene.xmlparser.QueryBuilderFactory;
++import org.w3c.dom.Element;
++
++/**
++ * Filters are cached in an LRU Cache keyed on the contained query or filter object. Using this will 
++ * speed up overall performance for repeated uses of the same expensive query/filter. The sorts of 
++ * queries/filters likely to benefit from caching need not necessarily be complex - e.g. simple 
++ * TermQuerys with a large DF (document frequency) can be expensive	on large indexes. 
++ * A good example of this might be a term query on a field with only 2 possible	values - 
++ * "true" or "false". In a large index, querying or filtering on this field requires reading 
++ * millions	of document ids from disk which can more usefully be cached as a filter bitset.
++ * 
++ * For Queries/Filters to be cached and reused the object must implement hashcode and
++ * equals methods correctly so that duplicate queries/filters can be detected in the cache.
++ * 
++ * The CoreParser.maxNumCachedFilters property can be used to control the size of the LRU 
++ * Cache established during the construction of CoreParser instances.
++ * 
++ * @author maharwood
++ */
++public class CachedFilterBuilder implements FilterBuilder {
++
++	private QueryBuilderFactory queryFactory;
++	private FilterBuilderFactory filterFactory;
++	
++    private  LRUCache filterCache = null;
++
++	private int cacheSize;
++
++	public CachedFilterBuilder(QueryBuilderFactory queryFactory, 
++			FilterBuilderFactory filterFactory,int cacheSize)
++	{
++		this.queryFactory=queryFactory;
++		this.filterFactory=filterFactory;
++		this.cacheSize=cacheSize;
++	}
++
++	public Filter getFilter(Element e) throws ParserException
++	{
++
++		Element childElement = DOMUtils.getFirstChildOrFail(e);
++
++		if (filterCache == null)
++		{
++			filterCache = new LRUCache(cacheSize);
++		}
++
++		// Test to see if child Element is a query or filter that needs to be
++		// cached
++		QueryBuilder qb = queryFactory.getQueryBuilder(childElement
++				.getNodeName());
++		Object cacheKey = null;
++		Query q = null;
++		Filter f = null;
++		if (qb != null)
++		{
++			q = qb.getQuery(childElement);
++			cacheKey = q;
++		} else
++		{
++			f = filterFactory.getFilter(childElement);
++			cacheKey = f;
++		}
++		Filter cachedFilter = null;
++		synchronized (filterCache)
++		{ // check cache
++			cachedFilter = (Filter) filterCache.get(cacheKey);
++			if (cachedFilter != null)
++			{
++				return cachedFilter; // cache hit
++			}
++		}
++		
++		//cache miss
++		if (qb != null)
++		{
++			cachedFilter = new QueryFilter(q);
++		} else
++		{
++			cachedFilter = new CachingWrapperFilter(f);
++		}
++
++		synchronized (filterCache)
++		{ // update cache
++			filterCache.put(cacheKey, cachedFilter);
++		}
++		return cachedFilter;
++	}
++	
++	static class LRUCache extends java.util.LinkedHashMap
++	{
++	    public LRUCache(int maxsize)
++	    {
++	        super(maxsize * 4 / 3 + 1, 0.75f, true);
++	        this.maxsize = maxsize;
++	    }
++
++	    protected int maxsize;
++
++	    protected boolean removeEldestEntry(Entry eldest)
++	    {
++	        return size() > maxsize;
++	    }
++
++	}
++
++}
+diff --git a/lucene/java/trunk/contrib/xml-query-parser/src/test/org/apache/lucene/xmlparser/TestParser.java b/lucene/java/trunk/contrib/xml-query-parser/src/test/org/apache/lucene/xmlparser/TestParser.java
+index 056f81b2..f2db03ab 100644
+--- a/lucene/java/trunk/contrib/xml-query-parser/src/test/org/apache/lucene/xmlparser/TestParser.java
++++ b/lucene/java/trunk/contrib/xml-query-parser/src/test/org/apache/lucene/xmlparser/TestParser.java
+@@ -155,6 +155,11 @@ public void testNestedBooleanQuery() throws ParserException, IOException
+ 			Query q=parse("NestedBooleanQuery.xml");
+ 			dumpResults("Nested Boolean query", q, 5);
+ 	}
++	public void testCachedFilterXML() throws ParserException, IOException
++	{
++			Query q=parse("CachedFilter.xml");
++			dumpResults("Cached filter", q, 5);
++	}
+ 	
+ 
+ 

@@ -1,0 +1,676 @@
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+index 663ae1b2..00fe964f 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+@@ -18,7 +18,6 @@
+  */
+ 
+ import java.io.IOException;
+-import java.net.ConnectException;
+ import java.util.ArrayList;
+ import java.util.HashSet;
+ import java.util.List;
+@@ -40,17 +39,13 @@
+ import org.apache.solr.client.solrj.request.UpdateRequestExt;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrException.ErrorCode;
+-import org.apache.solr.common.SolrInputDocument;
+-import org.apache.solr.common.SolrInputField;
+ import org.apache.solr.common.params.ModifiableSolrParams;
+-import org.apache.solr.common.params.UpdateParams;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.core.SolrCore;
+-import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.response.SolrQueryResponse;
+-import org.apache.solr.schema.SchemaField;
+-import org.apache.solr.update.processor.DistributedUpdateProcessor;
+ 
++// TODO: we are not really using the buffering anymore due to DistribUpdateProc...
++// we might want to bring back a form of slots...
+ public class SolrCmdDistributor {
+   // TODO: shut this thing down
+   static ThreadPoolExecutor commExecutor = new ThreadPoolExecutor(0,
+@@ -68,10 +63,10 @@
+   CompletionService<Request> completionService;
+   Set<Future<Request>> pending;
+   
+-  private final SolrQueryRequest req;
++  //private final SolrQueryRequest req;
+   private final SolrQueryResponse rsp;
+ 
+-  private final SchemaField idField;
++  //private final SchemaField idField;
+   
+   int maxBufferedAddsPerServer = 10;
+   int maxBufferedDeletesPerServer = 100;
+@@ -79,49 +74,41 @@
+   private List<AddUpdateCommand> alist;
+   private ArrayList<DeleteUpdateCommand> dlist;
+   
+-  public SolrCmdDistributor(SolrQueryRequest req,
+-      SolrQueryResponse rsp) {
+-    this.req = req;
++  public SolrCmdDistributor(SolrQueryResponse rsp) {
++    //this.req = req;
+     this.rsp = rsp;
+-    this.idField = req.getSchema().getUniqueKeyField();
+   }
+   
+-  public void finish(List<String> shards) {
++  public void finish(List<String> shards, ModifiableSolrParams params) {
+ 
+     // piggyback on any outstanding adds or deletes if possible.
+-    flushAdds(1, null, shards);
+-    flushDeletes(1, null, shards);
++    flushAdds(1, null, shards, params);
++    flushDeletes(1, null, shards, params);
+ 
+     checkResponses(true);
+   }
+   
+-  public void distribDelete(DeleteUpdateCommand cmd, List<String> shards) throws IOException {
++  public void distribDelete(DeleteUpdateCommand cmd, List<String> shards, ModifiableSolrParams params) throws IOException {
+     checkResponses(false);
+     
+     if (cmd.isDeleteById()) {
+-      doDelete(cmd, shards);
++      doDelete(cmd, shards, params);
+     } else {
+       // TODO: query must be broadcast to all ??
+-      doDelete(cmd, shards);
++      doDelete(cmd, shards, params);
+     }
+   }
+   
+-  public void distribAdd(AddUpdateCommand cmd, List<String> shards) throws IOException {
++  public void distribAdd(AddUpdateCommand cmd, List<String> shards, ModifiableSolrParams params) throws IOException {
+     
+     checkResponses(false);
+     
+-    SolrInputDocument doc = cmd.getSolrInputDocument();
+-    SolrInputField field = doc.getField(idField.getName());
+-    if (field == null) {
+-      throw new RuntimeException("no id field found");
+-    }
+-    
+     // make sure any pending deletes are flushed
+-    flushDeletes(1, null, shards);
++    flushDeletes(1, null, shards, params);
+     
+     // TODO: this is brittle
+     // need to make a clone since these commands may be reused
+-    AddUpdateCommand clone = new AddUpdateCommand(req);
++    AddUpdateCommand clone = new AddUpdateCommand(null);
+     
+     clone.solrDoc = cmd.solrDoc;
+     clone.commitWithin = cmd.commitWithin;
+@@ -138,10 +125,10 @@ public void distribAdd(AddUpdateCommand cmd, List<String> shards) throws IOExcep
+     }
+     alist.add(clone);
+     
+-    flushAdds(maxBufferedAddsPerServer, null, shards);
++    flushAdds(maxBufferedAddsPerServer, null, shards, params);
+   }
+   
+-  public void distribCommit(CommitUpdateCommand cmd, List<String> shards)
++  public void distribCommit(CommitUpdateCommand cmd, List<String> shards, ModifiableSolrParams params)
+       throws IOException {
+     
+     // Wait for all outstanding repsonses to make sure that a commit
+@@ -152,21 +139,16 @@ public void distribCommit(CommitUpdateCommand cmd, List<String> shards)
+     
+     // piggyback on any outstanding adds or deletes if possible.
+     // TODO: review this
+-    flushAdds(1, cmd, shards);
++    flushAdds(1, cmd, shards, params);
+     
+-    flushDeletes(1, cmd, shards);
++    flushDeletes(1, cmd, shards, params);
+     
+     UpdateRequestExt ureq = new UpdateRequestExt();
++    ureq.setParams(params);
+ 
+-    if (ureq.getParams() == null) {
+-      ureq.setParams(new ModifiableSolrParams());
+-    }
+-    passOnParams(ureq);
+     addCommit(ureq, cmd);
+     submit(ureq, shards);
+     
+-    // if (next != null && shardStr == null) next.processCommit(cmd);
+-    
+     // if the command wanted to block until everything was committed,
+     // then do that here.
+     // nocommit
+@@ -175,32 +157,16 @@ public void distribCommit(CommitUpdateCommand cmd, List<String> shards)
+     }
+   }
+ 
+-  private void passOnParams(UpdateRequestExt ureq) {
+-    String seenLeader = req.getParams().get(
+-        DistributedUpdateProcessor.SEEN_LEADER);
+-    if (seenLeader != null) {
+-      ureq.getParams().add(DistributedUpdateProcessor.SEEN_LEADER, seenLeader);
+-    }
+-    String updateChain = req.getParams().get(UpdateParams.UPDATE_CHAIN);
+-    if (updateChain != null) {
+-      ureq.getParams().add(UpdateParams.UPDATE_CHAIN, updateChain);
+-    }
+-    String commitEndPoint = req.getParams().get(DistributedUpdateProcessor.COMMIT_END_POINT);
+-    if (commitEndPoint != null) {
+-      ureq.getParams().add(DistributedUpdateProcessor.COMMIT_END_POINT, commitEndPoint);
+-    }
+-  }
+-  
+-  private void doDelete(DeleteUpdateCommand cmd, List<String> shards) throws IOException {
++  private void doDelete(DeleteUpdateCommand cmd, List<String> shards, ModifiableSolrParams params) throws IOException {
+     
+-    flushAdds(1, null, shards);
++    flushAdds(1, null, shards, params);
+     
+     if (dlist == null) {
+       dlist = new ArrayList<DeleteUpdateCommand>(2);
+     }
+     dlist.add(clone(cmd));
+     
+-    flushDeletes(maxBufferedDeletesPerServer, null, shards);
++    flushDeletes(maxBufferedDeletesPerServer, null, shards, params);
+   }
+   
+   void addCommit(UpdateRequestExt ureq, CommitUpdateCommand cmd) {
+@@ -210,17 +176,13 @@ void addCommit(UpdateRequestExt ureq, CommitUpdateCommand cmd) {
+         : AbstractUpdateRequest.ACTION.COMMIT, false, cmd.waitSearcher);
+   }
+   
+-  boolean flushAdds(int limit, CommitUpdateCommand ccmd, List<String> urls) {
++  boolean flushAdds(int limit, CommitUpdateCommand ccmd, List<String> urls, ModifiableSolrParams params) {
+     // check for pending deletes
+     if (alist == null || alist.size() < limit) return false;
+     
+     UpdateRequestExt ureq = new UpdateRequestExt();
+-    // pass on seen leader
+-    if (ureq.getParams() == null) {
+-      ureq.setParams(new ModifiableSolrParams());
+-    }
++    ureq.setParams(params);
+     
+-    passOnParams(ureq);
+     addCommit(ureq, ccmd);
+     
+     for (AddUpdateCommand cmd : alist) {
+@@ -232,17 +194,13 @@ boolean flushAdds(int limit, CommitUpdateCommand ccmd, List<String> urls) {
+     return true;
+   }
+   
+-  boolean flushDeletes(int limit, CommitUpdateCommand ccmd, List<String> shards) {
++  boolean flushDeletes(int limit, CommitUpdateCommand ccmd, List<String> shards, ModifiableSolrParams params) {
+     // check for pending deletes
+     if (dlist == null || dlist.size() < limit) return false;
+     
+     UpdateRequestExt ureq = new UpdateRequestExt();
+-    // pass on version
+-    if (ureq.getParams() == null) {
+-      ureq.setParams(new ModifiableSolrParams());
+-    }
++    ureq.setParams(params);
+     
+-    passOnParams(ureq);
+     addCommit(ureq, ccmd);
+     
+     for (DeleteUpdateCommand cmd : dlist) {
+@@ -261,7 +219,6 @@ boolean flushDeletes(int limit, CommitUpdateCommand ccmd, List<String> shards) {
+   private DeleteUpdateCommand clone(DeleteUpdateCommand cmd) {
+     DeleteUpdateCommand c = (DeleteUpdateCommand)cmd.clone();
+     // TODO: shouldnt the clone do this?
+-    c.setReq(req);
+     c.setFlags(cmd.getFlags());
+     c.setVersion(cmd.getVersion());
+     return c;
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+index 9ddb5026..0ace2505 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+@@ -29,6 +29,7 @@
+ import org.apache.lucene.util.CharsRef;
+ import org.apache.solr.cloud.HashPartitioner;
+ import org.apache.solr.cloud.HashPartitioner.Range;
++import org.apache.solr.cloud.ZkController;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.SolrInputField;
+@@ -89,7 +90,11 @@
+   private List<String> shards;
+ 
+   private boolean zkEnabled = false;
+-  private boolean alreadySetup = false;
++
++  private String collection;
++  private ZkController zkController;
++  
++  
+   
+   public DistributedUpdateProcessor(SolrQueryRequest req,
+       SolrQueryResponse rsp, UpdateRequestProcessor next) {
+@@ -110,40 +115,37 @@ public DistributedUpdateProcessor(SolrQueryRequest req,
+ 
+     this.req = req;
+     
+-    this.zkEnabled  = req.getCore().getCoreDescriptor().getCoreContainer().isZooKeeperAware();
++    CoreDescriptor coreDesc = req.getCore().getCoreDescriptor();
++    
++    this.zkEnabled  = coreDesc.getCoreContainer().isZooKeeperAware();
+     //this.rsp = reqInfo != null ? reqInfo.getRsp() : null;
+     
+-    cmdDistrib = new SolrCmdDistributor(req, rsp);
+-  }
+ 
+-  private List<String> setupRequest(int hash) {
+-    if (alreadySetup) {
+-      return shards;
+-    }
+-    alreadySetup = true;
++    zkController = req.getCore().getCoreDescriptor().getCoreContainer().getZkController();
+     
+-    List<String> shards = null;
++    collection = coreDesc.getCloudDescriptor().getCollectionName();
+     
+-    CoreDescriptor coreDesc = req.getCore().getCoreDescriptor();
++    cmdDistrib = new SolrCmdDistributor(rsp);
++  }
+     
+-    CloudState cloudState = req.getCore().getCoreDescriptor().getCoreContainer().getZkController().getCloudState();
++  private List<String> setupRequest(int hash) {
+     
+-    String collection = coreDesc.getCloudDescriptor().getCollectionName();
+-    String shardId = getShard(hash, collection, cloudState); // get the right shard based on the hash...
++    List<String> shards = null;
+ 
+     // if we are in zk mode...
+-    if (coreDesc.getCoreContainer().getZkController() != null) {
++    if (zkEnabled) {
+       // the leader is...
+       // TODO: if there is no leader, wait and look again
+       // TODO: we are reading the leader from zk every time - we should cache
+       // this and watch for changes?? Just pull it from ZkController cluster state probably?
+ 
++      String shardId = getShard(hash, collection, zkController.getCloudState()); // get the right shard based on the hash...
++      
+       ModifiableSolrParams params = new ModifiableSolrParams(req.getParams());
+       
+       String leaderNode = ZkStateReader.COLLECTIONS_ZKNODE + "/" + collection
+           + ZkStateReader.LEADER_ELECT_ZKNODE + "/" + shardId + "/leader";
+-      SolrZkClient zkClient = coreDesc.getCoreContainer().getZkController()
+-          .getZkClient();
++      SolrZkClient zkClient = zkController.getZkClient();
+ 
+       try {
+         List<String> leaderChildren = zkClient.getChildren(leaderNode, null);
+@@ -173,9 +175,6 @@ public DistributedUpdateProcessor(SolrQueryRequest req,
+             // so get the replicas...
+             shards = getReplicaUrls(req, collection, shardId,
+                 shardZkNodeName);
+-            
+-            // mark that this req has been to the leader
+-            params.set(SEEN_LEADER, true);
+           } else {
+             // I need to forward onto the leader...
+             shards = new ArrayList<String>(1);
+@@ -183,7 +182,6 @@ public DistributedUpdateProcessor(SolrQueryRequest req,
+             forwardToLeader = true;
+             isLeader = false;
+           }
+-          req.setParams(params);
+         }
+       } catch (KeeperException e) {
+         throw new ZooKeeperException(SolrException.ErrorCode.SERVER_ERROR, "",
+@@ -227,6 +225,8 @@ private String getShard(int hash, String collection, CloudState cloudState) {
+ 
+   @Override
+   public void processAdd(AddUpdateCommand cmd) throws IOException {
++    // TODO: check for id field?
++    
+     int hash = 0;
+     if (zkEnabled) {
+       hash = hash(cmd);
+@@ -246,8 +246,13 @@ public void processAdd(AddUpdateCommand cmd) throws IOException {
+       return;
+     }
+     
++    ModifiableSolrParams params = null;
+     if (shards != null) {
+-      cmdDistrib.distribAdd(cmd, shards);
++      params = new ModifiableSolrParams(req.getParams());
++      if (isLeader) {
++        params.set(SEEN_LEADER, true);
++      }
++      cmdDistrib.distribAdd(cmd, shards, params);
+     } else {
+       // nocommit: At a minimum, local updates must be protected by synchronization
+       // right now we count on versionAdd to do the local add
+@@ -265,6 +270,10 @@ public void processAdd(AddUpdateCommand cmd) throws IOException {
+       addsResponse.add(scratch.toString(), cmd.getVersion());
+     }
+ 
++    if (shards != null) {
++      cmdDistrib.finish(shards, params);
++    }
++    
+     // TODO: keep track of errors?  needs to be done at a higher level though since
+     // an id may fail before it gets to this processor.
+     // Given that, it may also make sense to move the version reporting out of this
+@@ -385,7 +394,10 @@ public void processDelete(DeleteUpdateCommand cmd) throws IOException {
+       // TODO: handle versioned and distributed deleteByQuery
+ 
+       // even in non zk mode, tests simulate updates from a leader
++      if(!zkEnabled) {
+       isLeader = !req.getParams().getBool(SEEN_LEADER, false);
++      }
++      
+       processDeleteByQuery(cmd);
+       return;
+     }
+@@ -409,8 +421,13 @@ public void processDelete(DeleteUpdateCommand cmd) throws IOException {
+       return;
+     }
+ 
++    ModifiableSolrParams params = null;
+     if (shards != null) {
+-      cmdDistrib.distribDelete(cmd, shards);
++      params = new ModifiableSolrParams(req.getParams());
++      if (isLeader) {
++        params.set(SEEN_LEADER, true);
++      }
++      cmdDistrib.distribDelete(cmd, shards, params);
+     } else {
+       // super.processDelete(cmd);
+     }
+@@ -425,6 +442,10 @@ public void processDelete(DeleteUpdateCommand cmd) throws IOException {
+       idField.getType().indexedToReadable(cmd.getIndexedId(), scratch);
+       deleteResponse.add(scratch.toString(), cmd.getVersion());  // we're returning the version of the delete.. not the version of the doc we deleted.
+     }
++    
++    if (shards != null) {
++      cmdDistrib.finish(shards, params);
++    }
+   }
+ 
+   private boolean versionDelete(DeleteUpdateCommand cmd) throws IOException {
+@@ -560,7 +581,6 @@ private void processDeleteByQuery(DeleteUpdateCommand cmd) throws IOException {
+ 
+   @Override
+   public void processCommit(CommitUpdateCommand cmd) throws IOException {
+-
+     if (vinfo != null) {
+       vinfo.lockForUpdate();
+     }
+@@ -578,18 +598,21 @@ public void processCommit(CommitUpdateCommand cmd) throws IOException {
+       }
+     }
+     // nocommit: we should consider this? commit everyone in the current collection
++
+     if (zkEnabled) {
+       ModifiableSolrParams params = new ModifiableSolrParams(req.getParams());
+       if (!params.getBool(COMMIT_END_POINT, false)) {
+         params.set(COMMIT_END_POINT, true);
+-        req.setParams(params);
++
+         String nodeName = req.getCore().getCoreDescriptor().getCoreContainer()
+             .getZkController().getNodeName();
+         String shardZkNodeName = nodeName + "_" + req.getCore().getName();
+         shards = getReplicaUrls(req, req.getCore().getCoreDescriptor()
+             .getCloudDescriptor().getCollectionName(), shardZkNodeName);
++
+         if (shards != null) {
+-          cmdDistrib.distribCommit(cmd, shards);
++          cmdDistrib.distribCommit(cmd, shards, params);
++          cmdDistrib.finish(shards, params);
+         }
+       }
+     }
+@@ -597,7 +620,6 @@ public void processCommit(CommitUpdateCommand cmd) throws IOException {
+   
+   @Override
+   public void finish() throws IOException {
+-    if (shards != null) cmdDistrib.finish(shards);
+     if (next != null && shards == null) next.finish();
+   }
+   
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicFullDistributedZkTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicFullDistributedZkTest.java
+index 59b8926f..74f39fff 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicFullDistributedZkTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicFullDistributedZkTest.java
+@@ -17,8 +17,9 @@
+  * limitations under the License.
+  */
+ 
+-import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.solr.client.solrj.SolrQuery;
++import org.apache.solr.client.solrj.SolrServer;
++import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.request.UpdateRequest;
+ import org.apache.solr.client.solrj.response.QueryResponse;
+ import org.apache.solr.common.SolrInputDocument;
+@@ -69,7 +70,7 @@ public void doTest() throws Exception {
+     
+     commit();
+     
+-    assertDocCounts();
++    assertDocCounts(VERBOSE);
+     
+     results = clients.get(0).query(params);
+     System.out.println("results1:" + results.getResults());
+@@ -96,9 +97,11 @@ public void doTest() throws Exception {
+     //uReq.setParam(UpdateParams.UPDATE_CHAIN, DISTRIB_UPDATE_CHAIN);
+     SolrInputDocument doc1 = new SolrInputDocument();
+ 
++    System.out.println("add doc1:" + doc1);
+     addFields(doc1, "id", docId++);
+     uReq.add(doc1);
+     SolrInputDocument doc2 = new SolrInputDocument();
++    System.out.println("add doc2:" + doc2);
+     addFields(doc2, "id", docId++);
+     uReq.add(doc2);
+     
+@@ -107,8 +110,71 @@ public void doTest() throws Exception {
+     
+     commit();
+     
+-    results = cloudClient.query(new SolrQuery("*:*"));
++    checkShardConsistency();
++    
++    System.out.println("controldocs: " + query(controlClient).getResults().getNumFound());
++    System.out.println("clouddocs: " + query(cloudClient).getResults().getNumFound());
++    
++    assertDocCounts(VERBOSE);
++    
++    results = query(cloudClient);
+     assertEquals(2, results.getResults().getNumFound());
++    
++    // two deletes
++    System.out.println("delete:" + Long.toString(docId-1));
++    uReq = new UpdateRequest();
++    uReq.deleteById(Long.toString(docId-1));
++    uReq.deleteById(Long.toString(docId-2)).process(cloudClient);
++    controlClient.deleteById(Long.toString(docId-1));
++    controlClient.deleteById(Long.toString(docId-2));
++    
++    commit();
++    
++    results = query(cloudClient);
++    assertEquals(0, results.getResults().getNumFound());
++    
++    results = query(controlClient);
++    assertEquals(0, results.getResults().getNumFound());
++    
++    // add two docs together, a 3rd doc and a delete
++    indexr("id", docId++, t1, "originalcontent");
++    
++    uReq = new UpdateRequest();
++    doc1 = new SolrInputDocument();
++
++    addFields(doc1, "id", docId++);
++    System.out.println("added doc:" + docId);
++    uReq.add(doc1);
++    doc2 = new SolrInputDocument();
++    addFields(doc2, "id", docId++);
++    System.out.println("added doc:" + docId);
++    uReq.add(doc2);
++ 
++    uReq.process(cloudClient);
++    uReq.process(controlClient);
++    
++    uReq = new UpdateRequest();
++    System.out.println("delete doc:" + (docId - 2));
++    uReq.deleteById(Long.toString(docId - 2)).process(cloudClient);
++    controlClient.deleteById(Long.toString(docId - 2));
++    
++    commit();
++    
++    assertDocCounts(VERBOSE);
++    
++    checkShardConsistency();
++    
++    results = query(controlClient);
++    assertEquals(2, results.getResults().getNumFound());
++    
++    results = query(cloudClient);
++    assertEquals(2, results.getResults().getNumFound());
++  }
++
++  private QueryResponse query(SolrServer server) throws SolrServerException {
++    SolrQuery query = new SolrQuery("*:*");
++    query.setParam("distrib", true);
++    return server.query(query);
+   }
+   
+   @Override
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
+index 17eb806e..8ccedc80 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
+@@ -25,6 +25,7 @@
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
+@@ -419,19 +420,19 @@ public void doTest() throws Exception {
+     
+     commit();
+     
+-    assertDocCounts();
++    assertDocCounts(VERBOSE);
+     
+     indexAbunchOfDocs();
+ 
+     commit();
+     
+-    assertDocCounts();
++    assertDocCounts(VERBOSE);
+     checkQueries();
+     
+     // TODO: this is failing because the counts per shard don't add up to the control - distrib total
+     // counts do match, so the same doc (same id) must be on different shards.
+     // our hash is not stable yet in distrib update proc
+-    assertDocCounts();
++    assertDocCounts(VERBOSE);
+ 
+     query("q", "*:*", "sort", "n_tl1 desc");
+     
+@@ -532,7 +533,7 @@ private void addNewReplica() throws Exception, InterruptedException,
+ 
+     checkShardConsistency(SHARD2);
+ 
+-    assertDocCounts();
++    assertDocCounts(VERBOSE);
+   }
+ 
+   private void brindDownShardIndexSomeDocsAndRecover() throws Exception,
+@@ -762,21 +763,46 @@ private void indexAbunchOfDocs() throws Exception {
+     }
+   }
+ 
+-  private void checkShardConsistency(String shard) throws SolrServerException {
++  protected void checkShardConsistency(String shard) throws SolrServerException {
+     List<SolrServer> solrClients = shardToClient.get(shard);
+     long num = -1;
+     long lastNum = -1;
++    System.out.println("\n\ncheck const");
+     for (SolrServer client : solrClients) {
+       num = client.query(new SolrQuery("*:*")).getResults().getNumFound();
++      System.out.println("num:" + num + "\n\n");
+       if (lastNum > -1 && lastNum != num) {
+         fail("shard is not consistent, expected:" + lastNum + " and got:" + num);
+       }
+       lastNum = num;
+     }
+-    assertEquals(shardToClient.get("shard1").get(0).query(new SolrQuery("*:*"))
+-        .getResults().getNumFound(),
+-        shardToClient.get("shard1").get(shardToClient.get("shard1").size() - 1)
+-            .query(new SolrQuery("*:*")).getResults().getNumFound());
++    
++    // now check that the right # are on each shard
++    long docs = controlClient.query(new SolrQuery("*:*")).getResults().getNumFound();
++    Set<String> theShards = shardToClient.keySet();
++    int cnt = 0;
++    for (String s : theShards) {
++      int times = shardToClient.get(s).size();
++      for (int i = 0; i < times; i++) {
++        try {
++          cnt += shardToClient.get(s).get(i).query(new SolrQuery("*:*")).getResults().getNumFound();
++          break;
++        } catch(SolrServerException e) {
++          // if we have a problem, try the next one
++          if (i == times - 1) {
++            throw e;
++          }
++        }
++      }
++    }
++    assertEquals(docs, cnt);
++  }
++  
++  protected void checkShardConsistency() throws SolrServerException {
++    Set<String> theShards = shardToClient.keySet();
++    for (String shard : theShards) {
++      checkShardConsistency(shard);
++    }
+   }
+ 
+   private SolrServer getClient(String nodeName) {
+@@ -788,10 +814,10 @@ private SolrServer getClient(String nodeName) {
+     return null;
+   }
+ 
+-  protected void assertDocCounts() throws Exception {
++  protected void assertDocCounts(boolean verbose) throws Exception {
+     // TODO: as we create the clients, we should build a map from shard to node/client
+     // and node/client to shard?
+-    if (VERBOSE) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
++    if (verbose) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
+     long controlCount = controlClient.query(new SolrQuery("*:*")).getResults().getNumFound();
+ 
+     // do some really inefficient mapping...
+@@ -816,7 +842,7 @@ protected void assertDocCounts() throws Exception {
+         Map<String,ZkNodeProps> theShards = slice.getValue().getShards();
+         for (Map.Entry<String,ZkNodeProps> shard : theShards.entrySet()) {
+           String shardName = new URI(((CommonsHttpSolrServer)client).getBaseURL()).getPort() + "_solr_";
+-          if (VERBOSE && shard.getKey().endsWith(shardName)) {
++          if (verbose && shard.getKey().endsWith(shardName)) {
+             System.out.println("shard:" + slice.getKey());
+             System.out.println(shard.getValue());
+           }
+@@ -829,9 +855,9 @@ protected void assertDocCounts() throws Exception {
+         count = client.query(new SolrQuery("*:*")).getResults().getNumFound();
+       }
+ 
+-      if (VERBOSE) System.out.println("client docs:" + count + "\n\n");
++      if (verbose) System.out.println("client docs:" + count + "\n\n");
+     }
+-    if (VERBOSE) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
++    if (verbose) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
+     SolrQuery query = new SolrQuery("*:*");
+     query.add("distrib", "true");
+     assertEquals("Doc Counts do not add up", controlCount, cloudClient.query(query).getResults().getNumFound());

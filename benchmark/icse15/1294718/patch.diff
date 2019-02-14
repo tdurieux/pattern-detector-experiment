@@ -1,0 +1,152 @@
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+index d27a1401..a83fed4b 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+@@ -19,6 +19,7 @@
+ import org.apache.lucene.index.IndexCommit;
+ import org.apache.lucene.index.IndexDeletionPolicy;
+ import org.apache.lucene.index.IndexReader;
++import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.params.CommonParams;
+ import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.params.SolrParams;
+@@ -86,6 +87,8 @@
+ 
+   private boolean replicateOnStart = false;
+ 
++  private int numberBackupsToKeep = 0; //zero: do not delete old backups
++
+   private int numTimesReplicated = 0;
+ 
+   private final Map<String, FileInfo> confFileInfoCache = new HashMap<String, FileInfo>();
+@@ -278,18 +281,31 @@ boolean isReplicating() {
+     return snapPullLock.isLocked();
+   }
+ 
+-  private void doSnapShoot(SolrParams params, SolrQueryResponse rsp, SolrQueryRequest req) {
++  private void doSnapShoot(SolrParams params, SolrQueryResponse rsp,
++      SolrQueryRequest req) {
+     try {
+-      int numberToKeep = params.getInt(NUMBER_BACKUPS_TO_KEEP, Integer.MAX_VALUE);
++      int numberToKeep = params.getInt(NUMBER_BACKUPS_TO_KEEP_REQUEST_PARAM, 0);
++      if (numberToKeep > 0 && numberBackupsToKeep > 0) {
++        throw new SolrException(ErrorCode.BAD_REQUEST, "Cannot use "
++            + NUMBER_BACKUPS_TO_KEEP_REQUEST_PARAM + " if "
++            + NUMBER_BACKUPS_TO_KEEP_INIT_PARAM
++            + " was specified in the configuration.");
++      }
++      numberToKeep = Math.max(numberToKeep, numberBackupsToKeep);
++      if (numberToKeep < 1) {
++        numberToKeep = Integer.MAX_VALUE;
++      }
++      
+       IndexDeletionPolicyWrapper delPolicy = core.getDeletionPolicy();
+       IndexCommit indexCommit = delPolicy.getLatestCommit();
+       
+-      if(indexCommit == null) {
++      if (indexCommit == null) {
+         indexCommit = req.getSearcher().getReader().getIndexCommit();
+       }
+       
+       // small race here before the commit point is saved
+-      new SnapShooter(core, params.get("location")).createSnapAsync(indexCommit, numberToKeep, this);
++      new SnapShooter(core, params.get("location")).createSnapAsync(
++          indexCommit, numberToKeep, this);
+       
+     } catch (Exception e) {
+       LOG.warn("Exception during creating a snapshot", e);
+@@ -778,6 +794,12 @@ public void inform(SolrCore core) {
+     this.core = core;
+     registerFileStreamResponseWriter();
+     registerCloseHook();
++    Object nbtk = initArgs.get(NUMBER_BACKUPS_TO_KEEP_INIT_PARAM);
++    if(nbtk!=null) {
++      numberBackupsToKeep = Integer.parseInt(nbtk.toString());
++    } else {
++      numberBackupsToKeep = 0;
++    }
+     NamedList slave = (NamedList) initArgs.get("slave");
+     boolean enableSlave = isEnabled( slave );
+     if (enableSlave) {
+@@ -1155,5 +1177,7 @@ private void writeNothing() throws IOException {
+ 
+   public static final String NEXT_EXECUTION_AT = "nextExecutionAt";
+   
+-  public static final String NUMBER_BACKUPS_TO_KEEP = "numberToKeep";
++  public static final String NUMBER_BACKUPS_TO_KEEP_REQUEST_PARAM = "numberToKeep";
++  
++  public static final String NUMBER_BACKUPS_TO_KEEP_INIT_PARAM = "maxNumberOfBackups";
+ }
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+index 44099f68..2d89a78b 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/handler/SnapShooter.java
+@@ -135,7 +135,7 @@ private void deleteOldBackups(int numberToKeep) {
+     Collections.sort(dirs);
+     int i=1;
+     for(OldBackupDirectory dir : dirs) {
+-      if( i > numberToKeep-1 ) {
++      if( i++ > numberToKeep-1 ) {
+         SnapPuller.delTree(dir.dir);
+       }
+     }   
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java b/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+index 103cf48f..f769f597 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+@@ -619,9 +619,16 @@ private void doTestIndexAndConfigAliasReplication() throws Exception {
+ 
+   
+   private void doTestBackup() throws Exception {
+-
++    String configFile = "solrconfig-master1.xml";
++    boolean addNumberToKeepInRequest = true;
++    String backupKeepParamName = ReplicationHandler.NUMBER_BACKUPS_TO_KEEP_REQUEST_PARAM;
++    if(random.nextBoolean()) {
++      configFile = "solrconfig-master1-keepOneBackup.xml";
++      addNumberToKeepInRequest = false;
++      backupKeepParamName = ReplicationHandler.NUMBER_BACKUPS_TO_KEEP_INIT_PARAM;
++    }
+     masterJetty.stop();
+-    master.copyConfigFile(CONF_DIR + "solrconfig-master1.xml", 
++    master.copyConfigFile(CONF_DIR + configFile, 
+                           "solrconfig.xml");
+ 
+     masterJetty = createJetty(master);
+@@ -636,9 +643,17 @@ private void doTestBackup() throws Exception {
+    
+     class BackupThread extends Thread {
+       volatile String fail = null;
++      final boolean addNumberToKeepInRequest;
++      String backupKeepParamName;
++      BackupThread(boolean addNumberToKeepInRequest, String backupKeepParamName) {
++        this.addNumberToKeepInRequest = addNumberToKeepInRequest;
++        this.backupKeepParamName = backupKeepParamName;
++      }
+       @Override
+       public void run() {
+-        String masterUrl = "http://localhost:" + masterJetty.getLocalPort() + "/solr/replication?command=" + ReplicationHandler.CMD_BACKUP + "&" + ReplicationHandler.NUMBER_BACKUPS_TO_KEEP + "=1";
++        String masterUrl = 
++          "http://localhost:" + masterJetty.getLocalPort() + "/solr/replication?command=" + ReplicationHandler.CMD_BACKUP + 
++          (addNumberToKeepInRequest ? "&" + backupKeepParamName + "=1" : "");
+         URL url;
+         InputStream stream = null;
+         try {
+@@ -697,7 +712,7 @@ public void run() {
+     File[] snapDir = new File[2];
+     String firstBackupTimestamp = null;
+     for(int i=0 ; i<2 ; i++) {
+-      BackupThread backupThread = new BackupThread();
++      BackupThread backupThread = new BackupThread(addNumberToKeepInRequest, backupKeepParamName);
+       backupThread.start();
+       
+       File dataDir = new File(master.getDataDir());
+@@ -748,7 +763,7 @@ public boolean accept(File dir, String name) {
+       dir.close();
+     }
+     if(snapDir[0].exists()) {
+-      fail("The first backup should have been cleaned up because " + ReplicationHandler.NUMBER_BACKUPS_TO_KEEP + " was set to 1");
++      fail("The first backup should have been cleaned up because " + backupKeepParamName + " was set to 1.");
+     }
+     
+     for(int i=0 ; i< snapDir.length ; i++) {

@@ -1,0 +1,372 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 8f8930a7..0577bece 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -496,6 +496,15 @@ void applyBinary(DecoratedKey key, byte[] buffer)
+         writeStats_.addNano(System.nanoTime() - start);
+     }
+ 
++    public static ColumnFamily removeDeletedCF(ColumnFamily cf, int gcBefore)
++    {
++        // in case of a timestamp tie, tombstones get priority over non-tombstones.
++        // (we want this to be deterministic to avoid confusion.)
++        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
++            return null;
++        return cf;
++    }
++
+     /*
+      This is complicated because we need to preserve deleted columns, supercolumns, and columnfamilies
+      until they have been deleted for at least GC_GRACE_IN_SECONDS.  But, we do not need to preserve
+@@ -509,25 +518,24 @@ public static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
+             return null;
+         }
+ 
++        removeDeletedColumnsOnly(cf, gcBefore);
++        return removeDeletedCF(cf, gcBefore);
++    }
++
++    private static void removeDeletedColumnsOnly(ColumnFamily cf, int gcBefore)
++    {
+         if (cf.isSuper())
+             removeDeletedSuper(cf, gcBefore);
+         else
+             removeDeletedStandard(cf, gcBefore);
+-
+-        // in case of a timestamp tie, tombstones get priority over non-tombstones.
+-        // (we want this to be deterministic to avoid confusion.)
+-        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
+-        {
+-            return null;
+-        }
+-        return cf;
+     }
+ 
+     private static void removeDeletedStandard(ColumnFamily cf, int gcBefore)
+     {
+-        for (byte[] cname : cf.getColumnNames())
++        for (Map.Entry<byte[], IColumn> entry : cf.getColumnsMap().entrySet())
+         {
+-            IColumn c = cf.getColumnsMap().get(cname);
++            byte[] cname = entry.getKey();
++            IColumn c = entry.getValue();
+             // remove columns if
+             // (a) the column itself is tombstoned or
+             // (b) the CF is tombstoned and the column is not newer than it
+@@ -552,9 +560,9 @@ private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
+         // TODO assume deletion means "most are deleted?" and add to clone, instead of remove from original?
+         // this could be improved by having compaction, or possibly even removeDeleted, r/m the tombstone
+         // once gcBefore has passed, so if new stuff is added in it doesn't used the wrong algorithm forever
+-        for (byte[] cname : cf.getColumnNames())
++        for (Map.Entry<byte[], IColumn> entry : cf.getColumnsMap().entrySet())
+         {
+-            IColumn c = cf.getColumnsMap().get(cname);
++            SuperColumn c = (SuperColumn) entry.getValue();
+             List<IClock> clocks = Arrays.asList(cf.getMarkedForDeleteAt());
+             IClock minClock = c.getMarkedForDeleteAt().getSuperset(clocks);
+             for (IColumn subColumn : c.getSubColumns())
+@@ -565,14 +573,14 @@ private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
+                 // (we split the test to avoid computing ClockRelationship if not necessary)
+                 if (subColumn.isMarkedForDelete() && subColumn.getLocalDeletionTime() <= gcBefore)
+                 {
+-                    ((SuperColumn)c).remove(subColumn.name());
++                    c.remove(subColumn.name());
+                 }
+                 else
+                 {
+                     ClockRelationship subRel = subColumn.clock().compare(minClock);
+                     if ((ClockRelationship.LESS_THAN == subRel) || (ClockRelationship.EQUAL == subRel))
+                     {
+-                        ((SuperColumn)c).remove(subColumn.name());
++                        c.remove(subColumn.name());
+                     }
+                 }
+             }
+@@ -783,6 +791,11 @@ public ColumnFamily getColumnFamily(DecoratedKey key, QueryPath path, byte[] sta
+         return getColumnFamily(QueryFilter.getSliceFilter(key, path, start, finish, null, reversed, limit));
+     }
+ 
++    /**
++     * get a list of columns starting from a given column, in a specified order.
++     * only the latest version of a column is returned.
++     * @return null if there is no data and no tombstones; otherwise a ColumnFamily
++     */
+     public ColumnFamily getColumnFamily(QueryFilter filter)
+     {
+         return getColumnFamily(filter, CompactionManager.getDefaultGCBefore());
+@@ -801,12 +814,7 @@ private ColumnFamily cacheRow(DecoratedKey key)
+         return cached;
+     }
+ 
+-    /**
+-     * get a list of columns starting from a given column, in a specified order.
+-     * only the latest version of a column is returned.
+-     * @return null if there is no data and no tombstones; otherwise a ColumnFamily
+-     */
+-    public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
++    private ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+     {
+         assert columnFamily_.equals(filter.getColumnFamilyName());
+ 
+@@ -814,17 +822,37 @@ public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+         try
+         {
+             if (ssTables_.getRowCache().getCapacity() == 0)
+-                return removeDeleted(getTopLevelColumns(filter, gcBefore), gcBefore);
++            {
++                ColumnFamily cf = getTopLevelColumns(filter, gcBefore);
++                // TODO this is necessary because when we collate supercolumns together, we don't check
++                // their subcolumns for relevance, so we need to do a second prune post facto here.
++                return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
++            }
+ 
+             ColumnFamily cached = cacheRow(filter.key);
+             if (cached == null)
+                 return null;
++            
++            // special case slicing the entire row:
++            // we can skip the filter step entirely, and we can help out removeDeleted by re-caching the result
++            // if any tombstones have aged out since last time.  (This means that the row cache will treat gcBefore as
++            // max(gcBefore, all previous gcBefore), which is fine for correctness.)
++            if (filter.filter instanceof SliceQueryFilter)
++            {
++                SliceQueryFilter sliceFilter = (SliceQueryFilter) filter.filter;
++                if (sliceFilter.start.length == 0 && sliceFilter.finish.length == 0 && sliceFilter.count > cached.getColumnCount())
++                {
++                    removeDeletedColumnsOnly(cached, gcBefore);
++                    return removeDeletedCF(cached, gcBefore);
++                }
++            }
++            
+             IColumnIterator ci = filter.getMemtableColumnIterator(cached, null, getComparator());
+-            ColumnFamily returnCF = ci.getColumnFamily().cloneMeShallow();
+-            filter.collectCollatedColumns(returnCF, ci, gcBefore);
++            ColumnFamily cf = ci.getColumnFamily().cloneMeShallow();
++            filter.collectCollatedColumns(cf, ci, gcBefore);
+             // TODO this is necessary because when we collate supercolumns together, we don't check
+             // their subcolumns for relevance, so we need to do a second prune post facto here.
+-            return removeDeleted(returnCF, gcBefore);
++            return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
+         }
+         catch (IOException e)
+         {
+@@ -878,7 +906,10 @@ private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore)
+             Comparator<IColumn> comparator = QueryFilter.getColumnComparator(getComparator());
+             Iterator collated = IteratorUtils.collatedIterator(comparator, iterators);
+             filter.collectCollatedColumns(returnCF, collated, gcBefore);
+-            return returnCF; // caller is responsible for final removeDeleted
++            // Caller is responsible for final removeDeletedCF.  This is important for cacheRow to work correctly:
++            // we need to distinguish between "there is no data at all for this row" (BF will let us rebuild that efficiently)
++            // and "there used to be data, but it's gone now" (we should cache the empty CF so we don't need to rebuild that slower)
++            return returnCF;
+         }
+         catch (IOException e)
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 11b02a9f..17588ae6 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -238,9 +238,7 @@ public boolean hasNext()
+ 
+             public IColumn next()
+             {
+-                // clone supercolumns so caller can freely removeDeleted or otherwise mutate it
+-                // TODO can't the callers that wish to mutate it clone it themselves?
+-                return isSuper ? ((SuperColumn) filteredIter.next()).cloneMe() : filteredIter.next();
++                return filteredIter.next();
+             }
+         };
+     }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+index a0e34714..eae3f991 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+@@ -40,7 +40,7 @@
+ 
+     public final DecoratedKey key;
+     public final QueryPath path;
+-    private final IFilter filter;
++    public final IFilter filter;
+     private final IFilter superFilter;
+ 
+     public QueryFilter(DecoratedKey key, QueryPath path, IFilter filter)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+index e78a61ac..bd28403f 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+@@ -81,7 +81,6 @@ public IColumnIterator getSSTableColumnIterator(SSTableReader sstable, FileDataI
+                : getBitmaskMatchColumnPredicate();
+     }
+ 
+-
+     public SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore)
+     {
+         // we clone shallow, then add, under the theory that generally we're interested in a relatively small number of subcolumns.
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/LazilyCompactedRow.java b/cassandra/trunk/src/java/org/apache/cassandra/io/LazilyCompactedRow.java
+index eb193052..21d745f0 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/LazilyCompactedRow.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/LazilyCompactedRow.java
+@@ -117,7 +117,7 @@ public void update(MessageDigest digest)
+ 
+     public boolean isEmpty()
+     {
+-        boolean cfIrrelevant = ColumnFamilyStore.removeDeleted(emptyColumnFamily, gcBefore) == null;
++        boolean cfIrrelevant = ColumnFamilyStore.removeDeletedCF(emptyColumnFamily, gcBefore) == null;
+         return cfIrrelevant && columnCount == 0;
+     }
+ 
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/Util.java b/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+index edca3a20..a7dc60be 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+@@ -105,4 +105,9 @@ public static ColumnFamily getColumnFamily(Table table, DecoratedKey key, String
+         assert cfStore != null : "Column family " + cfName + " has not been defined";
+         return cfStore.getColumnFamily(QueryFilter.getIdentityFilter(key, new QueryPath(cfName)));
+     }
++
++    public static ColumnFamily cloneAndRemoveDeleted(ColumnFamily cf, int gcBefore)
++    {
++        return ColumnFamilyStore.removeDeleted(cf.cloneMe(), gcBefore);
++    }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyTest.java
+index cae6930c..4c443a4e 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyTest.java
+@@ -53,6 +53,6 @@ public void testRemoveColumnFamily() throws IOException, ExecutionException, Int
+         ColumnFamily retrieved = store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Standard1", null, "Column1".getBytes())));
+         assert retrieved.isMarkedForDelete();
+         assertNull(retrieved.getColumn("Column1".getBytes()));
+-        assertNull(ColumnFamilyStore.removeDeleted(retrieved, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(retrieved, Integer.MAX_VALUE));
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush1Test.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush1Test.java
+index 435b41a7..1bf2866c 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush1Test.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush1Test.java
+@@ -55,6 +55,6 @@ public void testRemoveColumnFamilyWithFlush1() throws IOException, ExecutionExce
+         ColumnFamily retrieved = store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Standard1")));
+         assert retrieved.isMarkedForDelete();
+         assertNull(retrieved.getColumn("Column1".getBytes()));
+-        assertNull(ColumnFamilyStore.removeDeleted(retrieved, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(retrieved, Integer.MAX_VALUE));
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush2Test.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush2Test.java
+index 688bbf89..f596db66 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush2Test.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnFamilyWithFlush2Test.java
+@@ -53,6 +53,6 @@ public void testRemoveColumnFamilyWithFlush2() throws IOException, ExecutionExce
+         ColumnFamily retrieved = store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Standard1", null, "Column1".getBytes())));
+         assert retrieved.isMarkedForDelete();
+         assertNull(retrieved.getColumn("Column1".getBytes()));
+-        assertNull(ColumnFamilyStore.removeDeleted(retrieved, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(retrieved, Integer.MAX_VALUE));
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnTest.java
+index 6cfdc44f..3e6ecf1b 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveColumnTest.java
+@@ -24,7 +24,7 @@
+ import org.junit.Test;
+ 
+ import static junit.framework.Assert.assertNull;
+-import org.apache.cassandra.db.filter.NamesQueryFilter;
++
+ import org.apache.cassandra.db.filter.QueryFilter;
+ import org.apache.cassandra.db.filter.QueryPath;
+ 
+@@ -54,7 +54,7 @@ public void testRemoveColumn() throws IOException, ExecutionException, Interrupt
+ 
+         ColumnFamily retrieved = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Standard1"), "Column1".getBytes()));
+         assert retrieved.getColumn("Column1".getBytes()).isMarkedForDelete();
+-        assertNull(ColumnFamilyStore.removeDeleted(retrieved, Integer.MAX_VALUE));
+-        assertNull(ColumnFamilyStore.removeDeleted(store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Standard1"))), Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(retrieved, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Standard1"))), Integer.MAX_VALUE));
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSubColumnTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSubColumnTest.java
+index 6b97f018..7bf31162 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSubColumnTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSubColumnTest.java
+@@ -53,6 +53,6 @@ public void testRemoveSubColumn() throws IOException, ExecutionException, Interr
+ 
+         ColumnFamily retrieved = store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Super1", "SC1".getBytes())));
+         assert retrieved.getColumn("SC1".getBytes()).getSubColumn(getBytes(1)).isMarkedForDelete();
+-        assertNull(ColumnFamilyStore.removeDeleted(retrieved, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(retrieved, Integer.MAX_VALUE));
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+index 184fda58..350ab0fa 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+@@ -93,20 +93,24 @@ public void testRemoveDeletedSubColumn() throws IOException, ExecutionException,
+     private void validateRemoveSubColumn(DecoratedKey dk) throws IOException
+     {
+         ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Super3");
+-        assertNull(store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super3", "SC1".getBytes()), Util.getBytes(1)), Integer.MAX_VALUE));
+-        assertNotNull(store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super3", "SC1".getBytes()), Util.getBytes(2)), Integer.MAX_VALUE));
++        ColumnFamily cf = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super3", "SC1".getBytes()), Util.getBytes(1)));
++        assertNull(Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE));
++        cf = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super3", "SC1".getBytes()), Util.getBytes(2)));
++        assertNotNull(Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE));
+     }
+ 
+     private void validateRemoveTwoSources(DecoratedKey dk) throws IOException
+     {
+         ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Super1");
+-        ColumnFamily resolved = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super1"), "SC1".getBytes()));
+-        assert ((TimestampClock)resolved.getSortedColumns().iterator().next().getMarkedForDeleteAt()).timestamp() == 1 : resolved;
+-        assert resolved.getSortedColumns().iterator().next().getSubColumns().size() == 0 : resolved;
+-        assertNull(ColumnFamilyStore.removeDeleted(resolved, Integer.MAX_VALUE));
+-        assertNull(store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super1"), "SC1".getBytes()), Integer.MAX_VALUE));
+-        assertNull(store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Super1")), Integer.MAX_VALUE));
+-        assertNull(ColumnFamilyStore.removeDeleted(store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Super1"))), Integer.MAX_VALUE));
++        ColumnFamily cf = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super1"), "SC1".getBytes()));
++        assert ((TimestampClock)cf.getSortedColumns().iterator().next().getMarkedForDeleteAt()).timestamp() == 1 : cf;
++        assert cf.getSortedColumns().iterator().next().getSubColumns().size() == 0 : cf;
++        assertNull(Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE));
++        cf = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super1"), "SC1".getBytes()));
++        assertNull(Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE));
++        cf = store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Super1")));
++        assertNull(Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(store.getColumnFamily(QueryFilter.getIdentityFilter(dk, new QueryPath("Super1"))), Integer.MAX_VALUE));
+     }
+ 
+     private void validateRemoveCompacted(DecoratedKey dk) throws IOException
+@@ -154,8 +158,8 @@ public void testRemoveSuperColumnWithNewData() throws IOException, ExecutionExce
+     private void validateRemoveWithNewData(DecoratedKey dk) throws IOException
+     {
+         ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Super2");
+-        ColumnFamily resolved = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super2", "SC1".getBytes()), getBytes(2)), Integer.MAX_VALUE);
+-        Collection<IColumn> subColumns = resolved.getSortedColumns().iterator().next().getSubColumns();
++        ColumnFamily cf = store.getColumnFamily(QueryFilter.getNamesFilter(dk, new QueryPath("Super2", "SC1".getBytes()), getBytes(2)));
++        Collection<IColumn> subColumns = cf.getSortedColumns().iterator().next().getSubColumns();
+         assert subColumns.size() == 1;
+         assert ((TimestampClock)subColumns.iterator().next().clock()).timestamp() == 2;
+     }
+@@ -176,7 +180,7 @@ public void testRemoveSuperColumnResurrection() throws IOException, ExecutionExc
+         rm = new RowMutation("Keyspace1", key.key);
+         rm.delete(new QueryPath("Super2", "SC1".getBytes()), new TimestampClock(1));
+         rm.apply();
+-        assertNull(store.getColumnFamily(QueryFilter.getNamesFilter(key, new QueryPath("Super2"), "SC1".getBytes()), Integer.MAX_VALUE));
++        assertNull(Util.cloneAndRemoveDeleted(store.getColumnFamily(QueryFilter.getNamesFilter(key, new QueryPath("Super2"), "SC1".getBytes())), Integer.MAX_VALUE));
+ 
+         // resurrect
+         rm = new RowMutation("Keyspace1", key.key);
+@@ -184,8 +188,9 @@ public void testRemoveSuperColumnResurrection() throws IOException, ExecutionExc
+         rm.apply();
+ 
+         // validate
+-        ColumnFamily resolved = store.getColumnFamily(QueryFilter.getNamesFilter(key, new QueryPath("Super2"), "SC1".getBytes()), Integer.MAX_VALUE);
+-        Collection<IColumn> subColumns = resolved.getSortedColumns().iterator().next().getSubColumns();
++        ColumnFamily cf = store.getColumnFamily(QueryFilter.getNamesFilter(key, new QueryPath("Super2"), "SC1".getBytes()));
++        cf = Util.cloneAndRemoveDeleted(cf, Integer.MAX_VALUE);
++        Collection<IColumn> subColumns = cf.getSortedColumns().iterator().next().getSubColumns();
+         assert subColumns.size() == 1;
+         assert ((TimestampClock)subColumns.iterator().next().clock()).timestamp() == 2;
+     }

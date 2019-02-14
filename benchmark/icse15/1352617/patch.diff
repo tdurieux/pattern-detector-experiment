@@ -1,0 +1,336 @@
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java
+index 1dc05e46..1eec53c3 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriter.java
+@@ -202,7 +202,6 @@ private void ensureOpen() throws AlreadyClosedException {
+    *  discarding any docs added since last flush. */
+   synchronized void abort() throws IOException {
+     boolean success = false;
+-
+     synchronized (this) {
+       deleteQueue.clear();
+     }
+@@ -233,6 +232,7 @@ synchronized void abort() throws IOException {
+           perThread.unlock();
+         }
+       }
++      flushControl.waitForFlush();
+       success = true;
+     } finally {
+       if (infoStream.isEnabled("DW")) {
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java
+index 191f2dce..cf41ea08 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterFlushControl.java
+@@ -343,9 +343,11 @@ DocumentsWriterPerThread nextPendingFlush() {
+ 
+   synchronized void setClosed() {
+     // set by DW to signal that we should not release new DWPT after close
++    if (!closed) {
+     this.closed = true;
+     perThreadPool.deactivateUnreleasedStates();
+   }
++  }
+ 
+   /**
+    * Returns an iterator that provides access to all currently active {@link ThreadState}s 
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+index 24d00f57..ac0eedd8 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/DocumentsWriterPerThread.java
+@@ -463,10 +463,6 @@ FlushedSegment flush() throws IOException {
+       pendingDeletes.docIDs.clear();
+     }
+ 
+-    if (infoStream.isEnabled("DWPT")) {
+-      infoStream.message("DWPT", "flush postings as segment " + flushState.segmentInfo.name + " numDocs=" + numDocsInRAM);
+-    }
+-
+     if (aborting) {
+       if (infoStream.isEnabled("DWPT")) {
+         infoStream.message("DWPT", "flush: skip because aborting is set");
+@@ -474,6 +470,10 @@ FlushedSegment flush() throws IOException {
+       return null;
+     }
+ 
++    if (infoStream.isEnabled("DWPT")) {
++      infoStream.message("DWPT", "flush postings as segment " + flushState.segmentInfo.name + " numDocs=" + numDocsInRAM);
++    }
++
+     boolean success = false;
+ 
+     try {
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index f3e394fc..76dc594d 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -843,15 +843,19 @@ public void close() throws CorruptIndexException, IOException {
+    */
+   public void close(boolean waitForMerges) throws CorruptIndexException, IOException {
+ 
+-    // Ensure that only one thread actually gets to do the closing:
++    // Ensure that only one thread actually gets to do the
++    // closing, and make sure no commit is also in progress:
++    synchronized(commitLock) {
+     if (shouldClose()) {
+       // If any methods have hit OutOfMemoryError, then abort
+       // on close, in case the internal state of IndexWriter
+       // or DocumentsWriter is corrupt
+-      if (hitOOM)
++        if (hitOOM) {
+         rollbackInternal();
+-      else
+-        closeInternal(waitForMerges);
++        } else {
++          closeInternal(waitForMerges, !hitOOM);
++        }
++      }
+     }
+   }
+ 
+@@ -870,12 +874,13 @@ synchronized private boolean shouldClose() {
+           // successfully) or another (fails to close)
+           doWait();
+         }
+-      } else
++      } else {
+         return false;
+     }
+   }
++  }
+ 
+-  private void closeInternal(boolean waitForMerges) throws CorruptIndexException, IOException {
++  private void closeInternal(boolean waitForMerges, boolean doFlush) throws CorruptIndexException, IOException {
+ 
+     try {
+ 
+@@ -891,8 +896,10 @@ private void closeInternal(boolean waitForMerges) throws CorruptIndexException,
+ 
+       // Only allow a new merge to be triggered if we are
+       // going to wait for merges:
+-      if (!hitOOM) {
++      if (doFlush) {
+         flush(waitForMerges, true);
++      } else {
++        docWriter.abort(); // already closed
+       }
+ 
+       if (waitForMerges)
+@@ -912,7 +919,7 @@ private void closeInternal(boolean waitForMerges) throws CorruptIndexException,
+         infoStream.message("IW", "now call final commit()");
+       }
+ 
+-      if (!hitOOM) {
++      if (doFlush) {
+         commitInternal(null);
+       }
+ 
+@@ -1776,10 +1783,14 @@ private synchronized void updatePendingMerges(int maxNumSegments)
+   public void rollback() throws IOException {
+     ensureOpen();
+ 
+-    // Ensure that only one thread actually gets to do the closing:
+-    if (shouldClose())
++    // Ensure that only one thread actually gets to do the
++    // closing, and make sure no commit is also in progress:
++    synchronized(commitLock) {
++      if (shouldClose()) {
+       rollbackInternal();
+   }
++    }
++  }
+ 
+   private void rollbackInternal() throws IOException {
+ 
+@@ -1789,6 +1800,7 @@ private void rollbackInternal() throws IOException {
+       infoStream.message("IW", "rollback");
+     }
+ 
++
+     try {
+       synchronized(this) {
+         finishMerges(false);
+@@ -1806,7 +1818,8 @@ private void rollbackInternal() throws IOException {
+       mergeScheduler.close();
+ 
+       bufferedDeletesStream.clear();
+-
++      docWriter.close(); // mark it as closed first to prevent subsequent indexing actions/flushes 
++      docWriter.abort();
+       synchronized(this) {
+ 
+         if (pendingCommit != null) {
+@@ -1829,7 +1842,6 @@ private void rollbackInternal() throws IOException {
+           infoStream.message("IW", "rollback: infos=" + segString(segmentInfos));
+         }
+ 
+-        docWriter.abort();
+ 
+         assert testPoint("rollback before checkpoint");
+ 
+@@ -1856,7 +1868,7 @@ private void rollbackInternal() throws IOException {
+       }
+     }
+ 
+-    closeInternal(false);
++    closeInternal(false, false);
+   }
+ 
+   /**
+@@ -2504,6 +2516,7 @@ public final void prepareCommit() throws CorruptIndexException, IOException {
+   public final void prepareCommit(Map<String,String> commitUserData) throws CorruptIndexException, IOException {
+     ensureOpen(false);
+ 
++    synchronized(commitLock) {
+     if (infoStream.isEnabled("IW")) {
+       infoStream.message("IW", "prepareCommit: flush");
+       infoStream.message("IW", "  index before flush " + segString());
+@@ -2595,8 +2608,10 @@ public final void prepareCommit(Map<String,String> commitUserData) throws Corrup
+ 
+     startCommit(toCommit, commitUserData);
+   }
++  }
+ 
+-  // Used only by commit, below; lock order is commitLock -> IW
++  // Used only by commit and prepareCommit, below; lock
++  // order is commitLock -> IW
+   private final Object commitLock = new Object();
+ 
+   /**
+@@ -2656,6 +2671,8 @@ private final void commitInternal(Map<String,String> commitUserData) throws Corr
+     }
+ 
+     synchronized(commitLock) {
++      ensureOpen(false);
++
+       if (infoStream.isEnabled("IW")) {
+         infoStream.message("IW", "commit: enter lock");
+       }
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterWithThreads.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterWithThreads.java
+index d7fe92e7..87a0ba94 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterWithThreads.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterWithThreads.java
+@@ -20,6 +20,10 @@
+ 
+ import java.io.IOException;
+ import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicReference;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReentrantLock;
+ 
+ import org.apache.lucene.analysis.MockAnalyzer;
+ import org.apache.lucene.document.Document;
+@@ -32,6 +36,8 @@
+ import org.apache.lucene.store.MockDirectoryWrapper;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
++import org.apache.lucene.util.LineFileDocs;
++import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util._TestUtil;
+@@ -39,6 +45,7 @@
+ /**
+  * MultiThreaded IndexWriter tests
+  */
++@SuppressCodecs("Lucene3x")
+ public class TestIndexWriterWithThreads extends LuceneTestCase {
+ 
+   // Used by test cases below
+@@ -494,4 +501,95 @@ public void run() {
+        }
+      }
+    }
++
++  // LUCENE-4147
++  public void testRollbackAndCommitWithThreads() throws Exception {
++    final MockDirectoryWrapper d = newFSDirectory(_TestUtil.getTempDir("RollbackAndCommitWithThreads"));
++    d.setPreventDoubleWrite(false);
++
++    final int threadCount = _TestUtil.nextInt(random(), 2, 6);
++
++    final AtomicReference<IndexWriter> writerRef = new AtomicReference<IndexWriter>();
++    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
++    final LineFileDocs docs = new LineFileDocs(random());
++    final Thread[] threads = new Thread[threadCount];
++    final int iters = atLeast(1000);
++    final AtomicBoolean failed = new AtomicBoolean();
++    final Lock rollbackLock = new ReentrantLock();
++    final Lock commitLock = new ReentrantLock();
++    for(int threadID=0;threadID<threadCount;threadID++) {
++      threads[threadID] = new Thread() {
++          @Override
++          public void run() {
++            for(int iter=0;iter<iters && !failed.get();iter++) {
++              //final int x = random().nextInt(5);
++              final int x = random().nextInt(3);
++              try {
++                switch(x) {
++                case 0:
++                  rollbackLock.lock();
++                  if (VERBOSE) {
++                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now rollback");
++                  }
++                  try {
++                    writerRef.get().rollback();
++                    if (VERBOSE) {
++                      System.out.println("TEST: " + Thread.currentThread().getName() + ": rollback done; now open new writer");
++                    }
++                    writerRef.set(new IndexWriter(d, newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()))));
++                  } finally {
++                    rollbackLock.unlock();
++                  }
++                  break;
++                case 1:
++                  commitLock.lock();
++                  if (VERBOSE) {
++                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now commit");
++                  }
++                  try {
++                    if (random().nextBoolean()) {
++                      writerRef.get().prepareCommit();
++                    }
++                    writerRef.get().commit();
++                  } catch (AlreadyClosedException ace) {
++                    // ok
++                  } catch (NullPointerException npe) {
++                    // ok
++                  } finally {
++                    commitLock.unlock();
++                  }
++                  break;
++                case 2:
++                  if (VERBOSE) {
++                    System.out.println("\nTEST: " + Thread.currentThread().getName() + ": now add");
++                  }
++                  try {
++                    writerRef.get().addDocument(docs.nextDoc());
++                  } catch (AlreadyClosedException ace) {
++                    // ok
++                  } catch (NullPointerException npe) {
++                    // ok
++                  } catch (AssertionError ae) {
++                    // ok
++                  }
++                  break;
++                }
++              } catch (Throwable t) {
++                failed.set(true);
++                throw new RuntimeException(t);
++              }
++            }
++          }
++        };
++      threads[threadID].start();
++    }
++
++    for(int threadID=0;threadID<threadCount;threadID++) {
++      threads[threadID].join();
++    }
++
++    assertTrue(!failed.get());
++    writerRef.get().close();
++    d.close();
++  }
+ }

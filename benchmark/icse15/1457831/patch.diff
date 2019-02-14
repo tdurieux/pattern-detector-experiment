@@ -1,0 +1,166 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+index 1e81d855..48a28513 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+@@ -70,14 +70,16 @@ public CacheValue(String path, Directory directory) {
+     // has close(Directory) been called on this?
+     public boolean closeDirectoryCalled = false;
+     public boolean doneWithDir = false;
++    private boolean deleteAfterCoreClose = false;
+     public Set<CacheValue> removeEntries = new HashSet<CacheValue>();
+     public Set<CacheValue> closeEntries = new HashSet<CacheValue>();
+     
+-    public void setDeleteOnClose(boolean deleteOnClose) {
++    public void setDeleteOnClose(boolean deleteOnClose, boolean deleteAfterCoreClose) {
+       if (deleteOnClose) {
+         removeEntries.add(this);
+       }
+       this.deleteOnClose = deleteOnClose;
++      this.deleteAfterCoreClose = deleteAfterCoreClose;
+     }
+     
+     @Override
+@@ -95,6 +97,8 @@ public String toString() {
+   
+   protected Map<Directory,List<CloseListener>> closeListeners = new HashMap<Directory,List<CloseListener>>();
+ 
++  protected Set<CacheValue> removeEntries = new HashSet<CacheValue>();
++
+   private Double maxWriteMBPerSecFlush;
+ 
+   private Double maxWriteMBPerSecMerge;
+@@ -187,6 +191,11 @@ public void close() throws IOException {
+       
+       byDirectoryCache.clear();
+       byPathCache.clear();
++      
++      for (CacheValue val : removeEntries) {
++        log.info("Removing directory: " + val.path);
++        removeDirectory(val);
++      }
+     }
+   }
+   
+@@ -246,6 +255,9 @@ private void closeDirectory(CacheValue cacheValue) {
+         // get a sub path to close us later
+         if (otherCacheValue.path.startsWith(cacheValue.path) && !otherCacheValue.closeDirectoryCalled) {
+           // we let the sub dir remove and close us
++          if (!otherCacheValue.deleteAfterCoreClose && cacheValue.deleteAfterCoreClose) {
++            otherCacheValue.deleteAfterCoreClose = true;
++          }
+           otherCacheValue.removeEntries.addAll(cacheValue.removeEntries);
+           otherCacheValue.closeEntries.addAll(cacheValue.closeEntries);
+           cacheValue.closeEntries.clear();
+@@ -255,13 +267,16 @@ private void closeDirectory(CacheValue cacheValue) {
+     }
+     
+     for (CacheValue val : cacheValue.removeEntries) {
++      if (!val.deleteAfterCoreClose) {
+       try {
+         log.info("Removing directory: " + val.path);
+         removeDirectory(val);
+-        
+       } catch (Throwable t) {
+         SolrException.log(log, "Error removing directory", t);
+       }
++      } else {
++        removeEntries.add(val);
++      }
+     }
+     
+     for (CacheValue val : cacheValue.closeEntries) {
+@@ -426,23 +441,33 @@ public void release(Directory directory) throws IOException {
+   
+   @Override
+   public void remove(String path) throws IOException {
++    remove(path, false);
++  }
++  
++  @Override
++  public void remove(Directory dir) throws IOException {
++    remove(dir, false);
++  }
++  
++  @Override
++  public void remove(String path, boolean deleteAfterCoreClose) throws IOException {
+     synchronized (this) {
+       CacheValue val = byPathCache.get(normalize(path));
+       if (val == null) {
+         throw new IllegalArgumentException("Unknown directory " + path);
+       }
+-      val.setDeleteOnClose(true);
++      val.setDeleteOnClose(true, deleteAfterCoreClose);
+     }
+   }
+   
+   @Override
+-  public void remove(Directory dir) throws IOException {
++  public void remove(Directory dir, boolean deleteAfterCoreClose) throws IOException {
+     synchronized (this) {
+       CacheValue val = byDirectoryCache.get(dir);
+       if (val == null) {
+         throw new IllegalArgumentException("Unknown directory " + dir);
+       }
+-      val.setDeleteOnClose(true);
++      val.setDeleteOnClose(true, deleteAfterCoreClose);
+     }
+   }
+   
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/DirectoryFactory.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/DirectoryFactory.java
+index dd899e42..65484093 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/DirectoryFactory.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/DirectoryFactory.java
+@@ -92,6 +92,26 @@
+    */
+   public abstract void remove(Directory dir) throws IOException;
+   
++  /**
++   * Removes the Directory's persistent storage.
++   * For example: A file system impl may remove the
++   * on disk directory.
++   * @throws IOException If there is a low-level I/O error.
++   * 
++   */
++  public abstract void remove(Directory dir, boolean afterCoreClose) throws IOException;
++  
++  /**
++   * This remove is special in that it may be called even after
++   * the factory has been closed. Remove only makes sense for
++   * persistent directory factories.
++   * 
++   * @param path to remove
++   * @param afterCoreClose whether to wait until after the core is closed.
++   * @throws IOException If there is a low-level I/O error.
++   */
++  public abstract void remove(String path, boolean afterCoreClose) throws IOException;
++  
+   /**
+    * This remove is special in that it may be called even after
+    * the factory has been closed. Remove only makes sense for
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
+index 624ed11c..ad2d422a 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/admin/CoreAdminHandler.java
+@@ -601,7 +601,7 @@ protected boolean handleUnloadAction(SolrQueryRequest req,
+ 
+       if (params.getBool(CoreAdminParams.DELETE_DATA_DIR, false)) {
+         try {
+-          core.getDirectoryFactory().remove(core.getDataDir());
++          core.getDirectoryFactory().remove(core.getDataDir(), true);
+         } catch (Exception e) {
+           SolrException.log(log, "Failed to flag data dir for removal for core:"
+                   + core.getName() + " dir:" + core.getDataDir());
+diff --git a/lucene/dev/branches/branch_4x/solr/solrj/src/test/org/apache/solr/client/solrj/MultiCoreExampleTestBase.java b/lucene/dev/branches/branch_4x/solr/solrj/src/test/org/apache/solr/client/solrj/MultiCoreExampleTestBase.java
+index 1a88280b..599164cc 100644
+--- a/lucene/dev/branches/branch_4x/solr/solrj/src/test/org/apache/solr/client/solrj/MultiCoreExampleTestBase.java
++++ b/lucene/dev/branches/branch_4x/solr/solrj/src/test/org/apache/solr/client/solrj/MultiCoreExampleTestBase.java
+@@ -70,8 +70,8 @@
+ import java.io.File;
+ 
+ import org.apache.solr.client.solrj.request.AbstractUpdateRequest.ACTION;
+-import org.apache.solr.client.solrj.request.CoreAdminRequest.Unload;
+ import org.apache.solr.client.solrj.request.CoreAdminRequest;
++import org.apache.solr.client.solrj.request.CoreAdminRequest.Unload;
+ import org.apache.solr.client.solrj.request.QueryRequest;
+ import org.apache.solr.client.solrj.request.UpdateRequest;
+ import org.apache.solr.client.solrj.response.CoreAdminResponse;

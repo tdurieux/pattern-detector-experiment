@@ -1,0 +1,262 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetStatementReply.java b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetStatementReply.java
+index f4ac326e..7e5e60fd 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetStatementReply.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetStatementReply.java
+@@ -489,6 +489,12 @@ protected void parseOpenQuery(StatementCallbackInterface statementI) throws Disc
+                 //
+                 // this will override the same call made from parsePrepareDescribe
+                 //  this will not work, this is not the DA for the stored proc params
++                //
++                // DERBY-5459. We may now receive a new SQLDARD (unrequested, a
++                // DRDA protocol extension) when a query is opened iff the
++                // underlying server's prepared statement has been recompiled
++                // since the client first received metadata when preparing the
++                // statement.
+                 statementI.completePrepareDescribeOutput(columnMetaData, netSqlca);
+                 peekCP = parseTypdefsOrMgrlvlovrs();
+             }
+diff --git a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+index e5c0ce8e..9ae53265 100644
+--- a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
++++ b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+@@ -828,6 +828,7 @@ private void processCommands() throws DRDAProtocolException
+ 					try {
+ 						database.getConnection().clearWarnings();
+ 						sqldaType = parsePRPSQLSTT();
++                        database.getCurrentStatement().sqldaType = sqldaType;
+ 						if (sqldaType > 0)		// do write SQLDARD
+ 							writeSQLDARD(database.getCurrentStatement(),
+ 										 (sqldaType ==  CodePoint.TYPSQLDA_LIGHT_OUTPUT),
+@@ -871,6 +872,27 @@ private void processCommands() throws DRDAProtocolException
+ 							writeOPNQRYRM(false, stmt);
+ 							checkWarning(null, ps, null, 0, false, true);
+ 
++                            long sentVersion = stmt.versionCounter;
++                            long currentVersion =
++                                    ((EnginePreparedStatement)stmt.ps).
++                                    getVersionCounter();
++
++                            if (stmt.sqldaType ==
++                                    CodePoint.TYPSQLDA_LIGHT_OUTPUT &&
++                                    currentVersion != sentVersion) {
++                                // DERBY-5459. The prepared statement has a
++                                // result set and has changed on the server
++                                // since we last informed the client about its
++                                // shape, so re-send metadata.
++                                //
++                                // NOTE: This is an extension of the standard
++                                // DRDA protocol since we send the SQLDARD
++                                // even if it isn't requested in this case.
++                                // This is OK because there is already code on the
++                                // client to handle an unrequested SQLDARD at
++                                // this point in the protocol.
++                                writeSQLDARD(stmt, true, null);
++                            }
+ 							writeQRYDSC(stmt, false);
+ 
+ 							stmt.rsSuspend();
+diff --git a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+index 976f0c77..f475a6c2 100644
+--- a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
++++ b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+@@ -284,6 +284,19 @@ public void setStreamedParameter(EXTDTAReaderInputStream eis) {
+ 	boolean needsToSendParamData = false;
+ 	boolean explicitlyPrepared = false;    //Prepared with PRPSQLSTT (reusable) 
+ 
++    /**
++     * If this changes, we need to re-send result set metadata to client, since
++     * a change indicates the engine has recompiled the prepared statement.
++     */
++    long versionCounter;
++
++    /**
++     * Saved value returned from {@link DRDAConnThread#from
++     * parsePRPSQLSTT}. Used to determine if the statment is such that we may
++     * need to re-send metadata at execute time, see {@link #versionCounter}.
++     */
++    int sqldaType;
++
+ 	// constructor
+ 	/**
+ 	 * DRDAStatement constructor
+@@ -678,6 +691,9 @@ protected PreparedStatement prepare(String sqlStmt)   throws SQLException
+ 			ps.setCursorName(cursorName);
+ 		if (isolationSet)
+ 			database.setPrepareIsolation(saveIsolationLevel);
++
++        versionCounter = ((EnginePreparedStatement)ps).getVersionCounter();
++
+ 				return ps;
+ 	}
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
+index fc37a4fd..dc89cf84 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
+@@ -549,4 +549,9 @@ public PreparedStatement createDuplicateStatement(Connection conn, PreparedState
+ 
+ 		return newStatement;
+ 	}
++
++    public final long getVersionCounter() throws SQLException {
++        return ((EnginePreparedStatement)getPreparedStatement()).
++                getVersionCounter();
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/EnginePreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/EnginePreparedStatement.java
+index 86f4f993..da06fa55 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/EnginePreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/EnginePreparedStatement.java
+@@ -39,4 +39,12 @@ public void setBinaryStream(int parameterIndex, InputStream x)
+     
+     public void setCharacterStream(int parameterIndex, Reader reader)
+         throws SQLException;
++
++    /**
++     * Get the version of the prepared statement. If this has not been changed,
++     * the caller may assume that a recompilation has not taken place, i.e.
++     * meta-data are (also) unchanged.
++     * @return version counter
++     */
++    public long getVersionCounter() throws SQLException;
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/PreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/PreparedStatement.java
+index dec76e40..aca4e500 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/PreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/PreparedStatement.java
+@@ -270,4 +270,10 @@ ResultSet executeSubStatement(LanguageConnectionContext lcc,
+ 	*/
+ 	public SQLWarning getCompileTimeWarnings();
+ 
++    /**
++     * Get the version counter. A change in the value indicates a recompile
++     * has happened.
++     * @return version counter
++     */
++    public long getVersionCounter();
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+index c94b3a21..e2cf6563 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+@@ -1971,4 +1971,8 @@ private final void checkBlobConditions(int parameterIndex)
+             throw dataTypeConversion(parameterIndex, "java.sql.Blob");
+         }
+     }
++
++    public final long getVersionCounter() throws SQLException {
++        return preparedStatement.getVersionCounter();
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+index ae6295c4..1f4e7304 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+@@ -173,6 +173,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	*/
+ 	private Cacheable cacheHolder;
+ 
++    /**
++     * Incremented for each (re)compile.
++     */
++    private long versionCounter;
++
+ 	//
+ 	// constructors
+ 	//
+@@ -1241,4 +1246,12 @@ public List getRequiredPermissionsList()
+ 	{
+ 		return requiredPermissionsList;
+ 	}
++
++    public final long getVersionCounter() {
++        return versionCounter;
++    }
++
++    public final void incrementVersionCounter() {
++        ++versionCounter;
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+index 3414b5ed..d8682ca9 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+@@ -545,6 +545,7 @@ private PreparedStatement prepMinion(LanguageConnectionContext lcc, boolean cach
+ 					preparedStmt.setConstantAction( qt.makeConstantAction() );
+ 					preparedStmt.setSavedObjects( cc.getSavedObjects() );
+ 					preparedStmt.setRequiredPermissionsList(cc.getRequiredPermissionsList());
++                    preparedStmt.incrementVersionCounter();
+ 					preparedStmt.setActivationClass(ac);
+ 					preparedStmt.setNeedsSavepoint(qt.needsSavepoint());
+ 					preparedStmt.setCursorInfo((CursorInfo)cc.getCursorInfo());
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/PrepStmtMetaDataTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/PrepStmtMetaDataTest.java
+index fb2de331..870130fd 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/PrepStmtMetaDataTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/PrepStmtMetaDataTest.java
+@@ -115,18 +115,20 @@ public void testAlterTableMeta() throws SQLException {
+         assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(1));
+         assertEquals("C11", rsmd.getColumnName(1));
+ 
++        s.executeUpdate("alter table bug4579 add column c12 int");
++
++        if (usingDerbyNetClient()) {
+         // DERBY-2402 Client does not report added columns.
+         // Take out check when DERBY-2402 is fixed
+-        if (usingDerbyNetClient())
+-            return;
+-
+-        s.executeUpdate("alter table bug4579 add column c12 int");
++            //
++        } else {
+         rsmd = ps.getMetaData();
+         assertEquals(2, rsmd.getColumnCount());
+         assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(1));
+         assertEquals("C11", rsmd.getColumnName(1));
+         assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(2));
+         assertEquals("C12", rsmd.getColumnName(2));
++        }
+ 
+         // ResultSetMetaData for select * after alter table and
+         // executeQuery.
+@@ -140,6 +142,17 @@ public void testAlterTableMeta() throws SQLException {
+         assertEquals("C12", rsmd.getColumnName(2));
+         assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(3));
+         assertEquals("C13", rsmd.getColumnName(3));
++
++        // Check ps metadata again
++        rsmd = ps.getMetaData();
++        assertEquals(3, rsmd.getColumnCount());
++        assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(1));
++        assertEquals("C11", rsmd.getColumnName(1));
++        assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(2));
++        assertEquals("C12", rsmd.getColumnName(2));
++        assertEquals(java.sql.Types.INTEGER, rsmd.getColumnType(3));
++        assertEquals("C13", rsmd.getColumnName(3));
++
+         rs.close();
+         ps.close();
+         s.executeUpdate("drop table bug4579");
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+index 2d43bcaa..74091c75 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+@@ -200,19 +200,12 @@ public void testAddColumn() throws Exception {
+         // select * prepared statements do see added columns after 
+         // alter table
+ 
+-        if (usingEmbedded()) // client/server doesn't keep cursor open.
+-        {
+             rs = pSt.executeQuery();
+             JDBC.assertColumnNames(rs, new String[]{"C1", "C2"});
+             JDBC.assertFullResultSet(rs, new String[][]{
+                         {"1", null},
+                         {"2", null}
+                     });
+-        } else {
+-            rs = pSt.executeQuery();
+-            JDBC.assertColumnNames(rs, new String[]{"C1"});
+-            JDBC.assertFullResultSet(rs, new String[][]{{"1"}, {"2"}});
+-        }
+ 
+         // add non-nullable column to 0 row table and verify
+         st.executeUpdate("alter table t0 add column c2 int not null default 0");

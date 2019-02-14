@@ -1,0 +1,462 @@
+diff --git a/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsDriver.java b/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsDriver.java
+index 9c424906..1cc8a45c 100644
+--- a/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsDriver.java
++++ b/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsDriver.java
+@@ -18,6 +18,10 @@
+ package org.apache.mahout.clustering.evaluation;
+ 
+ import java.io.IOException;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Map.Entry;
+ 
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FileStatus;
+@@ -35,6 +39,7 @@
+ import org.apache.mahout.clustering.AbstractCluster;
+ import org.apache.mahout.clustering.Cluster;
+ import org.apache.mahout.clustering.WeightedVectorWritable;
++import org.apache.mahout.clustering.kmeans.OutputLogFilter;
+ import org.apache.mahout.common.AbstractJob;
+ import org.apache.mahout.common.commandline.DefaultOptionCreator;
+ import org.apache.mahout.common.distance.DistanceMeasure;
+@@ -64,6 +69,7 @@ public int run(String[] args) throws ClassNotFoundException, InstantiationExcept
+     addOutputOption();
+     addOption(DefaultOptionCreator.distanceMeasureOption().create());
+     addOption(DefaultOptionCreator.maxIterationsOption().create());
++    addOption(DefaultOptionCreator.methodOption().create());
+     if (parseArguments(args) == null) {
+       return -1;
+     }
+@@ -72,10 +78,11 @@ public int run(String[] args) throws ClassNotFoundException, InstantiationExcept
+     Path output = getOutputPath();
+     String distanceMeasureClass = getOption(DefaultOptionCreator.DISTANCE_MEASURE_OPTION);
+     int maxIterations = Integer.parseInt(getOption(DefaultOptionCreator.MAX_ITERATIONS_OPTION));
++    boolean runSequential = getOption(DefaultOptionCreator.METHOD_OPTION).equalsIgnoreCase(DefaultOptionCreator.SEQUENTIAL_METHOD);
+     ClassLoader ccl = Thread.currentThread().getContextClassLoader();
+     DistanceMeasure measure = ccl.loadClass(distanceMeasureClass).asSubclass(DistanceMeasure.class).newInstance();
+ 
+-    run(getConf(), input, null, output, measure, maxIterations);
++    run(getConf(), input, null, output, measure, maxIterations, runSequential);
+     return 0;
+   }
+ 
+@@ -84,7 +91,8 @@ public static void run(Configuration conf,
+                          Path clusteredPointsIn,
+                          Path output,
+                          DistanceMeasure measure,
+-                         int numIterations) throws InstantiationException, IllegalAccessException, IOException,
++                         int numIterations,
++                         boolean runSequential) throws InstantiationException, IllegalAccessException, IOException,
+       InterruptedException, ClassNotFoundException {
+     Path stateIn = new Path(output, "representativePoints-0");
+     writeInitialState(stateIn, clustersIn);
+@@ -93,7 +101,7 @@ public static void run(Configuration conf,
+       log.info("Iteration {}", iteration);
+       // point the output to a new directory per iteration
+       Path stateOut = new Path(output, "representativePoints-" + (iteration + 1));
+-      runIteration(clusteredPointsIn, stateIn, stateOut, measure);
++      runIteration(conf, clusteredPointsIn, stateIn, stateOut, measure, runSequential);
+       // now point the input to the old output directory
+       stateIn = stateOut;
+     }
+@@ -124,9 +132,24 @@ private static void writeInitialState(Path output, Path clustersIn) throws Insta
+     }
+   }
+ 
++  private static void runIteration(Configuration conf,
++                                   Path clusteredPointsIn,
++                                   Path stateIn,
++                                   Path stateOut,
++                                   DistanceMeasure measure,
++                                   boolean runSequential) throws IOException, InterruptedException, ClassNotFoundException,
++      InstantiationException, IllegalAccessException {
++    if (runSequential) {
++      runIterationSeq(conf, clusteredPointsIn, stateIn, stateOut, measure);
++    } else {
++      runIterationMR(conf, clusteredPointsIn, stateIn, stateOut, measure);
++    }
++  }
++
+   /**
+-   * Run the job using supplied arguments
+-   * 
++   * Run the job using supplied arguments as a sequential process
++   * @param conf 
++   *          the Configuration to use
+    * @param input
+    *          the directory pathname for input points
+    * @param stateIn
+@@ -134,11 +157,70 @@ private static void writeInitialState(Path output, Path clustersIn) throws Insta
+    * @param stateOut
+    *          the directory pathname for output state
+    * @param measure
+-   *          the DistanceMeasure
++   *          the DistanceMeasure to use
+    */
+-  private static void runIteration(Path input, Path stateIn, Path stateOut, DistanceMeasure measure) throws IOException,
+-      InterruptedException, ClassNotFoundException {
+-    Configuration conf = new Configuration();
++  private static void runIterationSeq(Configuration conf,
++                                      Path clusteredPointsIn,
++                                      Path stateIn,
++                                      Path stateOut,
++                                      DistanceMeasure measure) throws IOException, InstantiationException, IllegalAccessException {
++
++    Map<Integer, List<VectorWritable>> repPoints = RepresentativePointsMapper.getRepresentativePoints(conf, stateIn);
++    Map<Integer, WeightedVectorWritable> mostDistantPoints = new HashMap<Integer, WeightedVectorWritable>();
++    FileSystem fs = FileSystem.get(clusteredPointsIn.toUri(), conf);
++    FileStatus[] status = fs.listStatus(clusteredPointsIn, new OutputLogFilter());
++    int part = 0;
++    for (FileStatus s : status) {
++      SequenceFile.Reader reader = new SequenceFile.Reader(fs, s.getPath(), conf);
++      try {
++        IntWritable key = (IntWritable) reader.getKeyClass().asSubclass(Writable.class).newInstance();
++        WeightedVectorWritable vw = (WeightedVectorWritable) reader.getValueClass().asSubclass(Writable.class).newInstance();
++        while (reader.next(key, vw)) {
++          RepresentativePointsMapper.mapPoint(key, vw, measure, repPoints, mostDistantPoints);
++        }
++      } finally {
++        reader.close();
++      }
++    }
++    SequenceFile.Writer writer = new SequenceFile.Writer(fs,
++                                                         conf,
++                                                         new Path(stateOut, "part-m-" + part++),
++                                                         IntWritable.class,
++                                                         VectorWritable.class);
++    try {
++      for (Entry<Integer, List<VectorWritable>> entry : repPoints.entrySet()) {
++        for (VectorWritable vw : entry.getValue()) {
++          writer.append(new IntWritable(entry.getKey()), vw);
++        }
++      }
++    } finally {
++      writer.close();
++    }
++    writer = new SequenceFile.Writer(fs, conf, new Path(stateOut, "part-m-" + part++), IntWritable.class, VectorWritable.class);
++    try {
++      for (Map.Entry<Integer, WeightedVectorWritable> entry : mostDistantPoints.entrySet()) {
++        writer.append(new IntWritable(entry.getKey()), new VectorWritable(entry.getValue().getVector()));
++      }
++    } finally {
++      writer.close();
++    }
++  }
++
++  /**
++   * Run the job using supplied arguments as a Map/Reduce process
++   * @param conf 
++   *          the Configuration to use
++   * @param input
++   *          the directory pathname for input points
++   * @param stateIn
++   *          the directory pathname for input state
++   * @param stateOut
++   *          the directory pathname for output state
++   * @param measure
++   *          the DistanceMeasure to use
++   */
++  private static void runIterationMR(Configuration conf, Path input, Path stateIn, Path stateOut, DistanceMeasure measure)
++      throws IOException, InterruptedException, ClassNotFoundException {
+     conf.set(STATE_IN_KEY, stateIn.toString());
+     conf.set(DISTANCE_MEASURE_KEY, measure.getClass().getName());
+     Job job = new Job(conf);
+diff --git a/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsMapper.java b/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsMapper.java
+index c15ecb44..f39b35c2 100644
+--- a/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsMapper.java
++++ b/mahout/trunk/utils/src/main/java/org/apache/mahout/clustering/evaluation/RepresentativePointsMapper.java
+@@ -54,12 +54,20 @@ protected void cleanup(Context context) throws IOException, InterruptedException
+ 
+   @Override
+   protected void map(IntWritable clusterId, WeightedVectorWritable point, Context context) throws IOException, InterruptedException {
++    mapPoint(clusterId, point, measure, representativePoints, mostDistantPoints);
++  }
++
++  public static void mapPoint(IntWritable clusterId,
++                              WeightedVectorWritable point,
++                              DistanceMeasure measure,
++                              Map<Integer, List<VectorWritable>> representativePoints,
++                              Map<Integer, WeightedVectorWritable> mostDistantPoints) {
+     int key = clusterId.get();
+     WeightedVectorWritable currentMDP = mostDistantPoints.get(key);
+ 
+-    List<VectorWritable> refPoints = representativePoints.get(key);
++    List<VectorWritable> repPoints = representativePoints.get(key);
+     double totalDistance = 0.0;
+-    for (VectorWritable refPoint : refPoints) {
++    for (VectorWritable refPoint : repPoints) {
+       totalDistance += measure.distance(refPoint.get(), point.getVector());
+     }
+     if (currentMDP == null || currentMDP.getWeight() < totalDistance) {
+@@ -98,11 +106,14 @@ public void configure(Map<Integer, List<VectorWritable>> referencePoints, Distan
+ 
+   public static Map<Integer, List<VectorWritable>> getRepresentativePoints(Configuration conf) {
+     String statePath = conf.get(RepresentativePointsDriver.STATE_IN_KEY);
++    return getRepresentativePoints(conf, new Path(statePath));
++  }
++
++  public static Map<Integer, List<VectorWritable>> getRepresentativePoints(Configuration conf, Path statePath) {
+     Map<Integer, List<VectorWritable>> representativePoints = new HashMap<Integer, List<VectorWritable>>();
+     try {
+-      Path path = new Path(statePath);
+-      FileSystem fs = FileSystem.get(path.toUri(), conf);
+-      FileStatus[] status = fs.listStatus(path, new OutputLogFilter());
++      FileSystem fs = FileSystem.get(statePath.toUri(), conf);
++      FileStatus[] status = fs.listStatus(statePath, new OutputLogFilter());
+       for (FileStatus s : status) {
+         SequenceFile.Reader reader = new SequenceFile.Reader(fs, s.getPath(), conf);
+         try {
+diff --git a/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/TestClusterEvaluator.java b/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/TestClusterEvaluator.java
+index f9e0b236..70421047 100644
+--- a/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/TestClusterEvaluator.java
++++ b/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/TestClusterEvaluator.java
+@@ -41,6 +41,7 @@
+ import org.apache.mahout.clustering.kmeans.KMeansDriver;
+ import org.apache.mahout.clustering.kmeans.TestKmeansClustering;
+ import org.apache.mahout.clustering.meanshift.MeanShiftCanopyDriver;
++import org.apache.mahout.common.HadoopUtil;
+ import org.apache.mahout.common.MahoutTestCase;
+ import org.apache.mahout.common.distance.DistanceMeasure;
+ import org.apache.mahout.common.distance.EuclideanDistanceMeasure;
+@@ -114,9 +115,10 @@ private void generateSamples() {
+     generateSamples(300, 0, 2, 0.1);
+   }
+ 
+-  private void checkRefPoints(int numIterations) throws IOException {
++  private void printRepPoints(int numIterations) throws IOException {
+     for (int i = 0; i <= numIterations; i++) {
+       Path out = new Path(getTestTempDirPath("output"), "representativePoints-" + i);
++      System.out.println("Representative Points for iteration " + i);
+       Configuration conf = new Configuration();
+       FileSystem fs = FileSystem.get(conf);
+       for (FileStatus file : fs.listStatus(out)) {
+@@ -160,6 +162,29 @@ private void initData(double dC, double dP, DistanceMeasure measure) {
+     }
+   }
+ 
++  @Test
++  public void testRepresentativePoints() throws Exception {
++    ClusteringTestUtils.writePointsToFile(referenceData, new Path(testdata, "file1"), fs, conf);
++    DistanceMeasure measure = new EuclideanDistanceMeasure();
++    Configuration conf = new Configuration();
++    // run using MR reference point calculation
++    CanopyDriver.run(conf, testdata, output, measure, 3.1, 1.1, true, true);
++    int numIterations = 2;
++    Path clustersIn = new Path(output, "clusters-0");
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, false);
++    printRepPoints(numIterations);
++    ClusterEvaluator evaluatorMR = new ClusterEvaluator(conf, clustersIn);
++    // now run again using sequential reference point calculation
++    HadoopUtil.overwriteOutput(output);
++    CanopyDriver.run(conf, testdata, output, measure, 3.1, 1.1, true, true);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
++    printRepPoints(numIterations);
++    ClusterEvaluator evaluatorSeq = new ClusterEvaluator(conf, clustersIn);
++    // compare results
++    assertEquals("InterCluster Density", evaluatorMR.interClusterDensity(), evaluatorSeq.interClusterDensity(), EPSILON);
++    assertEquals("IntraCluster Density", evaluatorMR.intraClusterDensity(), evaluatorSeq.intraClusterDensity(), EPSILON);
++  }
++
+   @Test
+   public void testCluster0() throws IOException {
+     ClusteringTestUtils.writePointsToFile(referenceData, new Path(testdata, "file1"), fs, conf);
+@@ -249,13 +274,13 @@ public void testCanopy() throws Exception {
+     CanopyDriver.run(conf, testdata, output, measure, 3.1, 1.1, true, true);
+     int numIterations = 10;
+     Path clustersIn = new Path(output, "clusters-0");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     ClusterEvaluator evaluator = new ClusterEvaluator(conf, clustersIn);
+     // now print out the Results
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+     System.out.println("Inter-cluster density = " + evaluator.interClusterDensity());
+ 
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+   }
+ 
+   @Test
+@@ -269,12 +294,12 @@ public void testKmeans() throws Exception {
+     KMeansDriver.run(testdata, new Path(output, "clusters-0"), output, measure, 0.001, 10, true, true);
+     int numIterations = 10;
+     Path clustersIn = new Path(output, "clusters-2");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     ClusterEvaluator evaluator = new ClusterEvaluator(conf, clustersIn);
+     // now print out the Results
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+     System.out.println("Inter-cluster density = " + evaluator.interClusterDensity());
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+   }
+ 
+   @Test
+@@ -288,12 +313,12 @@ public void testFuzzyKmeans() throws Exception {
+     FuzzyKMeansDriver.run(testdata, new Path(output, "clusters-0"), output, measure, 0.001, 10, 2, true, true, 0, true);
+     int numIterations = 10;
+     Path clustersIn = new Path(output, "clusters-4");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     ClusterEvaluator evaluator = new ClusterEvaluator(conf, clustersIn);
+     // now print out the Results
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+     System.out.println("Inter-cluster density = " + evaluator.interClusterDensity());
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+   }
+ 
+   @Test
+@@ -304,12 +329,12 @@ public void testMeanShift() throws Exception {
+     new MeanShiftCanopyDriver().run(conf, testdata, output, measure, 2.1, 1.0, 0.001, 10, false, true, true);
+     int numIterations = 10;
+     Path clustersIn = new Path(output, "clusters-10");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     ClusterEvaluator evaluator = new ClusterEvaluator(conf, clustersIn);
+     // now print out the Results
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+     System.out.println("Inter-cluster density = " + evaluator.interClusterDensity());
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+   }
+ 
+   @Test
+@@ -325,12 +350,13 @@ public void testDirichlet() throws Exception {
+                                    new Path(output, "clusteredPoints"),
+                                    output,
+                                    new EuclideanDistanceMeasure(),
+-                                   numIterations);
++                                   numIterations,
++                                   true);
+     ClusterEvaluator evaluator = new ClusterEvaluator(conf, clustersIn);
+     // now print out the Results
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+     System.out.println("Inter-cluster density = " + evaluator.interClusterDensity());
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+   }
+ 
+ }
+diff --git a/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/cdbw/TestCDbwEvaluator.java b/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/cdbw/TestCDbwEvaluator.java
+index 3bbfbadf..e9858526 100644
+--- a/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/cdbw/TestCDbwEvaluator.java
++++ b/mahout/trunk/utils/src/test/java/org/apache/mahout/clustering/cdbw/TestCDbwEvaluator.java
+@@ -71,9 +71,10 @@ public void setUp() throws Exception {
+     ClusteringTestUtils.writePointsToFile(sampleData, getTestTempFilePath("testdata/file1"), fs, conf);
+   }
+ 
+-  private void checkRefPoints(int numIterations) throws IOException {
++  private void printRepPoints(int numIterations) throws IOException {
+     for (int i = 0; i <= numIterations; i++) {
+       Path out = new Path(getTestTempDirPath("output"), "representativePoints-" + i);
++      System.out.println("Representative Points for iteration " + i);
+       Configuration conf = new Configuration();
+       FileSystem fs = FileSystem.get(conf);
+       for (FileStatus file : fs.listStatus(out)) {
+@@ -204,7 +205,7 @@ public void testAllSameValueCluster() {
+   }
+ 
+   @Test
+-  public void testCanopy() throws Exception { // now run the Job
++  public void testCanopy() throws Exception {
+     DistanceMeasure measure = new EuclideanDistanceMeasure();
+     CanopyDriver.run(new Configuration(),
+                      getTestTempDirPath("testdata"),
+@@ -213,14 +214,14 @@ public void testCanopy() throws Exception { // now run the Job
+                      3.1,
+                      2.1,
+                      true,
+-                     false);
++                     true);
+     int numIterations = 2;
+     Path output = getTestTempDirPath("output");
+     Configuration conf = new Configuration();
+     Path clustersIn = new Path(output, "clusters-0");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     CDbwEvaluator evaluator = new CDbwEvaluator(conf, clustersIn);
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+     // now print out the Results
+     System.out.println("CDbw = " + evaluator.getCDbw());
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+@@ -239,16 +240,16 @@ public void testKmeans() throws Exception {
+                      3.1,
+                      2.1,
+                      false,
+-                     false);
++                     true);
+     // now run the KMeans job
+     Path output = getTestTempDirPath("output");
+-    KMeansDriver.run(getTestTempDirPath("testdata"), new Path(output, "clusters-0"), output, measure, 0.001, 10, true, false);
++    KMeansDriver.run(getTestTempDirPath("testdata"), new Path(output, "clusters-0"), output, measure, 0.001, 10, true, true);
+     int numIterations = 2;
+     Configuration conf = new Configuration();
+     Path clustersIn = new Path(output, "clusters-2");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     CDbwEvaluator evaluator = new CDbwEvaluator(conf, clustersIn);
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+     // now print out the Results
+     System.out.println("CDbw = " + evaluator.getCDbw());
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+@@ -267,7 +268,7 @@ public void testFuzzyKmeans() throws Exception {
+                      3.1,
+                      2.1,
+                      false,
+-                     false);
++                     true);
+     // now run the KMeans job
+     Path output = getTestTempDirPath("output");
+     FuzzyKMeansDriver.run(getTestTempDirPath("testdata"),
+@@ -280,13 +281,13 @@ public void testFuzzyKmeans() throws Exception {
+                           true,
+                           true,
+                           0,
+-                          false);
++                          true);
+     int numIterations = 2;
+     Configuration conf = new Configuration();
+     Path clustersIn = new Path(output, "clusters-4");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     CDbwEvaluator evaluator = new CDbwEvaluator(conf, clustersIn);
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+     // now print out the Results
+     System.out.println("CDbw = " + evaluator.getCDbw());
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+@@ -307,13 +308,14 @@ public void testMeanShift() throws Exception {
+                                     0.001,
+                                     10,
+                                     false,
+-                                    true, false);
++                                    true,
++                                    true);
+     int numIterations = 2;
+     Path output = getTestTempDirPath("output");
+     Path clustersIn = new Path(output, "clusters-2");
+-    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations);
++    RepresentativePointsDriver.run(conf, clustersIn, new Path(output, "clusteredPoints"), output, measure, numIterations, true);
+     CDbwEvaluator evaluator = new CDbwEvaluator(conf, clustersIn);
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+     // now print out the Results
+     System.out.println("CDbw = " + evaluator.getCDbw());
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());
+@@ -343,9 +345,10 @@ public void testDirichlet() throws Exception {
+                                    new Path(output, "clusteredPoints"),
+                                    output,
+                                    new EuclideanDistanceMeasure(),
+-                                   numIterations);
++                                   numIterations,
++                                   true);
+     CDbwEvaluator evaluator = new CDbwEvaluator(conf, clustersIn);
+-    checkRefPoints(numIterations);
++    printRepPoints(numIterations);
+     // now print out the Results
+     System.out.println("CDbw = " + evaluator.getCDbw());
+     System.out.println("Intra-cluster density = " + evaluator.intraClusterDensity());

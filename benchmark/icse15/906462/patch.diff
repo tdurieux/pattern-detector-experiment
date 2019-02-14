@@ -1,0 +1,782 @@
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/GlobalPersistenceManager.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/GlobalPersistenceManager.java
+index 1a7a7d5c..18395674 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/GlobalPersistenceManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/GlobalPersistenceManager.java
+@@ -29,21 +29,30 @@
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.BundleEvent;
+ import org.osgi.framework.SynchronousBundleListener;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+  * Class that coordinates PersistenceContextManagers across multiple (nested) OSGi frameworks.
+  */
+ public class GlobalPersistenceManager implements PersistenceManager, SynchronousBundleListener {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container.context");
+ 
+   private JTAPersistenceContextRegistry registry;
+   
+-  /** The list of persistence context managers. Each is valid for exactly one framework
++  /** 
++   *    The list of persistence context managers. Each is valid for exactly one framework
+    *    as identified by the respective system bundle. This allows us to work properly in 
+    *    a multi (nested) framework environment without using the (deprecated) CompositeBundle API.
+    */
+   private Map<Bundle, PersistenceContextManager> managers = 
+     new HashMap<Bundle, PersistenceContextManager>();
+   
++  /**
++   *  This Map relates persistence context clients to persistence contexts. A bundle may be
++   *  a client of more than one persistence context. 
++   */
+   private Map<Bundle, Set<String>> persistenceContexts = 
+     new HashMap<Bundle, Set<String>>();
+   
+@@ -53,54 +62,86 @@ public void setRegistry(JTAPersistenceContextRegistry registry) {
+   }
+   
+   public void registerContext(String unitName, Bundle client, HashMap<String, Object> properties) {
++    if (_logger.isDebugEnabled()) {
++      _logger.debug("Registering bundle {} as a client of persistence unit {} with properties {}.", 
++          new Object[] {client.getSymbolicName() + "_" + client.getVersion(), unitName, properties});
++    }
++    //Find the framework for this bundle (we may be in a composite)
+     Bundle frameworkBundle = client.getBundleContext().getBundle(0);
+     PersistenceContextManager manager = null;
+     boolean newManager = false;
+     
++    //Synchronize to update internal state atomically
+     synchronized (this) {
++      //If we already have a manager use it
+       if (managers.containsKey(frameworkBundle)) {
+         manager = managers.get(frameworkBundle);
+       } else {
++        if (_logger.isDebugEnabled()) {
++          _logger.debug("No existing manager for the framework with identity hash code {}. Creating a new one.",
++              new Object[] {System.identityHashCode(frameworkBundle)});
++        }
+         manager = new PersistenceContextManager(frameworkBundle.getBundleContext(), registry);
+         managers.put(frameworkBundle, manager);
++        //Remember to listen to this new framework so that we know when bundles are starting/stopping
+         frameworkBundle.getBundleContext().addBundleListener(this);
+         
+         newManager = true;
+       }
+       
++      //Register the new bundle as a client
+       if (!persistenceContexts.containsKey(client)) {
+         persistenceContexts.put(client, new HashSet<String>());
+       }
+       
+       persistenceContexts.get(client).add(unitName);
+     }
+-    
++    //Remember to start the manager if it was new. This MUST occur outside the synchronized block.
+     if (newManager)
+       manager.open();
+     
+     manager.registerContext(unitName, client, properties);
+   }
+ 
++  /**
++   * This method is used to track the lifecycle of bundles inside composites
++   */
+   public void bundleChanged(BundleEvent event) {
+     Bundle bundle = event.getBundle();
+     
+-    if (event.getType() == event.STOPPING) {
++    //We only care about bundles stopping
++    if (event.getType() == BundleEvent.STOPPING) {
+       Set<String> contextsToBeRemoved = Collections.emptySet();
+       Bundle frameworkBundle = bundle.getBundleContext().getBundle(0);
+       PersistenceContextManager manager = null;
+       boolean removeManager = false;
+       
++      //Synchronize to update internal state atomically
+       synchronized (this) {
+         if (persistenceContexts.containsKey(bundle)) {
+-          contextsToBeRemoved = persistenceContexts.get(bundle);
+-          persistenceContexts.remove(bundle);
++          //This is a client, find the contexts to remove
++          contextsToBeRemoved = persistenceContexts.remove(bundle);
++          
++          if (_logger.isDebugEnabled()) {
++            _logger.debug("The bundle {} in framework {}, which is a client of the persistence contexts {} is stopping.",
++                new Object[] {bundle.getSymbolicName() + "_" + bundle.getVersion(), 
++                System.identityHashCode(frameworkBundle), contextsToBeRemoved});
++          }
+           
+           manager = managers.get(frameworkBundle);
+-          if (manager == null)
++          if (manager == null) {
++              _logger.error("There was no context manager for framework {}. This should never happen");
+             throw new IllegalStateException();
++          }
+         } else if (managers.containsKey(bundle)) {
++          //The framework is stopping, tidy up the manager
++          if (_logger.isDebugEnabled()) {
++            _logger.debug("The framework {} is stopping.",
++                new Object[] {bundle.getSymbolicName() + "_" + bundle.getVersion(), 
++                System.identityHashCode(frameworkBundle)});
++          }
+           removeManager = true;
+-          manager = managers.remove(bundle);
++          managers.remove(bundle);
+           bundle.getBundleContext().removeBundleListener(this);
+         }
+       }
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/PersistenceManager.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/PersistenceManager.java
+index 1bc0c7c9..090034df 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/PersistenceManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/PersistenceManager.java
+@@ -23,5 +23,13 @@
+ import org.osgi.framework.Bundle;
+ 
+ public interface PersistenceManager {
++  /**
++   * This method will be called whenever a persistence context element is processed by the jpa
++   * blueprint namespace handler.
++   * 
++   * @param unitName   The name of the persistence unit
++   * @param client     The blueprint bundle that declares the dependency
++   * @param properties Properties that should be used to create the persistence unit
++   */
+   void registerContext(String unitName, Bundle client, HashMap<String,Object> properties);
+ }
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/ManagedPersistenceContextFactory.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/ManagedPersistenceContextFactory.java
+index dcd4ab00..0f849d6b 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/ManagedPersistenceContextFactory.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/ManagedPersistenceContextFactory.java
+@@ -31,10 +31,17 @@
+ import org.apache.aries.jpa.container.context.transaction.impl.JTAEntityManager;
+ import org.apache.aries.jpa.container.context.transaction.impl.JTAPersistenceContextRegistry;
+ import org.osgi.framework.ServiceReference;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ /**
+- * A service factory that can lazily create persistence contexts
++ * A factory that can lazily create managed persistence contexts.
++ * This is registered in the Service registry to be looked up by blueprint.
++ * The EntityManagerFactory interface is used to ensure a shared class space
++ * with the client. Only the createEntityManager() method is supported.
+  */
+ public class ManagedPersistenceContextFactory implements EntityManagerFactory {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container.context");
+ 
+   private final ServiceReference emf;
+   private final Map<String, Object> properties;
+@@ -50,13 +57,17 @@ public ManagedPersistenceContextFactory(ServiceReference unit,
+   }
+ 
+   public EntityManager createEntityManager() {
++    if(_logger.isDebugEnabled()) {
++      _logger.debug("Creating a container managed entity manager for the perstence unit {} with the following properties {}",
++          new Object[] {emf, properties});
++    }
+     EntityManagerFactory factory = (EntityManagerFactory) emf.getBundle().getBundleContext().getService(emf);
+     
+     PersistenceContextType type = (PersistenceContextType) properties.get(PersistenceContextManager.PERSISTENCE_CONTEXT_TYPE);
+     if(type == PersistenceContextType.TRANSACTION || type == null)
+       return new JTAEntityManager(factory, properties, registry);
+     else {
+-      //TODO add support, or log the failure
++      _logger.error("There is currently no support for extended scope EntityManagers");
+       return null;
+     }
+ 
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/PersistenceContextManager.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/PersistenceContextManager.java
+index 1712fd16..61e13b0a 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/PersistenceContextManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/impl/PersistenceContextManager.java
+@@ -39,12 +39,18 @@
+ import org.osgi.framework.ServiceReference;
+ import org.osgi.framework.ServiceRegistration;
+ import org.osgi.util.tracker.ServiceTracker;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ 
+ /**
+- * This class is responsible for managing all of the persistence contexts at a defined scope
+- * It will automatically manage the lifecycle of all registered persistence contexts
++ * This class is responsible for managing all of the persistence contexts at a defined scope,
++ * i.e. for a single framework or composite. It will automatically manage the lifecycle of all
++ * registered persistence contexts.
+  */
+ public class PersistenceContextManager extends ServiceTracker{
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container.context");
++  
+   /** The key to use when storing the {@link PersistenceContextType} for this context */
+   public static final String PERSISTENCE_CONTEXT_TYPE = "org.apache.aries.jpa.context.type";
+   /** The filter this tracker uses to select Persistence Units. */
+@@ -52,12 +58,15 @@
+   static {
+     Filter f = null;
+     try {
++      //Create a filter to select container managed persistence units that 
++      //are not proxies for managed persistence contexts 
+       f = FrameworkUtil.createFilter("(&(" + Constants.OBJECTCLASS
+         + "=" + "javax.persistence.EntityManagerFactory" + ")(" + 
+-        PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true))" );
++        PersistenceUnitConstants.CONTAINER_MANAGED_PERSISTENCE_UNIT + "=true)(!("
++        + NSHandler.PROXY_FACTORY_EMF_ATTRIBUTE + "=*)))" );
+     } catch (InvalidSyntaxException e) {
+-      // TODO This should never ever happen!
+-      e.printStackTrace();
++      _logger.error("There was an exception creating the EntityManagerFactory filter. This should never happen.", e);
++      throw new RuntimeException(e);
+     }
+     filter = f;
+   }
+@@ -101,6 +110,10 @@ public void close() {
+   @Override
+   public Object addingService(ServiceReference reference) {
+ 
++    if(_logger.isDebugEnabled()) {
++      _logger.debug("A new managed persistence unit, {}, has been detected.", new Object[] {reference});
++    }
++    
+     String unitName = (String) reference.getProperty(PersistenceUnitConstants.OSGI_UNIT_NAME);
+     if(unitName == null)
+       unitName = "";
+@@ -111,8 +124,8 @@ public Object addingService(ServiceReference reference) {
+       //If we already track a unit with the same name then we are in trouble!
+       //only one unit with a given name should exist at a single scope
+       if(persistenceUnits.containsKey(unitName)) {
+-        //TODO log a big warning here!
+-        //Stop tracking the duplicate unit.
++        _logger.warn("The persistence unit {} exists twice at the same framework scope. " +
++        		"The second service will be ignored", new Object[] {reference});
+         return null;
+       }
+       //If this is a new unit, then add it, and check whether we have any waiting
+@@ -129,6 +142,10 @@ public Object addingService(ServiceReference reference) {
+ 
+   public void removedService(ServiceReference ref, Object o)
+   {
++    if(_logger.isDebugEnabled()) {
++      _logger.debug("A managed persistence unit, {}, has been unregistered.", new Object[] {ref});
++    }
++    
+     String unitName = (String) ref.getProperty(PersistenceUnitConstants.OSGI_UNIT_NAME);
+     if(unitName == null)
+       unitName = "";
+@@ -148,7 +165,10 @@ public void removedService(ServiceReference ref, Object o)
+    *                   This must contain the {@link PersistenceContextType}
+    */
+   public void registerContext(String name, Bundle client, HashMap<String, Object> properties) {
+-    
++    if (_logger.isDebugEnabled()) {
++      _logger.debug("Registering bundle {} as a client of persistence unit {} with properties {}.", 
++          new Object[] {client.getSymbolicName() + "_" + client.getVersion(), name, properties});
++    }
+     HashMap<String, Object> oldProps;
+     boolean register;
+     //Use a synchronized to get an atomic view
+@@ -167,7 +187,8 @@ public void registerContext(String name, Bundle client, HashMap<String, Object>
+       oldProps = persistenceContextDefinitions.put(name, properties);
+       if(oldProps != null) {
+         if(!!!oldProps.equals(properties)) {
+-          //TODO log an error and use the old properties
++          _logger.warn("The bundle {} depends on a managed persistence context {} with properties {}, but the context already exists with properties {}. The existing properties will be used.", 
++          new Object[] {client.getSymbolicName() + "_" + client.getVersion(), name, properties, oldProps});
+           persistenceContextDefinitions.put(name, oldProps);
+         }
+       }
+@@ -187,6 +208,10 @@ public void registerContext(String name, Bundle client, HashMap<String, Object>
+    */
+   public void unregisterContext(String name, Bundle client)
+   {
++    if (_logger.isDebugEnabled()) {
++      _logger.debug("Unregistering the bundle {} as a client of persistence unit {}.", 
++          new Object[] {client.getSymbolicName() + "_" + client.getVersion(), name});
++    }
+     boolean unregister = false;
+     //Keep an atomic view of our state
+     synchronized (this) {
+@@ -226,6 +251,9 @@ private void registerEM(String name) {
+           alreadyRegistered = true;
+           return;
+         }
++        if(_logger.isDebugEnabled()) {
++          _logger.debug("Registering a managed persistence context for persistence unit {}", new Object[] {name});
++        }
+         //Block other threads from trying to register by adding the key
+         entityManagerRegistrations.put(name, null);
+         
+@@ -234,8 +262,12 @@ private void registerEM(String name) {
+         Map<String, Object> props = persistenceContextDefinitions.get(name);
+         
+         //If either of these things is undefined then the context cannot be registered
+-        if(props == null || unit == null)
++        if(props == null || unit == null) {
++          _logger.error("The managed persistence context {} cannot be registered for persistence unit {} and properties {}.",
++              new Object[] {name, unit, props});
++          //The finally block will clear the entityManagerRegistrations key
+           return;
++        }
+ 
+         //Create the service factory
+         entityManagerServiceFactory = new ManagedPersistenceContextFactory(unit, props, persistenceContextRegistry);
+@@ -268,10 +300,12 @@ private void registerEM(String name) {
+           //If the key still exists then all is well
+           if(entityManagerRegistrations.containsKey(name)) {
+             entityManagerRegistrations.put(name, reg);
++          } else {
+           //Else we were in a potential live-lock and the service could not be unregistered
+           //earlier. This means we have to do it (but outside the synchronized. Make sure we
+           //also remove the registration key!
+-          } else {
++            _logger.warn("Recovering from a potential live-lock registering a container managed peristence context for persistence unit {}.",
++                new Object[] {name});
+             entityManagerRegistrations.remove(name);
+             recoverFromLiveLock = true;
+           }
+@@ -329,8 +363,7 @@ private void unregisterEM(String unitName) {
+           try {
+             this.wait(500);
+           } catch (InterruptedException e) {
+-            // TODO Log this properly
+-            e.printStackTrace();
++            _logger.warn("The Aries JPA container was interrupted when waiting for managed persistence context {} to be unregistered", new Object[] {unitName});
+           }
+         //Increment the loop to prevent us from live-locking
+         tries++;
+@@ -341,7 +374,8 @@ private void unregisterEM(String unitName) {
+       if(!found) {
+         //Possible Live lock, just remove the key
+         entityManagerRegistrations.remove(unitName);
+-        //TODO log the potential issue
++        _logger.warn("The JPA container detected a possible live lock whilst unregistering the managed persistence context {}. The service cannot be unregistered immediately so the context may become unusable before being unregistered.",
++            new Object[] {unitName});
+       }
+     }
+     //If we found the registration then unregister it outside the synchronized.
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/namespace/NSHandler.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/namespace/NSHandler.java
+index fd90ed5a..7e04b150 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/namespace/NSHandler.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/namespace/NSHandler.java
+@@ -26,8 +26,10 @@
+ import java.util.Map;
+ import java.util.Set;
+ 
++import javax.persistence.EntityManager;
+ import javax.persistence.EntityManagerFactory;
+ import javax.persistence.PersistenceContextType;
++import javax.persistence.PersistenceUnit;
+ 
+ import org.apache.aries.blueprint.NamespaceHandler;
+ import org.apache.aries.blueprint.ParserContext;
+@@ -36,6 +38,7 @@
+ import org.apache.aries.blueprint.mutable.MutableRefMetadata;
+ import org.apache.aries.blueprint.mutable.MutableReferenceMetadata;
+ import org.apache.aries.jpa.container.PersistenceUnitConstants;
++import org.apache.aries.jpa.container.context.GlobalPersistenceManager;
+ import org.apache.aries.jpa.container.context.PersistenceManager;
+ import org.osgi.framework.Bundle;
+ import org.osgi.service.blueprint.reflect.BeanArgument;
+@@ -49,60 +52,94 @@
+ import org.osgi.service.blueprint.reflect.ReferenceMetadata;
+ import org.osgi.service.blueprint.reflect.Target;
+ import org.osgi.service.blueprint.reflect.ValueMetadata;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.w3c.dom.Element;
+ import org.w3c.dom.Node;
+ import org.w3c.dom.NodeList;
+ 
++/**
++ * This class handles the JPA namespace in blueprint xml files, it configures
++ * injection for managed persistence units and managed persistence contexts.
++ * The namespace handler also registers clients of managed persistence contexts
++ * with the {@link GlobalPersistenceManager}.
++ */
+ public class NSHandler implements NamespaceHandler {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container.context");
+   
++  /** The JPA namespace */
+   public static final String NS_URI = "http://aries.apache.org/xmlns/jpa/v1.0.0";
++  /** The standard blueprint namespace */
+   private static final String BLUEPRINT_NS = "http://www.osgi.org/xmlns/blueprint/v1.0.0";
+   
++  /** The element name for an injected persistence unit (see {@link PersistenceUnit}) */
+   private static final String TAG_UNIT = "unit";
++  /** The element name for an injected persistence context (see {@link PersistenceContext}) */
+   private static final String TAG_CONTEXT = "context";
++  /** The element name for a blueprint map */
+   private static final String TAG_MAP = "map";
+   
++  /** The jpa attribute for property injection, provides the injection site */
+   private static final String ATTR_PROPERTY = "property";
++  /** The {@link PersistenceContextType} of a persistence context */
+   private static final String ATTR_TYPE = "type";
++  /** The name of the persistence unit */
+   private static final String ATTR_UNIT_NAME = "unitname";
+-  
+-  private static final String TYPE_JTA = "TRANSACTION";
++  /** The default name to use if no unit name is specified */
+   private static final String DEFAULT_UNIT_NAME = "";
+   
++  /** A filter to find persistence units that specify an empty name */
+   public static final String EMPTY_UNIT_NAME_FILTER = 
+     "(" + PersistenceUnitConstants.EMPTY_PERSISTENCE_UNIT_NAME + "=true)";
+   
++  /** The service property indicating that a registered EMF is used to create managed persistence contexts */
+   public static final String PROXY_FACTORY_EMF_ATTRIBUTE = "org.apache.aries.jpa.proxy.factory";
+ 
++  /** The blueprint attribute value to make a bean eager */
+   private static final String ACTIVATION_EAGER = "EAGER";
+-  
++  /** The {@link PersistenceManager} to register contexts with */
+   private PersistenceManager manager;
+   
+   public void setManager(PersistenceManager manager) {
+     this.manager = manager;
+   }
+ 
++  /**
++   * Called by blueprint when we meet a JPA namespace element
++   */
+   public ComponentMetadata decorate(Node node, ComponentMetadata component, ParserContext context) {
+-    if (node.getNodeType() != Node.ELEMENT_NODE)
++    //The node should always be an element
++    if (node.getNodeType() != Node.ELEMENT_NODE) {
++      _logger.error("The JPA namespace handler does not understand the DOM node {}.", new Object[] {node});
+       throw new IllegalArgumentException();    
++    }
+     
+     Element element = (Element) node;
+-    
+-    if (!(component instanceof BeanMetadata))
++    //The surrounding component should always be a bean
++    if (!(component instanceof BeanMetadata)) {
++      _logger.error("The JPA namespace should only be used to inject properties into a bean. The surrounding component was {}.", new Object[] {component});
+       throw new IllegalArgumentException();
++    }
+     
+     final BeanMetadata bean = (BeanMetadata) component;
+     
+-    if (!NS_URI.equals(element.getNamespaceURI()))
++    if (!NS_URI.equals(element.getNamespaceURI())) {
++      _logger.error("The JPA namespace handler should not be called for the namespace {}.", new Object[] {element.getNamespaceURI()});
+       throw new IllegalArgumentException();
++    }
+         
+-    if (!TAG_UNIT.equals(element.getLocalName()) && !TAG_CONTEXT.equals(element.getLocalName()))
++    if (!TAG_UNIT.equals(element.getLocalName()) && !TAG_CONTEXT.equals(element.getLocalName())) {
++      _logger.error("The JPA namespace handler did not recognize the element named {}.", new Object[] {element.getLocalName()});
+       throw new IllegalArgumentException();
++    }
+     
++    //Create an injection point for the JPA resource (a blueprint property)
+     final BeanProperty beanProperty = createInjectMetadata(element, 
+         TAG_UNIT.equals(element.getLocalName()),
+         context);
+       
++    //If this is a persistence context then register it with the manager
+     if (TAG_CONTEXT.equals(element.getLocalName())) {
+       Bundle client = getBlueprintBundle(context);
+       String unitName = parseUnitName(element);
+@@ -114,12 +151,14 @@ public ComponentMetadata decorate(Node node, ComponentMetadata component, Parser
+       manager.registerContext(unitName, client, properties);      
+     }
+     
++    // Create a new Bean to replace the one passed in
+     return new BeanMetadata() {
+       
+       public String getId() {
+         return bean.getId();
+       }
+       
++      @SuppressWarnings("unchecked")
+       public List<String> getDependsOn() {
+         return bean.getDependsOn();
+       }
+@@ -132,7 +171,9 @@ public String getScope() {
+         return bean.getScope();
+       }
+       
++      @SuppressWarnings("unchecked")
+       public List<BeanProperty> getProperties() {
++        //Remember to add the jpa injection property
+         ArrayList<BeanProperty> result = new ArrayList<BeanProperty>(bean.getProperties());
+         result.add(beanProperty);
+         return result;
+@@ -158,13 +199,16 @@ public String getClassName() {
+         return bean.getClassName();
+       }
+       
++      @SuppressWarnings("unchecked")
+       public List<BeanArgument> getArguments() {
+         return bean.getArguments();
+       }
+     };
+   }
+ 
++  @SuppressWarnings("unchecked")
+   public Set<Class> getManagedClasses() {
++    //This is a no-op
+     return null;
+   }
+ 
+@@ -174,28 +218,49 @@ public URL getSchemaLocation(String namespace) {
+ 
+   public Metadata parse(Element element, ParserContext context) {
+     /*
+-     * The namespace does not any top-level elements, so we should never get here.
++     * The namespace does not define any top-level elements, so we should never get here.
+      * In case we do -> explode.
+      */
++    _logger.error("The JPA namespace handler was called to parse a top level element.");
+     throw new UnsupportedOperationException();
+   }
+   
++  /**
++   * Create a BeanProperty that will inject a JPA resource into a bean
++   * @param element  The element being parsed
++   * @param isPersistenceUnit  true if this is a persistence unit
++   * @param ctx  The current parser context
++   * @return
++   */
+   private BeanProperty createInjectMetadata(Element element, boolean isPersistenceUnit, ParserContext ctx) {
+     String unitName = parseUnitName(element);
+-    final String property = parseProperty(element);
++    final String property = element.getAttribute(ATTR_PROPERTY);
+ 
++    if(_logger.isDebugEnabled()) {
++      if(isPersistenceUnit)
++      _logger.debug("Creating blueprint injection metadata to inject the unit {} into bean property {}",
++          new Object[] {unitName, property});
++      else
++        _logger.debug("Creating blueprint injection metadata to inject the context {} into bean property {}",
++            new Object[] {unitName, property});
++    }
++    
++    //Create a service reference for the EMF (it is an EMF for persistence contexts and units)
+     final MutableReferenceMetadata refMetadata = (MutableReferenceMetadata) ctx.createMetadata(ReferenceMetadata.class);
+     refMetadata.setActivation(ACTIVATION_EAGER.equalsIgnoreCase(ctx.getDefaultActivation()) ?
+         ReferenceMetadata.ACTIVATION_EAGER : ReferenceMetadata.ACTIVATION_LAZY);
+     refMetadata.setAvailability(ReferenceMetadata.AVAILABILITY_MANDATORY);
+     refMetadata.setInterface(EntityManagerFactory.class.getName());    
+     
++    //Pick the right EMF by looking for the presence, or absence, of the PROXY_FACTORY service property 
+     StringBuilder filter = new StringBuilder("(&");
++    //Persistence units do not have the property, persistence contexts do
+     if (isPersistenceUnit)
+       filter.append("(!(").append(PROXY_FACTORY_EMF_ATTRIBUTE).append("=*))");
+     else
+       filter.append("(").append(PROXY_FACTORY_EMF_ATTRIBUTE).append("=*)");      
+       
++    //Add the empty name filter if necessary
+     if (!"".equals(unitName))
+       filter.append("(" + PersistenceUnitConstants.OSGI_UNIT_NAME + "=" + unitName + ")");
+     else
+@@ -208,6 +273,7 @@ private BeanProperty createInjectMetadata(Element element, boolean isPersistence
+     refMetadata.setDependsOn((List<String>) Collections.EMPTY_LIST);
+     refMetadata.setId(ctx.generateId());
+             
++    //Finally, if this is a persistence context we need to create the entity manager as the Target
+     final Metadata target = isPersistenceUnit ? refMetadata 
+         : createInjectionBeanMetedata(ctx, refMetadata);
+     
+@@ -222,7 +288,19 @@ public String getName() {
+     };
+   }
+   
++  /**
++   * This method turns a persistence context factory into an {@link EntityManager} using blueprint
++   * factories 
++   * @param ctx  the {@link ParserContext}
++   * @param factory  the reference bean for the persistence context factory
++   * @return
++   */
+   private Metadata createInjectionBeanMetedata(ParserContext ctx, ReferenceMetadata factory) {
++    
++    if(_logger.isDebugEnabled())
++      _logger.debug("Creating a managed persistence context definition for injection");
++    
++    //Register the factory bean, and then create an entitymanager from it
+     ctx.getComponentDefinitionRegistry().registerComponentDefinition(factory);
+     
+     MutableBeanMetadata meta = (MutableBeanMetadata) ctx.createMetadata(BeanMetadata.class);
+@@ -237,6 +315,11 @@ private Metadata createInjectionBeanMetedata(ParserContext ctx, ReferenceMetadat
+     return meta;
+   }
+   
++  /**
++   * Get hold of the blueprint bundle using the built in components
++   * @param context
++   * @return
++   */
+   private Bundle getBlueprintBundle(ParserContext context) {
+     PassThroughMetadata metadata = (PassThroughMetadata) context.getComponentDefinitionRegistry()
+       .getComponentDefinition("blueprintBundle");
+@@ -249,14 +332,11 @@ private Bundle getBlueprintBundle(ParserContext context) {
+     return result;
+   }
+   
+-  private String parseProperty(Element element) {
+-    return element.getAttribute(ATTR_PROPERTY);
+-  }
+ 
+   private PersistenceContextType parseType(Element element) {
+-    String typeName = element.hasAttribute(ATTR_TYPE) ? element.getAttribute(ATTR_TYPE) : TYPE_JTA;
+-    
+-    return PersistenceContextType.valueOf(typeName);
++    if(element.hasAttribute(ATTR_TYPE))
++      return PersistenceContextType.valueOf(element.getAttribute(ATTR_TYPE));
++    else return PersistenceContextType.TRANSACTION;
+   }
+   
+   private String parseUnitName(Element element) {
+@@ -264,10 +344,16 @@ private String parseUnitName(Element element) {
+         element.getAttribute(ATTR_UNIT_NAME) : DEFAULT_UNIT_NAME;
+   }
+   
++  /**
++   * Parse any properties for creating the persistence context
++   * @param element
++   * @param context
++   * @return
++   */
+   private Map<String, Object> parseJPAProperties(Element element, ParserContext context) {
+     Map<String, Object> result = new HashMap<String, Object>();
+     NodeList ns = element.getElementsByTagNameNS(BLUEPRINT_NS, TAG_MAP);
+-    
++    //Use the parser context to parse the map for us
+     for (int i=0; i<ns.getLength(); i++) {
+       MapMetadata metadata = context.parseElement(MapMetadata.class, null, (Element) ns.item(i));
+       for (MapEntry entry : (List<MapEntry>) metadata.getEntries()) {
+@@ -277,6 +363,7 @@ private String parseUnitName(Element element) {
+           
+           result.put(key.getStringValue(), value.getStringValue());
+         } else {
++          _logger.error("There was a problem parsing a map of JPA properties");
+           throw new UnsupportedOperationException();
+         }
+       }
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAEntityManager.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAEntityManager.java
+index 9abd5f8f..6bbc94c8 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAEntityManager.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAEntityManager.java
+@@ -37,9 +37,16 @@
+  */
+ public class JTAEntityManager implements EntityManager {
+ 
++  /** The {@link EntityManagerFactory} that can create new {@link EntityManager} instances */
+   private final EntityManagerFactory emf;
++  /** The map of properties to pass when creating EntityManagers */
+   private final Map<String, Object> props;
++  /** A registry for creating new persistence contexts */
+   private final JTAPersistenceContextRegistry reg;
++  /** 
++   * The entity manager to use when there is no transaction. Note that there is one of these
++   * per injection site.
++   */
+   private EntityManager detachedManager = null;
+   
+   public JTAEntityManager(EntityManagerFactory factory,
+@@ -76,7 +83,6 @@ private EntityManager getPersistenceContext(boolean forceTransaction)
+           if (temp != null)
+             temp.close();
+         }
+-        
+         return detachedManager;
+       }
+     }
+@@ -105,7 +111,7 @@ public void clear()
+   public void close()
+   {
+     //TODO add a message here
+-    throw new IllegalStateException();
++    throw new IllegalStateException("It is forbidden to call close on a container managed EntityManager");
+   }
+ 
+   public boolean contains(Object arg0)
+@@ -169,8 +175,7 @@ public FlushModeType getFlushMode()
+ 
+   public EntityTransaction getTransaction()
+   {
+-    //TODO add a message here
+-    throw new IllegalStateException();
++    throw new IllegalStateException("Transaction management is not available for container managed EntityManagers");
+   }
+ 
+   public boolean isOpen()
+@@ -331,9 +336,6 @@ public void refresh(Object arg0, LockModeType arg1, Map<String, Object> arg2)
+ 
+   public void setProperty(String arg0, Object arg1)
+   {
+-    /*
+-     * TODO check whether we need to change the properies as well
+-     */
+     getPersistenceContext(false).setProperty(arg0, arg1);
+   }
+ 
+diff --git a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAPersistenceContextRegistry.java b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAPersistenceContextRegistry.java
+index 2df3ab16..57416798 100644
+--- a/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAPersistenceContextRegistry.java
++++ b/incubator/aries/trunk/jpa/jpa-container-context/src/main/java/org/apache/aries/jpa/container/context/transaction/impl/JTAPersistenceContextRegistry.java
+@@ -29,10 +29,15 @@
+ import javax.transaction.Synchronization;
+ import javax.transaction.TransactionSynchronizationRegistry;
+ 
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ /**
+  * This class is used to manage the lifecycle of JTA peristence contexts
+  */
+ public class JTAPersistenceContextRegistry {
++  /** Logger */
++  private static final Logger _logger = LoggerFactory.getLogger("org.apache.aries.jpa.container.context");
+ 
+   /** 
+    * The transaction synchronization registry, used to determine the currently
+@@ -67,10 +72,9 @@ public EntityManager getCurrentPersistenceContext(EntityManagerFactory persisten
+     
+     Object transactionKey = tranRegistry.getTransactionKey();
+     
+-    //TODO Globalize and log this problem
+     //Throw the error on to the client
+     if(transactionKey == null) {
+-      throw new TransactionRequiredException();
++      throw new TransactionRequiredException("No transaction currently active");
+     }
+     
+     //Get hold of the Map. If there is no Map already registered then add one.
+@@ -86,8 +90,7 @@ public EntityManager getCurrentPersistenceContext(EntityManagerFactory persisten
+         tranRegistry.registerInterposedSynchronization(new EntityManagerClearUp(transactionKey));
+       } catch (IllegalStateException e) {
+         persistenceContextRegistry.remove(transactionKey);
+-        //TODO add a message
+-        throw new TransactionRequiredException();
++        throw new TransactionRequiredException("Unable to synchronize with transaction " + transactionKey);
+       }
+     }
+     
+@@ -98,9 +101,9 @@ public EntityManager getCurrentPersistenceContext(EntityManagerFactory persisten
+       toReturn = (properties == null) ? persistenceUnit.createEntityManager() : persistenceUnit.createEntityManager(properties);
+       contextsForTransaction.put(persistenceUnit, toReturn);
+     } else {
+-      //TODO maybe add debug
++      if(_logger.isDebugEnabled())
++        _logger.debug("Re-using a persistence context for transaction " + transactionKey);
+     }
+-    
+     return toReturn;
+   }
+   
+@@ -144,7 +147,7 @@ public void beforeCompletion() {
+           try {
+             em.close();
+           } catch (Exception e) {
+-            //TODO Log this, but continue
++            _logger.warn("There was an error when the container closed an EntityManager", em);
+           }
+         }
+       }

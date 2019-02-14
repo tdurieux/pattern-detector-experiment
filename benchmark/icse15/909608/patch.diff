@@ -1,0 +1,323 @@
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMergeReducer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMergeReducer.java
+index 479fadff..6cc74de5 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMergeReducer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMergeReducer.java
+@@ -27,6 +27,7 @@
+ import org.apache.hadoop.mapred.Reducer;
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.mahout.math.RandomAccessSparseVector;
++import org.apache.mahout.math.SequentialAccessSparseVector;
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.VectorWritable;
+ 
+@@ -40,6 +41,8 @@
+   private final VectorWritable vectorWritable = new VectorWritable();
+   
+   private double normPower;
++  private int dimension;
++  private boolean sequentialAccess;
+   
+   @Override
+   public void reduce(WritableComparable<?> key,
+@@ -47,8 +50,7 @@ public void reduce(WritableComparable<?> key,
+                      OutputCollector<WritableComparable<?>,VectorWritable> output,
+                      Reporter reporter) throws IOException {
+     
+-    Vector vector = new RandomAccessSparseVector(key
+-        .toString(), Integer.MAX_VALUE, 10);
++    Vector vector = new RandomAccessSparseVector(key.toString(), dimension, 10);
+     while (values.hasNext()) {
+       VectorWritable value = values.next();
+       value.get().addTo(vector);
+@@ -56,6 +58,9 @@ public void reduce(WritableComparable<?> key,
+     if (normPower != PartialVectorMerger.NO_NORMALIZING) {
+       vector = vector.normalize(normPower);
+     }
++    if (sequentialAccess) {
++      vector = new SequentialAccessSparseVector(vector);
++    }
+     vectorWritable.set(vector);
+     output.collect(key, vectorWritable);
+   }
+@@ -65,5 +70,7 @@ public void configure(JobConf job) {
+     super.configure(job);
+     normPower = job.getFloat(PartialVectorMerger.NORMALIZATION_POWER,
+       PartialVectorMerger.NO_NORMALIZING);
++    dimension = job.getInt(PartialVectorMerger.DIMENSION, Integer.MAX_VALUE);
++    sequentialAccess = job.getBoolean(PartialVectorMerger.SEQUENTIAL_ACCESS, false);
+   }
+ }
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMerger.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMerger.java
+index 92fc4620..dee0fb98 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMerger.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/common/PartialVectorMerger.java
+@@ -48,6 +48,10 @@
+   
+   public static final String NORMALIZATION_POWER = "normalization.power";
+   
++  public static final String DIMENSION = "vector.dimension";
++
++  public static final String SEQUENTIAL_ACCESS = "vector.sequentialAccess";
++  
+   /**
+    * Cannot be initialized. Use the static functions
+    */
+@@ -71,7 +75,9 @@ private PartialVectorMerger() {
+    */
+   public static void mergePartialVectors(List<Path> partialVectorPaths,
+                                          String output,
+-                                         float normPower) throws IOException {
++                                         float normPower,
++                                         int dimension,
++                                         boolean sequentialAccess) throws IOException {
+     if (normPower != NO_NORMALIZING && normPower < 0) {
+       throw new IllegalArgumentException("normPower must either be -1 or >= 0");
+     }
+@@ -83,7 +89,8 @@ public static void mergePartialVectors(List<Path> partialVectorPaths,
+           + "org.apache.hadoop.io.serializer.WritableSerialization");
+     // this conf parameter needs to be set enable serialisation of conf values
+     conf.setJobName("PartialVectorMerger::MergePartialVectors");
+-    
++    conf.setBoolean(SEQUENTIAL_ACCESS, sequentialAccess);
++    conf.setInt(DIMENSION, dimension);
+     conf.setFloat(NORMALIZATION_POWER, normPower);
+     
+     conf.setOutputKeyClass(Text.class);
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
+index 89a48200..4f4b869c 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
+@@ -126,7 +126,8 @@ public static void createTermFrequencyVectors(String input,
+                                                 int maxNGramSize,
+                                                 float minLLRValue,
+                                                 int numReducers,
+-                                                int chunkSizeInMegabytes) throws IOException {
++                                                int chunkSizeInMegabytes,
++                                                boolean sequentialAccess) throws IOException {
+     if (chunkSizeInMegabytes < MIN_CHUNKSIZE) {
+       chunkSizeInMegabytes = MIN_CHUNKSIZE;
+     } else if (chunkSizeInMegabytes > MAX_CHUNKSIZE) { // 10GB
+@@ -137,17 +138,18 @@ public static void createTermFrequencyVectors(String input,
+     Path inputPath = new Path(input);
+     Path dictionaryJobPath = new Path(output + DICTIONARY_JOB_FOLDER);
+     
++    int[] maxTermDimension = new int[1];
+     List<Path> dictionaryChunks;
+     if (maxNGramSize == 1) {
+       startWordCounting(inputPath, dictionaryJobPath, minSupport);
+       dictionaryChunks = createDictionaryChunks(minSupport, dictionaryJobPath,
+-        output, chunkSizeInMegabytes, new LongWritable());
++        output, chunkSizeInMegabytes, new LongWritable(), maxTermDimension);
+     } else {
+       CollocDriver.generateAllGrams(inputPath.toString(), dictionaryJobPath
+           .toString(), maxNGramSize, minSupport, minLLRValue, numReducers);
+       dictionaryChunks = createDictionaryChunks(minSupport, new Path(
+           output + DICTIONARY_JOB_FOLDER, CollocDriver.NGRAM_OUTPUT_DIRECTORY), output,
+-        chunkSizeInMegabytes, new DoubleWritable());
++        chunkSizeInMegabytes, new DoubleWritable(), maxTermDimension);
+     }
+     
+     int partialVectorIndex = 0;
+@@ -156,8 +158,12 @@ public static void createTermFrequencyVectors(String input,
+       Path partialVectorOutputPath = getPath(output + VECTOR_OUTPUT_FOLDER,
+         partialVectorIndex++);
+       partialVectorPaths.add(partialVectorOutputPath);
+-      makePartialVectors(input, maxNGramSize, dictionaryChunk,
+-        partialVectorOutputPath);
++      makePartialVectors(input,
++                         maxNGramSize,
++                         dictionaryChunk,
++                         partialVectorOutputPath,
++                         maxTermDimension[0],
++                         sequentialAccess);
+     }
+     
+     Configuration conf = new Configuration();
+@@ -165,8 +171,11 @@ public static void createTermFrequencyVectors(String input,
+     
+     String outputDir = output + DOCUMENT_VECTOR_OUTPUT_FOLDER;
+     if (dictionaryChunks.size() > 1) {
+-      PartialVectorMerger
+-          .mergePartialVectors(partialVectorPaths, outputDir, -1);
++      PartialVectorMerger.mergePartialVectors(partialVectorPaths,
++                                              outputDir,
++                                              -1,
++                                              maxTermDimension[0],
++                                              sequentialAccess);
+       HadoopUtil.deletePaths(partialVectorPaths, fs);
+     } else {
+       Path singlePartialVectorOutputPath = partialVectorPaths.get(0);
+@@ -189,7 +198,8 @@ public static void createTermFrequencyVectors(String input,
+                                                    Path wordCountPath,
+                                                    String dictionaryPathBase,
+                                                    int chunkSizeInMegabytes,
+-                                                   Writable value) throws IOException {
++                                                   Writable value,
++                                                   int[] maxTermDimension) throws IOException {
+     List<Path> chunkPaths = new ArrayList<Path>();
+     
+     Writable key = new Text();
+@@ -233,7 +243,7 @@ public static void createTermFrequencyVectors(String input,
+         dictWriter.append(key, new IntWritable(i++));
+       }
+     }
+-    
++    maxTermDimension[0] = (int)i;
+     dictWriter.close();
+     
+     return chunkPaths;
+@@ -260,7 +270,9 @@ private static Path getPath(String basePath, int index) {
+   private static void makePartialVectors(String input,
+                                          int maxNGramSize,
+                                          Path dictionaryFilePath,
+-                                         Path output) throws IOException {
++                                         Path output,
++                                         int dimension,
++                                         boolean sequentialAccess) throws IOException {
+     
+     Configurable client = new JobClient();
+     JobConf conf = new JobConf(DictionaryVectorizer.class);
+@@ -272,14 +284,15 @@ private static void makePartialVectors(String input,
+     conf.setJobName("DictionaryVectorizer::MakePartialVectors: input-folder: "
+                     + input + ", dictionary-file: "
+                     + dictionaryFilePath.toString());
++    conf.setInt(PartialVectorMerger.DIMENSION, dimension);
++    conf.setBoolean(PartialVectorMerger.SEQUENTIAL_ACCESS, sequentialAccess);
+     conf.setInt(MAX_NGRAMS, maxNGramSize);
+     
+     conf.setMapOutputKeyClass(Text.class);
+     conf.setMapOutputValueClass(StringTuple.class);
+     conf.setOutputKeyClass(Text.class);
+     conf.setOutputValueClass(VectorWritable.class);
+-    DistributedCache
+-        .setCacheFiles(new URI[] {dictionaryFilePath.toUri()}, conf);
++    DistributedCache.setCacheFiles(new URI[] {dictionaryFilePath.toUri()}, conf);
+     FileInputFormat.setInputPaths(conf, new Path(input));
+     
+     FileOutputFormat.setOutputPath(conf, output);
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/term/TFPartialVectorReducer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/term/TFPartialVectorReducer.java
+index f41c37d3..d39b85d4 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/term/TFPartialVectorReducer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/term/TFPartialVectorReducer.java
+@@ -36,9 +36,11 @@
+ import org.apache.lucene.analysis.tokenattributes.TermAttribute;
+ import org.apache.mahout.common.StringTuple;
+ import org.apache.mahout.math.RandomAccessSparseVector;
++import org.apache.mahout.math.SequentialAccessSparseVector;
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.VectorWritable;
+ import org.apache.mahout.math.map.OpenObjectIntHashMap;
++import org.apache.mahout.utils.vectors.common.PartialVectorMerger;
+ import org.apache.mahout.utils.nlp.collocations.llr.CollocMapper.IteratorTokenStream;
+ import org.apache.mahout.utils.vectors.text.DictionaryVectorizer;
+ 
+@@ -51,6 +53,9 @@
+   
+   private final VectorWritable vectorWritable = new VectorWritable();
+   
++  private int dimension;
++  private boolean sequentialAccess;
++  
+   private int maxNGramSize = 1;
+   
+   @Override
+@@ -62,7 +67,8 @@ public void reduce(Text key,
+     StringTuple value = values.next();
+     
+     Vector vector = new RandomAccessSparseVector(key.toString(),
+-        Integer.MAX_VALUE, value.length()); // guess at initial size
++                                                 dimension,
++                                                 value.length()); // guess at initial size
+     
+     if (maxNGramSize >= 2) {
+       ShingleFilter sf = new ShingleFilter(new IteratorTokenStream(value
+@@ -89,6 +95,9 @@ public void reduce(Text key,
+         }
+       }
+     }
++    if (sequentialAccess) {
++      vector = new SequentialAccessSparseVector(vector);
++    }
+     vectorWritable.set(vector);
+     output.collect(key, vectorWritable);
+     
+@@ -98,6 +107,8 @@ public void reduce(Text key,
+   public void configure(JobConf job) {
+     super.configure(job);
+     try {
++      dimension = job.getInt(PartialVectorMerger.DIMENSION, Integer.MAX_VALUE);
++      sequentialAccess = job.getBoolean(PartialVectorMerger.SEQUENTIAL_ACCESS, false);
+       maxNGramSize = job.getInt(DictionaryVectorizer.MAX_NGRAMS, maxNGramSize);
+       URI[] localFiles = DistributedCache.getCacheFiles(job);
+       if (localFiles == null || localFiles.length < 1) {
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
+index 9a02153e..13c5336d 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
+@@ -123,7 +123,8 @@ public static void processTfIdf(String input,
+                                   int chunkSizeInMegabytes,
+                                   int minDf,
+                                   int maxDFPercent,
+-                                  float normPower) throws IOException {
++                                  float normPower,
++                                  boolean sequentialAccessOutput) throws IOException {
+     if (chunkSizeInMegabytes < MIN_CHUNKSIZE) {
+       chunkSizeInMegabytes = MIN_CHUNKSIZE;
+     } else if (chunkSizeInMegabytes > MAX_CHUNKSIZE) { // 10GB
+@@ -151,8 +152,12 @@ public static void processTfIdf(String input,
+       Path partialVectorOutputPath = getPath(output + VECTOR_OUTPUT_FOLDER,
+         partialVectorIndex++);
+       partialVectorPaths.add(partialVectorOutputPath);
+-      makePartialVectors(input, datasetFeatures.getFirst()[0], datasetFeatures
+-          .getFirst()[1], minDf, maxDFPercent, dictionaryChunk,
++      makePartialVectors(input,
++                         datasetFeatures.getFirst()[0],
++                         datasetFeatures.getFirst()[1],
++                         minDf,
++                         maxDFPercent,
++                         dictionaryChunk,
+         partialVectorOutputPath);
+     }
+     
+@@ -161,8 +166,11 @@ public static void processTfIdf(String input,
+     
+     String outputDir = output + DOCUMENT_VECTOR_OUTPUT_FOLDER;
+     if (dictionaryChunks.size() > 1) {
+-      PartialVectorMerger.mergePartialVectors(partialVectorPaths, outputDir,
+-        normPower);
++      PartialVectorMerger.mergePartialVectors(partialVectorPaths,
++                                              outputDir,
++                                              normPower,
++                                              (int)(long)datasetFeatures.getFirst()[0],
++                                              sequentialAccessOutput);
+       HadoopUtil.deletePaths(partialVectorPaths, fs);
+     } else {
+       Path singlePartialVectorOutputPath = partialVectorPaths.get(0);
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFPartialVectorReducer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFPartialVectorReducer.java
+index f9c61479..5eb80793 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFPartialVectorReducer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFPartialVectorReducer.java
+@@ -64,7 +64,7 @@ public void reduce(WritableComparable<?> key,
+     Vector value = values.next().get();
+     Iterator<Element> it = value.iterateNonZero();
+     Vector vector = new RandomAccessSparseVector(key
+-        .toString(), Integer.MAX_VALUE, value.getNumNondefaultElements());
++        .toString(), (int)featureCount, value.getNumNondefaultElements());
+     while (it.hasNext()) {
+       Element e = it.next();
+       if (!dictionary.containsKey(e.index())) continue;
+diff --git a/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizerTest.java b/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizerTest.java
+index 7c093690..de83fe40 100644
+--- a/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizerTest.java
++++ b/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizerTest.java
+@@ -137,8 +137,8 @@ public void testCreateTermFrequencyVectors() throws IOException,
+     DocumentProcessor.tokenizeDocuments(pathString, analyzer,
+       "output/tokenized-documents");
+     DictionaryVectorizer.createTermFrequencyVectors("output/tokenized-documents",
+-      "output/wordcount", 2, 1, 0.0f, 1, 100);
+-    TFIDFConverter.processTfIdf("output/wordcount/vectors", "output/tfidf/", 100, 1, 99, 1.0f);
++      "output/wordcount", 2, 1, 0.0f, 1, 100, false);
++    TFIDFConverter.processTfIdf("output/wordcount/vectors", "output/tfidf/", 100, 1, 99, 1.0f, false);
+     
+   }
+ }

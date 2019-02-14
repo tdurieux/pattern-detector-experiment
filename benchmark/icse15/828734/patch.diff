@@ -1,0 +1,271 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 23d103eb..6cb152ed 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -76,6 +76,7 @@
+     private static Set<String> applicationColumnFamilies_ = new HashSet<String>();
+     private static int bmtThreshold_ = 256;
+ 
++    private static Map<String, Double> tableKeysCachedFractions_;
+     /*
+      * A map from table names to the set of column families for the table and the
+      * corresponding meta data for that column family.
+@@ -407,6 +408,7 @@ else if (commitLogSync_ == CommitLogSync.batch)
+                 CommitLog.setSegmentSize(Integer.parseInt(value) * 1024 * 1024);
+ 
+             tableToCFMetaDataMap_ = new HashMap<String, Map<String, CFMetaData>>();
++            tableKeysCachedFractions_ = new HashMap<String, Double>();
+ 
+             /* See which replica placement strategy to use */
+             String replicaPlacementStrategyClassName = xmlUtils.getNodeValue("/Storage/ReplicaPlacementStrategy");
+@@ -443,6 +445,17 @@ else if (commitLogSync_ == CommitLogSync.batch)
+                 tables_.add(tName);
+                 tableToCFMetaDataMap_.put(tName, new HashMap<String, CFMetaData>());
+ 
++                String xqlCacheSize = "/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/KeysCachedFraction";
++                value = xmlUtils.getNodeValue(xqlCacheSize);
++                if (value == null)
++                {
++                    tableKeysCachedFractions_.put(tName, 0.01);
++                }
++                else
++                {
++                    tableKeysCachedFractions_.put(tName, Double.valueOf(value));
++                }
++
+                 String xqlTable = "/Storage/Keyspaces/Keyspace[@Name='" + tName + "']/";
+                 NodeList columnFamilies = xmlUtils.getRequestedNodeList(xqlTable + "ColumnFamily");
+ 
+@@ -527,6 +540,7 @@ else if (XMLUtils.getAttributeValue(columnFamily, "CompareSubcolumnsWith") != nu
+             systemMetadata.put(data.cfName, data);
+ 
+             tableToCFMetaDataMap_.put(Table.SYSTEM_TABLE, systemMetadata);
++            tableKeysCachedFractions_.put(Table.SYSTEM_TABLE, 0.0);
+ 
+             /* make sure we have a directory for each table */
+             createTableDirectories();
+@@ -911,6 +925,11 @@ public static AbstractType getSubComparator(String tableName, String cfName)
+         return tableToCFMetaDataMap_;
+     }
+ 
++    public static double getKeysCachedFraction(String tableName)
++    {
++        return tableKeysCachedFractions_.get(tableName);
++    }
++
+     private static class ConfigurationException extends Exception
+     {
+         public ConfigurationException(String message)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
+index d74a265d..f73a33b9 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
+@@ -144,7 +144,7 @@ public SSTableReader writeSortedContents(List<DecoratedKey> sortedKeys) throws I
+             assert bytes.length > 0;
+             writer.append(key, bytes);
+         }
+-        SSTableReader sstable = writer.closeAndOpenReader();
++        SSTableReader sstable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
+         logger_.info("Completed flushing " + writer.getFilename());
+         return sstable;
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 3e41f1c3..b8170a24 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -814,7 +814,7 @@ void doCleanup(SSTableReader sstable) throws IOException
+ 
+         if (writer != null)
+         {
+-            results.add(writer.closeAndOpenReader());
++            results.add(writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_)));
+             String format = "AntiCompacted to %s.  %d/%d bytes for %d keys.  Time: %dms.";
+             long dTime = System.currentTimeMillis() - startTime;
+             logger_.info(String.format(format, writer.getFilename(), getTotalBytes(sstables), results.get(0).length(), totalkeysWritten, dTime));
+@@ -890,7 +890,7 @@ int doFileCompaction(Collection<SSTableReader> sstables, int gcBefore) throws IO
+             ci.close();
+         }
+ 
+-        SSTableReader ssTable = writer.closeAndOpenReader();
++        SSTableReader ssTable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
+         ssTables_.add(ssTable);
+         ssTables_.markCompacted(sstables);
+         CompactionManager.instance().submit(ColumnFamilyStore.this);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 218b975c..9b477ec1 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -217,8 +217,8 @@ public SSTableReader writeSortedContents(List<DecoratedKey> sortedKeys) throws I
+             /* Now write the key and value to disk */
+             writer.append(key, buffer);
+         }
+-        buffer.close();
+-        SSTableReader ssTable = writer.closeAndOpenReader();
++
++        SSTableReader ssTable = writer.closeAndOpenReader(DatabaseDescriptor.getKeysCachedFraction(table_));
+         isFlushed_ = true;
+         logger_.info("Completed flushing " + ssTable.getFilename());
+         return ssTable;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
+index c498a7ef..36f2f1de 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableReader.java
+@@ -36,6 +36,7 @@
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.marshal.AbstractType;
+ import org.cliffc.high_scale_lib.NonBlockingHashMap;
++import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
+ 
+ /**
+  * SSTableReaders are open()ed by Table.onStart; after that they are created by SSTableWriter.renameAndOpen.
+@@ -133,10 +134,10 @@ public static long getApproximateKeyCount(Iterable<SSTableReader> sstables)
+ 
+     public static SSTableReader open(String dataFileName) throws IOException
+     {
+-        return open(dataFileName, StorageService.getPartitioner());
++        return open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
+     }
+ 
+-    public static SSTableReader open(String dataFileName, IPartitioner partitioner) throws IOException
++    public static SSTableReader open(String dataFileName, IPartitioner partitioner, double cacheFraction) throws IOException
+     {
+         assert partitioner != null;
+         assert openedFiles.get(dataFileName) == null;
+@@ -145,6 +146,10 @@ public static SSTableReader open(String dataFileName, IPartitioner partitioner)
+         SSTableReader sstable = new SSTableReader(dataFileName, partitioner);
+         sstable.loadIndexFile();
+         sstable.loadBloomFilter();
++        if (cacheFraction > 0)
++        {
++            sstable.keyCache = createKeyCache((int)((sstable.getIndexPositions().size() + 1) * INDEX_INTERVAL * cacheFraction));
++        }
+         if (logger.isDebugEnabled())
+             logger.debug("INDEX LOAD TIME for "  + dataFileName + ": " + (System.currentTimeMillis() - start) + " ms.");
+ 
+@@ -153,7 +158,14 @@ public static SSTableReader open(String dataFileName, IPartitioner partitioner)
+ 
+     FileDeletingReference phantomReference;
+ 
+-    SSTableReader(String filename, IPartitioner partitioner, List<KeyPosition> indexPositions, BloomFilter bloomFilter)
++    public static ConcurrentLinkedHashMap<DecoratedKey, Long> createKeyCache(int size)
++    {
++        return ConcurrentLinkedHashMap.create(ConcurrentLinkedHashMap.EvictionPolicy.SECOND_CHANCE, size);
++    }
++
++    private ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache;
++
++    SSTableReader(String filename, IPartitioner partitioner, List<KeyPosition> indexPositions, BloomFilter bloomFilter, ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache)
+     {
+         super(filename, partitioner);
+         this.indexPositions = indexPositions;
+@@ -161,11 +173,12 @@ public static SSTableReader open(String dataFileName, IPartitioner partitioner)
+         phantomReference = new FileDeletingReference(this, finalizerQueue);
+         finalizers.add(phantomReference);
+         openedFiles.put(filename, this);
++        this.keyCache = keyCache;
+     }
+ 
+     private SSTableReader(String filename, IPartitioner partitioner)
+     {
+-        this(filename, partitioner, null, null);
++        this(filename, partitioner, null, null, null);
+     }
+ 
+     public List<KeyPosition> getIndexPositions()
+@@ -229,6 +242,14 @@ public long getPosition(DecoratedKey decoratedKey) throws IOException
+     {
+         if (!bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
+             return -1;
++        if (keyCache != null)
++        {
++            Long cachedPosition = keyCache.get(decoratedKey);
++            if (cachedPosition != null)
++            {
++                return cachedPosition;
++            }
++        }
+         long start = getIndexScanPosition(decoratedKey, partitioner);
+         if (start < 0)
+         {
+@@ -256,6 +277,8 @@ public long getPosition(DecoratedKey decoratedKey) throws IOException
+                 int v = partitioner.getDecoratedKeyComparator().compare(indexDecoratedKey, decoratedKey);
+                 if (v == 0)
+                 {
++                    if (keyCache != null)
++                        keyCache.put(decoratedKey, position);
+                     return position;
+                 }
+                 if (v > 0)
+@@ -335,7 +358,7 @@ static void reopenUnsafe() throws IOException // testing only
+         openedFiles.clear();
+         for (SSTableReader sstable : sstables)
+         {
+-            SSTableReader.open(sstable.path, sstable.partitioner);
++            SSTableReader.open(sstable.path, sstable.partitioner, 0.01);
+         }
+     }
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
+index 1340d2c8..8562461a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTableWriter.java
+@@ -35,6 +35,7 @@
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import com.reardencommerce.kernel.collections.shared.evictable.ConcurrentLinkedHashMap;
+ 
+ public class SSTableWriter extends SSTable
+ {
+@@ -118,7 +119,7 @@ public void append(DecoratedKey decoratedKey, byte[] value) throws IOException
+     /**
+      * Renames temporary SSTable files to valid data, index, and bloom filter files
+      */
+-    public SSTableReader closeAndOpenReader() throws IOException
++    public SSTableReader closeAndOpenReader(double cacheFraction) throws IOException
+     {
+         // bloom filter
+         FileOutputStream fos = new FileOutputStream(filterFilename());
+@@ -139,7 +140,10 @@ public SSTableReader closeAndOpenReader() throws IOException
+         rename(filterFilename());
+         path = rename(path); // important to do this last since index & filter file names are derived from it
+ 
+-        return new SSTableReader(path, partitioner, indexPositions, bf);
++        ConcurrentLinkedHashMap<DecoratedKey, Long> keyCache = cacheFraction > 0
++                                                        ? SSTableReader.createKeyCache((int) (cacheFraction * keysWritten))
++                                                        : null;
++        return new SSTableReader(path, partitioner, indexPositions, bf, keyCache);
+     }
+ 
+     static String rename(String tmpFilename)
+@@ -154,7 +158,7 @@ public static SSTableReader renameAndOpen(String dataFileName) throws IOExceptio
+         SSTableWriter.rename(indexFilename(dataFileName));
+         SSTableWriter.rename(filterFilename(dataFileName));
+         dataFileName = SSTableWriter.rename(dataFileName);
+-        return SSTableReader.open(dataFileName, StorageService.getPartitioner());
++        return SSTableReader.open(dataFileName, StorageService.getPartitioner(), DatabaseDescriptor.getKeysCachedFraction(parseTableName(dataFileName)));
+     }
+ 
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
+index 081e27c3..8c8dc903 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/SSTableTest.java
+@@ -42,7 +42,7 @@ public void testSingleWrite() throws IOException {
+ 
+         String key = Integer.toString(1);
+         writer.append(writer.partitioner.decorateKey(key), bytes);
+-        SSTableReader ssTable = writer.closeAndOpenReader();
++        SSTableReader ssTable = writer.closeAndOpenReader(0.01);
+ 
+         // verify
+         verifySingle(ssTable, bytes, key);
+@@ -82,7 +82,7 @@ public void testManyWrites() throws IOException {
+         {
+             writer.append(writer.partitioner.decorateKey(key), map.get(key));
+         }
+-        SSTableReader ssTable = writer.closeAndOpenReader();
++        SSTableReader ssTable = writer.closeAndOpenReader(0.01);
+ 
+         // verify
+         verifyMany(ssTable, map);

@@ -1,0 +1,241 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 895331ab..9b045c29 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -575,7 +575,7 @@ public String getTempSSTablePath(String directory)
+ 
+             assert memtable == oldMemtable;
+             memtable.freeze();
+-            final CommitLogSegment.CommitLogContext ctx = writeCommitLog ? CommitLog.instance().getContext() : null;
++            final CommitLogSegment.CommitLogContext ctx = writeCommitLog ? CommitLog.instance.getContext() : null;
+             logger.info("switching in a fresh Memtable for " + columnFamily + " at " + ctx);
+ 
+             // submit the memtable for any indexed sub-cfses, and our own.
+@@ -605,7 +605,7 @@ public void runMayThrow() throws InterruptedException, IOException
+                     {
+                         // if we're not writing to the commit log, we are replaying the log, so marking
+                         // the log header with "you can discard anything written before the context" is not valid
+-                        CommitLog.instance().discardCompletedSegments(metadata.cfId, ctx);
++                        CommitLog.instance.discardCompletedSegments(metadata.cfId, ctx);
+                     }
+                 }
+             });
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 0f5d4e64..637f5029 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -62,9 +62,8 @@
+      */
+     static final ReentrantReadWriteLock flusherLock = new ReentrantReadWriteLock(true);
+ 
+-    // This is a result of pushing down the point in time when storage directories get created.  It used to happen in
+-    // CassandraDaemon, but it is possible to call Table.open without a running daemon, so it made sense to ensure
+-    // proper directories here.
++    // It is possible to call Table.open without a running daemon, so it makes sense to ensure
++    // proper directories here as well as in CassandraDaemon.
+     static
+     {
+         try
+@@ -73,7 +72,7 @@
+         }
+         catch (IOException ex)
+         {
+-            throw new RuntimeException(ex);
++            throw new IOError(ex);
+         }
+     }
+ 
+@@ -350,7 +349,7 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+         try
+         {
+             if (writeCommitLog)
+-                CommitLog.instance().add(mutation, serializedMutation);
++                CommitLog.instance.add(mutation, serializedMutation);
+         
+             DecoratedKey key = StorageService.getPartitioner().decorateKey(mutation.key());
+             for (ColumnFamily cf : mutation.getColumnFamilies())
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
+index a5448579..588c4e69 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
+@@ -95,7 +95,7 @@ private void processWithSyncBatch() throws Exception
+         // now sync and set the tasks' values (which allows thread calling get() to proceed)
+         try
+         {
+-            CommitLog.instance().sync();
++            CommitLog.instance.sync();
+         }
+         catch (IOException e)
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index cab9f3fe..6f74a91e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -80,15 +80,7 @@
+ 
+     static final Logger logger = LoggerFactory.getLogger(CommitLog.class);
+ 
+-    public static CommitLog instance()
+-    {
+-        return CLHandle.instance;
+-    }
+-
+-    private static class CLHandle
+-    {
+         public static final CommitLog instance = new CommitLog();
+-    }
+ 
+     private final Deque<CommitLogSegment> segments = new ArrayDeque<CommitLogSegment>();
+ 
+@@ -97,11 +89,6 @@ public static void setSegmentSize(int size)
+         SEGMENT_SIZE = size;
+     }
+ 
+-    public int getSegmentCount()
+-    {
+-        return segments.size();
+-    }
+-
+     private final ICommitLogExecutorService executor;
+ 
+     /**
+@@ -112,6 +99,15 @@ public int getSegmentCount()
+     */
+     private CommitLog()
+     {
++        try
++        {
++            DatabaseDescriptor.createAllDirectories();
++        }
++        catch (IOException e)
++        {
++            throw new IOError(e);
++        }
++
+         // all old segments are recovered and deleted before CommitLog is instantiated.
+         // All we need to do is create a new one.
+         segments.add(new CommitLogSegment());
+@@ -157,6 +153,22 @@ public void run()
+         }
+     }
+ 
++    public void resetUnsafe()
++    {
++        segments.clear();
++        segments.add(new CommitLogSegment());
++    }
++
++    private boolean manages(String name)
++    {
++        for (CommitLogSegment segment : segments)
++        {
++            if (segment.getPath().endsWith(name))
++                return true;
++        }
++        return false;
++    }
++
+     public static void recover() throws IOException
+     {
+         String directory = DatabaseDescriptor.getCommitLogLocation();
+@@ -164,11 +176,17 @@ public static void recover() throws IOException
+         {
+             public boolean accept(File dir, String name)
+             {
+-                return CommitLogSegment.possibleCommitLogFile(name);
++                // we used to try to avoid instantiating commitlog (thus creating an empty segment ready for writes)
++                // until after recover was finished.  this turns out to be fragile; it is less error-prone to go
++                // ahead and allow writes before recover(), and just skip active segments when we do.
++                return CommitLogSegment.possibleCommitLogFile(name) && !instance.manages(name);
+             }
+         });
+         if (files.length == 0)
++        {
++            logger.info("No commitlog files found; skipping replay");
+             return;
++        }
+ 
+         Arrays.sort(files, new FileUtils.FileComparator());
+         logger.info("Replaying " + StringUtils.join(files, ", "));
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 7f3caa02..bf56ecb4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -339,8 +339,6 @@ public synchronized void initServer() throws IOException, org.apache.cassandra.c
+         initialized = true;
+         isClientMode = false;
+ 
+-        DatabaseDescriptor.createAllDirectories();
+-
+         try
+         {
+             GCInspector.instance.start();
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java b/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
+index a908c284..f817e331 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
+@@ -24,6 +24,7 @@
+ import org.junit.BeforeClass;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.io.util.FileUtils;
+ 
+ import org.slf4j.Logger;
+@@ -39,6 +40,7 @@ public static void cleanupAndLeaveDirs() throws IOException
+         mkdirs();
+         cleanup();
+         mkdirs();
++        CommitLog.instance.resetUnsafe(); // cleanup screws w/ CommitLog, this brings it back to safe state
+     }
+ 
+     public static void cleanup() throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
+index d2cb5599..8c0f2e2b 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager2Test.java
+@@ -62,6 +62,7 @@ public void testWithFlush() throws Exception
+ 
+         logger.debug("begin manual replay");
+         // replay the commit log (nothing should be replayed since everything was flushed)
++        CommitLog.instance.resetUnsafe();
+         CommitLog.recover();
+ 
+         // since everything that was flushed was removed (i.e. clearUnsafe)
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager3Test.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager3Test.java
+index d2294364..5b235cd9 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager3Test.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManager3Test.java
+@@ -31,6 +31,7 @@
+ import org.apache.cassandra.Util;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.commitlog.CommitLog;
++import org.apache.cassandra.io.util.FileUtils;
+ 
+ import static org.apache.cassandra.Util.column;
+ import static org.apache.cassandra.db.TableTest.assertColumns;
+@@ -66,10 +67,10 @@ public void testMissingHeader() throws IOException, ExecutionException, Interrup
+         for (File file : new File(DatabaseDescriptor.getCommitLogLocation()).listFiles())
+         {
+             if (file.getName().endsWith(".header"))
+-                if (!file.delete())
+-                    throw new AssertionError();
++                FileUtils.deleteWithConfirm(file);
+         }
+ 
++        CommitLog.instance.resetUnsafe(); // disassociate segments from live CL
+         CommitLog.recover();
+ 
+         assertColumns(Util.getColumnFamily(table1, dk, "Standard1"), "col1");
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+index 94dc771c..9fda65b1 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+@@ -63,6 +63,7 @@ public void testOne() throws IOException, ExecutionException, InterruptedExcepti
+         table1.getColumnFamilyStore("Standard1").clearUnsafe();
+         table2.getColumnFamilyStore("Standard3").clearUnsafe();
+ 
++        CommitLog.instance.resetUnsafe(); // disassociate segments from live CL
+         CommitLog.recover();
+ 
+         assertColumns(Util.getColumnFamily(table1, dk, "Standard1"), "col1");

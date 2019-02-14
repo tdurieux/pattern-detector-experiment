@@ -1,0 +1,772 @@
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+index 7b0bbf2e..6701fa57 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+@@ -210,6 +210,10 @@ public String toString() {
+     return name;
+   }
+ 
++  public SolrCore getCore() {
++    return core;
++  }
++
+ 
+   /** Register sub-objects such as caches
+    */
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/CommitTracker.java b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
+index e69de29b..7d43fa51 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
+@@ -0,0 +1,225 @@
++package org.apache.solr.update;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.apache.solr.common.SolrException;
++import org.apache.solr.common.params.ModifiableSolrParams;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.request.LocalSolrQueryRequest;
++import org.apache.solr.request.SolrQueryRequest;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Helper class for tracking autoCommit state.
++ * 
++ * Note: This is purely an implementation detail of autoCommit and will
++ * definitely change in the future, so the interface should not be relied-upon
++ * 
++ * Note: all access must be synchronized.
++ */
++final class CommitTracker implements Runnable {
++  protected final static Logger log = LoggerFactory.getLogger(CommitTracker.class);
++  
++  // scheduler delay for maxDoc-triggered autocommits
++  public final int DOC_COMMIT_DELAY_MS = 1;
++  
++  // settings, not final so we can change them in testing
++  private int docsUpperBound;
++  private long timeUpperBound;
++  
++  private final ScheduledExecutorService scheduler = Executors
++      .newScheduledThreadPool(1);
++  private ScheduledFuture pending;
++  
++  // state
++  private AtomicLong docsSinceCommit = new AtomicLong(0);
++  private AtomicInteger autoCommitCount = new AtomicInteger(0);
++
++  private final SolrCore core;
++
++  private final boolean softCommit;
++  private final boolean waitSearcher;
++
++  private String name;
++  
++  public CommitTracker(String name, SolrCore core, int docsUpperBound, int timeUpperBound, boolean waitSearcher, boolean softCommit) {
++    this.core = core;
++    this.name = name;
++    pending = null;
++    
++    this.docsUpperBound = docsUpperBound;
++    this.timeUpperBound = timeUpperBound;
++    
++    this.softCommit = softCommit;
++    this.waitSearcher = waitSearcher;
++
++    SolrCore.log.info(name + " AutoCommit: " + this);
++  }
++  
++  public synchronized void close() {
++    if (pending != null) {
++      pending.cancel(true);
++      pending = null;
++    }
++    scheduler.shutdownNow();
++  }
++  
++  /** schedule individual commits */
++  public void scheduleCommitWithin(long commitMaxTime) {
++    _scheduleCommitWithin(commitMaxTime);
++  }
++
++  private void _scheduleCommitWithin(long commitMaxTime) {
++    if (commitMaxTime <= 0) return;
++    synchronized (this) {
++      if (pending != null && pending.getDelay(TimeUnit.MILLISECONDS) <= commitMaxTime) {
++        // There is already a pending commit that will happen first, so
++        // nothing else to do here.
++        // log.info("###returning since getDelay()==" + pending.getDelay(TimeUnit.MILLISECONDS) + " less than " + commitMaxTime);
++
++        return;
++      }
++
++      if (pending != null) {
++        // we need to schedule a commit to happen sooner than the existing one,
++        // so lets try to cancel the existing one first.
++        boolean canceled = pending.cancel(false);
++        if (!canceled) {
++          // It looks like we can't cancel... it must have just started running!
++          // this is possible due to thread scheduling delays and a low commitMaxTime.
++          // Nothing else to do since we obviously can't schedule our commit *before*
++          // the one that just started running (or has just completed).
++          // log.info("###returning since cancel failed");
++          return;
++        }
++      }
++
++      // log.info("###scheduling for " + commitMaxTime);
++
++      // schedule our new commit
++      pending = scheduler.schedule(this, commitMaxTime, TimeUnit.MILLISECONDS);
++    }
++  }
++  
++  /**
++   * Indicate that documents have been added
++   */
++  public void addedDocument(int commitWithin) {
++    // maxDocs-triggered autoCommit.  Use == instead of > so we only trigger once on the way up
++    if (docsUpperBound > 0) {
++      long docs = docsSinceCommit.incrementAndGet();
++      if (docs == docsUpperBound + 1) {
++        // reset the count here instead of run() so we don't miss other documents being added
++        docsSinceCommit.set(0);
++        _scheduleCommitWithin(DOC_COMMIT_DELAY_MS);
++      }
++    }
++    
++    // maxTime-triggered autoCommit
++    long ctime = (commitWithin > 0) ? commitWithin : timeUpperBound;
++
++    if (ctime > 0) {
++      _scheduleCommitWithin(ctime);
++    }
++  }
++  
++  /** Inform tracker that a commit has occurred */
++  public void didCommit() {
++  }
++  
++  /** Inform tracker that a rollback has occurred, cancel any pending commits */
++  public void didRollback() {
++    synchronized (this) {
++      if (pending != null) {
++        pending.cancel(false);
++        pending = null; // let it start another one
++      }
++      docsSinceCommit.set(0);
++    }
++  }
++  
++  /** This is the worker part for the ScheduledFuture **/
++  public void run() {
++    synchronized (this) {
++      // log.info("###start commit. pending=null");
++      pending = null;  // allow a new commit to be scheduled
++    }
++
++    SolrQueryRequest req = new LocalSolrQueryRequest(core,
++        new ModifiableSolrParams());
++    try {
++      CommitUpdateCommand command = new CommitUpdateCommand(false);
++      command.waitSearcher = waitSearcher;
++      // no need for command.maxOptimizeSegments = 1; since it is not optimizing
++
++      // we increment this *before* calling commit because it was causing a race
++      // in the tests (the new searcher was registered and the test proceeded
++      // to check the commit count before we had incremented it.)
++      autoCommitCount.incrementAndGet();
++
++      core.getUpdateHandler().commit(command);
++    } catch (Exception e) {
++      SolrException.log(log, "auto commit error...", e);
++    } finally {
++      // log.info("###done committing");
++      req.close();
++    }
++  }
++  
++  // to facilitate testing: blocks if called during commit
++  public int getCommitCount() {
++    return autoCommitCount.get();
++  }
++  
++  @Override
++  public String toString() {
++    if (timeUpperBound > 0 || docsUpperBound > 0) {
++      return (timeUpperBound > 0 ? ("if uncommited for " + timeUpperBound + "ms; ")
++          : "")
++          + (docsUpperBound > 0 ? ("if " + docsUpperBound + " uncommited docs ")
++              : "");
++      
++    } else {
++      return "disabled";
++    }
++  }
++
++  public long getTimeUpperBound() {
++    return timeUpperBound;
++  }
++
++  int getDocsUpperBound() {
++    return docsUpperBound;
++  }
++
++  void setDocsUpperBound(int docsUpperBound) {
++    this.docsUpperBound = docsUpperBound;
++  }
++
++  void setTimeUpperBound(long timeUpperBound) {
++    this.timeUpperBound = timeUpperBound;
++  }
++}
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index b6017c78..5a8c3737 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -29,14 +29,9 @@
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.lucene.search.TermQuery;
+ import org.apache.lucene.search.BooleanClause.Occur;
+-import org.apache.lucene.store.Directory;
+ 
+-import java.util.concurrent.Executors;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.ExecutionException;
+-import java.util.concurrent.ScheduledExecutorService;
+-import java.util.concurrent.ScheduledFuture;
+-import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReadWriteLock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+@@ -140,7 +135,7 @@
+   AtomicLong numErrorsCumulative = new AtomicLong();
+ 
+   // tracks when auto-commit should occur
+-  protected final CommitTracker tracker;
++  protected final CommitTracker commitTracker;
+ 
+   // iwCommit protects internal data and open/close of the IndexWriter and
+   // is a mutex. Any use of the index writer should be protected by iwAccess, 
+@@ -159,7 +154,9 @@ public DirectUpdateHandler2(SolrCore core) throws IOException {
+     iwAccess = rwl.readLock();
+     iwCommit = rwl.writeLock();
+ 
+-    tracker = new CommitTracker();
++    commitTracker = new CommitTracker("commitTracker", core,
++        core.getSolrConfig().getUpdateHandlerInfo().autoCommmitMaxDocs,
++        core.getSolrConfig().getUpdateHandlerInfo().autoCommmitMaxTime, true, false);
+   }
+ 
+   // must only be called when iwCommit lock held
+@@ -221,7 +218,7 @@ public int addDoc(AddUpdateCommand cmd) throws IOException {
+       synchronized (this) {
+         // adding document -- prep writer
+         openWriter();
+-        tracker.addedDocument( cmd.commitWithin );
++        commitTracker.addedDocument( cmd.commitWithin );
+       } // end synchronized block
+ 
+       // this is the only unsynchronized code in the iwAccess block, which
+@@ -293,9 +290,7 @@ public void delete(DeleteUpdateCommand cmd) throws IOException {
+       iwCommit.unlock();
+     }
+ 
+-    if( tracker.timeUpperBound > 0 ) {
+-      tracker.scheduleCommitWithin( tracker.timeUpperBound );
+-    }
++    commitTracker.scheduleCommitWithin(commitTracker.getTimeUpperBound());
+   }
+ 
+   // why not return number of docs deleted?
+@@ -336,9 +331,8 @@ public void deleteByQuery(DeleteUpdateCommand cmd) throws IOException {
+ 
+      madeIt=true;
+ 
+-     if( tracker.timeUpperBound > 0 ) {
+-       tracker.scheduleCommitWithin( tracker.timeUpperBound );
+-     }
++     commitTracker.scheduleCommitWithin(commitTracker.getTimeUpperBound());
++
+     } finally {
+       if (!madeIt) {
+         numErrors.incrementAndGet();
+@@ -369,8 +363,8 @@ public int mergeIndexes(MergeIndexesCommand cmd) throws IOException {
+       iwCommit.unlock();
+     }
+ 
+-    if (rc == 1 && tracker.timeUpperBound > 0) {
+-      tracker.scheduleCommitWithin(tracker.timeUpperBound);
++    if (rc == 1 && commitTracker.getTimeUpperBound() > 0) {
++      commitTracker.scheduleCommitWithin(commitTracker.getTimeUpperBound());
+     }
+ 
+     return rc;
+@@ -425,7 +419,7 @@ public void commit(CommitUpdateCommand cmd) throws IOException {
+       core.getSearcher(true,false,waitSearcher);
+ 
+       // reset commit tracking
+-      tracker.didCommit();
++      commitTracker.didCommit();
+ 
+       log.info("end_commit_flush");
+ 
+@@ -470,7 +464,7 @@ public void rollback(RollbackUpdateCommand cmd) throws IOException {
+       //callPostRollbackCallbacks();
+ 
+       // reset commit tracking
+-      tracker.didRollback();
++      commitTracker.didRollback();
+ 
+       log.info("end_rollback");
+ 
+@@ -494,12 +488,7 @@ public void close() throws IOException {
+     log.info("closing " + this);
+     iwCommit.lock();
+     try{
+-      // cancel any pending operations
+-      if( tracker.pending != null ) {
+-        tracker.pending.cancel( true );
+-        tracker.pending = null;
+-      }
+-      tracker.scheduler.shutdown();
++      commitTracker.close();
+       closeWriter();
+     } finally {
+       iwCommit.unlock();
+@@ -507,144 +496,6 @@ public void close() throws IOException {
+     log.info("closed " + this);
+   }
+ 
+-  /** Helper class for tracking autoCommit state.
+-   *
+-   * Note: This is purely an implementation detail of autoCommit and will
+-   * definitely change in the future, so the interface should not be
+-   * relied-upon
+-   *
+-   * Note: all access must be synchronized.
+-   */
+-  class CommitTracker implements Runnable
+-  {
+-    // scheduler delay for maxDoc-triggered autocommits
+-    public final int DOC_COMMIT_DELAY_MS = 250;
+-
+-    // settings, not final so we can change them in testing
+-    int docsUpperBound;
+-    long timeUpperBound;
+-
+-    private final ScheduledExecutorService scheduler =
+-       Executors.newScheduledThreadPool(1);
+-    private ScheduledFuture pending;
+-
+-    // state
+-    long docsSinceCommit;
+-    int autoCommitCount = 0;
+-    long lastAddedTime = -1;
+-
+-    public CommitTracker() {
+-      docsSinceCommit = 0;
+-      pending = null;
+-
+-      docsUpperBound = core.getSolrConfig().getUpdateHandlerInfo().autoCommmitMaxDocs;   //getInt("updateHandler/autoCommit/maxDocs", -1);
+-      timeUpperBound = core.getSolrConfig().getUpdateHandlerInfo().autoCommmitMaxTime;    //getInt("updateHandler/autoCommit/maxTime", -1);
+-
+-      SolrCore.log.info("AutoCommit: " + this);
+-    }
+-
+-    /** schedule individual commits */
+-    public synchronized void scheduleCommitWithin(long commitMaxTime)
+-    {
+-      _scheduleCommitWithin( commitMaxTime );
+-    }
+-
+-    private void _scheduleCommitWithin(long commitMaxTime)
+-    {
+-      // Check if there is a commit already scheduled for longer then this time
+-      if( pending != null &&
+-          pending.getDelay(TimeUnit.MILLISECONDS) >= commitMaxTime )
+-      {
+-        pending.cancel(false);
+-        pending = null;
+-      }
+-
+-      // schedule a new commit
+-      if( pending == null ) {
+-        pending = scheduler.schedule( this, commitMaxTime, TimeUnit.MILLISECONDS );
+-      }
+-    }
+-
+-    /** Indicate that documents have been added
+-     */
+-    public void addedDocument( int commitWithin ) {
+-      docsSinceCommit++;
+-      lastAddedTime = System.currentTimeMillis();
+-      // maxDocs-triggered autoCommit
+-      if( docsUpperBound > 0 && (docsSinceCommit > docsUpperBound) ) {
+-        _scheduleCommitWithin( DOC_COMMIT_DELAY_MS );
+-      }
+-
+-      // maxTime-triggered autoCommit
+-      long ctime = (commitWithin>0) ? commitWithin : timeUpperBound;
+-      if( ctime > 0 ) {
+-        _scheduleCommitWithin( ctime );
+-      }
+-    }
+-
+-    /** Inform tracker that a commit has occurred, cancel any pending commits */
+-    public void didCommit() {
+-      if( pending != null ) {
+-        pending.cancel(false);
+-        pending = null; // let it start another one
+-      }
+-      docsSinceCommit = 0;
+-    }
+-
+-    /** Inform tracker that a rollback has occurred, cancel any pending commits */
+-    public void didRollback() {
+-      if( pending != null ) {
+-        pending.cancel(false);
+-        pending = null; // let it start another one
+-      }
+-      docsSinceCommit = 0;
+-    }
+-
+-    /** This is the worker part for the ScheduledFuture **/
+-    public synchronized void run() {
+-      long started = System.currentTimeMillis();
+-      try {
+-        CommitUpdateCommand command = new CommitUpdateCommand( false );
+-        command.waitFlush = true;
+-        command.waitSearcher = true;
+-        //no need for command.maxOptimizeSegments = 1;  since it is not optimizing
+-        commit( command );
+-        autoCommitCount++;
+-      }
+-      catch (Exception e) {
+-        log.error( "auto commit error..." );
+-        e.printStackTrace();
+-      }
+-      finally {
+-        pending = null;
+-      }
+-
+-      // check if docs have been submitted since the commit started
+-      if( lastAddedTime > started ) {
+-        if( docsUpperBound > 0 && docsSinceCommit > docsUpperBound ) {
+-          pending = scheduler.schedule( this, 100, TimeUnit.MILLISECONDS );
+-        }
+-        else if( timeUpperBound > 0 ) {
+-          pending = scheduler.schedule( this, timeUpperBound, TimeUnit.MILLISECONDS );
+-        }
+-      }
+-    }
+-
+-    // to facilitate testing: blocks if called during commit
+-    public synchronized int getCommitCount() { return autoCommitCount; }
+-
+-    @Override
+-    public String toString() {
+-      if(timeUpperBound > 0 || docsUpperBound > 0) {
+-        return
+-          (timeUpperBound > 0 ? ("if uncommited for " + timeUpperBound + "ms; ") : "") +
+-          (docsUpperBound > 0 ? ("if " + docsUpperBound + " uncommited docs ") : "");
+-
+-      } else {
+-        return "disabled";
+-      }
+-    }
+-  }
+ 
+ 
+   /////////////////////////////////////////////////////////////////////
+@@ -682,13 +533,14 @@ public String getSource() {
+   public NamedList getStatistics() {
+     NamedList lst = new SimpleOrderedMap();
+     lst.add("commits", commitCommands.get());
+-    if (tracker.docsUpperBound > 0) {
+-      lst.add("autocommit maxDocs", tracker.docsUpperBound);
++    if (commitTracker.getTimeUpperBound() > 0) {
++      lst.add("autocommit maxDocs", commitTracker.getTimeUpperBound());
+     }
+-    if (tracker.timeUpperBound > 0) {
+-      lst.add("autocommit maxTime", "" + tracker.timeUpperBound + "ms");
++    if (commitTracker.getTimeUpperBound() > 0) {
++      lst.add("autocommit maxTime", "" + commitTracker.getTimeUpperBound() + "ms");
+     }
+-    lst.add("autocommits", tracker.autoCommitCount);
++    lst.add("autocommits", commitTracker.getCommitCount());
++
+     lst.add("optimizes", optimizeCommands.get());
+     lst.add("rollbacks", rollbackCommands.get());
+     lst.add("expungeDeletes", expungeDeleteCommands.get());
+diff --git a/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/update/AutoCommitTest.java b/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/update/AutoCommitTest.java
+index e48b32d7..d1ba6503 100644
+--- a/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/update/AutoCommitTest.java
++++ b/lucene/dev/branches/branch_3x/solr/core/src/test/org/apache/solr/update/AutoCommitTest.java
+@@ -25,52 +25,76 @@
+ import org.apache.solr.common.util.ContentStream;
+ import org.apache.solr.common.util.ContentStreamBase;
+ import org.apache.solr.common.util.NamedList;
+-import org.apache.solr.core.*;
+-import org.apache.solr.search.*;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.core.SolrEventListener;
+ import org.apache.solr.handler.XmlUpdateRequestHandler;
+ import org.apache.solr.request.SolrQueryRequestBase;
+ import org.apache.solr.response.SolrQueryResponse;
++import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.util.AbstractSolrTestCase;
+ import org.apache.solr.util.RefCounted;
+ 
+-class CommitListener implements SolrEventListener {
+-  public volatile boolean triggered = false;
+-  public volatile SolrIndexSearcher currentSearcher;
+-  public SolrCore core;
++class NewSearcherListener implements SolrEventListener {
+ 
+-  public CommitListener(SolrCore core) {
+-    this.core = core;
++  enum TriggerOn {Both, Soft, Hard}
++
++  private volatile boolean triggered = false;
++  private volatile TriggerOn lastType;
++  private volatile TriggerOn triggerOnType;
++  private volatile SolrIndexSearcher newSearcher;
++
++  public NewSearcherListener() {
++    this(TriggerOn.Both);
++  }
++
++  public NewSearcherListener(TriggerOn type) {
++    this.triggerOnType = type;
+   }
+ 
+   public void init(NamedList args) {}
+ 
+-  public void newSearcher(SolrIndexSearcher newSearcher, SolrIndexSearcher currentSearcher) {
+-    this.currentSearcher = currentSearcher;
++  public void newSearcher(SolrIndexSearcher newSearcher,
++      SolrIndexSearcher currentSearcher) {
++    if (triggerOnType == TriggerOn.Soft && lastType == TriggerOn.Soft) {
+     triggered = true;
++    } else if (triggerOnType == TriggerOn.Hard && lastType == TriggerOn.Hard) {
++      triggered = true;
++    } else if (triggerOnType == TriggerOn.Both) {
++      triggered = true;
++    }
++    this.newSearcher = newSearcher;
++    // log.info("TEST: newSearcher event: triggered="+triggered+" newSearcher="+newSearcher);
+   }
++
+   public void postCommit() {
+-    triggered = true;
++    lastType = TriggerOn.Hard;
+   }
+-  public void reset() {
+-    triggered=false;
++
++  public void postSoftCommit() {
++    lastType = TriggerOn.Soft;
+   }
+ 
+-  public boolean waitForCommit(int timeout) {
+-    //triggered = false;
++  public void reset() {
++    triggered = false;
++    // log.info("TEST: trigger reset");
++  }
+     
+-    for (int towait=timeout; towait > 0; towait -= 250) {
+-      try {
++  boolean waitForNewSearcher(int timeout) {
++    long timeoutTime = System.currentTimeMillis() + timeout;
++    while (System.currentTimeMillis() < timeoutTime) {
+         if (triggered) {
+-          RefCounted<SolrIndexSearcher> holder = core.getSearcher();
+-          SolrIndexSearcher s = holder.get();
+-          holder.decref();
+-          // since there could be two commits in a row, don't test for a specific new searcher
+-          // just test that the old one has been replaced.
+-          if (s != currentSearcher) return true;
+-          // it may be that a commit just happened, but the new searcher hasn't been registered yet.
++        // check if the new searcher has been registered yet
++        RefCounted<SolrIndexSearcher> registeredSearcherH = newSearcher.getCore().getSearcher();
++        SolrIndexSearcher registeredSearcher = registeredSearcherH.get();
++        registeredSearcherH.decref();
++        if (registeredSearcher == newSearcher) return true;
++        // log.info("TEST: waiting for searcher " + newSearcher + " to be registered.  current=" + registeredSearcher);
+         }
+-        Thread.sleep( 250 );
++
++      try {
++        Thread.sleep(250);
+       } catch (InterruptedException e) {}
++
+     }
+     return false;
+   }
+@@ -83,6 +107,19 @@ public boolean waitForCommit(int timeout) {
+   @Override
+   public String getSolrConfigFile() { return "solrconfig.xml"; }
+ 
++  public static void verbose(Object... args) {
++    if (!VERBOSE) return;
++    StringBuilder sb = new StringBuilder("###TEST:");
++    sb.append(Thread.currentThread().getName());
++    sb.append(':');
++    for (Object o : args) {
++      sb.append(' ');
++      sb.append(o.toString());
++    }
++    log.info(sb.toString());
++    // System.out.println(sb.toString());
++  }
++
+   /**
+    * Take a string and make it an iterable ContentStream
+    * 
+@@ -97,65 +134,64 @@ public boolean waitForCommit(int timeout) {
+     return streams;
+   }
+ 
+-  /* This test is causing too many failures on one of the build slaves.
+-     Temporarily disabled. -Mike Klaas */
+-  public void XXXtestMaxDocs() throws Exception {
++  public void testMaxDocs() throws Exception {
+ 
+     SolrCore core = h.getCore();
+-    CommitListener trigger = new CommitListener(core);
++    NewSearcherListener trigger = new NewSearcherListener();
++
++    DirectUpdateHandler2 updateHandler = (DirectUpdateHandler2)core.getUpdateHandler();
++    CommitTracker tracker = updateHandler.commitTracker;
++    tracker.setTimeUpperBound(-1);
++    tracker.setDocsUpperBound(14);
++    core.registerNewSearcherListener(trigger);
+ 
+-    DirectUpdateHandler2 updater = (DirectUpdateHandler2)core.getUpdateHandler();
+-    DirectUpdateHandler2.CommitTracker tracker = updater.tracker;
+-    tracker.timeUpperBound = 100000;
+-    tracker.docsUpperBound = 14;
+-    // updater.commitCallbacks.add(trigger);
+     
+     XmlUpdateRequestHandler handler = new XmlUpdateRequestHandler();
+     handler.init( null );
+     
+     MapSolrParams params = new MapSolrParams( new HashMap<String, String>() );
+     
+-    // Add a single document
++    // Add documents
+     SolrQueryResponse rsp = new SolrQueryResponse();
+     SolrQueryRequestBase req = new SolrQueryRequestBase( core, params ) {};
+     for( int i=0; i<14; i++ ) {
+       req.setContentStreams( toContentStreams(
+-        adoc("id", "A"+i, "subject", "info" ), null ) );
++        adoc("id", Integer.toString(i), "subject", "info" ), null ) );
+       handler.handleRequest( req, rsp );
+     }
+     // It should not be there right away
+-    assertQ("shouldn't find any", req("id:A1") ,"//result[@numFound=0]" );
++    assertQ("shouldn't find any", req("id:1") ,"//result[@numFound=0]" );
+     assertEquals( 0, tracker.getCommitCount());
+ 
+     req.setContentStreams( toContentStreams(
+-        adoc("id", "A14", "subject", "info" ), null ) );
++        adoc("id", "14", "subject", "info" ), null ) );
+     handler.handleRequest( req, rsp );
+-    // Wait longer than the autocommit time
+-    assertTrue(trigger.waitForCommit(20000));
++
++    assertTrue(trigger.waitForNewSearcher(10000));
+ 
+     req.setContentStreams( toContentStreams(
+-        adoc("id", "A15", "subject", "info" ), null ) );
++        adoc("id", "15", "subject", "info" ), null ) );
+     handler.handleRequest( req, rsp );
+       
+     // Now make sure we can find it
+-    assertQ("should find one", req("id:A14") ,"//result[@numFound=1]" );
++    assertQ("should find one", req("id:14") ,"//result[@numFound=1]" );
+     assertEquals( 1, tracker.getCommitCount());
+     // But not the one added afterward
+-    assertQ("should not find one", req("id:A15") ,"//result[@numFound=0]" );
++    assertQ("should not find one", req("id:15") ,"//result[@numFound=0]" );
+     assertEquals( 1, tracker.getCommitCount());
+     
+   }
+ 
+   public void testMaxTime() throws Exception {
+     SolrCore core = h.getCore();
+-    CommitListener trigger = new CommitListener(core);    
++    NewSearcherListener trigger = new NewSearcherListener();    
+     core.registerNewSearcherListener(trigger);
+     DirectUpdateHandler2 updater = (DirectUpdateHandler2) core.getUpdateHandler();
+-    DirectUpdateHandler2.CommitTracker tracker = updater.tracker;
++    CommitTracker tracker = updater.commitTracker;
+     // too low of a number can cause a slow host to commit before the test code checks that it
+     // isn't there... causing a failure at "shouldn't find any"
+-    tracker.timeUpperBound = 1000;
+-    tracker.docsUpperBound = -1;
++    tracker.setTimeUpperBound(1000);
++    tracker.setDocsUpperBound(-1);
+     // updater.commitCallbacks.add(trigger);
+     
+     XmlUpdateRequestHandler handler = new XmlUpdateRequestHandler();
+@@ -175,7 +211,7 @@ public void testMaxTime() throws Exception {
+     assertQ("shouldn't find any", req("id:529") ,"//result[@numFound=0]" );
+ 
+     // Wait longer than the autocommit time
+-    assertTrue(trigger.waitForCommit(30000));
++    assertTrue(trigger.waitForNewSearcher(30000));
+     trigger.reset();
+     req.setContentStreams( toContentStreams(
+       adoc("id", "530", "field_t", "what's inside?", "subject", "info"), null ) );
+@@ -190,7 +226,7 @@ public void testMaxTime() throws Exception {
+     assertU( delI("529") );
+     assertQ("deleted, but should still be there", req("id:529") ,"//result[@numFound=1]" );
+     // Wait longer than the autocommit time
+-    assertTrue(trigger.waitForCommit(30000));
++    assertTrue(trigger.waitForNewSearcher(30000));
+     trigger.reset();
+     req.setContentStreams( toContentStreams(
+       adoc("id", "550", "field_t", "what's inside?", "subject", "info"), null ) );
+@@ -208,7 +244,7 @@ public void testMaxTime() throws Exception {
+     assertQ("should not be there yet", req("id:500") ,"//result[@numFound=0]" );
+     
+     // Wait longer than the autocommit time
+-    assertTrue(trigger.waitForCommit(30000));
++    assertTrue(trigger.waitForNewSearcher(45000));
+     trigger.reset();
+     
+     req.setContentStreams( toContentStreams(
+@@ -217,7 +253,6 @@ public void testMaxTime() throws Exception {
+     assertEquals( 3, tracker.getCommitCount() );
+ 
+     assertQ("now it should", req("id:500") ,"//result[@numFound=1]" );
+-    assertQ("but not this", req("id:531") ,"//result[@numFound=0]" );
+   }
+ 
+ }

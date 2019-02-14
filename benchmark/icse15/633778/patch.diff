@@ -1,0 +1,272 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
+index 308a3ce8..430b75ca 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
+@@ -2266,7 +2266,6 @@ protected void checksBeforeUpdateXXX(String methodName, int columnIndex) throws
+ 	//1)Make sure JDBC ResultSet is not closed
+ 	//2)Make sure this is an updatable ResultSet
+ 	//3)Make sure JDBC ResultSet is positioned on a row
+-	//4)Make sure underneath language resultset is not closed
+ 	protected void checksBeforeUpdateOrDelete(String methodName, int columnIndex) throws SQLException {
+ 
+       //1)Make sure JDBC ResultSet is not closed
+@@ -2277,13 +2276,6 @@ protected void checksBeforeUpdateOrDelete(String methodName, int columnIndex) th
+ 
+       //3)Make sure JDBC ResultSet is positioned on a row
+       if (!isOnInsertRow) checkOnRow(); // make sure there's a current row
+-      //in case of autocommit on, if there was an exception which caused runtime rollback in this transaction prior to this call,
+-      //the rollback code will mark the language resultset closed (it doesn't mark the JDBC ResultSet closed).
+-      //That is why alongwith the earlier checkIfClosed call in this method, there is a check for language resultset close as well.
+-
+-      //4)Make sure underneath language resultset is not closed
+-      if (theResults.isClosed())
+-        throw Util.generateCsSQLException(SQLState.LANG_RESULT_SET_NOT_OPEN, methodName);
+ 	}
+ 
+ 	//mark the column as updated and return DataValueDescriptor for it. It will be used by updateXXX methods to put new values
+@@ -2299,7 +2291,6 @@ protected DataValueDescriptor getDVDforColumnToBeUpdated(int columnIndex, String
+      * 1) Make sure JDBC ResultSet is not closed
+      * 2) Make sure this is an updatable ResultSet
+      * 3) Make sure JDBC ResultSet is positioned on insertRow
+-     * 4) Make sure underneath language resultset is not closed
+      */
+     protected void checksBeforeInsert() throws SQLException {
+         // 1)Make sure JDBC ResultSet is not closed
+@@ -2313,11 +2304,6 @@ protected void checksBeforeInsert() throws SQLException {
+         if (!isOnInsertRow) {
+             throw newSQLException(SQLState.CURSOR_NOT_POSITIONED_ON_INSERT_ROW);
+         }
+-
+-        // 4)Make sure underneath language resultset is not closed
+-        if (theResults.isClosed()) {
+-            throw Util.generateCsSQLException(SQLState.LANG_RESULT_SET_NOT_OPEN, "insertRow");
+-        }
+     }
+ 
+     /**
+@@ -4276,7 +4262,21 @@ private final void closeCurrentStream() {
+ 	 * @exception SQLException		Thrown if this ResultSet is closed.
+ 	 */
+ 	final void checkIfClosed(String operation) throws SQLException {
+-		if (isClosed) {
++		// If the JDBC ResultSet has been explicitly closed, isClosed is
++		// true. In some cases, the underlying language ResultSet can be closed
++		// without setting isClosed in the JDBC ResultSet. This happens if the
++		// ResultSet is non-holdable and the transaction has been committed, or
++		// if an error in auto-commit mode causes a rollback of the
++		// transaction.
++		if (isClosed || theResults.isClosed()) {
++
++			// The JDBC ResultSet hasn't been explicitly closed. Perform some
++			// basic cleanup and mark it as closed.
++			if (!isClosed) {
++				closeCurrentStream();
++				isClosed = true;
++			}
++
+ 			throw newSQLException(SQLState.LANG_RESULT_SET_NOT_OPEN, operation);
+ 		}
+ 	}
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
+index 4404a8e1..90a48c24 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
+@@ -1613,8 +1613,15 @@ static EmbedResultSet processDynamicResult(EmbedConnection conn,
+             return null;
+ 
+         // ignore closed result sets.
+-        if (lrs.isClosed)
++        try {
++        	//following will check if the JDBC ResultSet or the language
++        	//ResultSet is closed. If yes, then it will throw an exception.
++        	//So, the exception indicates that the ResultSet is closed and
++        	//hence we should ignore it. 
++        	lrs.checkIfClosed("");
++        } catch (SQLException ex) {
+             return null;
++        }
+         
+         lrs.setDynamicResultSet(callStatement);
+ 
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+index 9260888d..9fe33a0a 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+@@ -2693,7 +2693,11 @@ public boolean isLastHandler(int severity)
+ 
+ 	/**
+ 		If we are called as part of rollback code path, then we will reset all 
+-		the activations. 
++		the activations that have resultset returning rows associated with 
++		them. DERBY-3304 Resultsets that do not return rows should be left 
++		alone when the rollback is through the JDBC Connection object. If the 
++		rollback is caused by an exception, then at that time, all kinds of
++		resultsets should be closed. 
+ 		
+ 		If we are called as part of commit code path, then we will do one of 
+ 		the following if the activation has resultset assoicated with it. Also,
+@@ -2732,10 +2736,25 @@ private void endTransactionActivationHandling(boolean forRollback) throws Standa
+ 				continue;
+ 			}
+ 
++			//Determine if the activation has a resultset and if that resultset
++			//returns rows. For such an activation, we need to take special
++			//actions during commit and rollback as explained in the comments
++			//below.
++			ResultSet activationResultSet = a.getResultSet();
++			boolean resultsetReturnsRows =  
++				(activationResultSet != null) && activationResultSet.returnsRows(); ;
++
+ 			if (forRollback) { 
+-				//Since we are dealing with rollback, we need to reset the 
+-				//activation no matter what the holdability might be or no
+-				//matter whether the associated resultset returns rows or not.
++				if (resultsetReturnsRows)
++					//Since we are dealing with rollback, we need to reset 
++					//the activation no matter what the holdability might 
++					//be provided that resultset returns rows. An example
++					//where we do not want to close a resultset that does
++					//not return rows would be a java procedure which has
++					//user invoked rollback inside of it. That rollback
++					//should not reset the activation associated with
++					//the call to java procedure because that activation
++					//is still being used.
+ 				a.reset();
+ 				// Only invalidate statements if we performed DDL.
+ 				if (dataDictionaryInWriteMode()) {
+@@ -2746,11 +2765,6 @@ private void endTransactionActivationHandling(boolean forRollback) throws Standa
+ 				}
+ 			} else {
+ 				//We are dealing with commit here. 
+-				if (a.getResultSet() != null) {
+-					ResultSet activationResultSet = a.getResultSet();
+-					boolean resultsetReturnsRows = activationResultSet.returnsRows();
+-					//if the activation has resultset associated with it, then 
+-					//use following criteria to take the action
+ 					if (resultsetReturnsRows){
+ 						if (a.getResultSetHoldability() == false)
+ 							//Close result sets that return rows and are not held 
+@@ -2768,7 +2782,6 @@ private void endTransactionActivationHandling(boolean forRollback) throws Standa
+ 							//before doing any row operations.
+ 							activationResultSet.clearCurrentRow();							
+ 					}
+-				}
+ 				a.clearHeapConglomerateController();
+ 			}
+ 		}
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ResultSetTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ResultSetTest.java
+index 056b0ec3..8c97c39d 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ResultSetTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ResultSetTest.java
+@@ -1445,6 +1445,21 @@ public void testUpdateBlobWithStreamLengthlessParameterName()
+         rs1.close();
+     }
+ 
++    /**
++     * Test that a {@code ResultSet} is marked as closed after commit if its
++     * holdability is {@code CLOSE_CURSORS_AT_COMMIT} (DERBY-3404).
++     */
++    public void testIsClosedOnNonHoldableResultSet() throws SQLException {
++        getConnection().setAutoCommit(false);
++        getConnection().setHoldability(ResultSet.CLOSE_CURSORS_AT_COMMIT);
++        ResultSet rs = createStatement().executeQuery(
++            "SELECT TABLENAME FROM SYS.SYSTABLES");
++        assertEquals("ResultSet shouldn't be holdable",
++                     ResultSet.CLOSE_CURSORS_AT_COMMIT, rs.getHoldability());
++        commit();
++        assertTrue("Commit should have closed the ResultSet", rs.isClosed());
++    }
++
+     /************************************************************************
+      **                        T E S T  S E T U P                           *
+      ************************************************************************/
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DataSourceTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DataSourceTest.java
+index 5fa206c8..eed8ff06 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DataSourceTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DataSourceTest.java
+@@ -2517,9 +2517,6 @@ else if (usingDerbyNetClient())
+             rsh.next();
+             fail("rsh's connection not active id ");
+         } catch (SQLException sqle) {
+-            if (usingEmbedded())
+-                assertSQLState("08003", sqle);
+-            else if (usingDerbyNetClient())
+                 assertSQLState("XCL16", sqle);
+         }
+ 
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/LangProcedureTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/LangProcedureTest.java
+index 26556f60..0c635c2b 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/LangProcedureTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/LangProcedureTest.java
+@@ -797,10 +797,33 @@ else if (pass == 3)
+             .execute("create procedure procWithRollback(p1 int) parameter style JAVA READS SQL DATA dynamic result sets 1 language java external name 'org.apache.derbyTesting.functionTests.tests.lang.LangProcedureTest.rollbackInsideProc'");
+             drs1 = prepareCall("CALL procWithRollback(3)");
+             drs1.execute();
+-            rs = drs1.getResultSet();
+-
++            //Following shows that the rollback inside the java procedure will
++            //cuase procedure to return no resultset (A procedure does
++            //not return closed resultsets). In 10.2 codeline though, java
++            //procedure returns a closed resultset if there is a rollback 
++            //inside the java procedure.
++            JDBC.assertNoMoreResults(drs1);
+             JDBC.assertClosed(rs1);
+             JDBC.assertClosed(resultSet);
++
++            //Following shows that the rollback inside the java procedure will 
++            //only close the resultset created before the rollback. The 
++            //resultset created after the rollback will remain open and if it
++            //is a resultset returned through the procedure then it will be
++            //available to the caller of the procedure. Notice that even though
++            //the procedure is defined to 2 return dynamic resultsets, only one
++            //is returned because the other one was closed as a result of 
++            //rollback.
++            s.execute("create procedure procWithRollbackAnd2Resulsets"+
++            		"(p1 int) parameter style JAVA READS SQL DATA dynamic "+
++            		"result sets 2 language java external name "+
++            		"'org.apache.derbyTesting.functionTests.tests.lang.LangProcedureTest.rollbackInsideProcWith2ResultSets'");
++            drs1 = prepareCall("CALL procWithRollbackAnd2Resulsets(3)");
++            drs1.execute();
++            rs = drs1.getResultSet();
++            JDBC.assertDrainResults(rs);
++            JDBC.assertNoMoreResults(drs1);
++
+             //Create a procedure which does an insert into a table. Then call 
+             //it with parameters such that insert will fail because of 
+             //duplicate key. The procedure also has couple select statements
+@@ -1153,6 +1176,35 @@ public static void rollbackInsideProc(int p1, ResultSet[] data)
+         conn.close();
+     }
+ 
++    /**
++     * A test case for DERBY-3304. An explicit rollback inside the procedure
++     * should close all the resultsets created before the call to the
++     * procedure and any resultsets created inside the procedure including
++     * the dynamic resultsets. But the resultset created after the rollback
++     * should stay open
++     * 
++     * @param p1
++     * @param data
++     * @throws SQLException
++     */
++    public static void rollbackInsideProcWith2ResultSets(int p1, 
++    		ResultSet[] data1,
++            ResultSet[] data2) 
++    throws SQLException {
++        Connection conn = DriverManager.getConnection(
++        		"jdbc:default:connection");
++        PreparedStatement ps = conn.prepareStatement(
++        		"select * from t1 where i = ?");
++        ps.setInt(1, p1);
++        data1[0] = ps.executeQuery();
++        conn.rollback();
++        ps = conn.prepareStatement(
++        		"select * from dellater1 where i = ?");
++        ps.setInt(1, p1);
++        data2[0] = ps.executeQuery();
++        conn.close();
++    }
++
+     /**
+      * A test case for DERBY-3304. The procedure is attempting to insert a
+      * duplicate key into a table which causes an internal rollback (vs a

@@ -1,0 +1,16 @@
+  Merged /lucene/dev/trunk/lucene/CHANGES.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/util/TestAttributeSource.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/document/TestNumberTools.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/document/TestDateTools.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/urls.from.random.text.with.urls.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/TestISOLatin1AccentFilter.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/random.text.with.email.addresses.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/email.addresses.from.random.text.with.email.addresses.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/LuceneResourcesWikiPageURLs.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/random.text.with.urls.txt:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/LuceneResourcesWikiPage.html:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis/WordBreakTestUnicode_5_2_0.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/analysis:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/collation:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/TestCachingWrapperFilter.java:r1021449
+  Merged /lucene/dev/trunk/lucene/src/test/org/apache/lucene/search/spans/TestPayloadSpans.java:r1021449

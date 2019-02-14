@@ -1,0 +1,807 @@
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyClusterer.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyClusterer.java
+index e69de29b..96f9be7c 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyClusterer.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyClusterer.java
+@@ -0,0 +1,181 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.mahout.clustering.canopy;
++
++import java.io.IOException;
++import java.util.List;
++
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.mahout.common.distance.DistanceMeasure;
++import org.apache.mahout.matrix.Vector;
++
++public class CanopyClusterer {
++
++  private int nextCanopyId;
++  
++  // the T1 distance threshold
++  private double t1;
++
++  // the T2 distance threshold
++  private double t2;
++
++  // the distance measure
++  private DistanceMeasure measure;
++
++  private int nextClusterId = 0;
++  
++  public CanopyClusterer(final DistanceMeasure measure, final double t1, final double t2) {
++    this.t1 = t1;
++    this.t2 = t2;
++    this.measure = measure;
++  }
++
++  public CanopyClusterer(JobConf job) {
++    this.configure(job);
++  }
++
++  /**
++   * Configure the Canopy and its distance measure
++   * 
++   * @param job the JobConf for this job
++   */
++  public void configure(JobConf job) {
++    try {
++      ClassLoader ccl = Thread.currentThread().getContextClassLoader();
++      Class<?> cl = ccl.loadClass(job
++          .get(CanopyConfigKeys.DISTANCE_MEASURE_KEY));
++      measure = (DistanceMeasure) cl.newInstance();
++      measure.configure(job);
++    } catch (ClassNotFoundException e) {
++      throw new IllegalStateException(e);
++    } catch (IllegalAccessException e) {
++      throw new IllegalStateException(e);
++    } catch (InstantiationException e) {
++      throw new IllegalStateException(e);
++    }
++    t1 = Double.parseDouble(job.get(CanopyConfigKeys.T1_KEY));
++    t2 = Double.parseDouble(job.get(CanopyConfigKeys.T2_KEY));
++    nextCanopyId = 0;
++  }
++
++  /** Configure the Canopy for unit tests */
++  public void config(DistanceMeasure aMeasure, double aT1, double aT2) {
++    measure = aMeasure;
++    t1 = aT1;
++    t2 = aT2;
++  }
++
++  /**
++   * This is the same algorithm as the reference but inverted to iterate over
++   * existing canopies instead of the points. Because of this it does not need
++   * to actually store the points, instead storing a total points vector and the
++   * number of points. From this a centroid can be computed.
++   * <p/>
++   * This method is used by the CanopyReducer.
++   * 
++   * @param point the point to be added
++   * @param canopies the List<Canopy> to be appended
++   */
++  public void addPointToCanopies(Vector point, List<Canopy> canopies) {
++    boolean pointStronglyBound = false;
++    for (Canopy canopy : canopies) {
++      double dist = measure.distance(canopy.getCenter().getLengthSquared(),
++          canopy.getCenter(), point);
++      if (dist < t1) {
++        canopy.addPoint(point);
++      }
++      pointStronglyBound = pointStronglyBound || (dist < t2);
++    }
++    if (!pointStronglyBound) {
++      canopies.add(new Canopy(point, nextCanopyId++));
++    }
++  }
++
++  /**
++   * This method is used by the CanopyMapper to perform canopy inclusion tests
++   * and to emit the point and its covering canopies to the output. The
++   * CanopyCombiner will then sum the canopy points and produce the centroids.
++   * 
++   * @param point the point to be added
++   * @param canopies the List<Canopy> to be appended
++   * @param collector an OutputCollector in which to emit the point
++   */
++  public void emitPointToNewCanopies(Vector point, List<Canopy> canopies,
++      OutputCollector<Text, Vector> collector) throws IOException {
++    boolean pointStronglyBound = false;
++    for (Canopy canopy : canopies) {
++      double dist = measure.distance(canopy.getCenter().getLengthSquared(),
++          canopy.getCenter(), point);
++      if (dist < t1) {
++        canopy.emitPoint(point, collector);
++      }
++      pointStronglyBound = pointStronglyBound || (dist < t2);
++    }
++    if (!pointStronglyBound) {
++      Canopy canopy = new Canopy(point, nextCanopyId++);
++      canopies.add(canopy);
++      canopy.emitPoint(point, collector);
++    }
++  }
++
++  /**
++   * This method is used by the CanopyMapper to perform canopy inclusion tests
++   * and to emit the point keyed by its covering canopies to the output. if the
++   * point is not covered by any canopies (due to canopy centroid clustering),
++   * emit the point to the closest covering canopy.
++   * 
++   * @param point the point to be added
++   * @param canopies the List<Canopy> to be appended
++   * @param collector an OutputCollector in which to emit the point
++   */
++  public void emitPointToExistingCanopies(Vector point, List<Canopy> canopies,
++      OutputCollector<Text, Vector> collector) throws IOException {
++    double minDist = Double.MAX_VALUE;
++    Canopy closest = null;
++    boolean isCovered = false;
++    for (Canopy canopy : canopies) {
++      double dist = measure.distance(canopy.getCenter().getLengthSquared(),
++          canopy.getCenter(), point);
++      if (dist < t1) {
++        isCovered = true;
++        collector.collect(new Text(canopy.getIdentifier()), point);
++      } else if (dist < minDist) {
++        minDist = dist;
++        closest = canopy;
++      }
++    }
++    // if the point is not contained in any canopies (due to canopy centroid
++    // clustering), emit the point to the closest covering canopy.
++    if (!isCovered) {
++      collector.collect(new Text(closest.getIdentifier()), point);
++    }
++  }
++
++  /**
++   * Return if the point is covered by the canopy
++   * 
++   * @param point a point
++   * @return if the point is covered
++   */
++  public boolean canopyCovers(Canopy canopy, Vector point) {
++    return measure.distance(canopy.getCenter().getLengthSquared(), 
++        canopy.getCenter(), point) < t1;
++  }
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyConfigKeys.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyConfigKeys.java
+index e69de29b..e60b688e 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyConfigKeys.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/canopy/CanopyConfigKeys.java
+@@ -0,0 +1,11 @@
++package org.apache.mahout.clustering.canopy;
++
++public class CanopyConfigKeys {
++
++	public static final String T1_KEY = "org.apache.mahout.clustering.canopy.t1";
++	public static final String CANOPY_PATH_KEY = "org.apache.mahout.clustering.canopy.path";
++	public static final String T2_KEY = "org.apache.mahout.clustering.canopy.t2";
++	// keys used by Driver, Mapper, Combiner & Reducer
++	  public static final String DISTANCE_MEASURE_KEY = "org.apache.mahout.clustering.canopy.measure";
++
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansClusterer.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansClusterer.java
+index e69de29b..a2d07a5c 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansClusterer.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansClusterer.java
+@@ -0,0 +1,183 @@
++package org.apache.mahout.clustering.fuzzykmeans;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.mahout.common.distance.DistanceMeasure;
++import org.apache.mahout.matrix.Vector;
++
++public class FuzzyKMeansClusterer {
++
++
++  private static final double MINIMAL_VALUE = 0.0000000001; // using it for
++  // adding
++  // exception
++  // this value to any
++  // zero valued
++  // variable to avoid
++  // divide by Zero
++
++  private int nextClusterId = 0;
++  
++  private DistanceMeasure measure;
++
++  private double convergenceDelta = 0;
++  
++  private double m = 2.0; // default value
++  
++  /**
++   * Init the fuzzy k-means clusterer with the distance measure to use for comparison.
++   * 
++   * @param measure
++   *          The distance measure to use for comparing clusters against points.
++   * @param convergenceDelta
++   *          When do we define a cluster to have converged?
++   * 
++   * */
++  public FuzzyKMeansClusterer(final DistanceMeasure measure, double convergenceDelta, double m) {
++    this.measure = measure;
++    this.convergenceDelta = convergenceDelta;
++    this.m = m;
++  }
++  
++  public FuzzyKMeansClusterer(JobConf job) {
++    this.configure(job);
++  }
++  
++  /**
++   * Configure the distance measure directly. Used by unit tests.
++   *
++   * @param aMeasure          the DistanceMeasure
++   * @param aConvergenceDelta the delta value used to define convergence
++   */
++  private void config(DistanceMeasure aMeasure, double aConvergenceDelta) {
++    measure = aMeasure;
++    convergenceDelta = aConvergenceDelta;
++    nextClusterId = 0;
++  }
++  
++  /**
++   * Configure the distance measure from the job
++   *
++   * @param job the JobConf for the job
++   */
++  private void configure(JobConf job) {
++    try {
++      ClassLoader ccl = Thread.currentThread().getContextClassLoader();
++      Class<?> cl = ccl.loadClass(job.get(FuzzyKMeansConfigKeys.DISTANCE_MEASURE_KEY));
++      measure = (DistanceMeasure) cl.newInstance();
++      measure.configure(job);
++      convergenceDelta = Double.parseDouble(job.get(FuzzyKMeansConfigKeys.CLUSTER_CONVERGENCE_KEY));
++      nextClusterId = 0;
++      m = Double.parseDouble(job.get(FuzzyKMeansConfigKeys.M_KEY));
++    } catch (ClassNotFoundException e) {
++      throw new IllegalStateException(e);
++    } catch (IllegalAccessException e) {
++      throw new IllegalStateException(e);
++    } catch (InstantiationException e) {
++      throw new IllegalStateException(e);
++    }
++  }
++  
++  /**
++   * Emit the point and its probability of belongingness to each cluster
++   *
++   * @param point    a point
++   * @param clusters a List<SoftCluster>
++   * @param output   the OutputCollector to emit into
++   */
++  public void emitPointProbToCluster(Vector point,
++    List<SoftCluster> clusters,
++    OutputCollector<Text, FuzzyKMeansInfo> output) throws IOException {
++    
++    List<Double> clusterDistanceList = new ArrayList<Double>();
++    for (SoftCluster cluster : clusters) {
++      clusterDistanceList.add(measure.distance(cluster.getCenter(), point));
++    }
++
++    for (int i = 0; i < clusters.size(); i++) {
++      double probWeight = computeProbWeight(clusterDistanceList.get(i), clusterDistanceList);
++      Text key = new Text(clusters.get(i).getIdentifier()); // just output the
++      // identifier,avoids
++      // too much data
++      // traffic
++      /*Text value = new Text(Double.toString(probWeight)
++          + FuzzyKMeansDriver.MAPPER_VALUE_SEPARATOR + values.toString());*/
++      FuzzyKMeansInfo value = new FuzzyKMeansInfo(probWeight, point);
++      output.collect(key, value);
++    }
++  }
++
++  /**
++   * Output point with cluster info (Cluster and probability)
++   *
++   * @param point    a point
++   * @param clusters a List<SoftCluster> to test
++   * @param output   the OutputCollector to emit into
++   */
++  public void outputPointWithClusterProbabilities(String key,
++    Vector point, List<SoftCluster> clusters,
++    OutputCollector<Text, FuzzyKMeansOutput> output) throws IOException {
++    
++    List<Double> clusterDistanceList = new ArrayList<Double>();
++
++    for (SoftCluster cluster : clusters) {
++      clusterDistanceList.add(measure.distance(point, cluster.getCenter()));
++    }
++    FuzzyKMeansOutput fOutput = new FuzzyKMeansOutput(clusters.size());
++    for (int i = 0; i < clusters.size(); i++) {
++      // System.out.print("cluster:" + i + "\t" + clusterDistanceList.get(i));
++
++      double probWeight = computeProbWeight(clusterDistanceList.get(i),
++          clusterDistanceList);
++      /*outputValue.append(clusters.get(i).clusterId).append(':').append(
++          probWeight).append(' ');*/
++      fOutput.add(i, clusters.get(i), probWeight);
++    }
++    String name = point.getName();
++    output.collect(new Text(name != null && name.length() != 0 ? name
++        : point.asFormatString()),
++        fOutput);
++  }
++
++  /** Computes the probability of a point belonging to a cluster */
++  public double computeProbWeight(double clusterDistance,
++                                         List<Double> clusterDistanceList) {
++    if (clusterDistance == 0) {
++      clusterDistance = MINIMAL_VALUE;
++    }
++    double denom = 0.0;
++    for (double eachCDist : clusterDistanceList) {
++      if (eachCDist == 0.0) {
++        eachCDist = MINIMAL_VALUE;
++      }
++
++      denom += Math.pow(clusterDistance / eachCDist, 2.0 / (m - 1));
++
++    }
++    return 1.0 / denom;
++  }
++  
++  /**
++   * Return if the cluster is converged by comparing its center and centroid.
++   *
++   * @return if the cluster is converged
++   */
++  public boolean computeConvergence(SoftCluster cluster) {
++    Vector centroid = cluster.computeCentroid();
++    cluster.setConverged(measure.distance(cluster.getCenter(), centroid) <= convergenceDelta);
++    return cluster.isConverged();
++  }
++  
++  public double getM() {
++    return m;
++  }
++  
++  public DistanceMeasure getMeasure() {
++    return this.measure;
++  }
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansConfigKeys.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansConfigKeys.java
+index e69de29b..dfaa62cc 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansConfigKeys.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/fuzzykmeans/FuzzyKMeansConfigKeys.java
+@@ -0,0 +1,10 @@
++package org.apache.mahout.clustering.fuzzykmeans;
++
++public class FuzzyKMeansConfigKeys {
++
++  public static final String DISTANCE_MEASURE_KEY = "org.apache.mahout.clustering.kmeans.measure";
++  public static final String CLUSTER_PATH_KEY = "org.apache.mahout.clustering.kmeans.path";
++  public static final String CLUSTER_CONVERGENCE_KEY = "org.apache.mahout.clustering.kmeans.convergence";
++  public static final String M_KEY = "org.apache.mahout.clustering.fuzzykmeans.m";
++
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
+index e69de29b..f9578475 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
+@@ -0,0 +1,97 @@
++/* Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.mahout.clustering.kmeans;
++
++import java.io.IOException;
++import java.util.List;
++
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.mahout.common.distance.DistanceMeasure;
++import org.apache.mahout.matrix.Vector;
++
++/**
++ * This class implements the k-means clustering algorithm. It uses
++ * {@link Cluster} as a cluster representation. The class can be used as part of
++ * a clustering job to be started as map/reduce job.
++ * */
++public class KMeansClusterer {
++
++  /** Distance to use for point to cluster comparison. */
++  private final DistanceMeasure measure;
++
++  /**
++   * Init the k-means clusterer with the distance measure to use for comparison.
++   * 
++   * @param measure
++   *          The distance measure to use for comparing clusters against points.
++   * @param convergenceDelta
++   *          When do we define a cluster to have converged?
++   * 
++   * */
++  public KMeansClusterer(final DistanceMeasure measure) {
++    this.measure = measure;
++  }
++
++  /**
++   * Iterates over all clusters and identifies the one closes to the given
++   * point. Distance measure used is configured at creation time of
++   * {@link KMeansClusterer}.
++   * 
++   * @param point
++   *          a point to find a cluster for.
++   * @param clusters
++   *          a List<Cluster> to test.
++   */
++  public void emitPointToNearestCluster(Vector point,
++      List<Cluster> clusters, OutputCollector<Text, KMeansInfo> output) throws IOException {
++    Cluster nearestCluster = null;
++    double nearestDistance = Double.MAX_VALUE;
++    for (Cluster cluster : clusters) {
++      Vector clusterCenter = cluster.getCenter();
++      double distance = this.measure.distance(clusterCenter.getLengthSquared(),
++          clusterCenter, point);
++      System.out.println(distance + " Cluster: " + cluster.getId());
++      if (distance < nearestDistance || nearestCluster == null) {
++        nearestCluster = cluster;
++        nearestDistance = distance;
++      }
++    }
++    // emit only clusterID
++    output.collect(new Text(nearestCluster.getIdentifier()), new KMeansInfo(1, point));
++  }
++
++  public void outputPointWithClusterInfo(Vector point,
++      List<Cluster> clusters, OutputCollector<Text, Text> output) throws IOException {
++    Cluster nearestCluster = null;
++    double nearestDistance = Double.MAX_VALUE;
++    for (Cluster cluster : clusters) {
++      Vector clusterCenter = cluster.getCenter();
++      double distance = measure.distance(clusterCenter.getLengthSquared(),
++          clusterCenter, point);
++      if (distance < nearestDistance || nearestCluster == null) {
++        nearestCluster = cluster;
++        nearestDistance = distance;
++      }
++    }
++    
++    String name = point.getName();
++    String key = new String(name != null && name.length() != 0 ? name : point
++        .asFormatString());
++    output.collect(new Text(key), new Text(String.valueOf(nearestCluster.getId())));
++  }
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansConfigKeys.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansConfigKeys.java
+index e69de29b..48e2f9fd 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansConfigKeys.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansConfigKeys.java
+@@ -0,0 +1,16 @@
++package org.apache.mahout.clustering.kmeans;
++
++/**
++ * This class holds all config keys that are relevant to be used in the KMeans MapReduce JobConf.
++ * */
++public class KMeansConfigKeys {
++  /** Configuration key for distance measure to use. */
++  public static final String DISTANCE_MEASURE_KEY = "org.apache.mahout.clustering.kmeans.measure";
++  /** Configuration key for convergence threshold. */
++  public static final String CLUSTER_CONVERGENCE_KEY = "org.apache.mahout.clustering.kmeans.convergence";
++  /** Configuration key for ?? */
++  public static final String CLUSTER_PATH_KEY = "org.apache.mahout.clustering.kmeans.path";
++  /** The number of iterations that have taken place */
++  public static final String ITERATION_NUMBER = "org.apache.mahout.clustering.kmeans.iteration";
++  
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyClusterer.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyClusterer.java
+index e69de29b..b4b50908 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyClusterer.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyClusterer.java
+@@ -0,0 +1,151 @@
++package org.apache.mahout.clustering.meanshift;
++
++import java.io.IOException;
++import java.util.List;
++
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.WritableComparable;
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.mahout.common.distance.DistanceMeasure;
++import org.apache.mahout.common.distance.EuclideanDistanceMeasure;
++import org.apache.mahout.matrix.Vector;
++
++public class MeanShiftCanopyClusterer {
++
++  private double convergenceDelta = 0;
++  // the next canopyId to be allocated
++  private int nextCanopyId = 0;
++  // the T1 distance threshold
++  private double t1;
++  // the T2 distance threshold
++  private double t2;
++  // the distance measure
++  private DistanceMeasure measure;
++  
++  public double getT1() {
++    return t1;
++  }
++  public double getT2() {
++    return t2;
++  }
++  
++  public MeanShiftCanopyClusterer(DistanceMeasure aMeasure, double aT1, double aT2, double aDelta) {
++    config(aMeasure, aT1, aT2, aDelta);
++  }
++  
++  public MeanShiftCanopyClusterer(JobConf job) {
++    configure(job);
++  }
++  /**
++   * Configure the Canopy and its distance measure
++   *
++   * @param job the JobConf for this job
++   */
++  public void configure(JobConf job) {
++    try {
++      measure = Class.forName(job.get(MeanShiftCanopyConfigKeys.DISTANCE_MEASURE_KEY)).asSubclass(
++          DistanceMeasure.class).newInstance();
++      measure.configure(job);
++    } catch (ClassNotFoundException e) {
++      throw new IllegalStateException(e);
++    } catch (IllegalAccessException e) {
++      throw new IllegalStateException(e);
++    } catch (InstantiationException e) {
++      throw new IllegalStateException(e);
++    }
++    nextCanopyId = 0;
++    t1 = Double.parseDouble(job.get(MeanShiftCanopyConfigKeys.T1_KEY));
++    t2 = Double.parseDouble(job.get(MeanShiftCanopyConfigKeys.T2_KEY));
++    convergenceDelta = Double.parseDouble(job.get(MeanShiftCanopyConfigKeys.CLUSTER_CONVERGENCE_KEY));
++  }
++  /**
++   * Configure the Canopy for unit tests
++   *
++   * @param aDelta the convergence criteria
++   */
++  public void config(DistanceMeasure aMeasure, double aT1, double aT2,
++                            double aDelta) {
++    nextCanopyId = 100; // so canopyIds will sort properly
++    measure = aMeasure;
++    t1 = aT1;
++    t2 = aT2;
++    convergenceDelta = aDelta;
++  }
++  
++  /**
++   * Merge the given canopy into the canopies list. If it touches any existing canopy (norm<T1) then add the center of
++   * each to the other. If it covers any other canopies (norm<T2), then merge the given canopy with the closest covering
++   * canopy. If the given canopy does not cover any other canopies, add it to the canopies list.
++   *
++   * @param aCanopy  a MeanShiftCanopy to be merged
++   * @param canopies the List<Canopy> to be appended
++   */
++  public void mergeCanopy(MeanShiftCanopy aCanopy,
++                                 List<MeanShiftCanopy> canopies) {
++    MeanShiftCanopy closestCoveringCanopy = null;
++    double closestNorm = Double.MAX_VALUE;
++    for (MeanShiftCanopy canopy : canopies) {
++      double norm = measure.distance(canopy.getCenter(), aCanopy.getCenter());
++      if (norm < t1) {
++        aCanopy.touch(canopy);
++      }
++      if (norm < t2) {
++        if (closestCoveringCanopy == null || norm < closestNorm) {
++          closestNorm = norm;
++          closestCoveringCanopy = canopy;
++        }
++      }
++    }
++    if (closestCoveringCanopy == null) {
++      canopies.add(aCanopy);
++    } else {
++      closestCoveringCanopy.merge(aCanopy);
++    }
++  }
++
++  /** Emit the new canopy to the collector, keyed by the canopy's Id */
++  void emitCanopy(MeanShiftCanopy canopy,
++                  OutputCollector<Text, WritableComparable<?>> collector)
++      throws IOException {
++    String identifier = canopy.getIdentifier();
++    collector.collect(new Text(identifier), new Text("new " + canopy.toString()));
++  }
++  
++  /**
++   * Shift the center to the new centroid of the cluster
++   *
++   * @param the canopy to shift.
++   * @return if the cluster is converged
++   */
++  public boolean shiftToMean(MeanShiftCanopy canopy) {
++    Vector centroid = canopy.computeCentroid();
++    canopy.setConverged(new EuclideanDistanceMeasure().distance(centroid, canopy.getCenter()) < convergenceDelta);
++    canopy.setCenter(centroid);
++    canopy.setNumPoints(1);
++    canopy.setPointTotal(centroid.clone());
++    return canopy.isConverged();
++  }
++  
++  /**
++   * Return if the point is covered by this canopy
++   *
++   * @param canopy a canopy.
++   * @param point a Vector point
++   * @return if the point is covered
++   */
++  boolean covers(MeanShiftCanopy canopy, Vector point) {
++    return measure.distance(canopy.getCenter(), point) < t1;
++  }
++  
++  /**
++   * Return if the point is closely covered by the canopy
++   * 
++   * @param canopy a canopy.
++   * @param point a Vector point
++   * @return if the point is covered
++   */
++  public boolean closelyBound(MeanShiftCanopy canopy, Vector point) {
++    return measure.distance(canopy.getCenter(), point) < t2;
++  }
++}
+diff --git a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyConfigKeys.java b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyConfigKeys.java
+index e69de29b..9da15397 100644
+--- a/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyConfigKeys.java
++++ b/lucene/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/meanshift/MeanShiftCanopyConfigKeys.java
+@@ -0,0 +1,12 @@
++package org.apache.mahout.clustering.meanshift;
++
++public class MeanShiftCanopyConfigKeys {
++
++  // keys used by Driver, Mapper, Combiner & Reducer
++  public static final String DISTANCE_MEASURE_KEY = "org.apache.mahout.clustering.canopy.measure";
++  public static final String T1_KEY = "org.apache.mahout.clustering.canopy.t1";
++  public static final String T2_KEY = "org.apache.mahout.clustering.canopy.t2";
++  public static final String CONTROL_PATH_KEY = "org.apache.mahout.clustering.control.path";
++  public static final String CLUSTER_CONVERGENCE_KEY = "org.apache.mahout.clustering.canopy.convergence";
++
++}
+diff --git a/lucene/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestRandomSeedGenerator.java b/lucene/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestRandomSeedGenerator.java
+index e69de29b..edac7eae 100644
+--- a/lucene/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestRandomSeedGenerator.java
++++ b/lucene/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestRandomSeedGenerator.java
+@@ -0,0 +1,101 @@
++package org.apache.mahout.clustering.kmeans;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import junit.framework.TestCase;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.SequenceFile;
++import org.apache.hadoop.io.Writable;
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.mahout.clustering.ClusteringTestUtils;
++import org.apache.mahout.matrix.SparseVector;
++import org.apache.mahout.matrix.Vector;
++
++public class TestRandomSeedGenerator extends TestCase {
++  
++  static final double[][] raw = {{1, 1}, {2, 1}, {1, 2}, {2, 2},
++    {3, 3}, {4, 4}, {5, 4}, {4, 5}, {5, 5}};
++  
++  FileSystem fs;
++  
++  private static List<Vector> getPoints(double[][] raw) {
++    List<Vector> points = new ArrayList<Vector>();
++    int i = 0;
++    for (double[] fr : raw) {
++      Vector vec = new SparseVector(String.valueOf(i++), fr.length);
++      vec.assign(fr);
++      points.add(vec);
++    }
++    return points;
++  }
++  
++  private static void rmr(String path) throws Exception {
++    File f = new File(path);
++    if (f.exists()) {
++      if (f.isDirectory()) {
++        String[] contents = f.list();
++        for (String content : contents) {
++          rmr(f.toString() + File.separator + content);
++        }
++      }
++      f.delete();
++    }
++  }
++  
++  public void setUp() throws Exception {
++    super.setUp();
++    rmr("testdata");
++    Configuration conf = new Configuration();
++    fs = FileSystem.get(conf);
++  }
++  
++  /** Story: test random seed generation generates 4 clusters with proper ids and data */
++  public void testRandomSeedGenerator() throws Exception {
++    List<Vector> points = getPoints(raw);
++    File testData = new File("testdata");
++    if (!testData.exists()) {
++      testData.mkdir();
++    }
++    
++    File randomOutput = new File("testdata/random-output");
++    if (!randomOutput.exists()) {
++      randomOutput.mkdir();
++    }
++    
++    JobConf job = new JobConf(RandomSeedGenerator.class);
++    ClusteringTestUtils.writePointsToFile(points, "testdata/random-input", fs, job);
++    
++    RandomSeedGenerator.buildRandom("testdata/random-input", "testdata/random-output", 4);
++    
++    SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path("testdata/random-output/part-randomSeed"), job);
++    Writable key = (Writable) reader.getKeyClass().newInstance();
++    Cluster value = (Cluster) reader.getValueClass().newInstance();
++    
++    int clusterCount = 0;
++    Set<Integer> set = new HashSet<Integer>();
++    while (reader.next(key, value)) {
++      clusterCount++;
++      int id = value.getId();
++      TestCase.assertTrue(set.add(id)); // validate unique id's
++      
++      Vector v = value.getCenter();
++      assertVectorEquals(raw[id], v); // validate values match
++    }
++    
++    TestCase.assertEquals(4, clusterCount); // validate sample count
++  }
++  
++  public void assertVectorEquals(double[] raw, Vector v) {
++    TestCase.assertEquals(raw.length, v.size());
++    for (int i=0; i < raw.length; i++) {
++      TestCase.assertEquals(raw[i], v.getQuick(i));
++    }
++  }
++}

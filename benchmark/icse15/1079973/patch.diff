@@ -1,0 +1,512 @@
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Col.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Col.java
+index e69de29b..75baf3b4 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Col.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Col.java
+@@ -0,0 +1,23 @@
++package org.apache.cassandra.cql.driver;
++
++public class Col<N, V>
++{
++    public final N name;
++    public final V value;
++    
++    public Col(N name, V value)
++    {
++        this.name = name;
++        this.value = value;
++    }
++    
++    public N getName()
++    {
++        return name;
++    }
++    
++    public V getValue()
++    {
++        return value;
++    }
++}
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Connection.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Connection.java
+index cb5b0859..9f5e324f 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Connection.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Connection.java
+@@ -23,6 +23,8 @@
+ 
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
+ 
+ import org.apache.cassandra.thrift.AuthenticationException;
+ import org.apache.cassandra.thrift.AuthenticationRequest;
+@@ -46,6 +48,9 @@
+ /** CQL connection object. */
+ public class Connection
+ {
++    private static final Pattern KeyspacePattern = Pattern.compile("USE (\\w+);?", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
++    private static final Pattern SelectPattern = Pattern.compile("SELECT\\s+.+\\s+FROM\\s+(\\w+).*", Pattern.CASE_INSENSITIVE | Pattern.MULTILINE);
++    
+     public static Compression defaultCompression = Compression.GZIP;
+     public final String hostName;
+     public final int portNo;
+@@ -56,6 +61,11 @@
+     private Cassandra.Client client;
+     private TTransport transport;
+     
++    // todo: encapsulate.
++    public String curKeyspace;
++    public String curColumnFamily;
++    public SchemaDecoder decoder;
++    
+     /**
+      * Create a new <code>Connection</code> instance.
+      * 
+@@ -67,7 +77,6 @@ public Connection(String hostName, int portNo) throws TTransportException
+     {
+         this.hostName = hostName;
+         this.portNo = portNo;
+-        
+         TSocket socket = new TSocket(hostName, portNo);
+         transport = new TFramedTransport(socket);
+         TProtocol protocol = new TBinaryProtocol(transport);
+@@ -127,6 +136,15 @@ public CqlResult execute(String queryStr)
+     public CqlResult execute(String queryStr, Compression compress)
+     throws InvalidRequestException, UnavailableException, TimedOutException, TException
+     {
++        if (decoder == null)
++            decoder = new SchemaDecoder(client.describe_keyspaces());
++        
++        Matcher isKeyspace = KeyspacePattern.matcher(queryStr);
++        if (isKeyspace.matches())
++            curKeyspace = isKeyspace.group(1);
++        Matcher isSelect = SelectPattern.matcher(queryStr);
++        if (isSelect.matches())
++            curColumnFamily = isSelect.group(1);
+         try
+         {
+             return client.execute_cql_query(Utils.compressQuery(queryStr, compress), compress);
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Results.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Results.java
+index e69de29b..eb3cbdbb 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Results.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/Results.java
+@@ -0,0 +1,21 @@
++package org.apache.cassandra.cql.driver;
++
++
++public class Results
++{
++    private final SchemaDecoder decoder;
++    private final String keyspace;
++    private final String columnFamily;
++    
++    public Results(SchemaDecoder decoder, String keyspace, String columnFamily) 
++    {
++        this.decoder = decoder;
++        this.keyspace = keyspace;
++        this.columnFamily = columnFamily;
++    }
++    
++    public Col makeCol(byte[] name, byte[] value) {
++        return decoder.makeCol(keyspace, columnFamily, name, value);
++    }
++    
++}
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/SchemaDecoder.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/SchemaDecoder.java
+index e69de29b..e45e16b7 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/SchemaDecoder.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/SchemaDecoder.java
+@@ -0,0 +1,110 @@
++package org.apache.cassandra.cql.driver;
++
++import org.apache.cassandra.config.ConfigurationException;
++import org.apache.cassandra.db.marshal.AbstractType;
++import org.apache.cassandra.db.marshal.AsciiType;
++import org.apache.cassandra.db.marshal.BytesType;
++import org.apache.cassandra.db.marshal.IntegerType;
++import org.apache.cassandra.db.marshal.LexicalUUIDType;
++import org.apache.cassandra.db.marshal.LongType;
++import org.apache.cassandra.db.marshal.TimeUUIDType;
++import org.apache.cassandra.db.marshal.UTF8Type;
++import org.apache.cassandra.thrift.CfDef;
++import org.apache.cassandra.thrift.KsDef;
++import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.UUIDGen;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.UnsupportedEncodingException;
++import java.math.BigInteger;
++import java.nio.ByteBuffer;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++public class SchemaDecoder 
++{
++    private static final Logger logger = LoggerFactory.getLogger(SchemaDecoder.class);
++    private static final String MapFormatString = "%s.%s.%s";
++    
++    enum Specifier
++    {
++        Comparator,
++        Validator
++    }
++    
++    private Map<String, CfDef> cfDefs = new HashMap<String, CfDef>();
++    
++    // cache the comparators for efficiency.
++    private Map<String, AbstractType> comparators = new HashMap<String, AbstractType>();
++    
++    public SchemaDecoder(List<KsDef> defs)
++    {
++        for (KsDef ks : defs) 
++            for (CfDef cf : ks.getCf_defs())
++                cfDefs.put(String.format("%s.%s", ks.getName(), cf.getName()), cf);
++    }
++
++    /**
++     * @param keyspace ALWAYS specify
++     * @param columnFamily ALWAYS specify
++     * @param specifier ALWAYS specify
++     * @param def avoids additional map lookup if specified. null is ok. though.
++     * @return
++     */
++    private AbstractType getComparator(String keyspace, String columnFamily, Specifier specifier, CfDef def) 
++    {
++        // check cache first.
++        String key = String.format(MapFormatString, keyspace, columnFamily, specifier.name());
++        AbstractType comparator = comparators.get(key);
++
++        // make and put in cache.
++        if (comparator == null) 
++        {
++            if (def == null)
++                def = cfDefs.get(String.format("%s.%s", keyspace, columnFamily));
++            try 
++            {
++                switch (specifier)
++                {
++                    case Validator:
++                        comparator = FBUtilities.getComparator(def.getDefault_validation_class());
++                        break;
++                    case Comparator:
++                    default:
++                        comparator = FBUtilities.getComparator(def.getComparator_type());
++                        break;
++                }
++                comparators.put(key, comparator);
++            }
++            catch (ConfigurationException ex)
++            {
++                throw new RuntimeException(ex);
++            }
++        }
++        return comparator;
++    }
++    
++    public String colNameAsString(String keyspace, String columnFamily, String name) 
++    {
++        AbstractType comparator = getComparator(keyspace, columnFamily, Specifier.Comparator, null);
++        ByteBuffer bb = comparator.fromString(name);
++        return comparator.getString(bb);
++    }
++    
++    public String colNameAsString(String keyspace, String columnFamily, byte[] name) 
++    {
++        AbstractType comparator = getComparator(keyspace, columnFamily, Specifier.Comparator, null);
++        return comparator.getString(ByteBuffer.wrap(name));
++    }
++    
++    public Col makeCol(String keyspace, String columnFamily, byte[] name, byte[] value)
++    {
++        CfDef cfDef = cfDefs.get(String.format("%s.%s", keyspace, columnFamily));
++        AbstractType comparator = getComparator(keyspace, columnFamily, Specifier.Comparator, cfDef);
++        AbstractType validator = getComparator(keyspace, columnFamily, Specifier.Validator, null);
++        // todo: generate less garbage.
++        return new Col(comparator.compose(ByteBuffer.wrap(name)), validator.compose(ByteBuffer.wrap(value)));
++    }
++}
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraResultSet.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraResultSet.java
+index b1146773..8141456c 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraResultSet.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraResultSet.java
+@@ -45,6 +45,10 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.WeakHashMap;
++
++import org.apache.cassandra.cql.driver.Col;
++import org.apache.cassandra.cql.driver.Results;
++import org.apache.cassandra.cql.driver.SchemaDecoder;
+ import org.apache.cassandra.thrift.Column;
+ import org.apache.cassandra.thrift.CqlResult;
+ import org.apache.cassandra.thrift.CqlRow;
+@@ -56,16 +60,20 @@
+ {
+     
+     /** The r set. */
+-    private CqlResult rSet;
++    private final CqlResult rSet; 
++    
++    private final SchemaDecoder decoder;
++    private final String keyspace;
++    private final String columnFamily;
+     
+     /** The r set iter. */
+     private Iterator<CqlRow> rSetIter;
+     
+-    /** The row. */
+-    private CqlRow row;
++//    /** The row. */
++//    private CqlRow row;
+     
+     /** The values. */
+-    private List<Object> values = new ArrayList<Object>();
++    private List<Col> values = new ArrayList<Col>();
+     
+     /** The value map. */
+     private Map<String, Object> valueMap = new WeakHashMap<String, Object>();
+@@ -75,9 +83,12 @@
+      *
+      * @param resultSet the result set
+      */
+-    CassandraResultSet(CqlResult resultSet)
++    CassandraResultSet(CqlResult resultSet, SchemaDecoder decoder, String keyspace, String columnFamily)
+     {
+         this.rSet = resultSet;
++        this.decoder = decoder;
++        this.keyspace = keyspace;
++        this.columnFamily = columnFamily;
+         rSetIter = rSet.getRowsIterator();
+     }
+ 
+@@ -787,7 +798,7 @@ public Statement getStatement() throws SQLException
+      */
+     public String getString(int index) throws SQLException 
+     {
+-        return values.get(index) != null ? values.get(index).toString() : null;
++        return values.get(index) != null ? values.get(index).getValue().toString() : null;
+     }
+ 
+     /**
+@@ -797,7 +808,8 @@ public String getString(int index) throws SQLException
+      */
+     public String getString(String name) throws SQLException
+     {
+-        return valueMap.get(name) != null ? valueMap.get(name).toString() : null;
++        String nameAsString = this.decoder.colNameAsString(this.keyspace, this.columnFamily, name);
++        return valueMap.get(nameAsString) != null ? valueMap.get(nameAsString).toString() : null;
+     }
+ 
+     /**
+@@ -1033,14 +1045,15 @@ public synchronized boolean next() throws SQLException
+         }
+         if (rSetIter != null && rSetIter.hasNext())
+         {
+-            row = rSetIter.next();
++            CqlRow row = rSetIter.next();
+             List<Column> cols = row.getColumns();
+             for (Column col : cols)
+             {
+-                String name = new String(col.getName());
+-                String value = new String(col.getValue());
+-                values.add(value);
+-                valueMap.put(name, value);
++                byte[] name = col.getName();
++                byte[] value = col.getValue();
++                Col c = decoder.makeCol(keyspace, columnFamily, name, value);
++                values.add(c);
++                valueMap.put(decoder.colNameAsString(keyspace, columnFamily, name), c.getValue());
+             }
+             return !(values.isEmpty() && valueMap.isEmpty());
+         } 
+diff --git a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraStatement.java b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraStatement.java
+index 07389fdb..7e778607 100644
+--- a/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraStatement.java
++++ b/cassandra/trunk/drivers/java/src/org/apache/cassandra/cql/driver/jdbc/CassandraStatement.java
+@@ -43,6 +43,7 @@
+ import java.sql.Timestamp;
+ import java.util.Calendar;
+ 
++import org.apache.cassandra.cql.driver.Results;
+ import org.apache.cassandra.thrift.CqlResult;
+ import org.apache.cassandra.thrift.InvalidRequestException;
+ import org.apache.cassandra.thrift.TimedOutException;
+@@ -243,7 +244,8 @@ public ResultSet executeQuery(String query) throws SQLException
+         try
+         {
+             CqlResult rSet = connection.execute(query);
+-            return new CassandraResultSet(rSet);
++            // todo: encapsulate.
++            return new CassandraResultSet(rSet, connection.decoder, connection.curKeyspace, connection.curColumnFamily);
+         }
+         catch (InvalidRequestException e)
+         {
+diff --git a/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/EmbeddedServiceBase.java b/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/EmbeddedServiceBase.java
+index d47969f3..e69de29b 100644
+--- a/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/EmbeddedServiceBase.java
++++ b/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/EmbeddedServiceBase.java
+@@ -1,79 +0,0 @@
+-package org.apache.cassandra.cql.driver.jdbc;
+-
+-import java.io.IOException;
+-import java.net.Socket;
+-import java.net.UnknownHostException;
+-
+-import junit.framework.TestCase;
+-
+-import org.apache.cassandra.config.CFMetaData;
+-import org.apache.cassandra.config.ConfigurationException;
+-import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.config.KSMetaData;
+-import org.apache.cassandra.service.EmbeddedCassandraService;
+-
+-/**
+- * The abstract BaseClass.
+- */
+-public abstract class EmbeddedServiceBase extends TestCase
+-{
+-
+-    /** The embedded server cassandra. */
+-    private static EmbeddedCassandraService cassandra;
+-    
+-    /**
+-     * Start cassandra server.
+-     * @throws ConfigurationException 
+-     *
+-     * @throws Exception the exception
+-     */
+-    protected void startCassandraServer() throws IOException, ConfigurationException
+-    {
+-        if (!checkIfServerRunning())
+-        {
+-            System.setProperty("cassandra.config", "cassandra.yaml");
+-            loadData();
+-            cassandra = new EmbeddedCassandraService();
+-            cassandra.start();
+-        }
+-    }
+-
+-    
+-    /**
+-     * Load yaml tables.
+-     *
+-     * @throws ConfigurationException the configuration exception
+-     */
+-    private void loadData() throws ConfigurationException
+-    {
+-        for (KSMetaData table : DatabaseDescriptor.readTablesFromYaml())
+-        {
+-            for (CFMetaData cfm : table.cfMetaData().values())
+-            {
+-                CFMetaData.map(cfm);
+-            }
+-            DatabaseDescriptor.setTableDefinition(table, DatabaseDescriptor.getDefsVersion());
+-        }
+-    }
+-    /**
+-     * Check if server running.
+-     *
+-     * @return true, if successful
+-     */
+-    private boolean checkIfServerRunning()
+-    {
+-        try
+-        {
+-            Socket socket = new Socket("127.0.0.1", 9170);
+-            return socket.getInetAddress() != null;
+-        } 
+-        catch (UnknownHostException e)
+-        {
+-            return false;
+-        }
+-        catch (IOException e)
+-        {
+-            return false;
+-        }
+-    }
+-}
+diff --git a/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/jdbc/EmbeddedServiceBase.java b/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/jdbc/EmbeddedServiceBase.java
+index e69de29b..d47969f3 100644
+--- a/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/jdbc/EmbeddedServiceBase.java
++++ b/cassandra/trunk/drivers/java/test/org/apache/cassandra/cql/driver/jdbc/EmbeddedServiceBase.java
+@@ -0,0 +1,79 @@
++package org.apache.cassandra.cql.driver.jdbc;
++
++import java.io.IOException;
++import java.net.Socket;
++import java.net.UnknownHostException;
++
++import junit.framework.TestCase;
++
++import org.apache.cassandra.config.CFMetaData;
++import org.apache.cassandra.config.ConfigurationException;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.config.KSMetaData;
++import org.apache.cassandra.service.EmbeddedCassandraService;
++
++/**
++ * The abstract BaseClass.
++ */
++public abstract class EmbeddedServiceBase extends TestCase
++{
++
++    /** The embedded server cassandra. */
++    private static EmbeddedCassandraService cassandra;
++    
++    /**
++     * Start cassandra server.
++     * @throws ConfigurationException 
++     *
++     * @throws Exception the exception
++     */
++    protected void startCassandraServer() throws IOException, ConfigurationException
++    {
++        if (!checkIfServerRunning())
++        {
++            System.setProperty("cassandra.config", "cassandra.yaml");
++            loadData();
++            cassandra = new EmbeddedCassandraService();
++            cassandra.start();
++        }
++    }
++
++    
++    /**
++     * Load yaml tables.
++     *
++     * @throws ConfigurationException the configuration exception
++     */
++    private void loadData() throws ConfigurationException
++    {
++        for (KSMetaData table : DatabaseDescriptor.readTablesFromYaml())
++        {
++            for (CFMetaData cfm : table.cfMetaData().values())
++            {
++                CFMetaData.map(cfm);
++            }
++            DatabaseDescriptor.setTableDefinition(table, DatabaseDescriptor.getDefsVersion());
++        }
++    }
++    /**
++     * Check if server running.
++     *
++     * @return true, if successful
++     */
++    private boolean checkIfServerRunning()
++    {
++        try
++        {
++            Socket socket = new Socket("127.0.0.1", 9170);
++            return socket.getInetAddress() != null;
++        } 
++        catch (UnknownHostException e)
++        {
++            return false;
++        }
++        catch (IOException e)
++        {
++            return false;
++        }
++    }
++}

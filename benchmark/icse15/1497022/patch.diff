@@ -1,0 +1,170 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+index 27174735..77a4f6a4 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+@@ -403,7 +403,14 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+             successfulInstall = modifyIndexProps(tmpIdxDirName);
+             deleteTmpIdxDir  =  false;
+           } else {
++            solrCore.getUpdateHandler().getSolrCoreState()
++                .closeIndexWriter(core, true);
++            try {
+             successfulInstall = moveIndexFiles(tmpIndexDir, indexDir);
++            } finally {
++              solrCore.getUpdateHandler().getSolrCoreState()
++                  .openIndexWriter(core);
++            }
+           }
+           if (successfulInstall) {
+             if (isFullCopyNeeded) {
+@@ -426,7 +433,12 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+             successfulInstall = modifyIndexProps(tmpIdxDirName);
+             deleteTmpIdxDir =  false;
+           } else {
++            solrCore.getUpdateHandler().getSolrCoreState().closeIndexWriter(core, true);
++            try {
+             successfulInstall = moveIndexFiles(tmpIndexDir, indexDir);
++            } finally {
++              solrCore.getUpdateHandler().getSolrCoreState().openIndexWriter(core);
++            }
+           }
+           if (successfulInstall) {
+             logReplicationTimeAndConfFiles(modifiedConfFiles, successfulInstall);
+@@ -443,7 +455,11 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+               core.getDirectoryFactory().remove(indexDir);
+             }
+           }
+-          openNewWriterAndSearcher(isFullCopyNeeded);
++          if (isFullCopyNeeded) {
++            solrCore.getUpdateHandler().newIndexWriter(isFullCopyNeeded);
++          }
++          
++          openNewSearcherAndUpdateCommitPoint(isFullCopyNeeded);
+         }
+         
+         replicationStartTime = 0;
+@@ -615,11 +631,9 @@ private StringBuffer readToStringBuffer(long replicationTime, String str) {
+     return sb;
+   }
+ 
+-  private void openNewWriterAndSearcher(boolean isFullCopyNeeded) throws IOException {
++  private void openNewSearcherAndUpdateCommitPoint(boolean isFullCopyNeeded) throws IOException {
+     SolrQueryRequest req = new LocalSolrQueryRequest(solrCore,
+         new ModifiableSolrParams());
+-    // reboot the writer on the new index and get a new searcher
+-    solrCore.getUpdateHandler().newIndexWriter(isFullCopyNeeded);
+     
+     RefCounted<SolrIndexSearcher> searcher = null;
+     IndexCommit commitPoint;
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+index 2b345442..7ad2ab57 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+@@ -188,6 +188,76 @@ public synchronized void newIndexWriter(SolrCore core, boolean rollback) throws
+     }
+   }
+ 
++  @Override
++  public synchronized void closeIndexWriter(SolrCore core, boolean rollback)
++      throws IOException {
++    log.info("Closing IndexWriter...");
++    String coreName = core.getName();
++    synchronized (writerPauseLock) {
++      if (closed) {
++        throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
++      }
++      
++      // we need to wait for the Writer to fall out of use
++      // first lets stop it from being lent out
++      pauseWriter = true;
++      // then lets wait until its out of use
++      log.info("Waiting until IndexWriter is unused... core=" + coreName);
++      
++      while (!writerFree) {
++        try {
++          writerPauseLock.wait(100);
++        } catch (InterruptedException e) {}
++        
++        if (closed) {
++          throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE,
++              "SolrCoreState already closed");
++        }
++      }
++      
++      if (indexWriter != null) {
++        if (!rollback) {
++          try {
++            log.info("Closing old IndexWriter... core=" + coreName);
++            indexWriter.close();
++          } catch (Throwable t) {
++            SolrException.log(log, "Error closing old IndexWriter. core="
++                + coreName, t);
++          }
++        } else {
++          try {
++            log.info("Rollback old IndexWriter... core=" + coreName);
++            indexWriter.rollback();
++          } catch (Throwable t) {
++            SolrException.log(log, "Error rolling back old IndexWriter. core="
++                + coreName, t);
++          }
++        }
++      }
++      
++    }
++  }
++  
++  @Override
++  public synchronized void openIndexWriter(SolrCore core) throws IOException {
++    log.info("Creating new IndexWriter...");
++    synchronized (writerPauseLock) {
++      if (closed) {
++        throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
++      }
++      
++      try {
++        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2");
++        log.info("New IndexWriter is ready to be used.");
++        // we need to null this so it picks up the new writer next get call
++        refCntWriter = null;
++      } finally {
++        pauseWriter = false;
++        writerPauseLock.notifyAll();
++      }
++    }
++  }
++
+   @Override
+   public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
+     newIndexWriter(core, true);
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+index 1b8069ad..6581ece8 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+@@ -89,6 +89,26 @@ public boolean decrefSolrCoreState(IndexWriterCloser closer) {
+    */
+   public abstract void newIndexWriter(SolrCore core, boolean rollback) throws IOException;
+   
++  
++  /**
++   * Expert method that closes the IndexWriter - you must call {@link #openIndexWriter(SolrCore)}
++   * in a finally block after calling this method.
++   * 
++   * @param core that the IW belongs to
++   * @param rollback true if IW should rollback rather than close
++   * @throws IOException If there is a low-level I/O error.
++   */
++  public abstract void closeIndexWriter(SolrCore core, boolean rollback) throws IOException;
++  
++  /**
++   * Expert method that opens the IndexWriter - you must call {@link #closeIndexWriter(SolrCore, boolean)}
++   * first, and then call this method in a finally block.
++   * 
++   * @param core that the IW belongs to
++   * @throws IOException If there is a low-level I/O error.
++   */
++  public abstract void openIndexWriter(SolrCore core) throws IOException;
++  
+   /**
+    * Get the current IndexWriter. If a new IndexWriter must be created, use the
+    * settings from the given {@link SolrCore}.

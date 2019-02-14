@@ -1,0 +1,717 @@
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/ZkController.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+index 6129f6bf..70415cd1 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/ZkController.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+@@ -29,6 +29,7 @@
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
++import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.embedded.EmbeddedSolrServer;
+ import org.apache.solr.client.solrj.request.QueryRequest;
+ import org.apache.solr.common.SolrException;
+@@ -419,27 +420,9 @@ public String register(String coreName, final CoreDescriptor desc, final CloudDe
+     log.info("Attempting to update " + ZkStateReader.CLUSTER_STATE + " version "
+         + null);
+     CloudState state = CloudState.load(data);
+-    
+-    boolean recover = false;
+-    Map<String,Slice> slices = state.getSlices(cloudDesc.getCollectionName());
+     String shardZkNodeName = getNodeName() + "_" + coreName;
+-    if (slices != null) {
+-      Map<String,String> nodes = new HashMap<String,String>();
+ 
+-      for (Slice s : slices.values()) {
+-        System.out.println("add slice: "+ s.getName());
+-        for (String node : s.getShards().keySet()) {
+-          System.out.println("add node: "+ node);
+-          nodes.put(node, s.getName());
+-        }
+-      }
+-      System.out.println("print recovery:" + nodes + " name: " + shardZkNodeName);
+-      if (nodes.containsKey(shardZkNodeName)) {
+-        // TODO: we where already registered - go into recovery mode
+-        cloudDesc.setShardId(nodes.get(shardZkNodeName));
+-        recover = true;
+-      }
+-    }
++    boolean recover = getIsRecover(cloudDesc, state, shardZkNodeName);
+     
+     String shardId = cloudDesc.getShardId();
+     if (shardId == null && !recover) {
+@@ -447,7 +430,6 @@ public String register(String coreName, final CoreDescriptor desc, final CloudDe
+       cloudDesc.setShardId(shardId);
+     }
+     
+-
+     if (log.isInfoEnabled()) {
+         log.info("Register shard - core:" + coreName + " address:"
+             + shardUrl);
+@@ -455,16 +437,63 @@ public String register(String coreName, final CoreDescriptor desc, final CloudDe
+     
+     leaderElector.setupForSlice(shardId, collection);
+     
+-    ZkNodeProps props = addToZk(collection, desc, cloudDesc, shardUrl, shardZkNodeName, recover);
++    ZkNodeProps props = addToZk(collection, desc, cloudDesc, shardUrl, shardZkNodeName);
+     
+     // leader election
+     doLeaderElectionProcess(shardId, collection, shardZkNodeName, props);
++    
++    String leaderUrl = zkStateReader.getLeader(collection, cloudDesc.getShardId());
++    
++    System.out.println("leader url: "+ leaderUrl);
++    System.out.println("shard url: "+ shardUrl);
++    boolean iamleader = false;
++    if (leaderUrl.equals(shardUrl)) {
++      iamleader = true;
++    } else {
++      // we are not the leader, so catch up with recovery
++      recover = true;
++    }
++    
++    if (recover) {
++      if (desc.getCoreContainer() != null) {
++        doRecovery(collection, desc, cloudDesc, iamleader);
++      } else {
++        log.warn("For some odd reason a SolrCore is trying to recover but does not have access to a CoreContainer - skipping recovery.");
++      }
++    }
++
+     return shardId;
+   }
+ 
+ 
++  private boolean getIsRecover(final CloudDescriptor cloudDesc,
++      CloudState state, String shardZkNodeName) {
++    boolean recover = false;
++    Map<String,Slice> slices = state.getSlices(cloudDesc.getCollectionName());
++
++    if (slices != null) {
++      Map<String,String> nodes = new HashMap<String,String>();
++
++      for (Slice s : slices.values()) {
++        System.out.println("add slice: "+ s.getName());
++        for (String node : s.getShards().keySet()) {
++          System.out.println("add node: "+ node);
++          nodes.put(node, s.getName());
++        }
++      }
++      System.out.println("print recovery:" + nodes + " name: " + shardZkNodeName);
++      if (nodes.containsKey(shardZkNodeName)) {
++        // TODO: we where already registered - go into recovery mode
++        cloudDesc.setShardId(nodes.get(shardZkNodeName));
++        recover = true;
++      }
++    }
++    return recover;
++  }
++
++
+   ZkNodeProps addToZk(String collection, final CoreDescriptor desc, final CloudDescriptor cloudDesc, String shardUrl,
+-      final String shardZkNodeName, boolean recover)
++      final String shardZkNodeName)
+       throws Exception {
+     ZkNodeProps props = new ZkNodeProps();
+     props.put(ZkStateReader.URL_PROP, shardUrl);
+@@ -521,20 +550,35 @@ ZkNodeProps addToZk(String collection, final CoreDescriptor desc, final CloudDes
+ 					zkClient.setData(ZkStateReader.CLUSTER_STATE,
+ 							CloudState.store(state), stat.getVersion());
+ 					updated = true;
+-					if (recover) {
++				} catch (KeeperException e) {
++					if (e.code() != Code.BADVERSION) {
++						throw e;
++					}
++					log.info("Failed to update " + ZkStateReader.CLUSTER_STATE + ", retrying");
++				}
++
++			}
++		}
++    return props;
++  }
++
++
++  private void doRecovery(String collection, final CoreDescriptor desc,
++      final CloudDescriptor cloudDesc, boolean iamleader) throws Exception,
++      SolrServerException, IOException {
+ 					  // nocommit: joke code
+ 					  System.out.println("do recovery");
+ 					  // start buffer updates to tran log
+ 					  // and do recovery - either replay via realtime get 
+ 					  // or full index replication
+-            System.out.println("RECOVERY");
+-            // seems we cannot do this here since we are not fully running - 
++
++    // seems perhaps we cannot do this here since we are not fully running - 
+             // we need to trigger a recovery that happens later
+             System.out.println("shard is:" + cloudDesc.getShardId());
++    
+             String leaderUrl = zkStateReader.getLeader(collection, cloudDesc.getShardId());
+-            System.out.println("leader url: "+ leaderUrl);
+-            System.out.println("shard url: "+ shardUrl);
+-            if (!leaderUrl.equals(shardUrl)) {
++    
++    if (!iamleader) {
+               // if we are the leader, either we are trying to recover faster
+               // then our ephemeral timed out or we are the only node
+               
+@@ -557,17 +601,6 @@ ZkNodeProps addToZk(String collection, final CoreDescriptor desc, final CloudDes
+               server.request(req);
+             }
+ 					}
+-				} catch (KeeperException e) {
+-					if (e.code() != Code.BADVERSION) {
+-						throw e;
+-					}
+-					log.info("Failed to update " + ZkStateReader.CLUSTER_STATE + ", retrying");
+-				}
+-
+-			}
+-		}
+-    return props;
+-  }
+ 
+   private void doLeaderElectionProcess(String shardId,
+       final String collection, String shardZkNodeName, ZkNodeProps props) throws KeeperException,
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/core/SolrCore.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index f013b4fd..fc4477cc 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -561,7 +561,7 @@ public SolrCore(String name, String dataDir, SolrConfig config, IndexSchema sche
+     if (updateHandler == null) {
+       initDirectoryFactory();
+     } else {
+-      directoryFactory = updateHandler.getIndexWriterProvider().getDirectoryFactory();
++      directoryFactory = updateHandler.getSolrCoreState().getDirectoryFactory();
+     }
+     
+     initIndex();
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+index 75e190b0..6dc3b650 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+@@ -81,6 +81,8 @@
+  * @since solr 1.4
+  */
+ public class ReplicationHandler extends RequestHandlerBase implements SolrCoreAware {
++  static final String FORCE = "force";
++  
+   private static final Logger LOG = LoggerFactory.getLogger(ReplicationHandler.class.getName());
+   SolrCore core;
+ 
+@@ -118,6 +120,7 @@
+   public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throws Exception {
+     rsp.setHttpCaching(false);
+     final SolrParams solrParams = req.getParams();
++    boolean force = solrParams.getBool(FORCE, false);
+     String command = solrParams.get(COMMAND);
+     if (command == null) {
+       rsp.add(STATUS, OK_STATUS);
+@@ -131,8 +134,9 @@ public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throw
+       
+       // this is only set after commit or optimize or something - if it's not set,
+       // just use the most recent
+-      if (commitPoint == null) {
+-        commitPoint = req.getSearcher().getIndexReader().getIndexCommit();
++      if (commitPoint == null || force) {
++        commitPoint = core.getDeletionPolicy().getLatestCommit();
++        indexCommitPoint = commitPoint;
+       }
+       
+       if (commitPoint != null && replicationEnabled.get()) {
+@@ -143,6 +147,7 @@ public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throw
+         // the CMD_GET_FILE_LIST command.
+         //
+         core.getDeletionPolicy().setReserveDuration(commitPoint.getVersion(), reserveCommitDuration);
++        System.out.println("return version: " + commitPoint.getVersion());
+         rsp.add(CMD_INDEX_VERSION, commitPoint.getVersion());
+         rsp.add(GENERATION, commitPoint.getGeneration());
+       } else {
+@@ -288,7 +293,7 @@ void doFetch(SolrParams solrParams) {
+         nl.remove(SnapPuller.POLL_INTERVAL);
+         tempSnapPuller = new SnapPuller(nl, this, core);
+       }
+-      tempSnapPuller.fetchLatestIndex(core, solrParams == null ? false : solrParams.getBool("force", false));
++      tempSnapPuller.fetchLatestIndex(core, solrParams == null ? false : solrParams.getBool(FORCE, false));
+     } catch (Exception e) {
+       LOG.error("SnapPull failed ", e);
+     } finally {
+@@ -353,7 +358,9 @@ private void getFileList(SolrParams solrParams, SolrQueryResponse rsp) {
+       Collection<String> files = new HashSet<String>(commit.getFileNames());
+       for (String fileName : files) {
+         if(fileName.endsWith(".lock")) continue;
+-        File file = new File(core.getIndexDir(), fileName);
++        // use new dir in case we are replicating from a full index replication
++        // and have not yet reloaded the core
++        File file = new File(core.getNewIndexDir(), fileName);
+         Map<String, Object> fileMeta = getFileInfo(file);
+         result.add(fileMeta);
+       }
+@@ -763,9 +770,10 @@ Properties loadReplicationProperties() {
+   }
+ 
+ 
+-  void refreshCommitpoint() {
++  void refreshCommitpoint(boolean force) {
+     IndexCommit commitPoint = core.getDeletionPolicy().getLatestCommit();
+-    if(replicateOnCommit || (replicateOnOptimize && commitPoint.getSegmentCount() == 1)) {
++    System.out.println("refresh commit point to:" + commitPoint.getVersion());
++    if(force || replicateOnCommit || (replicateOnOptimize && commitPoint.getSegmentCount() == 1)) {
+       indexCommitPoint = commitPoint;
+     }
+   }
+@@ -1022,7 +1030,9 @@ public void write(OutputStream out) throws IOException {
+           file = new File(core.getResourceLoader().getConfigDir(), cfileName);
+         } else {
+           //else read from the indexdirectory
+-          file = new File(core.getIndexDir(), fileName);
++          // use new dir in case we are replicating from a full index replication
++          // and have not yet reloaded the core
++          file = new File(core.getNewIndexDir(), fileName);
+         }
+         if (file.exists() && file.canRead()) {
+           inputStream = new FileInputStream(file);
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/SnapPuller.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+index 9951ed0b..6bd0124d 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+@@ -172,12 +172,16 @@ public void run() {
+ 
+   /**
+    * Gets the latest commit version and generation from the master
++   * @param force 
+    */
+   @SuppressWarnings("unchecked")
+-  NamedList getLatestVersion() throws IOException {
++  NamedList getLatestVersion(boolean force) throws IOException {
+     PostMethod post = new PostMethod(masterUrl);
+     post.addParameter(COMMAND, CMD_INDEX_VERSION);
+     post.addParameter("wt", "javabin");
++    if (force) {
++      post.addParameter(ReplicationHandler.FORCE, "true");
++    }
+     return getNamedListResponse(post);
+   }
+ 
+@@ -249,7 +253,7 @@ boolean fetchLatestIndex(SolrCore core, boolean force) throws IOException {
+       //get the current 'replicateable' index version in the master
+       NamedList response = null;
+       try {
+-        response = getLatestVersion();
++        response = getLatestVersion(force);
+       } catch (Exception e) {
+         LOG.error("Master at: " + masterUrl + " is not available. Index fetch failed. Exception: " + e.getMessage());
+         return false;
+@@ -269,7 +273,7 @@ boolean fetchLatestIndex(SolrCore core, boolean force) throws IOException {
+         if (searcherRefCounted != null)
+           searcherRefCounted.decref();
+       }
+-      if (commit.getVersion() == latestVersion && commit.getGeneration() == latestGeneration) {
++      if (!force && commit.getVersion() == latestVersion && commit.getGeneration() == latestGeneration) {
+         //master and slave are alsready in sync just return
+         LOG.info("Slave in sync with master.");
+         return false;
+@@ -324,7 +328,7 @@ boolean fetchLatestIndex(SolrCore core, boolean force) throws IOException {
+           }
+           if (successfulInstall) {
+             logReplicationTimeAndConfFiles(modifiedConfFiles, successfulInstall);
+-            doCommit();
++            doCommit(isFullCopyNeeded);
+           }
+         }
+         replicationStartTime = 0;
+@@ -469,7 +473,7 @@ private StringBuffer readToStringBuffer(long replicationTime, String str) {
+     return sb;
+   }
+ 
+-  private void doCommit() throws IOException {
++  private void doCommit(boolean isFullCopyNeeded) throws IOException {
+     SolrQueryRequest req = new LocalSolrQueryRequest(solrCore,
+         new ModifiableSolrParams());
+     try {
+@@ -478,7 +482,7 @@ private void doCommit() throws IOException {
+       solrCore.getUpdateHandler().newIndexWriter();
+       solrCore.getSearcher(true, false, null);
+       
+-      replicationHandler.refreshCommitpoint();
++      replicationHandler.refreshCommitpoint(isFullCopyNeeded);
+     } finally {
+       req.close();
+     }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index aeebe9ef..776fceb2 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -559,7 +559,7 @@ public String toString() {
+     return "DirectUpdateHandler2" + getStatistics();
+   }
+   
+-  public SolrCoreState getIndexWriterProvider() {
++  public SolrCoreState getSolrCoreState() {
+     return solrCoreState;
+   }
+ 
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/UpdateHandler.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+index 61aaad4a..0b6de9ee 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+@@ -141,7 +141,7 @@ public UpdateHandler(SolrCore core)  {
+    */
+   public abstract void newIndexWriter() throws IOException;
+ 
+-  public abstract SolrCoreState getIndexWriterProvider();
++  public abstract SolrCoreState getSolrCoreState();
+ 
+   public abstract int addDoc(AddUpdateCommand cmd) throws IOException;
+   public abstract void delete(DeleteUpdateCommand cmd) throws IOException;
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+index 03713ee8..b5a2ca69 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+@@ -247,11 +247,8 @@ private void versionAdd(AddUpdateCommand cmd, int hash) throws IOException {
+ 
+     System.out.println("LeaderParam:"
+         + req.getParams().get(SEEN_LEADER));
+-
+-
+     System.out.println("leader? " + isLeader);
+ 
+-
+     // at this point, there is an update we need to try and apply.
+     // we may or may not be the leader.
+ 
+@@ -265,8 +262,6 @@ private void versionAdd(AddUpdateCommand cmd, int hash) throws IOException {
+       // TODO: check for the version in the request params (this will be for user provided versions and optimistic concurrency only)
+     }
+ 
+-
+-
+     VersionBucket bucket = vinfo.bucket(hash);
+     synchronized (bucket) {
+       // we obtain the version when synchronized and then do the add so we can ensure that
+@@ -285,9 +280,10 @@ private void versionAdd(AddUpdateCommand cmd, int hash) throws IOException {
+           cmd.setVersion(version);
+           cmd.getSolrInputDocument().setField(VersionInfo.VERSION_FIELD, version);
+           bucket.updateHighest(version);
+-          System.out.println("add version field to doc");
++          System.out.println("add version field to doc:" + version);
+         } else {
+           // The leader forwarded us this update.
++          System.out.println("got version from leader:" + versionOnUpdate);
+           cmd.setVersion(versionOnUpdate);
+ 
+           // if we aren't the leader, then we need to check that updates were not re-ordered
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
+index 5cabe214..de32f75a 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/BasicFunctionalityTest.java
+@@ -121,7 +121,7 @@ public void testSomeStuff() throws Exception {
+     // test merge factor picked up
+     SolrCore core = h.getCore();
+ 
+-    IndexWriter writer = ((DirectUpdateHandler2)core.getUpdateHandler()).getIndexWriterProvider().getIndexWriter(core);
++    IndexWriter writer = ((DirectUpdateHandler2)core.getUpdateHandler()).getSolrCoreState().getIndexWriter(core);
+     assertEquals("Mergefactor was not picked up", ((LogMergePolicy)writer.getConfig().getMergePolicy()).getMergeFactor(), 8);
+ 
+     lrf.args.put(CommonParams.VERSION,"2.2");
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicZkTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicZkTest.java
+index de25dae2..1aa65f91 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicZkTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/BasicZkTest.java
+@@ -48,7 +48,7 @@ public void testBasic() throws Exception {
+     // test merge factor picked up
+     SolrCore core = h.getCore();
+ 
+-    IndexWriter writer = ((DirectUpdateHandler2)core.getUpdateHandler()).getIndexWriterProvider().getIndexWriter(core);
++    IndexWriter writer = ((DirectUpdateHandler2)core.getUpdateHandler()).getSolrCoreState().getIndexWriter(core);
+ 
+     assertEquals("Mergefactor was not picked up", ((LogMergePolicy)writer.getConfig().getMergePolicy()).getMergeFactor(), 8);
+     
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
+index cefca61b..08851cfa 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullDistributedZkTest.java
+@@ -20,10 +20,13 @@
+ import java.io.IOException;
+ import java.net.MalformedURLException;
+ import java.net.URI;
++import java.net.URISyntaxException;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.solr.client.solrj.SolrQuery;
+ import org.apache.solr.client.solrj.SolrServer;
+@@ -39,6 +42,7 @@
+ import org.apache.solr.common.cloud.ZkStateReader;
+ import org.apache.solr.common.params.CommonParams;
+ import org.apache.solr.common.params.ModifiableSolrParams;
++import org.apache.zookeeper.KeeperException;
+ import org.junit.BeforeClass;
+ 
+ /**
+@@ -66,10 +70,12 @@
+   String invalidField="ignore_exception__invalid_field_not_in_schema";
+   private static final int sliceCount = 3;
+   
++  protected volatile CloudSolrServer cloudClient;
+   
+   protected Map<SolrServer,ZkNodeProps> clientToInfo = new HashMap<SolrServer,ZkNodeProps>();
+   protected Map<String,List<SolrServer>> shardToClient = new HashMap<String,List<SolrServer>>();
+   protected Map<String,List<JettySolrRunner>> shardToJetty = new HashMap<String,List<JettySolrRunner>>();
++  private AtomicInteger i = new AtomicInteger(0);
+   
+   @BeforeClass
+   public static void beforeClass() throws Exception {
+@@ -85,19 +91,44 @@ public FullDistributedZkTest() {
+     // TODO: for now, turn off stress because it uses regular clients, and we 
+     // need the cloud client because we kill servers
+     stress = 0;
++    
++    
++  }
++  
++  private void initCloudClient() {
++    // use the distributed solrj client
++    if (cloudClient == null) {
++      synchronized(this) {
++        try {
++          CloudSolrServer server = new CloudSolrServer(zkServer.getZkAddress());
++          server.setDefaultCollection(DEFAULT_COLLECTION);
++          cloudClient = server;
++        } catch (MalformedURLException e) {
++          throw new RuntimeException(e);
++        }
++      }
++    }
+   }
+   
+   @Override
+-  protected void createServers(int numShards) throws Exception {
++  protected void createServers(int numServers) throws Exception {
+     System.setProperty("collection", "control_collection");
+     controlJetty = createJetty(testDir, testDir + "/control/data", "control_shard");
+     System.clearProperty("collection");
+     controlClient = createNewSolrServer(controlJetty.getLocalPort());
+ 
++    createJettys(numServers);
++  }
++
++  private void createJettys(int numJettys) throws Exception,
++      InterruptedException, TimeoutException, IOException, KeeperException,
++      URISyntaxException {
++    List<JettySolrRunner> jettys = new ArrayList<JettySolrRunner>();
++    List<SolrServer> clients = new ArrayList<SolrServer>();
+     StringBuilder sb = new StringBuilder();
+-    for (int i = 1; i <= numShards; i++) {
++    for (int i = 1; i <= numJettys; i++) {
+       if (sb.length() > 0) sb.append(',');
+-      JettySolrRunner j = createJetty(testDir, testDir + "/jetty" + i, null, "solrconfig-distrib-update.xml");
++      JettySolrRunner j = createJetty(testDir, testDir + "/jetty" + this.i.incrementAndGet(), null, "solrconfig-distrib-update.xml");
+       jettys.add(j);
+       SolrServer client = createNewSolrServer(j.getLocalPort());
+       clients.add(client);
+@@ -168,10 +199,12 @@ protected void createServers(int numShards) throws Exception {
+       
+     }
+     
++    this.jettys.addAll(jettys);
++    this.clients.addAll(clients);
+     // build the shard string
+-    for (int i = 1; i <= numShards/2; i++) {
+-      JettySolrRunner j = jettys.get(i);
+-      JettySolrRunner j2 = jettys.get(i + (numShards/2 - 1));
++    for (int i = 1; i <= numJettys/2; i++) {
++      JettySolrRunner j = this.jettys.get(i);
++      JettySolrRunner j2 = this.jettys.get(i + (numJettys/2 - 1));
+       if (sb.length() > 0) sb.append(',');
+       sb.append("localhost:").append(j.getLocalPort()).append(context);
+       sb.append("|localhost:").append(j2.getLocalPort()).append(context);
+@@ -266,6 +299,8 @@ protected void del(String q) throws Exception {
+    */
+   @Override
+   public void doTest() throws Exception {
++    initCloudClient();
++    
+     handle.clear();
+     handle.put("QTime", SKIPVAL);
+     handle.put("timestamp", SKIPVAL);
+@@ -420,7 +455,7 @@ public void doTest() throws Exception {
+     
+     // kill a shard
+     JettySolrRunner deadShard = killShard("shard2", 0);
+-    JettySolrRunner deadShard2 = killShard("shard3", 1);
++    //JettySolrRunner deadShard2 = killShard("shard3", 1);
+     
+     // ensure shard is dead
+     try {
+@@ -492,9 +527,9 @@ public void doTest() throws Exception {
+ 
+     deadShard.start(true);
+     
+-    List<SolrServer> shard2Clients = shardToClient.get("shard2");
+-    System.out.println("shard2_1 port:" + ((CommonsHttpSolrServer)shard2Clients.get(0)).getBaseURL());
+-    System.out.println("shard2_2 port:" + ((CommonsHttpSolrServer)shard2Clients.get(1)).getBaseURL());
++    List<SolrServer> s2c = shardToClient.get("shard2");
++    System.out.println("shard2_1 port:" + ((CommonsHttpSolrServer)s2c.get(0)).getBaseURL());
++    System.out.println("shard2_2 port:" + ((CommonsHttpSolrServer)s2c.get(1)).getBaseURL());
+     
+     // wait a bit for replication
+     Thread.sleep(5000);
+@@ -502,8 +537,8 @@ public void doTest() throws Exception {
+ 
+     // if we properly recovered, we should now have the couple missing docs that
+     // came in while shard was down
+-    assertEquals(shard2Clients.get(0).query(new SolrQuery("*:*")).getResults()
+-        .getNumFound(), shard2Clients.get(1).query(new SolrQuery("*:*"))
++    assertEquals(s2c.get(0).query(new SolrQuery("*:*")).getResults()
++        .getNumFound(), s2c.get(1).query(new SolrQuery("*:*"))
+         .getResults().getNumFound());
+     
+     // kill the other shard3 replica
+@@ -512,11 +547,23 @@ public void doTest() throws Exception {
+     // should fail
+     //query("q", "id:[1 TO 5]", CommonParams.DEBUG, CommonParams.QUERY);
+     
+-    // we can't do this here - we have killed a shard
+-    //assertDocCounts();
+-    
+     query("q", "*:*", "sort", "n_tl1 desc");
+     
++    // test adding another replica to a shard - it should do a recovery/replication to pick up the index from the leader
++    createJettys(1);
++    
++    // new server should be part of first shard
++    // how man docs are on the new shard?
++    for (SolrServer client : shardToClient.get("shard1")) {
++      System.out.println("total:" + client.query(new SolrQuery("*:*")).getResults().getNumFound());
++    }
++    // wait a bit for replication
++    Thread.sleep(5000);
++    // assert the new server has the same number of docs as another server in that shard
++    assertEquals(shardToClient.get("shard1").get(0).query(new SolrQuery("*:*")).getResults().getNumFound(), shardToClient.get("shard1").get(2).query(new SolrQuery("*:*")).getResults().getNumFound());
++    
++    assertDocCounts();
++    
+     // Thread.sleep(10000000000L);
+     if (DEBUG) {
+       super.printLayout();
+@@ -567,31 +614,18 @@ private void assertDocCounts() throws Exception {
+       System.out.println("docs:" + count + "\n\n");
+       clientCount += count;
+     }
+-    assertEquals("Doc Counts do not add up", controlCount, clientCount / (shardCount / sliceCount));
++    SolrQuery query = new SolrQuery("*:*");
++    query.add("distrib", "true");
++    assertEquals("Doc Counts do not add up", controlCount, cloudClient.query(query).getResults().getNumFound());
+   }
+ 
+-  volatile CloudSolrServer solrj;
+-
+   @Override
+   protected QueryResponse queryServer(ModifiableSolrParams params) throws SolrServerException {
+ 
+-    // use the distributed solrj client
+-    if (solrj == null) {
+-      synchronized(this) {
+-        try {
+-          CloudSolrServer server = new CloudSolrServer(zkServer.getZkAddress());
+-          server.setDefaultCollection(DEFAULT_COLLECTION);
+-          solrj = server;
+-        } catch (MalformedURLException e) {
+-          throw new RuntimeException(e);
+-        }
+-      }
+-    }
+-
+     if (r.nextBoolean())
+       params.set("collection",DEFAULT_COLLECTION);
+ 
+-    QueryResponse rsp = solrj.query(params);
++    QueryResponse rsp = cloudClient.query(params);
+     return rsp;
+   }
+   
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestConfig.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestConfig.java
+index af0c502f..e02963b6 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestConfig.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestConfig.java
+@@ -116,7 +116,7 @@ public void testAutomaticDeprecationSupport() {
+ 
+   @Test
+   public void testTermIndexInterval() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     int interval = writer.getConfig().getTermIndexInterval();
+     assertEquals(256, interval);
+   }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestLegacyMergeSchedulerPolicyConfig.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestLegacyMergeSchedulerPolicyConfig.java
+index 5e4dbafd..f6e9c31d 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestLegacyMergeSchedulerPolicyConfig.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestLegacyMergeSchedulerPolicyConfig.java
+@@ -33,7 +33,7 @@ public static void beforeClass() throws Exception {
+ 
+   @Test
+   public void testLegacy() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     assertTrue(writer.getConfig().getMergePolicy().getClass().getName().equals(LogDocMergePolicy.class.getName()));
+     assertTrue(writer.getConfig().getMergeScheduler().getClass().getName().equals(SerialMergeScheduler.class.getName()));
+   }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInject.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInject.java
+index 1195ca40..b5b9b8b0 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInject.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInject.java
+@@ -37,13 +37,13 @@ public String getSolrConfigFile() {
+   }
+ 
+   public void testMergePolicy() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     LogByteSizeMergePolicy mp = (LogByteSizeMergePolicy)writer.getConfig().getMergePolicy();
+     assertEquals(64.0, mp.getMaxMergeMB(), 0);
+   }
+   
+   public void testProps() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler)writer.getConfig().getMergeScheduler();
+     assertEquals(2, cms.getMaxThreadCount());
+   }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInjectDefaults.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInjectDefaults.java
+index 9fe4354a..f121ec91 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInjectDefaults.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/core/TestPropInjectDefaults.java
+@@ -33,14 +33,14 @@ public static void beforeClass() throws Exception {
+ 
+   @Test
+   public void testMergePolicyDefaults() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     LogByteSizeMergePolicy mp = (LogByteSizeMergePolicy)writer.getConfig().getMergePolicy();
+     assertEquals(32.0, mp.getMaxMergeMB(), 0);
+   }
+   
+   @Test
+   public void testPropsDefaults() throws Exception {
+-    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getIndexWriterProvider().getIndexWriter(h.getCore());
++    IndexWriter writer = ((DirectUpdateHandler2)h.getCore().getUpdateHandler()).getSolrCoreState().getIndexWriter(h.getCore());
+     ConcurrentMergeScheduler cms = (ConcurrentMergeScheduler)writer.getConfig().getMergeScheduler();
+     assertEquals(4, cms.getMaxThreadCount());
+   }
+diff --git a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+index 73839d5e..a1d8e8c5 100644
+--- a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
++++ b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+@@ -320,7 +320,7 @@ public RunnableWatcher(Watcher watcher){
+ 
+ 	}
+   
+-  // TODO: do this with cloud state or something along those lines
++  // nocommit TODO: do this with cloud state or something along those lines
+   public String getLeader(String collection, String shard) throws Exception {
+     
+     String url = null;

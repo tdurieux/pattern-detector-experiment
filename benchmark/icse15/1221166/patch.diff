@@ -1,0 +1,294 @@
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BeanRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BeanRecipe.java
+index f39b87d1..dae1a74f 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BeanRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BeanRecipe.java
+@@ -31,6 +31,9 @@
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ import org.apache.aries.blueprint.BeanProcessor;
+ import org.apache.aries.blueprint.ComponentDefinitionRegistry;
+@@ -42,6 +45,7 @@
+ import org.apache.aries.blueprint.services.ExtendedBlueprintContainer;
+ import org.apache.aries.blueprint.utils.ReflectionUtils;
+ import org.apache.aries.blueprint.utils.ReflectionUtils.PropertyDescriptor;
++import org.apache.aries.proxy.UnableToProxyException;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.BundleContext;
+ import org.osgi.framework.FrameworkUtil;
+@@ -60,6 +64,49 @@
+  */
+ public class BeanRecipe extends AbstractRecipe {
+ 
++    public class VoidableCallable implements Callable<Object>, Voidable {
++
++        private final AtomicReference<Object> ref = new AtomicReference<Object>();
++        
++        private final Semaphore sem = new Semaphore(1);
++        
++        private final ThreadLocal<Object> deadlockDetector = new ThreadLocal<Object>();
++        
++        public void voidReference() {
++            ref.set(null);
++        }
++
++        public Object call() throws ComponentDefinitionException {
++            Object o = ref.get();
++            
++            if (o == null) {
++                if(deadlockDetector.get() != null) {
++                    deadlockDetector.remove();
++                    throw new ComponentDefinitionException("Construction cycle detected for bean " + name);
++                }
++                
++                sem.acquireUninterruptibly();
++                try {
++                    o = ref.get();
++                    if (o == null) {
++                        deadlockDetector.set(this);
++                        try {
++                            o = internalCreate2();
++                            ref.set(o);
++                        } finally {
++                            deadlockDetector.remove();
++                        }
++                    }
++                } finally {
++                  sem.release();
++                }
++            }
++            
++            return o;
++        }
++
++    }
++
+     private static final Logger LOGGER = LoggerFactory.getLogger(BeanRecipe.class);
+ 
+     private final ExtendedBlueprintContainer blueprintContainer;
+@@ -701,6 +748,29 @@ private Object addInterceptors(final Object original)
+         
+     @Override
+     protected Object internalCreate() throws ComponentDefinitionException {
++        if (factory instanceof ReferenceRecipe) {
++            ReferenceRecipe rr = (ReferenceRecipe) factory;
++            if (rr.getProxyChildBeanClasses() != null) {
++                return createProxyBean(rr);
++            }
++        } 
++        
++        return internalCreate2();
++    }
++    
++    private Object createProxyBean(ReferenceRecipe rr) {
++        try {
++            VoidableCallable vc = new VoidableCallable();
++            rr.addVoidableChild(vc);
++            return blueprintContainer.getProxyManager().createDelegatingProxy(
++                blueprintContainer.getBundleContext().getBundle(), rr.getProxyChildBeanClasses(),
++                vc, vc.call());
++        } catch (UnableToProxyException e) {
++            throw new ComponentDefinitionException(e);
++        }
++    }
++    
++    protected Object internalCreate2() throws ComponentDefinitionException {
+         
+         instantiateExplicitDependencies();
+ 
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ReferenceRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ReferenceRecipe.java
+index 5045c2cc..5276486f 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ReferenceRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ReferenceRecipe.java
+@@ -18,7 +18,11 @@
+  */
+ package org.apache.aries.blueprint.container;
+ 
++import java.lang.ref.WeakReference;
++import java.util.ArrayList;
++import java.util.Collection;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+@@ -59,6 +63,9 @@
+     private Object defaultBean;
+     private final Object monitor = new Object();
+ 
++    private final Collection<Class<?>> proxyChildBeanClasses;
++    private final Collection<WeakReference<Voidable>> proxiedChildren;
++    
+     public ReferenceRecipe(String name,
+                            ExtendedBlueprintContainer blueprintContainer,
+                            ReferenceMetadata metadata,
+@@ -66,6 +73,15 @@ public ReferenceRecipe(String name,
+                            List<Recipe> explicitDependencies) {
+         super(name, blueprintContainer, metadata, listenersRecipe, explicitDependencies);
+         this.metadata = metadata;
++        if(metadata instanceof ExtendedReferenceMetadata) 
++            proxyChildBeanClasses = ((ExtendedReferenceMetadata) metadata).getProxyChildBeanClasses();
++        else 
++            proxyChildBeanClasses = null;
++        
++        if (proxyChildBeanClasses != null)
++            proxiedChildren = new ArrayList<WeakReference<Voidable>>();
++        else
++            proxiedChildren = null;
+     }
+ 
+     @Override
+@@ -140,13 +156,15 @@ protected void untrack(ServiceReference ref) {
+     private void bind(ServiceReference ref) {
+         LOGGER.debug("Binding reference {} to {}", getName(), ref);
+         synchronized (monitor) {
+-            if (trackedServiceReference != null) {
+-                getBundleContextForServiceLookup().ungetService(trackedServiceReference);
+-            }
++            ServiceReference oldReference = trackedServiceReference;
+             trackedServiceReference = ref;
+             trackedService = null;
+-            monitor.notifyAll();
++            voidProxiedChildren();
+             bind(trackedServiceReference, proxy);
++            if (oldReference != null) {
++                getBundleContextForServiceLookup().ungetService(oldReference);
++            }
++            monitor.notifyAll();
+         }
+     }
+ 
+@@ -155,9 +173,11 @@ private void unbind() {
+         synchronized (monitor) {
+             if (trackedServiceReference != null) {
+                 unbind(trackedServiceReference, proxy);
+-                getBundleContextForServiceLookup().ungetService(trackedServiceReference);
++                ServiceReference oldReference = trackedServiceReference;
+                 trackedServiceReference = null;
+                 trackedService = null;
++                voidProxiedChildren();
++                getBundleContextForServiceLookup().ungetService(oldReference);
+                 monitor.notifyAll();
+             }
+         }
+@@ -221,6 +241,34 @@ private ServiceReference getServiceReference() throws InterruptedException {
+         }
+     }
+ 
++    private void voidProxiedChildren() {
++        if(proxyChildBeanClasses != null) {
++            synchronized(proxiedChildren) {
++                for(Iterator<WeakReference<Voidable>> it = proxiedChildren.iterator(); it.hasNext();) {
++                    Voidable v = it.next().get();
++                    if(v == null)
++                        it.remove();
++                    else
++                      v.voidReference();
++                }
++            }
++        }
++    }
++    
++    public void addVoidableChild(Voidable v) {
++        if(proxyChildBeanClasses != null) {
++            synchronized (proxiedChildren) {
++                proxiedChildren.add(new WeakReference<Voidable>(v));
++            }
++        } else {
++            throw new IllegalStateException("Proxying of child beans is disabled for this recipe");
++        }
++    }
++    
++    public Collection<Class<?>> getProxyChildBeanClasses() {
++        return proxyChildBeanClasses;
++    }
++
+     public class ServiceDispatcher implements Callable<Object> {
+ 
+         public Object call() throws Exception {
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/Voidable.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/Voidable.java
+index e69de29b..099b7ddf 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/Voidable.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/Voidable.java
+@@ -0,0 +1,5 @@
++package org.apache.aries.blueprint.container;
++
++public interface Voidable {
++    public void voidReference();
++}
+diff --git a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/ExtendedReferenceMetadata.java b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/ExtendedReferenceMetadata.java
+index 1e2cb31d..d2a7de4f 100644
+--- a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/ExtendedReferenceMetadata.java
++++ b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/ExtendedReferenceMetadata.java
+@@ -18,9 +18,13 @@
+  */
+ package org.apache.aries.blueprint;
+ 
++import java.util.Collection;
++
+ import org.osgi.service.blueprint.reflect.ReferenceMetadata;
+ 
+ public interface ExtendedReferenceMetadata extends ReferenceMetadata 
+ {
+     public String getDefaultBean();
++    
++    public Collection<Class<?>> getProxyChildBeanClasses();
+ }
+diff --git a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/mutable/MutableReferenceMetadata.java b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/mutable/MutableReferenceMetadata.java
+index 998f2de2..af9bff02 100644
+--- a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/mutable/MutableReferenceMetadata.java
++++ b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/mutable/MutableReferenceMetadata.java
+@@ -18,6 +18,8 @@
+  */
+ package org.apache.aries.blueprint.mutable;
+ 
++import java.util.Collection;
++
+ import org.apache.aries.blueprint.ExtendedReferenceMetadata;
+ 
+ /**
+@@ -31,4 +33,6 @@
+ 
+     void setDefaultBean(String value);
+ 
++    void setProxyChildBeanClasses(Collection<Class<?>> classes);
++
+ }
+diff --git a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/reflect/ReferenceMetadataImpl.java b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/reflect/ReferenceMetadataImpl.java
+index 037d92c4..4b7b962f 100644
+--- a/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/reflect/ReferenceMetadataImpl.java
++++ b/aries/trunk/blueprint/blueprint-parser/src/main/java/org/apache/aries/blueprint/reflect/ReferenceMetadataImpl.java
+@@ -18,6 +18,8 @@
+  */
+ package org.apache.aries.blueprint.reflect;
+ 
++import java.util.Collection;
++
+ import org.apache.aries.blueprint.mutable.MutableReferenceMetadata;
+ import org.osgi.service.blueprint.reflect.ReferenceMetadata;
+ 
+@@ -30,6 +32,7 @@
+ 
+     private long timeout;
+     private String defaultBeanId;
++    private Collection<Class<?>> proxyChildBeanClasses;
+ 
+     public ReferenceMetadataImpl() {
+     }
+@@ -69,4 +72,12 @@ public String toString() {
+                 ", timeout=" + timeout +
+                 ']';
+     }
++
++    public Collection<Class<?>> getProxyChildBeanClasses() {
++        return proxyChildBeanClasses;
++    }
++
++    public void setProxyChildBeanClasses(Collection<Class<?>> c) {
++        proxyChildBeanClasses = c;
++    }
+ }

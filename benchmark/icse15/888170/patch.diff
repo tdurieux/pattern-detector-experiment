@@ -1,0 +1,173 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Streaming.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Streaming.java
+index 2dd60da3..7d2e1d54 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Streaming.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Streaming.java
+@@ -51,7 +51,7 @@
+     public static final long RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
+ 
+     /**
+-     * split out files on disk locally for each range and then stream them to the target endpoint
++     * Split out files for all tables on disk locally for each range and then stream them to the target endpoint.
+     */
+     public static void transferRanges(InetAddress target, Collection<Range> ranges, Runnable callback)
+     {
+@@ -77,7 +77,7 @@ public static void transferRanges(InetAddress target, Collection<Range> ranges,
+                 if (logger.isDebugEnabled())
+                   logger.debug("Performing anticompaction ...");
+                 /* Get the list of files that need to be streamed */
+-                transferOneTable(target, table.forceAntiCompaction(ranges, target), tName); // SSTR GC deletes the file when done
++                transferSSTables(target, table.forceAntiCompaction(ranges, target), tName); // SSTR GC deletes the file when done
+             }
+             catch (IOException e)
+             {
+@@ -88,7 +88,11 @@ public static void transferRanges(InetAddress target, Collection<Range> ranges,
+             callback.run();
+     }
+ 
+-    private static void transferOneTable(InetAddress target, List<SSTableReader> sstables, String table) throws IOException
++    /**
++     * Transfers a group of sstables from a single table to the target endpoint
++     * and then marks them as ready for local deletion.
++     */
++    public static void transferSSTables(InetAddress target, List<SSTableReader> sstables, String table) throws IOException
+     {
+         StreamContextManager.StreamContext[] streamContexts = new StreamContextManager.StreamContext[SSTable.FILES_ON_DISK * sstables.size()];
+         int i = 0;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+index 1721103c..25ac24fe 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+@@ -53,7 +53,6 @@ public void run()
+             connection = new TcpConnection(from_, to_);
+             File file = new File(file_);             
+             connection.stream(file, startPosition_, total_);
+-            MessagingService.setStreamingMode(false);
+             if (logger_.isDebugEnabled())
+               logger_.debug("Done streaming " + file);
+         }            
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index 1974a6ba..0bfca4a4 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -57,8 +57,6 @@
+     };
+     
+     private static Map<String, String> reservedVerbs_ = new Hashtable<String, String>();
+-    /* Indicate if we are currently streaming data to another node or receiving streaming data */
+-    private static AtomicBoolean isStreaming_ = new AtomicBoolean(false);
+     
+     /* This records all the results mapped by message Id */
+     private static ICachetable<String, IAsyncCallback> callbackMap_;
+@@ -485,17 +483,11 @@ public void sendUdpOneWay(Message message, InetAddress to)
+ 
+     public void stream(String file, long startPosition, long total, InetAddress from, InetAddress to)
+     {
+-        isStreaming_.set(true);
+         /* Streaming asynchronously on streamExector_ threads. */
+         Runnable streamingTask = new FileStreamTask(file, startPosition, total, from, to);
+         streamExecutor_.execute(streamingTask);
+     }
+ 
+-    public static void setStreamingMode(boolean bVal)
+-    {
+-        isStreaming_.set(bVal);
+-    }
+-
+     public static void shutdown()
+     {
+         logger_.info("Shutting down ...");
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+index cf63cbac..0b85ec3a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+@@ -459,7 +459,6 @@ public void run()
+                     }
+                     else
+                     {
+-                        MessagingService.setStreamingMode(false);
+                         /* Close this socket connection  used for streaming */
+                         closeSocket();
+                     }                    
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ProtocolHeaderState.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ProtocolHeaderState.java
+index 9fe6d60a..e3e5efd0 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ProtocolHeaderState.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/io/ProtocolHeaderState.java
+@@ -50,9 +50,6 @@ public void morphState() throws IOException
+         int stream = MessagingService.getBits(pH, 3, 1);
+         stream_.getProtocolHeader().isStreamingMode_ = (stream == 1) ? true : false;
+         
+-        if ( stream_.getProtocolHeader().isStreamingMode_ )
+-            MessagingService.setStreamingMode(true);
+-        
+         int version = MessagingService.getBits(pH, 15, 8);
+         stream_.getProtocolHeader().version_ = version;
+         
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
+index e69de29b..e5118a09 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/io/StreamingTest.java
+@@ -0,0 +1,64 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++package org.apache.cassandra.io;
++
++import static junit.framework.Assert.assertEquals;
++import static org.junit.Assert.*;
++
++import java.net.InetAddress;
++import java.io.IOException;
++import java.util.*;
++
++import org.apache.cassandra.CleanupHelper;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.RangeReply;
++import org.apache.cassandra.db.Table;
++import org.apache.cassandra.io.SSTableUtils;
++import org.apache.cassandra.io.SSTableReader;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.FBUtilities;
++
++import org.junit.Test;
++
++public class StreamingTest extends CleanupHelper
++{
++    public static final InetAddress LOCAL = FBUtilities.getLocalAddress();
++
++    @Test
++    public void testTransferTable() throws Exception
++    {
++        StorageService.instance().start();
++
++        // write a temporary SSTable, but don't register it
++        Set<String> content = new HashSet<String>();
++        content.add("key");
++        SSTableReader sstable = SSTableUtils.writeSSTable(content);
++        String tablename = sstable.getTableName();
++        String cfname = sstable.getColumnFamilyName();
++
++        // transfer
++        Streaming.transferSSTables(LOCAL, Arrays.asList(sstable), tablename);
++
++        // confirm that the SSTable was transferred and registered
++        ColumnFamilyStore cfstore = Table.open(tablename).getColumnFamilyStore(cfname);
++        RangeReply rr = cfstore.getKeyRange("", "", 2);
++        assert rr.keys.size() == 1;
++        assert rr.keys.contains("key");
++    }
++}

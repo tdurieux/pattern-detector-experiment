@@ -1,0 +1,478 @@
+diff --git a/db/derby/code/branches/10.10/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java b/db/derby/code/branches/10.10/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+index 593bdc75..d65855b5 100644
+--- a/db/derby/code/branches/10.10/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
++++ b/db/derby/code/branches/10.10/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+@@ -1334,8 +1334,9 @@ public String getTriggerActionString(
+ 	/**
+ 	 * Load up the trigger descriptor list for this table
+ 	 * descriptor and return it.  If the descriptor list
+-	 * is already loaded up, it is retuned without further
+-	 * ado.
++     * is already loaded up, it is returned without further
++     * ado. The descriptors are returned in the order in
++     * which the triggers were created, with the oldest first.
+ 	 *
+ 	 * @param td			The table descriptor.
+ 	 *
+diff --git a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
+index 5cdef4ad..86688442 100644
+--- a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
++++ b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
+@@ -871,7 +871,6 @@ public ConstantAction makeConstantAction() throws StandardException
+ 											(actionCompSchemaId == null) ?
+ 												compSchemaDescriptor.getUUID() :
+ 												actionCompSchemaId,
+-											(Timestamp)null,	// creation time
+ 											referencedColInts,
+ 											referencedColsInTriggerAction,
+ 											originalActionText,
+diff --git a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+index e74503e5..00102ab0 100644
+--- a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
++++ b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.impl.sql.execute;
+ 
++import org.apache.derby.iapi.services.property.PropertyUtil;
+ import org.apache.derby.iapi.store.access.TransactionController;
+ 
+ import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+@@ -29,6 +30,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.sql.dictionary.DataDescriptorGenerator;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
++import org.apache.derby.iapi.sql.dictionary.GenericDescriptorList;
+ import org.apache.derby.iapi.sql.dictionary.SchemaDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.SPSDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+@@ -79,7 +81,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	private String					oldReferencingName;
+ 	private String					newReferencingName;
+ 	private UUID					spsCompSchemaId;
+-	private Timestamp				creationTimestamp;
+ 	private int[]					referencedCols;
+ 	private int[]					referencedColsInTriggerAction;
+ 
+@@ -102,8 +103,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 * @param spsCompSchemaId	the compilation schema for the action and when
+ 	 *							spses.   If null, will be set to the current default
+ 	 *							schema
+-	 * @param creationTimestamp	when was this trigger created?  if null, will be
+-	 *						set to the time that executeConstantAction() is invoked
+ 	 * @param referencedCols	what columns does this trigger reference (may be null)
+ 	 * @param referencedColsInTriggerAction	what columns does the trigger 
+ 	 *						action reference through old/new transition variables
+@@ -128,7 +127,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		UUID				actionSPSId,
+ 		String				actionText,
+ 		UUID				spsCompSchemaId,
+-		Timestamp			creationTimestamp,
+ 		int[]				referencedCols,
+ 		int[]				referencedColsInTriggerAction,
+ 		String				originalActionText,
+@@ -151,7 +149,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		this.actionSPSId = actionSPSId;
+ 		this.actionText = actionText;
+ 		this.spsCompSchemaId = spsCompSchemaId;
+-		this.creationTimestamp = creationTimestamp;
+ 		this.referencedCols = referencedCols;
+ 		this.referencedColsInTriggerAction = referencedColsInTriggerAction;
+ 		this.originalActionText = originalActionText;
+@@ -308,7 +305,7 @@ public void	executeConstantAction(Activation activation)
+ 									triggerTable,
+ 									whenspsd == null ? null : whenspsd.getUUID(),
+ 									actionSPSId,
+-									creationTimestamp == null ? new Timestamp(System.currentTimeMillis()) : creationTimestamp,
++                                    makeCreationTimestamp(dd),
+ 									referencedCols,
+ 									referencedColsInTriggerAction,
+ 									originalActionText,
+@@ -414,6 +411,54 @@ public String toString()
+ 	{
+ 		return constructToString("CREATE TRIGGER ", triggerName);		
+ 	}
+-}
+-
+ 
++    /**
++     * Construct the creation timestamp for the trigger. DERBY-5866: Also make
++     * sure the creation timestamp is higher than any timestamp on an existing
++     * trigger on the same table. Otherwise, the triggers may not fire in the
++     * correct order.
++     */
++    private Timestamp makeCreationTimestamp(DataDictionary dd)
++            throws StandardException {
++        Timestamp now = new Timestamp(System.currentTimeMillis());
++
++        // Allow overriding the timestamp in debug mode for testing of
++        // specific scenarios.
++        if (SanityManager.DEBUG) {
++            String val = PropertyUtil.getSystemProperty(
++                    "derby.debug.overrideTriggerCreationTimestamp");
++            if (val != null) {
++                now.setTime(Long.parseLong(val));
++            }
++        }
++
++        GenericDescriptorList tdl = dd.getTriggerDescriptors(triggerTable);
++        int numTriggers = tdl.size();
++
++        if (numTriggers == 0) {
++            // This is the first trigger on the table, so no need to check
++            // if there are any higher timestamps.
++            return now;
++        }
++
++        // Get the timestamp of the most recent existing trigger on the table.
++        Timestamp highest = ((TriggerDescriptor) tdl.get(numTriggers - 1))
++                                                     .getCreationTimestamp();
++
++        if (now.after(highest)) {
++            // The current timestamp is higher than the most recent existing
++            // trigger on the table, so it is OK.
++            return now;
++        }
++
++        // Otherwise, there is an existing trigger on the table with a
++        // timestamp that is at least as high as the current timestamp. Adjust
++        // the current timestamp so that it is one millisecond higher than the
++        // timestamp of the existing trigger. This ensures that the triggers
++        // will fire in the same order as they were created.
++
++        now.setTime(highest.getTime() + 1);
++
++        return now;
++    }
++}
+diff --git a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
+index f7bca0a3..1cf993df 100644
+--- a/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
++++ b/db/derby/code/branches/10.10/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
+@@ -947,8 +947,6 @@ static protected Authorizer getAuthorizer()
+ 	 * @param spsCompSchemaId	the compilation schema for the action and when
+ 	 *							spses.   If null, will be set to the current default
+ 	 *							schema
+-	 * @param creationTimestamp	when was this trigger created?  if null, will be
+-	 *						set to the time that executeConstantAction() is invoked
+ 	 * @param referencedCols	what columns does this trigger reference (may be null)
+ 	 * @param referencedColsInTriggerAction	what columns does the trigger 
+ 	 *						action reference through old/new transition variables
+@@ -973,7 +971,6 @@ static protected Authorizer getAuthorizer()
+ 		UUID				actionSPSId,
+ 		String				actionText,
+ 		UUID				spsCompSchemaId,
+-		Timestamp			creationTimestamp,
+ 		int[]				referencedCols,
+ 		int[]				referencedColsInTriggerAction,
+ 		String				originalActionText,
+@@ -985,7 +982,7 @@ static protected Authorizer getAuthorizer()
+ 	{
+ 		return new CreateTriggerConstantAction(triggerSchemaName, triggerName, 
+ 				eventMask, isBefore, isRow, isEnabled, triggerTable, whenSPSId,
+-				whenText, actionSPSId, actionText, spsCompSchemaId, creationTimestamp,
++                whenText, actionSPSId, actionText, spsCompSchemaId,
+ 				referencedCols, referencedColsInTriggerAction, originalActionText,
+ 				referencingOld, referencingNew, oldReferencingName, newReferencingName);
+ 	}
+diff --git a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/Derby5866TriggerOrderTest.java b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/Derby5866TriggerOrderTest.java
+index e69de29b..252038b1 100644
+--- a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/Derby5866TriggerOrderTest.java
++++ b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/Derby5866TriggerOrderTest.java
+@@ -0,0 +1,271 @@
++/*
++ * Derby - Class org.apache.derbyTesting.functionTests.tests.lang.Derby5866TriggerOrderTest
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ */
++
++package org.apache.derbyTesting.functionTests.tests.lang;
++
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.sql.Timestamp;
++import java.util.Calendar;
++import java.util.TimeZone;
++import junit.framework.Test;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.TestConfiguration;
++import org.apache.derbyTesting.junit.TimeZoneTestSetup;
++
++/**
++ * <p>
++ * Test that triggers for a specific event execute in the order in which they
++ * were defined. This is a regression test case for DERBY-5866, where triggers
++ * were seen to fire in a nondeterministic order if the system clock was too
++ * coarse-grained and gave the triggers identical creation time stamps. It
++ * also tests that triggers fire in the correct order when the triggers are
++ * created in different time zones, or right before or after daylight saving.
++ * </p>
++ */
++public class Derby5866TriggerOrderTest extends BaseJDBCTestCase {
++
++    private final static TimeZone TIMEZONE =
++            TimeZone.getTimeZone("Europe/Oslo");
++
++    private final static String OVERRIDE_TIME_PROP =
++            "derby.debug.overrideTriggerCreationTimestamp";
++
++    public Derby5866TriggerOrderTest(String name) {
++        super(name);
++    }
++
++    public static Test suite() {
++        Test test = new CleanDatabaseTestSetup(
++            TestConfiguration.embeddedSuite(Derby5866TriggerOrderTest.class));
++        return new TimeZoneTestSetup(test, TIMEZONE);
++    }
++
++    protected void tearDown() throws Exception {
++        // Reset the time zone after each test case, since the test case
++        // may have altered it.
++        TimeZoneTestSetup.setDefault(TIMEZONE);
++
++        // Clear the system property that overrides the trigger creation
++        // timestamps.
++        removeSystemProperty(OVERRIDE_TIME_PROP);
++
++        super.tearDown();
++    }
++
++    /**
++     * Test that triggers fire in the correct order if the time zone changes
++     * between two CREATE TRIGGER operations in a way that makes it look like
++     * the second trigger was created before the first trigger.
++     */
++    public void testTimeZoneChange() throws SQLException {
++        setAutoCommit(false);
++
++        Statement s = createStatement();
++        s.execute("create table t1(x int)");
++        s.execute("create table t2(x int generated always as identity, "
++                + "y varchar(128))");
++
++        // Create the first trigger while in the GMT time zone.
++        s.execute("create trigger tr1 after insert on t1 "
++                + "insert into t2(y) values 'I won! :)'");
++
++        // Travel back in time. Sort of... At least that's how it's perceived
++        // until TIMESTAMP WITH TIMEZONE is supported, and SYSTRIGGERS is
++        // updated to use it (DERBY-5974).
++        TimeZoneTestSetup.setDefault(TimeZone.getTimeZone("GMT-8:00"));
++        s.execute("create trigger tr2 after insert on t1 "
++                + "insert into t2(y) values 'I lost... :('");
++
++        // Fire the triggers.
++        s.execute("insert into t1 values 1");
++
++        // Check which of the triggers was executed first. It should have been
++        // the trigger that was defined first. Before DERBY-5866, they fired
++        // in the opposite order.
++        JDBC.assertFullResultSet(s.executeQuery("select * from t2 order by x"),
++                                 new String[][] {
++                                     { "1", "I won! :)" },
++                                     { "2", "I lost... :(" },
++                                 });
++    }
++
++    /**
++     * Test that triggers fire in the correct order if the clock shows the
++     * same creation time for all the triggers.
++     */
++    public void testEqualTimestamps() throws SQLException {
++        Timestamp now = new Timestamp(System.currentTimeMillis());
++        testSpecificTimestamps(new Timestamp[]{ now, now, now });
++    }
++
++    /**
++     * Test that the triggers fire in creation order even if the clock goes
++     * backwards.
++     */
++    public void testReversedTimestamps() throws SQLException {
++        long now = System.currentTimeMillis();
++        Timestamp[] args = {
++            new Timestamp(now), new Timestamp(now - 1),
++            new Timestamp(now - 2), new Timestamp(now - 3)
++        };
++        testSpecificTimestamps(args);
++    }
++
++    /**
++     * Test that triggers fire in the correct order if they are created around
++     * the daylight saving time switchover.
++     */
++    public void testCrossDaylightSaving() throws SQLException {
++        // Use a GMT-based calendar to prevent ambiguities. For example, with
++        // a CET-based calendar, it would be ambiguous whether 2014-10-26
++        // 02:45:00 means 2014-10-26 02:45:00 CET or 2014-10-26 02:45:00 CEST.
++        Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("GMT"));
++
++        // 15 min before Central European Time switches to DST.
++        cal.set(2014, Calendar.MARCH, 30, 0, 45, 0);
++
++        // Test that triggers are ordered correctly if they are created
++        // 15 min before switch and 15 min after switch.
++        Timestamp[] args = { new Timestamp(cal.getTimeInMillis()),
++                             new Timestamp(cal.getTimeInMillis() + 1800000) };
++        testSpecificTimestamps(args);
++
++        // 15 min before Central European Time switches from DST.
++        cal.clear();
++        cal.set(2014, Calendar.OCTOBER, 26, 0, 45, 0);
++
++        // Test that triggers are ordered correctly if they are created
++        // 15 min before switch and 15 min after switch.
++        args = new Timestamp[] { new Timestamp(cal.getTimeInMillis()),
++                                 new Timestamp(cal.getTimeInMillis() + 1800000) };
++        testSpecificTimestamps(args);
++
++        // Last millisecond before switch to DST.
++        cal.clear();
++        cal.set(2014, Calendar.MARCH, 30, 0, 59, 59);
++        cal.set(Calendar.MILLISECOND, 999);
++        Timestamp ts = new Timestamp(cal.getTimeInMillis());
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++
++        // Last millisecond before switch from DST.
++        cal.clear();
++        cal.set(2014, Calendar.OCTOBER, 26, 0, 59, 59);
++        cal.set(Calendar.MILLISECOND, 999);
++        ts = new Timestamp(cal.getTimeInMillis());
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++    }
++
++    /**
++     * Test that triggers created before the epoch (Jan 1 1970) fire in the
++     * correct order.
++     */
++    public void testPreEpoch() throws SQLException {
++        // 24 hours before the epoch
++        Timestamp ts = new Timestamp(-3600L * 24 * 1000);
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++
++        // Test with some non-zero fractions as well.
++
++        ts.setNanos(123000000);
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++
++        ts.setNanos(567000000);
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++
++        ts.setNanos(999000000);
++        testSpecificTimestamps(new Timestamp[] { ts, ts, ts });
++    }
++
++    /**
++     * Helper method that creates triggers with the specified creation
++     * timestamps and verifies that they fire in creation order. The creation
++     * timestamps can only be overridden in debug builds. When running in a
++     * non-debug build, this method will simply create the triggers without
++     * overriding the creation timestamps, and verify that they fire in the
++     * expected order.
++     */
++    private void testSpecificTimestamps(Timestamp[] timestamps)
++            throws SQLException {
++        setAutoCommit(false);
++
++        Statement s = createStatement();
++
++        s.execute("create table t1(x int)");
++        s.execute("create table t2(x int generated always as identity, y int)");
++
++        // Create the triggers.
++        for (int i = 0; i < timestamps.length; i++) {
++            overrideTriggerCreationTime(timestamps[i]);
++            s.execute("create trigger tr" + (i + 1) + " after insert on t1 "
++                    + "insert into t2(y) values " + (i + 1));
++        }
++
++        // Fire the triggers.
++        s.execute("insert into t1 values 1");
++
++        // Verify that the triggers executed in the correct order.
++        ResultSet rs = s.executeQuery("select * from t2 order by x");
++        for (int i = 1; i <= timestamps.length; i++) {
++            if (rs.next()) {
++                assertEquals("X", i, rs.getInt("X"));
++                assertEquals("Y", i, rs.getInt("Y"));
++            } else {
++                fail("Row " + i + " was missing");
++            }
++        }
++        JDBC.assertEmpty(rs);
++
++        // Verify that the CREATIONTIMESTAMP column in SYS.SYSTRIGGERS is
++        // monotonically increasing.
++        PreparedStatement ps = prepareStatement(
++                "select * from sys.sysschemas natural join sys.systriggers "
++                + "where schemaname = ? and triggername like 'TR%' "
++                + "order by creationtimestamp");
++        ps.setString(1, getTestConfiguration().getUserName());
++        rs = ps.executeQuery();
++        Timestamp prev = null;
++        for (int i = 1; i <= timestamps.length; i++) {
++            assertTrue(rs.next());
++            assertEquals("TR" + i, rs.getString("TRIGGERNAME"));
++            Timestamp ts = rs.getTimestamp("CREATIONTIMESTAMP");
++            assertNotNull(ts);
++            if (prev != null && !prev.before(ts)) {
++                fail(prev + " expected to be before " + ts);
++            }
++            prev = ts;
++        }
++        JDBC.assertEmpty(rs);
++
++        rollback();
++    }
++
++    /**
++     * Set a system property that makes the next CREATE TRIGGER operation
++     * use the specified timestamp instead of the current time when
++     * constructing the creation timestamp.
++     */
++    private void overrideTriggerCreationTime(Timestamp ts) {
++        setSystemProperty(OVERRIDE_TIME_PROP, String.valueOf(ts.getTime()));
++    }
++}
+diff --git a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+index 30a16ffa..9e6706ed 100644
+--- a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
++++ b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+@@ -237,6 +237,7 @@ public static Test suite() {
+         suite.addTest(TruncateTableAndOnlineBackupTest.suite()); 
+         suite.addTest(QueryPlanTest.suite());
+         suite.addTest(Derby6131.suite());
++        suite.addTest(Derby5866TriggerOrderTest.suite());
+         return suite;
+ 	}
+ }
+diff --git a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/junit/TimeZoneTestSetup.java b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/junit/TimeZoneTestSetup.java
+index da23190e..7eb86e24 100644
+--- a/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/junit/TimeZoneTestSetup.java
++++ b/db/derby/code/branches/10.10/java/testing/org/apache/derbyTesting/junit/TimeZoneTestSetup.java
+@@ -71,7 +71,7 @@ protected void tearDown() {
+         requestedDefault = null;
+     }
+     
+-    private void setDefault(final TimeZone tz) throws SecurityException{
++    public static void setDefault(final TimeZone tz) {
+         if (tz== null) {
+             throw new IllegalArgumentException("tz cannot be <null>");
+         }

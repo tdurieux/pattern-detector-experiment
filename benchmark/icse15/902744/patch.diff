@@ -1,0 +1,257 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/EndPointState.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/EndPointState.java
+index 9c086850..aa5436e8 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/EndPointState.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/EndPointState.java
+@@ -48,6 +48,12 @@
+     boolean isAlive_;
+     boolean isAGossiper_;
+ 
++    // whether this endpoint has token associated with it or not. Initially set false for all
++    // endpoints. After certain time of inactivity, gossiper will examine if this node has a
++    // token or not and will set this true if token is found. If there is no token, this is a
++    // fat client and will be removed automatically from gossip.
++    boolean hasToken_;
++
+     public static ICompactSerializer<EndPointState> serializer()
+     {
+         return serializer_;
+@@ -59,6 +65,7 @@
+         updateTimestamp_ = System.currentTimeMillis(); 
+         isAlive_ = true; 
+         isAGossiper_ = false;
++        hasToken_ = false;
+     }
+         
+     HeartBeatState getHeartBeatState()
+@@ -121,6 +128,16 @@ synchronized void isAGossiper(boolean value)
+         isAGossiper_ = value;        
+     }
+ 
++    public synchronized void setHasToken(boolean value)
++    {
++        hasToken_ = value;
++    }
++
++    public boolean getHasToken()
++    {
++        return hasToken_;
++    }
++
+     public List<Map.Entry<String,ApplicationState>> getSortedApplicationStates()
+     {
+         ArrayList<Map.Entry<String, ApplicationState>> entries = new ArrayList<Map.Entry<String, ApplicationState>>();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java
+index 6ba75916..8a586868 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/FailureDetector.java
+@@ -158,6 +158,11 @@ public void interpret(InetAddress ep)
+         }        
+     }
+     
++    public void remove(InetAddress ep)
++    {
++        arrivalSamples_.remove(ep);
++    }
++    
+     public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
+     {
+         fdEvntListeners_.add(listener);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
+index a1bce48d..3df42d28 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
+@@ -28,6 +28,7 @@
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.io.Streaming;
+ 
+ import org.apache.log4j.Logger;
+ 
+@@ -106,6 +107,7 @@ public void run()
+     private Timer gossipTimer_;
+     private InetAddress localEndPoint_;
+     private long aVeryLongTime_;
++    private long FatClientTimeout_;
+     private Random random_ = new Random();
+ 
+     /* subscribers for interest in EndPointState change */
+@@ -123,10 +125,19 @@ public void run()
+     /* map where key is the endpoint and value is the state associated with the endpoint */
+     Map<InetAddress, EndPointState> endPointStateMap_ = new Hashtable<InetAddress, EndPointState>();
+ 
++    /* map where key is endpoint and value is timestamp when this endpoint was removed from
++     * gossip. We will ignore any gossip regarding these endpoints for Streaming.RING_DELAY time
++     * after removal to prevent nodes from falsely reincarnating during the time when removal
++     * gossip gets propagated to all nodes */
++    Map<InetAddress, Long> justRemovedEndPoints_ = new Hashtable<InetAddress, Long>();
++
+     private Gossiper()
+     {
+         gossipTimer_ = new Timer(false);
++        // 3 days
+         aVeryLongTime_ = 259200 * 1000;
++        // 1 hour
++        FatClientTimeout_ = 60 * 60 * 1000;
+         /* register with the Failure Detector for receiving Failure detector events */
+         FailureDetector.instance.registerFailureDetectionEventListener(this);
+     }
+@@ -200,6 +211,18 @@ void evictFromMembership(InetAddress endpoint)
+         unreachableEndpoints_.remove(endpoint);
+     }
+ 
++    /**
++     * Removes the endpoint completely from Gossip
++     */
++    public void removeEndPoint(InetAddress endpoint)
++    {
++        liveEndpoints_.remove(endpoint);
++        unreachableEndpoints_.remove(endpoint);
++        endPointStateMap_.remove(endpoint);
++        FailureDetector.instance.remove(endpoint);
++        justRemovedEndPoints_.put(endpoint, System.currentTimeMillis());
++    }
++
+     /**
+      * No locking required since it is called from a method that already
+      * has acquired a lock. The gossip digest is built based on randomization
+@@ -354,8 +377,9 @@ void doGossipToSeed(Message message)
+ 
+     void doStatusCheck()
+     {
+-        Set<InetAddress> eps = endPointStateMap_.keySet();
++        long now = System.currentTimeMillis();
+ 
++        Set<InetAddress> eps = endPointStateMap_.keySet();
+         for ( InetAddress endpoint : eps )
+         {
+             if ( endpoint.equals(localEndPoint_) )
+@@ -365,12 +389,40 @@ void doStatusCheck()
+             EndPointState epState = endPointStateMap_.get(endpoint);
+             if ( epState != null )
+             {
+-                long duration = System.currentTimeMillis() - epState.getUpdateTimestamp();
++                long duration = now - epState.getUpdateTimestamp();
++
++                // check if this is a fat client. fat clients are removed automatically from
++                // gosip after FatClientTimeout
++                if (!epState.getHasToken() && !epState.isAlive() && (duration > FatClientTimeout_))
++                {
++                    if (StorageService.instance.getTokenMetadata().isMember(endpoint))
++                        epState.setHasToken(true);
++                    else
++                    {
++                        logger_.info("FatClient " + endpoint + " has been silent for " + FatClientTimeout_ + "ms, removing from gossip");
++                        removeEndPoint(endpoint);
++                    }
++                }
++
+                 if ( !epState.isAlive() && (duration > aVeryLongTime_) )
+                 {
+                     evictFromMembership(endpoint);
+                 }
+             }
++
++            if (!justRemovedEndPoints_.isEmpty())
++            {
++                Hashtable<InetAddress, Long> copy = new Hashtable<InetAddress, Long>(justRemovedEndPoints_);
++                for (Map.Entry<InetAddress, Long> entry : copy.entrySet())
++                {
++                    if ((now - entry.getValue()) > Streaming.RING_DELAY)
++                    {
++                        if (logger_.isDebugEnabled())
++                            logger_.debug(Streaming.RING_DELAY + " elapsed, " + entry.getKey() + " gossip quarantine over");
++                        justRemovedEndPoints_.remove(entry.getKey());
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -520,6 +572,8 @@ void markAlive(InetAddress addr, EndPointState localState)
+ 
+     private void handleNewJoin(InetAddress ep, EndPointState epState)
+     {
++        if (justRemovedEndPoints_.containsKey(ep))
++            return;
+     	logger_.info("Node " + ep + " is now part of the cluster");
+         handleMajorStateChange(ep, epState, false);
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/IFailureDetector.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/IFailureDetector.java
+index 04a93fa0..da8ab5d6 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/IFailureDetector.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/gms/IFailureDetector.java
+@@ -56,6 +56,11 @@
+     */
+     public void report(InetAddress ep);
+     
++    /**
++     * remove endpoint from failure detector
++     */
++    public void remove(InetAddress ep);
++    
+     /**
+      * Register interest for Failure Detector events. 
+      * @param listener implementation of an application provided IFailureDetectionEventListener 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 0c47bb40..f4448e58 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -533,12 +533,19 @@ private void handleStateLeft(InetAddress endPoint, String moveValue)
+             // if we're here, endPoint is not leaving but broadcasting remove token command
+             assert (typeOfState.equals(REMOVE_TOKEN));
+             InetAddress endPointThatLeft = tokenMetadata_.getEndPoint(token);
++            // let's make sure that we're not removing ourselves. This can happen when a node
++            // enters ring as a replacement for a removed node. removeToken for the old node is
++            // still in gossip, so we will see it.
++            if (endPointThatLeft.equals(FBUtilities.getLocalAddress()))
++            {
++                logger_.info("Received removeToken gossip about myself. Is this node a replacement for a removed one?");
++                return;
++            }
+             if (logger_.isDebugEnabled())
+                 logger_.debug("Token " + token + " removed manually (endpoint was " + ((endPointThatLeft == null) ? "unknown" : endPointThatLeft) + ")");
+             if (endPointThatLeft != null)
+             {
+-                restoreReplicaCount(endPointThatLeft);
+-                tokenMetadata_.removeEndpoint(endPointThatLeft);
++                removeEndPointLocally(endPointThatLeft);
+             }
+         }
+ 
+@@ -547,6 +554,17 @@ private void handleStateLeft(InetAddress endPoint, String moveValue)
+         calculatePendingRanges();
+     }
+ 
++    /**
++     * endPoint was completely removed from ring (as a result of removetoken command). Remove it
++     * from token metadata and gossip and restore replica count.
++     */
++    private void removeEndPointLocally(InetAddress endPoint)
++    {
++        restoreReplicaCount(endPoint);
++        Gossiper.instance.removeEndPoint(endPoint);
++        tokenMetadata_.removeEndpoint(endPoint);
++    }
++
+     /**
+      * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
+      *
+@@ -1378,13 +1396,15 @@ public void removeToken(String tokenString)
+         InetAddress endPoint = tokenMetadata_.getEndPoint(token);
+         if (endPoint != null)
+         {
++            if (endPoint.equals(FBUtilities.getLocalAddress()))
++                throw new UnsupportedOperationException("Cannot remove node's own token");
++
+             // Let's make sure however that we're not removing a live
+             // token (member)
+             if (Gossiper.instance.getLiveMembers().contains(endPoint))
+                 throw new UnsupportedOperationException("Node " + endPoint + " is alive and owns this token. Use decommission command to remove it from the ring");
+ 
+-            restoreReplicaCount(endPoint);
+-            tokenMetadata_.removeEndpoint(endPoint);
++            removeEndPointLocally(endPoint);
+             calculatePendingRanges();
+         }
+ 

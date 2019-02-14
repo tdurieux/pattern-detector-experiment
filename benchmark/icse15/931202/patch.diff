@@ -1,0 +1,591 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraDaemon.java b/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraDaemon.java
+index f06c8296..3da8f82a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraDaemon.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/avro/CassandraDaemon.java
+@@ -76,6 +76,16 @@ public void uncaughtException(Thread t, Throwable e)
+             }
+         });
+ 
++        try
++        {
++            DatabaseDescriptor.loadSchemas();
++        }
++        catch (IOException e)
++        {
++            logger.error("Fatal exception during initialization", e);
++            System.exit(100);
++        }
++
+         // initialize keyspaces
+         for (String table : DatabaseDescriptor.getTables())
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 506fe68f..a716562f 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -31,7 +31,9 @@
+ import org.apache.cassandra.locator.IEndPointSnitch;
+ import org.apache.cassandra.locator.AbstractReplicationStrategy;
+ import org.apache.cassandra.io.util.FileUtils;
++import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.UUIDGen;
+ import org.apache.cassandra.utils.XMLUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -483,26 +485,17 @@ else if (diskAccessMode == DiskAccessMode.mmap_index_only)
+             KSMetaData systemMeta = new KSMetaData(Table.SYSTEM_TABLE, null, -1, null, systemCfDefs);
+             tables.put(Table.SYSTEM_TABLE, systemMeta);
+             
+-            // todo: if tables are defined in the system store, use those.  load from xml otherwise.
+-            readTablesFromXml();
+-            
+-            // todo: fill in repStrat and epSnitch when this table is set to replicate.
+             CFMetaData[] definitionCfDefs = new CFMetaData[]
+             {
+                 new CFMetaData(Table.DEFINITIONS, Migration.MIGRATIONS_CF, "Standard", new TimeUUIDType(), null, "individual schema mutations", 0, 0),
+                 new CFMetaData(Table.DEFINITIONS, Migration.SCHEMA_CF, "Standard", new UTF8Type(), null, "current state of the schema", 0, 0)
+             };
+-            KSMetaData ksDefs = new KSMetaData(Table.DEFINITIONS, null, -1, null, definitionCfDefs);
+-            tables.put(Table.DEFINITIONS, ksDefs);
++            tables.put(Table.DEFINITIONS, new KSMetaData(Table.DEFINITIONS, null, -1, null, definitionCfDefs));
+             
+             // NOTE: make sure that all system CFMs defined by now. calling fixMaxId at this point will set the base id
+             // to a value that leaves room for future system cfms.
+             CFMetaData.fixMaxId();
+             
+-            // todo: if tables are defined in the system store, use those.  load from xml otherwise.
+-            readTablesFromXml();
+-            CFMetaData.fixMaxId();
+-            
+             /* Load the seeds for node contact points */
+             String[] seedsxml = xmlUtils.getNodeValues("/Storage/Seeds/Seed");
+             if (seedsxml.length <= 0)
+@@ -526,7 +519,42 @@ else if (diskAccessMode == DiskAccessMode.mmap_index_only)
+         }
+     }
+ 
+-    private static void readTablesFromXml() throws ConfigurationException
++    public static void loadSchemas() throws IOException
++    {
++        // we can load tables from local storage if a version is set in the system table and that acutally maps to
++        // real data in the definitions table.  If we do end up loading from xml, store the defintions so that we
++        // don't load from xml anymore.
++        UUID uuid = Migration.getLastMigrationId();
++        if (uuid == null)
++            logger.warn("Couldn't detect any schema definitions in local storage. I hope you've got a plan.");
++        else
++        {
++            logger.info("Loading schema version " + uuid.toString());
++            Collection<KSMetaData> tableDefs = DefsTable.loadFromStorage(uuid);   
++            for (KSMetaData def : tableDefs)
++            {
++                DatabaseDescriptor.setTableDefinition(def, uuid);
++                // this part creates storage and jmx objects.
++                Table.open(def.name);
++            }
++            
++            // since we loaded definitions from local storage, log a warning if definitions exist in xml.
++            try
++            {
++                XMLUtils xmlUtils = new XMLUtils(configFileName);
++                NodeList tablesxml = xmlUtils.getRequestedNodeList("/Storage/Keyspaces/Keyspace");
++                if (tablesxml.getLength() > 0)
++                    logger.warn("Schema definitions were defined both locally and in storage-conf.xml. Definitions in storage-conf.xml were ignored.");
++            }
++            catch (Exception ex)
++            {
++                logger.warn("Problem checking for schema defintions in xml", ex);
++            }
++        }
++        CFMetaData.fixMaxId();
++    }
++
++    public static void readTablesFromXml() throws ConfigurationException
+     {
+         XMLUtils xmlUtils = null;
+         try
+@@ -730,6 +758,8 @@ else if (XMLUtils.getAttributeValue(columnFamily, "CompareSubcolumnsWith") != nu
+             ex.initCause(e);
+             throw ex;
+         }
++        if (DatabaseDescriptor.listenAddress != null)
++            defsVersion = UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress());
+     }
+ 
+     public static IAuthenticator getAuthenticator()
+@@ -1118,10 +1148,9 @@ public static KSMetaData getTableDefinition(String table)
+     // process of mutating an individual keyspace, rather than setting manually here.
+     public static void setTableDefinition(KSMetaData ksm, UUID newVersion)
+     {
+-        // at some point, this assert will be valid, because defsVersion_ will be set when the table defs are loaded.
+-//        assert newVersion != null && !newVersion.equals(defsVersion_) && defsVersion_.compareTo(newVersion) < 0;
+         tables.put(ksm.name, ksm);
+         DatabaseDescriptor.defsVersion = newVersion;
++        StorageService.instance.initReplicationStrategy(ksm.name);
+     }
+     
+     public static void clearTableDefinition(KSMetaData ksm, UUID newVersion)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java b/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+index b02ad440..6c63ec69 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+@@ -25,6 +25,7 @@
+ import org.apache.cassandra.db.filter.QueryPath;
+ import org.apache.cassandra.db.filter.SliceQueryFilter;
+ import org.apache.cassandra.db.migration.Migration;
++import org.apache.cassandra.utils.UUIDGen;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.File;
+@@ -50,6 +51,10 @@ public static synchronized void dumpToStorage(UUID version) throws IOException
+             rm.add(new QueryPath(Migration.SCHEMA_CF, null, ks.name.getBytes()), KSMetaData.serialize(ks), now);
+         }
+         rm.apply();
++        
++        rm = new RowMutation(Table.DEFINITIONS, Migration.LAST_MIGRATION_KEY);
++        rm.add(new QueryPath(Migration.SCHEMA_CF, null, Migration.LAST_MIGRATION_KEY.getBytes()), UUIDGen.decompose(version), now);
++        rm.apply();
+     }
+ 
+     /** loads a version of keyspace definitions from storage */
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
+index 718b052d..d6b315b1 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
+@@ -145,7 +145,7 @@ public static UUID getLastMigrationId()
+         ColumnFamilyStore cfStore = defs.getColumnFamilyStore(SCHEMA_CF);
+         QueryFilter filter = QueryFilter.getNamesFilter(LAST_MIGRATION_KEY, new QueryPath(SCHEMA_CF), LAST_MIGRATION_KEY.getBytes());
+         ColumnFamily cf = cfStore.getColumnFamily(filter);
+-        if (cf.getColumnNames().size() == 0)
++        if (cf == null || cf.getColumnNames().size() == 0)
+             return null;
+         else
+             return UUIDGen.makeType1UUID(cf.getColumn(LAST_MIGRATION_KEY.getBytes()).value());
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 52f25b2e..9aa31225 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -33,9 +33,11 @@
+ 
+ import com.google.common.collect.Multimaps;
+ import org.apache.cassandra.concurrent.*;
++import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.commitlog.CommitLog;
++import org.apache.cassandra.db.migration.Migration;
+ import org.apache.cassandra.dht.*;
+ import org.apache.cassandra.gms.*;
+ import org.apache.cassandra.io.DeletionService;
+@@ -47,6 +49,7 @@
+ import org.apache.cassandra.thrift.ConsistencyLevel;
+ import org.apache.cassandra.thrift.UnavailableException;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.UUIDGen;
+ import org.apache.cassandra.utils.WrappedRunnable;
+ import org.apache.cassandra.io.util.FileUtils;
+ 
+@@ -1569,6 +1572,38 @@ public synchronized void drain() throws IOException, InterruptedException, Execu
+         setMode("Node is drained", true);
+     }
+     
++    /**
++     * load schema from xml. This can only be done on a fresh system.
++     * @throws ConfigurationException
++     * @throws IOException
++     */
++    public void loadSchemaFromXML() throws ConfigurationException, IOException
++    {
++        // blow up if there is a schema saved.
++        if (DatabaseDescriptor.getDefsVersion().timestamp() > 0 || Migration.getLastMigrationId() != null)
++            throw new ConfigurationException("Cannot load from XML on top of pre-existing schemas.");
++        DatabaseDescriptor.readTablesFromXml();
++        assert DatabaseDescriptor.getDefsVersion().timestamp() > 0;
++        DefsTable.dumpToStorage(DatabaseDescriptor.getDefsVersion());
++        // flush system and definition tables.
++        Collection<Future> flushers = new ArrayList<Future>();
++        flushers.addAll(Table.open(Table.SYSTEM_TABLE).flush());
++        flushers.addAll(Table.open(Table.DEFINITIONS).flush());
++        for (Future f : flushers)
++        {
++            try
++            {
++                f.get();
++            }
++            catch (Exception e)
++            {
++                ConfigurationException ce = new ConfigurationException(e.getMessage());
++                ce.initCause(e);
++                throw ce;
++            }
++        }
++        
++    }
+ 
+     // Never ever do this at home. Used by tests.
+     Map<String, AbstractReplicationStrategy> setReplicationStrategyUnsafe(Map<String, AbstractReplicationStrategy> replacement)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 48e0097c..a4eb1c6c 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -26,6 +26,7 @@
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.FutureTask;
+ 
++import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.dht.Range;
+ import java.net.InetAddress;
+ 
+@@ -169,4 +170,10 @@
+ 
+     /** makes node unavailable for writes, flushes memtables and replays commitlog. */
+     public void drain() throws IOException, InterruptedException, ExecutionException;
++
++    /**
++     * Introduced in 0.7 to allow nodes to load their existing xml defined schemas.
++     * @todo: deprecate in 0.7+1, remove in 0.7+2.
++     */ 
++    public void loadSchemaFromXML() throws ConfigurationException, IOException;
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
+index 915c5c61..06eb70c4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
+@@ -23,6 +23,7 @@
+ import java.net.InetSocketAddress;
+ import java.net.InetAddress;
+ 
++import org.apache.cassandra.config.ConfigurationException;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -85,6 +86,16 @@ public void uncaughtException(Thread t, Throwable e)
+             }
+         });
+ 
++        try
++        {
++            DatabaseDescriptor.loadSchemas();
++        }
++        catch (IOException e)
++        {
++            logger.error("Fatal exception during initialization", e);
++            System.exit(100);
++        }
++        
+         // initialize keyspaces
+         for (String table : DatabaseDescriptor.getTables())
+         {
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java b/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
+index 0a2e986e..d1c805f5 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/CleanupHelper.java
+@@ -29,7 +29,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-public class CleanupHelper
++public class CleanupHelper extends SchemaLoader
+ {
+     private static Logger logger = LoggerFactory.getLogger(CleanupHelper.class);
+ 
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java b/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
+index e69de29b..73add5a0 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
+@@ -0,0 +1,41 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * <p/>
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * <p/>
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra;
++
++import org.apache.cassandra.config.ConfigurationException;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.junit.BeforeClass;
++
++public class SchemaLoader
++{
++    // todo: when xml is fully deprecated, this method should be changed to manually load a few table definitions into
++    // the definitions keyspace.
++    @BeforeClass
++    public static void loadSchemaFromXml()
++    {
++        try
++        {
++            DatabaseDescriptor.readTablesFromXml();
++        }
++        catch (ConfigurationException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++}
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
+index dede3b7b..d5639a88 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
+@@ -24,13 +24,14 @@
+ import java.util.Arrays;
+ import java.util.TreeMap;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.db.filter.QueryPath;
+ import static org.apache.cassandra.Util.column;
+ 
+-public class ColumnFamilyTest
++public class ColumnFamilyTest extends SchemaLoader
+ {
+     // TODO test SuperColumns
+ 
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+index 5ab31ba9..1df2c790 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -59,12 +59,6 @@
+ 
+ public class DefsTest extends CleanupHelper
+ {
+-    @Before
+-    public void setup()
+-    {
+-        // just something to ensure that DD has been initialized.
+-        DatabaseDescriptor.getNonSystemTables();
+-    }
+ 
+     @Test
+     public void saveAndRestore() throws IOException
+@@ -105,10 +99,10 @@ public void addNewCfToBogusTable() throws InterruptedException
+     public void testMigrations() throws IOException, ConfigurationException
+     {
+         // do a save. make sure it doesn't mess with the defs version.
+-        assert DatabaseDescriptor.getDefsVersion() == null;
++        UUID prior = DatabaseDescriptor.getDefsVersion();
+         UUID ver0 = UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress());
+         DefsTable.dumpToStorage(ver0);
+-        assert DatabaseDescriptor.getDefsVersion() == null;
++        assert DatabaseDescriptor.getDefsVersion().equals(prior);
+         
+         // add a cf.
+         CFMetaData newCf1 = new CFMetaData("Keyspace1", "MigrationCf_1", "Standard", new UTF8Type(), null, "Migration CF ", 0, 0);
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/ReadMessageTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/ReadMessageTest.java
+index 8597fc2d..13ee6a9d 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/ReadMessageTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/ReadMessageTest.java
+@@ -26,13 +26,14 @@
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.commons.lang.ArrayUtils;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.db.filter.QueryPath;
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ 
+-public class ReadMessageTest
++public class ReadMessageTest extends SchemaLoader
+ {
+     @Test
+     public void testMakeReadMessage() throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RowTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RowTest.java
+index b578d178..5618970d 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RowTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RowTest.java
+@@ -20,13 +20,14 @@
+ 
+ import java.util.Arrays;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.junit.Test;
+ 
+ import static junit.framework.Assert.assertEquals;
+ import org.apache.cassandra.db.marshal.AsciiType;
+ import static org.apache.cassandra.Util.column;
+ 
+-public class RowTest
++public class RowTest extends SchemaLoader
+ {
+     @Test
+     public void testDiffColumnFamily()
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
+index 5da38d02..b0bdae74 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
+@@ -20,7 +20,9 @@
+ 
+ import com.google.common.collect.HashMultimap;
+ import com.google.common.collect.Multimap;
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.CFMetaData;
++import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.utils.Pair;
+ import org.junit.Before;
+@@ -34,14 +36,8 @@
+ import java.util.Collections;
+ import java.util.Map;
+ 
+-public class CommitLogHeaderTest
++public class CommitLogHeaderTest extends SchemaLoader
+ {
+-    @Before
+-    public void setup()
+-    {
+-        // data definitions must be loaded.
+-        DatabaseDescriptor.getTables();
+-    }
+     
+     @Test
+     public void testEmptyHeader()
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
+index 973e7621..913351d2 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/locator/RackUnawareStrategyTest.java
+@@ -25,6 +25,7 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.gms.ApplicationState;
+ import org.apache.cassandra.service.StorageServiceAccessor;
+@@ -40,7 +41,7 @@
+ import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ 
+-public class RackUnawareStrategyTest
++public class RackUnawareStrategyTest extends SchemaLoader
+ {
+     @Test
+     public void tryBogusTable()
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
+index 512f5229..58904ee7 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
+@@ -24,6 +24,8 @@
+ import java.io.IOException;
+ import java.io.UnsupportedEncodingException;
+ 
++import org.apache.cassandra.config.ConfigurationException;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.thrift.Cassandra;
+ import org.apache.cassandra.thrift.ColumnOrSuperColumn;
+ import org.apache.cassandra.thrift.ColumnPath;
+@@ -62,12 +64,13 @@
+      * @throws InterruptedException
+      */
+     @BeforeClass
+-    public static void setup() throws TTransportException, IOException, InterruptedException
++    public static void setup() throws TTransportException, IOException, InterruptedException, ConfigurationException
+     {
+ 
+         // Tell cassandra where the configuration files are.
+         // Use the test configuration file.
+         System.setProperty("storage-config", "test/conf");
++        DatabaseDescriptor.readTablesFromXml();
+ 
+         cassandra = new EmbeddedCassandraService();
+         cassandra.init();
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/ReadResponseResolverTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/ReadResponseResolverTest.java
+index f9c01259..8c988a2e 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/ReadResponseResolverTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/ReadResponseResolverTest.java
+@@ -23,6 +23,7 @@
+ 
+ import java.util.Arrays;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.db.ColumnFamily;
+@@ -31,7 +32,7 @@
+ import static org.apache.cassandra.Util.column;
+ import static junit.framework.Assert.assertNull;
+ 
+-public class ReadResponseResolverTest
++public class ReadResponseResolverTest extends SchemaLoader
+ {
+     @Test
+     public void testResolveSupersetNewer()
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+index 4a3de2e6..446b4e9f 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/streaming/BootstrapTest.java
+@@ -26,12 +26,13 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.sstable.SSTable;
+ 
+ import org.junit.Test;
+ 
+-public class BootstrapTest
++public class BootstrapTest extends SchemaLoader
+ {
+     @Test
+     public void testGetNewNames() throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+index f0baa375..54003771 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableExportTest.java
+@@ -23,6 +23,8 @@
+ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.util.Arrays;
++
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.filter.NamesQueryFilter;
+@@ -42,7 +44,7 @@
+ import org.json.simple.parser.ParseException;
+ import org.junit.Test;
+ 
+-public class SSTableExportTest
++public class SSTableExportTest extends SchemaLoader
+ {
+     @Test
+     public void testEnumeratekeys() throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
+index 6b09618f..d7b74bc9 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/tools/SSTableImportTest.java
+@@ -21,6 +21,8 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.util.Arrays;
++
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.IColumn;
+@@ -33,7 +35,7 @@
+ import org.json.simple.parser.ParseException;
+ import org.junit.Test;
+ 
+-public class SSTableImportTest
++public class SSTableImportTest extends SchemaLoader
+ {   
+     @Test
+     public void testImportSimpleCf() throws IOException, ParseException

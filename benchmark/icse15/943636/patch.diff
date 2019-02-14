@@ -1,0 +1,174 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 55a298f2..3e35aed0 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -189,7 +189,6 @@ public static void recover(File[] clogs) throws IOException
+             int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
+             BufferedRandomAccessFile reader = new BufferedRandomAccessFile(file.getAbsolutePath(), "r", bufferSize);
+             final CommitLogHeader clHeader = CommitLogHeader.readCommitLogHeader(reader);
+-            final Map<Pair<String, String>, Integer> cfIdMap = clHeader.getCfIdMap();
+             /* seek to the lowest position where any CF has non-flushed data */
+             int lowPos = CommitLogHeader.getLowestPosition(clHeader);
+             if (lowPos == 0)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogHeader.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogHeader.java
+index 02bda810..737be1e4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogHeader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogHeader.java
+@@ -52,14 +52,11 @@ else if (o2 == 0)
+     }
+ 
+     private Map<Integer, Integer> lastFlushedAt; // position at which each CF was last flushed
+-    private final byte[] serializedCfMap; // serialized. only needed during commit log recovery.
+     private final int cfCount; // we keep this in case cfcount changes in the interim (size of lastFlushedAt is not a good indication).
+     
+-    private transient Map<Pair<String, String>, Integer> cfIdMap; // only needed during recovery. created from this.serializedCfMap.
+-    
+     CommitLogHeader()
+     {
+-        this(new HashMap<Integer, Integer>(), serializeCfIdMap(CFMetaData.getCfIdMap()), CFMetaData.getCfIdMap().size());
++        this(new HashMap<Integer, Integer>(), CFMetaData.getCfIdMap().size());
+     }
+     
+     /*
+@@ -67,11 +64,10 @@ else if (o2 == 0)
+      * also builds an index of position to column family
+      * Id.
+     */
+-    private CommitLogHeader(Map<Integer, Integer> lastFlushedAt, byte[] serializedCfMap, int cfCount)
++    private CommitLogHeader(Map<Integer, Integer> lastFlushedAt, int cfCount)
+     {
+         this.cfCount = cfCount;
+         this.lastFlushedAt = lastFlushedAt;
+-        this.serializedCfMap = serializedCfMap;
+         assert lastFlushedAt.size() <= cfCount;
+     }
+         
+@@ -101,53 +97,6 @@ boolean isSafeToDelete() throws IOException
+         return lastFlushedAt.isEmpty();
+     }
+     
+-    synchronized Map<Pair<String, String>, Integer> getCfIdMap()
+-    {
+-        if (cfIdMap != null)
+-            return cfIdMap;
+-        DataInputStream in = new DataInputStream(new ByteArrayInputStream(serializedCfMap));
+-        cfIdMap = new HashMap<Pair<String, String>, Integer>();
+-        try
+-        {
+-            int sz = in.readInt();
+-            for (int i = 0; i < sz; i++)
+-            {
+-                Pair<String, String> key = new Pair<String, String>(in.readUTF(), in.readUTF());
+-                cfIdMap.put(key, in.readInt());
+-            }
+-        }
+-        catch (IOException ex)
+-        {
+-            throw new IOError(ex);
+-        }
+-        return cfIdMap;
+-    }
+-    
+-    private static byte[] serializeCfIdMap(Map<Pair<String, String>, Integer> map)
+-    {
+-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+-        DataOutputStream dos = new DataOutputStream(out);
+-        
+-        try
+-        {
+-            dos.writeInt(map.size());
+-            for (Map.Entry<Pair<String, String>, Integer> entry : map.entrySet())
+-            {
+-                Pair<String, String> p = entry.getKey();
+-                dos.writeUTF(p.left);
+-                dos.writeUTF(p.right);
+-                dos.writeInt(entry.getValue());
+-            }
+-            dos.close();
+-        }
+-        catch (IOException ex)
+-        {
+-            throw new IOError(ex);
+-        }
+-            
+-        return out.toByteArray();
+-    }
+-
+     byte[] toByteArray() throws IOException
+     {
+         ByteArrayOutputStream bos = new ByteArrayOutputStream();
+@@ -194,18 +143,14 @@ public void serialize(CommitLogHeader clHeader, DataOutputStream dos) throws IOE
+             assert clHeader.lastFlushedAt.size() <= clHeader.cfCount;
+             Checksum checksum = new CRC32();
+ 
+-            // write the first checksum after the fixed-size part, so we won't OOM allocating a bogus cfmap buffer
++            // write the first checksum after the fixed-size part, so we won't read garbage lastFlushedAt data.
+             dos.writeInt(clHeader.cfCount); // 4
+-            dos.writeInt(clHeader.serializedCfMap.length); // 4
+             dos.writeInt(clHeader.lastFlushedAt.size()); // 4
+             checksum.update(clHeader.cfCount);
+-            checksum.update(clHeader.serializedCfMap.length);
+             checksum.update(clHeader.lastFlushedAt.size());
+             dos.writeLong(checksum.getValue());
+ 
+-            // write the 2nd checksum after the cfmap and lastflushedat map
+-            dos.write(clHeader.serializedCfMap); // colMap.length
+-            checksum.update(clHeader.serializedCfMap, 0, clHeader.serializedCfMap.length);
++            // write the 2nd checksum after the lastflushedat map
+             for (Map.Entry<Integer, Integer> entry : clHeader.lastFlushedAt.entrySet())
+             {
+                 dos.writeInt(entry.getKey()); // 4
+@@ -229,18 +174,12 @@ public CommitLogHeader deserialize(DataInputStream dis) throws IOException
+ 
+             int cfCount = dis.readInt();
+             checksum.update(cfCount);
+-            int cfMapLength = dis.readInt();
+-            checksum.update(cfMapLength);
+             int lastFlushedAtSize = dis.readInt();
+             checksum.update(lastFlushedAtSize);
+             if (checksum.getValue() != dis.readLong())
+             {
+                 throw new IOException("Invalid or corrupt commitlog header");
+             }
+-
+-            byte[] cfMap = new byte[cfMapLength];
+-            dis.readFully(cfMap);
+-            checksum.update(cfMap, 0, cfMap.length);
+             Map<Integer, Integer> lastFlushedAt = new HashMap<Integer, Integer>();
+             for (int i = 0; i < lastFlushedAtSize; i++)
+             {
+@@ -255,7 +194,7 @@ public CommitLogHeader deserialize(DataInputStream dis) throws IOException
+                 throw new IOException("Invalid or corrupt commitlog header");
+             }
+ 
+-            return new CommitLogHeader(lastFlushedAt, cfMap, cfCount);
++            return new CommitLogHeader(lastFlushedAt, cfCount);
+         }
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
+index e17d5f64..a431d0cf 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/commitlog/CommitLogHeaderTest.java
+@@ -80,21 +80,4 @@ public void constantSize() throws IOException
+         
+         assert one.length == two.length;
+     }
+-
+-    @Test
+-    public void byteArray() throws IOException
+-    {
+-        CommitLogHeader clh = new CommitLogHeader();
+-        assert clh.getCfIdMap().size() > 0;
+-        CommitLogHeader clh2 = CommitLogHeader.serializer.deserialize(new DataInputStream(new ByteArrayInputStream(clh.toByteArray())));
+-        assert clh.getCfIdMap().equals(clh2.getCfIdMap());
+-    }
+-    
+-    @Test
+-    public void cfMapSerialization() throws IOException
+-    {
+-        Map<Pair<String, String>, Integer> map = CFMetaData.getCfIdMap();
+-        CommitLogHeader clh = new CommitLogHeader();
+-        assert clh.getCfIdMap().equals(map);
+-    }
+ }

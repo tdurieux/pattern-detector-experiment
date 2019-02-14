@@ -1,0 +1,854 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/catalog/SystemProcedures.java b/db/derby/code/trunk/java/engine/org/apache/derby/catalog/SystemProcedures.java
+index 11453cf4..316e0f28 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/catalog/SystemProcedures.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/catalog/SystemProcedures.java
+@@ -2237,4 +2237,20 @@ private static  void    checkLegalUser( DataDictionary dd, String userName )
+         }
+     }
+   
++    /**
++     * Peek at the current value of a sequence generator without advancing it.
++     *
++     * @param schemaName    The name of the schema holding the sequence.
++     * @param sequenceName    The name of the sequence in that schema.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public static Long SYSCS_PEEK_AT_SEQUENCE( String schemaName, String sequenceName )
++        throws SQLException
++    {
++        try {
++            return ConnectionUtil.getCurrentLCC().getDataDictionary().peekAtSequence( schemaName, sequenceName );
++        } catch (StandardException se) { throw PublicAPI.wrapStandardException(se); }
++    }
++
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+index aa440e00..dc7861be 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+@@ -1827,6 +1827,14 @@ public void setAutoincrementValue(TransactionController tc,
+         ( String sequenceUUIDstring, NumberDataValue returnValue )
+         throws StandardException;
+ 
++	/**
++     * <p>
++     * Peek at the next value which will be returned by a sequence generator.
++     * </p>
++     */
++    public Long peekAtSequence( String schemaName, String sequenceName )
++        throws StandardException;
++
+ 	/**
+ 	 * Gets all statistics Descriptors for a given table.
+ 	 */
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index 84a48b2b..b8b8aa74 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -418,6 +418,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	/* Number of readers that start in DDL_MODE */
+ 	volatile int	readersInDDLMode;
+ 
++    private HashMap sequenceIDs;
+ 
+ 	/**
+ 		True if the database is read only and requires
+@@ -472,6 +473,7 @@ and a different point release (later than 5.1.25?)
+ 	 */
+ 	private static final String[] sysUtilFunctionsWithPublicAccess = { 
+ 												"SYSCS_GET_RUNTIMESTATISTICS", 
++												"SYSCS_PEEK_AT_SEQUENCE",
+ 												};
+ 	
+ 	/**
+@@ -700,6 +702,8 @@ public void boot(boolean create, Properties startParams)
+ 		sequenceGeneratorCache = cf.newCacheManager
+             ( this, "SequenceGeneratorCache", seqgenCacheSize, seqgenCacheSize );
+ 
++        sequenceIDs = new HashMap();
++
+ 		/* Get the object to coordinate cache transitions */
+ 		cacheCoordinator = new ShExLockable();
+ 
+@@ -10479,6 +10483,20 @@ private RowLocation computeRowLocation(TransactionController tc,
+         }
+     }
+     
++    public Long peekAtSequence( String schemaName, String sequenceName )
++        throws StandardException
++    {
++        String  uuid = getSequenceID( schemaName, sequenceName );
++
++        if ( uuid == null )
++        {
++            throw StandardException.newException(SQLState.LANG_OBJECT_NOT_FOUND_DURING_EXECUTION, "SEQUENCE",
++                    ( schemaName + "." + sequenceName) );
++        }
++        
++        return ((SequenceUpdater) sequenceGeneratorCache.find( uuid )).peekAtCurrentValue();
++    }
++    
+     public RowLocation getRowLocationTemplate(LanguageConnectionContext lcc,
+                                               TableDescriptor td)
+           throws StandardException
+@@ -13243,6 +13261,34 @@ void create_10_9_system_procedures( TransactionController   tc, HashSet newlyCre
+                  tc
+                  );
+         }
++        
++        // BIGINT
++        // SYSCS_UTIL.SYSCS_PEEK_AT_SEQUENCE( VARCHAR(128), VARCHAR(128) )
++
++        {
++            // procedure argument names
++            String[] arg_names = { "schemaName", "sequenceName" };
++
++            // procedure argument types
++            TypeDescriptor[] arg_types =
++                {
++                    CATALOG_TYPE_SYSTEM_IDENTIFIER,
++                    CATALOG_TYPE_SYSTEM_IDENTIFIER
++                };
++
++            createSystemProcedureOrFunction(
++                "SYSCS_PEEK_AT_SEQUENCE",
++                sysUtilUUID,
++                arg_names,
++                arg_types,
++				0,
++				0,
++                RoutineAliasInfo.READS_SQL_DATA,
++                false,
++                DataTypeDescriptor.getCatalogType( Types.BIGINT ),
++                newlyCreatedRoutines,
++                tc);
++        }
+     }
+ 
+ 
+@@ -13992,6 +14038,8 @@ public void dropSequenceDescriptor(SequenceDescriptor descriptor, TransactionCon
+         keyRow.setColumn(1, sequenceIdOrderable);
+ 
+         ti.deleteRow(tc, keyRow, SYSSEQUENCESRowFactory.SYSSEQUENCES_INDEX1_ID);
++
++        dropSequenceID( descriptor );
+     }
+ 
+     public SequenceDescriptor getSequenceDescriptor(UUID uuid) throws StandardException {
+@@ -14008,7 +14056,7 @@ public SequenceDescriptor getSequenceDescriptor(UUID uuid) throws StandardExcept
+         ExecIndexRow keyRow = exFactory.getIndexableRow(1);
+         keyRow.setColumn(1, UUIDStringOrderable);
+ 
+-        return (SequenceDescriptor)
++        SequenceDescriptor  sequenceDescriptor = (SequenceDescriptor)
+                 getDescriptorViaIndex(
+                         SYSSEQUENCESRowFactory.SYSSEQUENCES_INDEX1_ID,
+                         keyRow,
+@@ -14017,6 +14065,10 @@ public SequenceDescriptor getSequenceDescriptor(UUID uuid) throws StandardExcept
+                         (TupleDescriptor) null,
+                         (List) null,
+                         false);
++
++        putSequenceID( sequenceDescriptor );
++        
++        return sequenceDescriptor;
+     }
+ 
+     /**
+@@ -14044,7 +14096,7 @@ public SequenceDescriptor getSequenceDescriptor(SchemaDescriptor sd, String sequ
+         keyRow.setColumn(1, schemaIDOrderable);
+         keyRow.setColumn(2, sequenceNameOrderable);
+ 
+-        return (SequenceDescriptor)
++        SequenceDescriptor  sequenceDescriptor = (SequenceDescriptor)
+                 getDescriptorViaIndex(
+                         SYSSEQUENCESRowFactory.SYSSEQUENCES_INDEX2_ID,
+                         keyRow,
+@@ -14053,6 +14105,78 @@ public SequenceDescriptor getSequenceDescriptor(SchemaDescriptor sd, String sequ
+                         (TupleDescriptor) null,
+                         (List) null,
+                         false);
++
++        putSequenceID( sequenceDescriptor );
++        
++        return sequenceDescriptor;
++    }
++
++    /** Map ( schemaName, sequenceName ) to sequenceID */
++    private void    putSequenceID( SequenceDescriptor sd )
++        throws StandardException
++    {
++        if ( sd == null ) { return; }
++        
++        SchemaDescriptor    schema = sd.getSchemaDescriptor();
++        String  schemaName = schema.getSchemaName();
++        String  sequenceName = sd.getSequenceName();
++        String  uuid = sd.getUUID().toString();
++        
++        HashMap sequencesInSchema = (HashMap) sequenceIDs.get( schemaName );
++        if ( sequencesInSchema == null )
++        {
++            sequencesInSchema = new HashMap();
++            sequenceIDs.put( schemaName, sequencesInSchema );
++        }
++
++        if ( sequencesInSchema.get( sequenceName ) == null )
++        {
++            sequencesInSchema.put( sequenceName, uuid );
++        }
++    }
++
++    /** Drop a sequenceID from the ( schemaName, sequenceName ) map */
++    private void    dropSequenceID( SequenceDescriptor sd )
++        throws StandardException
++    {
++        if ( sd == null ) { return; }
++        
++        SchemaDescriptor    schema = sd.getSchemaDescriptor();
++        String  schemaName = schema.getSchemaName();
++        String  sequenceName = sd.getSequenceName();
++        
++        HashMap sequencesInSchema = (HashMap) sequenceIDs.get( schemaName );
++        if ( sequencesInSchema == null ) { return; }
++
++        if ( sequencesInSchema.get( sequenceName ) == null ) { return; }
++        {
++            sequencesInSchema.remove( sequenceName );
++        }
++    }
++
++    /**
++     * <p>
++     * Get the uuid string of a sequence given its schema and sequence name.
++     * </p>
++     */
++    private String  getSequenceID( String schemaName, String sequenceName )
++        throws StandardException
++    {
++        HashMap sequencesInSchema = (HashMap) sequenceIDs.get( schemaName );
++        if ( sequencesInSchema != null )
++        {
++            String  uuid = (String) sequencesInSchema.get( sequenceName );
++
++            if ( uuid !=  null ) { return uuid; }
++        }
++
++        // oops, not saved in the sequenceID map yet. lookup the sequence.
++        // this will save the uuid in the sequenceID map.
++        SequenceDescriptor    desc = getSequenceDescriptor
++            ( getSchemaDescriptor( schemaName, getTransactionCompile(), true ), sequenceName );
++
++        if ( desc == null ) { return null; }
++        else { return desc.getUUID().toString(); }
+     }
+ 
+     /**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceGenerator.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceGenerator.java
+index e265d85c..1d00bcca 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceGenerator.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceGenerator.java
+@@ -100,7 +100,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  * <p>
+  * The peekAtCurrentValue() method is provided so that unused, pre-allocated values can
+  * be flushed when the sequence generator is being discarded. The caller updates the
+- * catalog with the value returned by peekAtCurrentValue().
++ * catalog with the value returned by peekAtCurrentValue(). The peekAtCurrentValue() method
++ * is also called by the syscs_peek_at_sequence() function which users should call rather
++ * than try to scan the underlying catalog themselves.
+  * </p>
+  *
+  */
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+index b153194d..286bd5f0 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+@@ -61,9 +61,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  * <ul>
+  * <li>It pre-allocates a range of values from a sequence so that we don't have to change
+  *  the on-disk value every time we get the next value for a sequence.</li>
+- * <li>When updating the on-disk value, we first try to do the writing in
+- *  a nested subtransaction. This is so that we can immediately release the write-lock afterwards.
+- *  If that fails, we then try to do the writing in the user's execution transaction.</li>
++ * <li>When updating the on-disk value, we use a subtransaction of the user's
++ * execution transaction. If the
++ * special transaction cannot do its work immediately, without waiting for a lock, then
++ * a TOO MUCH CONTENTION error is raised. It is believed that this can only happen
++ * if someone holds locks on SYSSEQUENCES, either via sequence DDL or a scan
++ * of the catalog. The TOO MUCH CONTENTION error tells
++ * the user to not scan SYSSEQUENCES directly, but to instead use the
++ * SYSCS_UTIL.SYSCS_PEEK_AT_SEQUENCE() if the user needs the current value of the
++ * sequence generator.</li>
+  * </ul>
+  *
+  * <p>
+@@ -76,34 +82,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  * (last number in the pre-allocated range) was previously recorded in the catalog row which
+  * describes this sequence. If we are successful in getting the next number, we
+  * return it and all is well.</li>
+- * <li>Otherwise, we must allocate a new range by updating the catalog row. At this
+- * point we may find ourselves racing another session, which also needs the next number
+- * in the sequence.</li>
+- * <li>When we try to update the catalog row, we check to see whether the current value
+- * there is what we expect it to be. If it is, then all is well: we update the catalog row
+- * then return to the first step to try to get the next number from the new cache of
+- * pre-allocated numbers.</li>
+- * <li>If, however, the value in the catalog row is not what we expect, then another
+- * session has won the race to update the catalog. We accept this fact gracefully and
+- * do not touch the catalog. Instead, we return to the first step and try to get the
+- * next number from the new cache of numbers which the other session has just
+- * pre-allocated.</li>
+- * <li>We only allow ourselves to retry this loop a small number of times. If we still
+- * can't get the next number in the sequence, we raise an exception complaining that
+- * there is too much contention on the generator.</li>
+- * </ul>
+- *
+- * <p>
+- * If applications start seeing exceptions complaining that there is too much contention
+- * on a sequence generator, then we should improve this algorithm. Here are some options
+- * based on the idea that contention should go down if we increase the number of
+- * pre-allocated numbers:
+- * </p>
+- *
+- * <ul>
+- * <li>We can let the user change the size of the pre-allocated range.</li>
+- * <li>Derby can increase the size of the pre-allocated range when Derby detects
+- * too much contention.</li>
++ * <li>Otherwise, we must allocate a new range by updating the catalog row. We should not
++ * be in contention with another connection because the update method is synchronized.</li>
+  * </ul>
+  *
+  */
+@@ -130,9 +110,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     // This is the object which allocates ranges of sequence values
+     protected SequenceGenerator _sequenceGenerator;
+ 
+-    // This is the lock timeout in milliseconds; a negative number means no timeout
+-    private long _lockTimeoutInMillis;
+-
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // CONSTRUCTOR
+@@ -142,7 +119,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     /** No-arg constructor to satisfy the Cacheable contract */
+     public SequenceUpdater()
+     {
+-        _lockTimeoutInMillis = getLockTimeout();
+     }
+ 
+     /** Normal constructor */
+@@ -170,9 +146,8 @@ abstract protected SequenceGenerator createSequenceGenerator( TransactionControl
+ 
+     /**
+      * <p>
+-     * Update the sequence value on disk. This method is first called with a read/write subtransaction
+-     * of the session's execution transaction. If work can't be done there immediately, this method
+-     * is called with the session's execution transaction.
++     * Update the sequence value on disk. This method does its work in a subtransaction of
++     * the user's execution transaction.
+      * </p>
+      *
+      * @param tc The transaction to use
+@@ -325,24 +300,28 @@ public Cacheable setIdentity(Object key) throws StandardException
+      * <p>
+      * Get the next sequence number managed by this generator and advance the number. Could raise an
+      * exception if the legal range is exhausted and wrap-around is not allowed.
+-     * Only one thread at a time is allowed through here. That synchronization is performed by
+-     * the sequence generator itself.
++     * Only one thread at a time is allowed through here. We do not want a race between the
++     * two calls to the sequence generator: getCurrentValueAndAdvance() and allocateNewRange().
+      * </p>
+      *
+      * @param returnValue This value is stuffed with the new sequence number.
+      */
+-    public void getCurrentValueAndAdvance
++    public synchronized void getCurrentValueAndAdvance
+         ( NumberDataValue returnValue ) throws StandardException
+     {
+-        Long startTime = null;
+-
+         //
+-        // We try to get a sequence number. We try until we've exceeded the lock timeout
+-        // in case we find ourselves in a race with another session which is draining numbers from
+-        // the same sequence generator.
++        // We may have to try to get a value from the Sequence Generator twice.
++        // The first attempt may fail because we need to pre-allocate a new chunk
++        // of values.
+         //
+-        while ( true )
++        for ( int i = 0; i < 2; i++ )
+         {
++            //
++            // We try to get a sequence number. The SequenceGenerator method is synchronized
++            // so only one writer should be in there at a time. Lock contention is possible if
++            // someone has selected from SYSSEQUENCES contrary to our advice. In that case,
++            // we raise a TOO MUCH CONTENTION exception.
++            //
+             long[] cvaa = _sequenceGenerator.getCurrentValueAndAdvance();
+             
+             int status = (int) cvaa[ SequenceGenerator.CVAA_STATUS ];
+@@ -372,43 +351,21 @@ public Cacheable setIdentity(Object key) throws StandardException
+             default:
+                 throw unimplementedFeature();
+             }
+-
+-            //
+-            // If we get here, then we failed to get a sequence number. Along the way,
+-            // we or another session may have allocated more sequence numbers on disk. We go back
+-            // in to try to grab one of those numbers.
+-            //
+-            if ( startTime == null )
+-            {
+-                // get the system time only if we have to
+-                startTime = new Long( System.currentTimeMillis() );
+-                continue;
+             }
+             
+-            if (
+-                (_lockTimeoutInMillis >= 0L) &&
+-                ( (System.currentTimeMillis() - startTime.longValue()) > _lockTimeoutInMillis )
+-                )
+-            {
+                 //
+-                // If we get here, then we exhausted our retry attempts. This might be a sign
+-                // that we need to increase the number of sequence numbers which we
+-                // allocate. There's an opportunity for Derby to tune itself here.
++        // If we get here, then we failed to allocate a new sequence number range.
+                 //
+                 throw tooMuchContentionException();
+             }
+             
+-        } // end of retry loop
+-
+-    }
+-
+     /**
+      * <p>
+      * Get the current value of the sequence generator without advancing it.
+      * May return null if the generator is exhausted.
+      * </p>
+      */
+-    private Long peekAtCurrentValue() throws StandardException
++    public Long peekAtCurrentValue() throws StandardException
+     {
+         return _sequenceGenerator.peekAtCurrentValue();
+     }
+@@ -421,15 +378,14 @@ private Long peekAtCurrentValue() throws StandardException
+ 
+     /**
+      * <p>
+-     * Update the value on disk. First tries to update the value in a
+-     * subtransaction. If that fails, falls back on the execution transaction.
+-     * This is a callback method invoked by the sequence generator.
++     * Update the value on disk. Does its work in a subtransaction of the user's
++     * execution transaction. If that fails, raises a TOO MUCH CONTENTION exception.
+      * </p>
+ 	 * 
+ 	 * @return Returns true if the value was successfully updated, false if we lost a race with another session.
+      *
+      */
+-    public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws StandardException
++    public synchronized boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws StandardException
+     {
+         LanguageConnectionContext   lcc = getLCC();
+ 
+@@ -458,17 +414,12 @@ public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws S
+ 		}
+ 
+         TransactionController executionTransaction = lcc.getTransactionExecute();
+-        TransactionController nestedTransaction = null;
++        TransactionController nestedTransaction = executionTransaction.startNestedUserTransaction( false );
+ 
+-        try {
+-            nestedTransaction = executionTransaction.startNestedUserTransaction( false );
+-        } catch (StandardException se) {}
+-        
+-        // First try to do the work in the nested transaction. Fail if we can't
+-        // get a lock immediately.
+         if ( nestedTransaction != null )
+         {
+-            try {
++            try
++            {
+                 return updateCurrentValueOnDisk( nestedTransaction, oldValue, newValue, false );
+             }
+             catch (StandardException se)
+@@ -487,9 +438,10 @@ public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws S
+         }
+         
+         // If we get here, we failed to do the work in the nested transaction.
+-        // Fall back on the execution transaction
++        // We might be self-deadlocking if the user has selected from SYSSEQUENCES
++        // contrary to our advice.
+         
+-        return updateCurrentValueOnDisk( executionTransaction, oldValue, newValue, true );
++        throw tooMuchContentionException();
+     }
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+@@ -539,12 +491,6 @@ private boolean isNumber( String text )
+         return true;
+     }
+     
+-    /** Get the time we wait for a lock, in milliseconds--overridden by unit tests */
+-    protected int getLockTimeout()
+-    {
+-        return getLCC().getTransactionExecute().getAccessManager().getLockFactory().getWaitTimeout();
+-    }
+-    
+ 	private static LanguageConnectionContext getLCC()
+     {
+ 		return (LanguageConnectionContext) 
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index b3c24234..0963493b 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -1382,7 +1382,7 @@ The message identifier (ie. the value that matches a field in this class)
+ 	String LANG_INVALID_CALL_TO_EXECUTE_UPDATE		                   = "X0Y79.S";
+ 	String LANG_NULL_DATA_IN_NON_NULL_COLUMN               	   	   	   = "X0Y80.S";
+     String LANG_IGNORE_MISSING_INDEX_ROW_DURING_DELETE                 = "X0Y83.S";
+-    String LANG_TOO_MUCH_CONTENTION_ON_SEQUENCE                 = "X0Y84.S";
++    String LANG_TOO_MUCH_CONTENTION_ON_SEQUENCE                 = "X0Y84.T";
+ 	String LANG_UNKNOWN_SEQUENCE_PREALLOCATOR                                = "X0Y85.S";
+ 	String LANG_CANT_FLUSH_PREALLOCATOR                                = "X0Y86.S";
+ 
+diff --git a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+index f7b7bb31..79b872c1 100644
+--- a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
++++ b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+@@ -743,6 +743,12 @@ public void dropFileInfoDescriptor(FileInfoDescriptor fid)
+ 		// Auto-generated method stub
+     }
+     
++    public Long peekAtSequence( String schemaName, String sequenceName )
++        throws StandardException
++    {
++		return null;
++    }
++    
+ 	public RowLocation getRowLocationTemplate(LanguageConnectionContext lcc,
+ 			TableDescriptor td) throws StandardException {
+ 		// Auto-generated method stub
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/TestDbMetaData.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/TestDbMetaData.java
+index 33c9f8eb..89b9e4e1 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/TestDbMetaData.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/TestDbMetaData.java
+@@ -167,6 +167,9 @@ private void assertGetFunctionsRs(ResultSet rs) throws SQLException {
+         { null, "SYSCS_UTIL", "SYSCS_GET_XPLAIN_SCHEMA",
+           "org.apache.derby.catalog.SystemProcedures." +
+           "SYSCS_GET_XPLAIN_SCHEMA", FUNCTION_NO_TABLE_VALUE, GENERIC_NAME },
++        { null, "SYSCS_UTIL", "SYSCS_PEEK_AT_SEQUENCE",
++          "org.apache.derby.catalog.SystemProcedures." +
++          "SYSCS_PEEK_AT_SEQUENCE", FUNCTION_NO_TABLE_VALUE, GENERIC_NAME },
+         { null, "SYSIBM", "BLOBCREATELOCATOR",
+           "org.apache.derby.impl.jdbc.LOBStoredProcedure." +
+           "BLOBCREATELOCATOR", FUNCTION_NO_TABLE_VALUE, GENERIC_NAME },
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
+index 1e6a7e29..47f954a4 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
+@@ -93,6 +93,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     protected static  final   String  TRIGGER_DROPPED_WARNING = "01502";
+     protected static  final   String  LANG_INVALID_USE_OF_DEFAULT = "42Y85";
+     protected static  final   String  GRANT_REVOKE_NOT_ALLOWED = "42509";
++    protected static  final   String  MISSING_OBJECT = "X0X81";
+     protected static  final   String  ROUTINE_DEPENDS_ON_TYPE = "X0Y30";
+     protected static  final   String  TABLE_DEPENDS_ON_TYPE = "X0Y29";
+     protected static  final   String  VIEW_DEPENDENCY = "X0Y23";
+@@ -106,6 +107,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     protected static  final   String  BAD_CAST = "42846";
+     protected static  final   String  DUPLICATE_CLAUSE = "42XAJ";
+     protected static  final   String  FORBIDDEN_DROP_TRIGGER = "X0Y24";
++    protected static  final   String  LOCK_TIMEOUT = "40XL1";
++    protected static  final   String  TOO_MUCH_CONTENTION = "X0Y84";
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+index 6d4c4181..ff0c470e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+@@ -7233,7 +7233,8 @@ public void testGrantRevokeDDL2() throws SQLException {
+             {"PUBLIC", "TEST_DBO", "N"},
+             {"PUBLIC", "TEST_DBO", "N"},
+             {"PUBLIC", "TEST_DBO", "N"},
+-            {"PUBLIC", "TEST_DBO", "N"}
++            {"PUBLIC", "TEST_DBO", "N"},
++            {"PUBLIC", "TEST_DBO", "N"},
+         };
+         
+         JDBC.assertFullResultSet(rs, expRS, true);
+@@ -7280,6 +7281,7 @@ public void testGrantRevokeDDL2() throws SQLException {
+             {"PUBLIC", "TEST_DBO", "N"},
+             {"PUBLIC", "TEST_DBO", "N"},
+             {"PUBLIC", "TEST_DBO", "N"},
++            {"PUBLIC", "TEST_DBO", "N"},
+             {"USER2", "USER1", "N"}
+         };
+         
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesTest.java
+index f35d93cc..5c4dd415 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesTest.java
+@@ -600,9 +600,9 @@ public void testSemantics() throws SQLException
+ 
+         assertSysColPermsRowCount(0, 2, 2);
+ 
+-        assertSysRoutinePermsRowCount(7, // 7 pre-existing grants to PUBLIC
+-                                      8,
+-                                      8);
++        assertSysRoutinePermsRowCount(8, // 8 pre-existing grants to PUBLIC
++                                      9,
++                                      9);
+ 
+         /*
+          * DROP ROLE
+@@ -630,12 +630,12 @@ public void testSemantics() throws SQLException
+                                   // to admin is de facto to a user
+                                   // named admin:
+                                   2);
+-        assertSysRoutinePermsRowCount(7, 7,
++        assertSysRoutinePermsRowCount(8, 8,
+                                       //  nonDbo run: role admin
+                                       // has been dropped, so this
+                                       // run's grant to admin is de
+                                       // facto to a user named admin:
+-                                      8);
++                                      9);
+ 
+         doStmt("drop role \"NONE\"",
+                sqlAuthorizationRequired, null , roleDboOnly);
+@@ -657,7 +657,7 @@ public void testSemantics() throws SQLException
+                                     1,
+                                     0);
+         assertSysColPermsRowCount(0,0,0);
+-        assertSysRoutinePermsRowCount(7,7,7);
++        assertSysRoutinePermsRowCount(8,8,8);
+ 
+         // roles foo and bar survive to nonDbo run and beyond:
+         assertSysRolesRowCount(0, 5, 5);
+@@ -1163,7 +1163,10 @@ private void assertSystableRowCount(String table,
+         ResultSet rs = _stm.executeQuery(
+                 "SELECT COUNT(*) FROM " + table);
+         rs.next();
+-        assertEquals(table + " row count:",
++        assertEquals(table +
++                     " (_authLevel == NO_SQLAUTHORIZATION) = " + (_authLevel == NO_SQLAUTHORIZATION) +
++                     ", isDbo() = " + isDbo() +
++                     ", row count:",
+                      _authLevel == NO_SQLAUTHORIZATION ? rcNoAuth :
+                      (isDbo() ? rcDbo : rcMereMortal),
+                      rs.getInt(1));
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+index 624c5f38..fb11052e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+@@ -109,8 +109,9 @@ public static Test suite()
+     {
+         TestSuite suite = (TestSuite) TestConfiguration.embeddedSuite(SequenceGeneratorTest.class);
+         Test        cleanTest = new CleanDatabaseTestSetup( suite );
++        Test        timeoutTest = DatabasePropertyTestSetup.setLockTimeouts( cleanTest, 5, 5 );
+         Test        authenticatedTest = DatabasePropertyTestSetup.builtinAuthentication
+-            ( cleanTest, LEGAL_USERS, "sequenceGenerator" );
++            ( timeoutTest, LEGAL_USERS, "sequenceGenerator" );
+         Test        authorizedTest = TestConfiguration.sqlAuthorizationDecorator( authenticatedTest );
+ 
+         return authorizedTest;
+@@ -681,6 +682,89 @@ public void test_10_5398() throws Exception
+         vetBumping( conn, TEST_DBO, "SEQ_10", seq_10_value++, seq_10_upperBound );
+     }
+ 
++    /**
++     * <p>
++     * Test that sequence values don't repeat via transaction trickery. See DERBY-5493.
++     * </p>
++     */
++    public void test_11_5493_correctness() throws Exception
++    {
++        Connection  conn = openUserConnection( TEST_DBO );
++
++        goodStatement( conn, "create table t_5493 (x int)\n" );
++        goodStatement( conn, "create sequence s_5493\n" );
++
++        boolean oldAutoCommit = conn.getAutoCommit();
++        conn.setAutoCommit( false );
++
++        PreparedStatement   ps = chattyPrepare( conn, "select count(*) from sys.syssequences with rs\n" );
++        getScalarInteger( ps );
++        ps.close();
++
++        int     expectedValue = -2147483648;
++        expectExecutionError( conn, TOO_MUCH_CONTENTION, "values next value for s_5493" );
++
++        goodStatement( conn, "drop table t_5493\n" );
++        conn.rollback();
++
++        ps = chattyPrepare( conn, "values next value for s_5493" );
++        assertEquals( expectedValue++, getScalarInteger( ps ) );
++        ps.close();
++
++        goodStatement( conn, "drop sequence s_5493 restrict\n" );
++        conn.commit();
++
++        conn.setAutoCommit( oldAutoCommit );
++    }
++
++    /**
++     * <p>
++     * Verify the syscs_peek_at_sequence function introduced by DERBY-5493.
++     * </p>
++     */
++    public void test_12_5493_function() throws Exception
++    {
++        Connection  dboConn = openUserConnection( TEST_DBO );
++        Connection  ruthConn = openUserConnection( "RUTH" );
++        PreparedStatement   ps;
++        int                 expectedValue;
++
++        goodStatement( dboConn, "create sequence s_5493\n" );
++        goodStatement( dboConn, "grant usage on sequence s_5493 to public\n" );
++
++        expectedValue = -2147483648;
++        ps = chattyPrepare( dboConn, "values next value for s_5493" );
++        assertEquals( expectedValue++, getScalarInteger( ps ) );
++        ps.close();
++
++        // test the syscs_peek_at_sequence() function
++        ps = chattyPrepare
++            (
++             dboConn,
++             "values syscs_util.syscs_peek_at_sequence( '" + TEST_DBO + "', 'S_5493' )\n"
++             );
++        assertEquals( expectedValue++, getScalarInteger( ps ) );
++        ps.close();
++
++        // error if sequence doesn't exist
++        expectExecutionError
++            ( dboConn, MISSING_OBJECT, "values syscs_util.syscs_peek_at_sequence( '" + TEST_DBO + "', 'S_5493_1' )\n" );
++
++        // drop the sequence but don't commit
++
++        dboConn.setAutoCommit( false );
++        goodStatement( dboConn, "drop sequence s_5493 restrict\n" );
++        
++        expectExecutionError( dboConn, MISSING_OBJECT, "values syscs_util.syscs_peek_at_sequence( '" + TEST_DBO + "', 'S_5493' )\n" );
++        expectCompilationError( dboConn, OBJECT_DOES_NOT_EXIST, "values next value for s_5493" );
++
++        expectExecutionError( ruthConn, LOCK_TIMEOUT, "values syscs_util.syscs_peek_at_sequence( '" + TEST_DBO + "', 'S_5493' )\n" );
++        expectCompilationError( ruthConn, LOCK_TIMEOUT, "values next value for " + TEST_DBO + ".s_5493" );
++
++        dboConn.commit();
++        dboConn.setAutoCommit( true );
++    }
++
+     /**
+      * <p>
+      * Verify that system crash does not rollback changes to SYSSEQUENCES.CURRENTVALUE.
+@@ -741,26 +825,11 @@ private void    assertNextValue( Connection conn, String schema, String sequence
+     private long getCurrentValue( String schemaName, String sequenceName )
+         throws Exception
+     {
+-        Connection  conn = openUserConnection( TEST_DBO );
+-        
+-        PreparedStatement ps = chattyPrepare
+-            ( conn,
+-              "select currentvalue from sys.syssequences seq, sys.sysschemas s where s.schemaname = ? and seq.sequencename = ? and s.schemaid = seq.schemaid" );
+-        ps.setString( 1, schemaName );
+-        ps.setString( 2, sequenceName );
+-
+-        long retval = getScalarLong( ps );
+-
+-        conn.commit();
+-        
+-        return retval;
++        return getCurrentValue( openUserConnection( TEST_DBO ), schemaName, sequenceName );
+     }
+ 
+     /** Get the current value from a sequence */
+-    private long getCurrentValue(
+-    Connection  conn, 
+-    String      schemaName, 
+-    String      sequenceName )
++    private long getCurrentValue( Connection conn, String schemaName, String sequenceName )
+         throws Exception
+     {
+         PreparedStatement ps = chattyPrepare
+@@ -870,9 +939,6 @@ public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue )
+             return updateCurrentValueOnDisk( null, oldValue, newValue, false );
+         }
+         
+-        // overridden to avoid a null pointer exception when we don't have a language context
+-        protected int getLockTimeout() { return 1000; }
+-    
+     }
+ 
+     // Illegal preallocator, which does not implement the correct interface
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_2.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_2.java
+index 4a80569e..1b4f7a6f 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_2.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_2.java
+@@ -335,6 +335,7 @@ public void testSystemRoutinePermissions() throws SQLException
+                     {"SYSCS_GET_RUNTIMESTATISTICS"},
+                     {"SYSCS_INPLACE_COMPRESS_TABLE"},
+                     {"SYSCS_MODIFY_PASSWORD"},
++                    {"SYSCS_PEEK_AT_SEQUENCE"},
+                     {"SYSCS_SET_RUNTIMESTATISTICS"},
+                     {"SYSCS_SET_STATISTICS_TIMING"},
+                     {"SYSCS_UPDATE_STATISTICS"}}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+index 4b023a5a..cf625e8e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+@@ -764,4 +764,52 @@ public boolean matches(char c) {
+             return c == this.c;
+         }
+     }
++    
++    
++    /**
++     * Test the changes introduced to fix correctness problems with sequences.
++     */
++    public  void    test_5493()  throws Exception
++    {
++        Connection  conn = getConnection();
++        Statement s = createStatement();
++
++        switch ( getPhase() )
++        {
++        case PH_CREATE: // create with old version
++            assertNull( getNewFunctionID( s ) );
++            break;
++            
++        case PH_SOFT_UPGRADE: // boot with new version and soft-upgrade
++            assertNull( getNewFunctionID( s ) );
++            break;
++            
++        case PH_POST_SOFT_UPGRADE: // soft-downgrade: boot with old version after soft-upgrade
++            assertNull( getNewFunctionID( s ) );
++            break;
++
++        case PH_HARD_UPGRADE: // boot with new version and hard-upgrade
++            assertNotNull( getNewFunctionID( s ) );
++            break;
++        }
++        
++        s.close();
++    }
++    private String    getNewFunctionID( Statement s )
++        throws Exception
++    {
++        ResultSet   rs = null;
++
++        try {
++            rs = s.executeQuery
++            ( "select aliasid from sys.sysaliases where alias = 'SYSCS_PEEK_AT_SEQUENCE'" );
++            if ( !rs.next() ) { return null; }
++            else { return rs.getString( 1 ); }
++        }
++        finally
++        {
++            if ( rs != null ) { rs.close(); }
++        }
++    }
++
+ }

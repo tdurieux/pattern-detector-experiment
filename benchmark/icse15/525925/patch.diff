@@ -1,0 +1,161 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
+index e9cce5f2..f80be3c7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
+@@ -338,18 +338,19 @@ public int getScanArgs(
+ 							)
+ 						throws StandardException
+ 	{
+-		/* If we're doing a Hash join then we shouldn't have any IN-list
+-		 * probe predicates in the store restriction list.  The reason
+-		 * is that those predicates are one-sided and thus if they
+-		 * make it this far they will be pushed down to the base table
+-		 * as restrictions on the rows read from disk.  That would be
+-		 * wrong because a probe predicate is of the form "col = <val>"
+-		 * where <val> is the first value in the IN-list.  But that's
+-		 * not correct--we need to return all rows having any value that
+-		 * appears in the IN-list (not just those rows matching the
+-		 * first value).  Checks elsewhere in the code should ensure
+-		 * that no probe predicates have made it this far, but if we're
+-		 * running in SANE mode it doesn't hurt to verify.
++		/* We do not currently support IN-list "multi-probing" for hash scans
++		 * (though we could do so in the future).  So if we're doing a hash
++		 * join then we shouldn't have any IN-list probe predicates in the
++		 * store restriction list at this point.  The reason is that, in the
++		 * absence of proper multi-probing logic, such predicates would act
++		 * as restrictions on the rows read from disk.  That would be wrong
++		 * because a probe predicate is of the form "col = <val>" where <val>
++		 * is the first value in the IN-list.  Enforcement of that restriction
++		 * would lead to incorrect results--we need to return all rows having
++		 * any value that appears in the IN-list, not just those rows matching
++		 * the first value.  Checks elsewhere in the code should ensure that
++		 * no probe predicates have made it this far, but if we're running in
++		 * SANE mode it doesn't hurt to verify.
+ 		 */
+ 		if (SanityManager.DEBUG)
+ 		{
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
+index 892bb658..b003a170 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
+@@ -596,6 +596,35 @@ private void orderUsefulPredicates(Optimizable optTable,
+ 		baseColumnPositions = cd.getIndexDescriptor().baseColumnPositions();
+ 		isAscending = cd.getIndexDescriptor().isAscending();
+ 
++		/* If we have a "useful" IN list probe predicate we will generate a
++		 * start/stop key for optTable of the form "col = <val>", where <val>
++		 * is the first value in the IN-list.  Then during normal index multi-
++		 * probing (esp. as implemented by exec/MultiProbeTableScanResultSet)
++		 * we will use that start/stop key as a "placeholder" into which we'll
++		 * plug the values from the IN-list one at a time.
++		 *
++		 * That said, if we're planning to do a hash join with optTable then
++		 * we won't generate a MultiProbeTableScanResult; instead we'll
++		 * generate a HashScanResultSet, which does not (yet) account for
++		 * IN-list multi-probing.  That means the start/stop key "col = <val>"
++		 * would be treated as a regular restriction, which could lead to
++		 * incorrect results.  So if we're dealing with a hash join, we do
++		 * not consider IN-list probe predicates to be "useful". DERBY-2500.
++		 *
++		 * Note that it should be possible to enhance HashScanResultSet to
++		 * correctly perform index multi-probing at some point, and there
++		 * would indeed be benefits to doing so (namely, we would scan fewer
++		 * rows from disk and build a smaller hash table). But until that
++		 * happens we have to make sure we do not consider probe predicates
++		 * to be "useful" for hash joins.
++		 *
++		 * Only need to do this check if "pushPreds" is true, i.e. if we're
++		 * modifying access paths and thus we know for sure that we are going
++		 * to generate a hash join.
++		 */
++		boolean skipProbePreds = pushPreds &&
++			optTable.getTrulyTheBestAccessPath().getJoinStrategy().isHashJoin();
++
+ 		/*
+ 		** Create an array of useful predicates.  Also, count how many
+ 		** useful predicates there are.
+@@ -629,6 +658,14 @@ private void orderUsefulPredicates(Optimizable optTable,
+ 				continue;
+ 			}
+ 
++			/* Skip it if we're doing a hash join and it's a probe predicate.
++			 * Then, since the probe predicate is deemed not useful, it will
++			 * be implicitly "reverted" to its underlying IN-list as part of
++			 * code generation.
++			 */
++			if (skipProbePreds && pred.isInListProbePredicate())
++				continue;
++
+ 			/* Look for an index column on one side of the relop */
+ 			for (indexPosition = 0;
+ 				indexPosition < baseColumnPositions.length;
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DistinctTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DistinctTest.java
+index b7d066b6..25929f53 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DistinctTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DistinctTest.java
+@@ -469,10 +469,12 @@ public void testDistinctInsertWithGeneratedColumn() throws SQLException {
+ 		s.close();
+ 	}
+ 	
+-	/*
+-	 * Following test case fails in the prepareStatement call,
+-	 * with an ASSERT related to the DERBY-47 in list changes.
+-	 *
++	/* Distinct query using ANDs and ORs, the latter of which will be
++	 * transformed into an IN list.  Assumption is that the optimizer
++	 * will choose to use an index for this query, though we don't
++	 * actually verify that (we're just checking that the query
++	 * compiles and executes without error).
++	 */
+ 	public void testResultSetInOrderWhenUsingIndex() throws SQLException{
+ 		Statement s = createStatement();
+ 		
+@@ -494,28 +496,42 @@ public void testResultSetInOrderWhenUsingIndex() throws SQLException{
+ 		s.execute("insert into netbuttonlibraryrole1 values('lusername2', 2,'user2', 'role2', default)");
+ 		
+ 		PreparedStatement p = prepareStatement("SELECT DISTINCT nb.name AS name, nb.summary AS summary FROM netbutton1 nb, netbuttonlibraryrole1 nlr, library_netbutton ln" +
+-		" WHERE nb.lname = ln.lname AND (nlr.lusername = ? OR nlr.lusername =?)");
+-
+-		p = prepareStatement("SELECT DISTINCT nb.name AS name, nb.summary AS summary FROM netbutton1 nb, netbuttonlibraryrole1 nlr, library_netbutton ln" +
+ 				" WHERE nlr.netbuttonlibrary_id = ln.netbuttonlibrary_id AND nb.lname = ln.lname AND (nlr.lusername = ? OR nlr.lusername = ?) AND nb.lname = ? ORDER BY summary");
+ 		
+ 		p.setString(1, "lusername1");
+ 		p.setString(2, "lusername2");
+-		//p.setString(3, "lname1");
++		p.setString(3, "lname1");
+ 		assertTrue(p.execute());
+ 
+-	
+ 		String [][] expected = { {"name1", "sum2" } };
+     	ResultSet rs = p.getResultSet();
+ 		JDBC.assertFullResultSet(rs, expected);
+ 		rs.close();
+ 		p.close();
+ 		
++		/* Similar to previous query but without the final equality predicate;
++		 * this query should return two rows.  Before the fix for DERBY-2500
++		 * we only returned one row, which was wrong.
++		 */
++		p = prepareStatement("SELECT DISTINCT nb.name AS name, nb.summary "
++			+ "AS summary FROM netbutton1 nb, netbuttonlibraryrole1 nlr, "
++			+ "library_netbutton ln WHERE nlr.netbuttonlibrary_id = "
++			+ "ln.netbuttonlibrary_id AND nb.lname = ln.lname AND "
++		 	+ "(nlr.lusername = ? OR nlr.lusername =?) ORDER BY summary");
++
++		p.setString(1, "lusername1");
++		p.setString(2, "lusername2");
++		assertTrue(p.execute());
++
++		expected = new String [][] { {"name1", "sum2" }, {"name2", "sum2"} };
++		rs = p.getResultSet();
++		JDBC.assertFullResultSet(rs, expected);
++		rs.close();
++
+ 		s.execute("drop table library_netbutton");
+ 		s.execute("drop table netbutton1");
+ 		s.close();
+ 	}
+-	*/
+ 	
+ 	public void testDistinctStoreSort() throws SQLException {
+ 		Statement s = createStatement();

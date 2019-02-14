@@ -1,0 +1,276 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
+index 32801ec0..94041649 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/BinaryMemtable.java
+@@ -34,7 +34,6 @@
+ 
+ import org.apache.log4j.Logger;
+ import org.cliffc.high_scale_lib.NonBlockingHashMap;
+-import java.util.*;
+ import org.apache.cassandra.dht.IPartitioner;
+ 
+ public class BinaryMemtable
+@@ -47,10 +46,11 @@
+     private String table_;
+     private String cfName_;
+     private boolean isFrozen_ = false;
+-    private Map<String, byte[]> columnFamilies_ = new NonBlockingHashMap<String, byte[]>();
++    private Map<DecoratedKey, byte[]> columnFamilies_ = new NonBlockingHashMap<DecoratedKey, byte[]>();
+     /* Lock and Condition for notifying new clients about Memtable switches */
+     Lock lock_ = new ReentrantLock();
+     Condition condition_;
++    private final IPartitioner partitioner_ = StorageService.getPartitioner();
+ 
+     BinaryMemtable(String table, String cfName) throws IOException
+     {
+@@ -123,7 +123,7 @@ void put(String key, byte[] buffer) throws IOException
+ 
+     private void resolve(String key, byte[] buffer)
+     {
+-            columnFamilies_.put(key, buffer);
++        columnFamilies_.put(partitioner_.decorateKeyObj(key), buffer);
+             currentSize_.addAndGet(buffer.length + key.length());
+     }
+ 
+@@ -144,7 +144,7 @@ void flush() throws IOException
+         String path;
+         SSTableWriter writer;
+         ColumnFamilyStore cfStore = Table.open(table_).getColumnFamilyStore(cfName_);
+-        List<String> keys = new ArrayList<String>( columnFamilies_.keySet() );
++        List<DecoratedKey> keys = new ArrayList<DecoratedKey>( columnFamilies_.keySet() );
+         /*
+             Adding a lock here so data directories are evenly used. By default currentIndex
+             is incremented, not an AtomicInteger. Let's fix this!
+@@ -160,19 +160,16 @@ void flush() throws IOException
+             lock_.unlock();
+         }
+ 
+-        final IPartitioner partitioner = StorageService.getPartitioner();
+-        final Comparator<String> dc = partitioner.getDecoratedKeyComparator();
+-        Collections.sort(keys, dc);
+-
++        Collections.sort(keys, partitioner_.getDecoratedKeyObjComparator());
+ 
+         /* Use this BloomFilter to decide if a key exists in a SSTable */
+-        for ( String key : keys )
++        for (DecoratedKey key : keys)
+         {           
+             byte[] bytes = columnFamilies_.get(key);
+-            if ( bytes.length > 0 )
++            if (bytes.length > 0)
+             {            	
+                 /* Now write the key and value to disk */
+-                writer.append(key, bytes);
++                writer.append(key.toString(), bytes);
+             }
+         }
+         cfStore.addSSTable(writer.closeAndOpenReader());
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
+index a0d81168..1cabee77 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
+@@ -18,8 +18,6 @@
+ 
+ package org.apache.cassandra.dht;
+ 
+-import java.io.UnsupportedEncodingException;
+-import java.math.BigInteger;
+ import java.text.Collator;
+ import java.util.Arrays;
+ import java.util.Comparator;
+@@ -27,6 +25,7 @@
+ import java.util.Random;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.db.DecoratedKey;
+ import org.apache.cassandra.utils.FBUtilities;
+ 
+ public class CollatingOrderPreservingPartitioner implements IPartitioner<BytesToken>
+@@ -44,6 +43,12 @@ public int compare(String o1, String o2)
+             return collator.compare(o1, o2);
+         }
+     };
++    private static final Comparator<DecoratedKey<BytesToken>> objComparator = new Comparator<DecoratedKey<BytesToken>>() {
++        public int compare(DecoratedKey<BytesToken> o1, DecoratedKey<BytesToken> o2)
++        {
++            return FBUtilities.compareByteArrays(o1.getToken().token, o2.getToken().token);
++        }
++    };    
+     private static final Comparator<String> reverseComparator = new Comparator<String>() {
+         public int compare(String o1, String o2)
+         {
+@@ -56,6 +61,11 @@ public String decorateKey(String key)
+         return key;
+     }
+ 
++    public DecoratedKey<BytesToken> decorateKeyObj(String key)
++    {
++        return new DecoratedKey<BytesToken>(getToken(key), key);
++    }
++    
+     public String undecorateKey(String decoratedKey)
+     {
+         return decoratedKey;
+@@ -66,6 +76,11 @@ public String undecorateKey(String decoratedKey)
+         return comparator;
+     }
+ 
++    public Comparator<DecoratedKey<BytesToken>> getDecoratedKeyObjComparator()
++    {
++        return objComparator;
++    }
++
+     public Comparator<String> getReverseDecoratedKeyComparator()
+     {
+         return reverseComparator;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/IPartitioner.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/IPartitioner.java
+index 94a7d5aa..431befdd 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/IPartitioner.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/IPartitioner.java
+@@ -20,6 +20,8 @@
+ 
+ import java.util.Comparator;
+ 
++import org.apache.cassandra.db.DecoratedKey;
++
+ public interface IPartitioner<T extends Token>
+ {
+     /**
+@@ -31,10 +33,23 @@
+      */
+     public String decorateKey(String key);
+ 
++    /**
++     * Transform key to object representation of the on-disk format.
++     *
++     * @param key the raw, client-facing key
++     * @return decorated version of key
++     */
++    public DecoratedKey<T> decorateKeyObj(String key);
++
+     public String undecorateKey(String decoratedKey);
+ 
+     public Comparator<String> getDecoratedKeyComparator();
+ 
++    /**
++     * @return a comparator for decorated key objects, not strings
++     */
++    public Comparator<DecoratedKey<T>> getDecoratedKeyObjComparator();
++
+     public Comparator<String> getReverseDecoratedKeyComparator();
+ 
+     /**
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
+index 3e979b65..f1dd4fe5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
+@@ -24,6 +24,7 @@
+ import java.util.Random;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.db.DecoratedKey;
+ 
+ public class OrderPreservingPartitioner implements IPartitioner<StringToken>
+ {
+@@ -38,6 +39,13 @@ public int compare(String o1, String o2)
+             return o1.compareTo(o2);
+         }
+     };
++    private static final Comparator<DecoratedKey<StringToken>> objComparator = 
++        new Comparator<DecoratedKey<StringToken>>() {
++        public int compare(DecoratedKey<StringToken> o1, DecoratedKey<StringToken> o2)
++        {
++            return o1.getKey().compareTo(o2.getKey());
++        }
++    };      
+     private static final Comparator<String> reverseComparator = new Comparator<String>() {
+         public int compare(String o1, String o2)
+         {
+@@ -50,6 +58,11 @@ public String decorateKey(String key)
+         return key;
+     }
+ 
++    public DecoratedKey<StringToken> decorateKeyObj(String key)
++    {
++        return new DecoratedKey<StringToken>(null, key);
++    }
++    
+     public String undecorateKey(String decoratedKey)
+     {
+         return decoratedKey;
+@@ -60,6 +73,11 @@ public String undecorateKey(String decoratedKey)
+         return comparator;
+     }
+ 
++    public Comparator<DecoratedKey<StringToken>> getDecoratedKeyObjComparator()
++    {
++        return objComparator;
++    }
++    
+     public Comparator<String> getReverseDecoratedKeyComparator()
+     {
+         return reverseComparator;
+@@ -234,4 +252,5 @@ public StringToken getToken(String key)
+     {
+         return new StringToken(key);
+     }
++
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/RandomPartitioner.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/RandomPartitioner.java
+index 37133c78..c43dc32f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/RandomPartitioner.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/RandomPartitioner.java
+@@ -23,6 +23,7 @@
+ import java.util.StringTokenizer;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.db.DecoratedKey;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.GuidGenerator;
+ 
+@@ -36,6 +37,21 @@
+ 
+     public static final BigIntegerToken MINIMUM = new BigIntegerToken("0");
+ 
++    private static final Comparator<DecoratedKey<BigIntegerToken>> objComparator = 
++        new Comparator<DecoratedKey<BigIntegerToken>>() {
++        public int compare(DecoratedKey<BigIntegerToken> o1, DecoratedKey<BigIntegerToken> o2)
++        {
++            // first, compare on the bigint hash "decoration".  usually this will be enough.
++            int v = o1.getToken().compareTo(o2.getToken());
++            if (v != 0) {
++                return v;
++            }
++
++            // if the hashes are equal, compare the strings
++            return o1.getKey().compareTo(o2.getKey());
++        }
++    };
++    
+     private static final Comparator<String> comparator = new Comparator<String>()
+     {
+         public int compare(String o1, String o2)
+@@ -69,6 +85,11 @@ public String decorateKey(String key)
+         return FBUtilities.hash(key).toString() + ":" + key;
+     }
+ 
++    public DecoratedKey<BigIntegerToken> decorateKeyObj(String key)
++    {
++        return new DecoratedKey<BigIntegerToken>(getToken(key), key);
++    }
++    
+     public String undecorateKey(String decoratedKey)
+     {
+         return decoratedKey.split(":", 2)[1];
+@@ -79,6 +100,11 @@ public String undecorateKey(String decoratedKey)
+         return comparator;
+     }
+ 
++    public Comparator<DecoratedKey<BigIntegerToken>> getDecoratedKeyObjComparator()
++    {
++        return objComparator;
++    }
++
+     public Comparator<String> getReverseDecoratedKeyComparator()
+     {
+         return rcomparator;

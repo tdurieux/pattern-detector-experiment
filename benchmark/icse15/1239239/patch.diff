@@ -1,0 +1,163 @@
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericActivationHolder.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericActivationHolder.java
+index a30230b6..2dd8aa67 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericActivationHolder.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericActivationHolder.java
+@@ -261,22 +261,23 @@ public ResultSet execute() throws StandardException
+ 		{
+ 			/* Has the activation class changed or has the activation been
+ 			 * invalidated? */
+-			if (gc != ps.getActivationClass() || !ac.isValid())
++            final boolean needNewClass =
++                    gc == null || gc != ps.getActivationClass();
++			if (needNewClass || !ac.isValid())
+ 			{
+ 
+                 GeneratedClass newGC;
+ 
+-				if (gc != ps.getActivationClass()) {
+-					// ensure the statement is valid by rePreparing it.
+-					// DERBY-3260: If someone else reprepares the statement at
+-					// the same time as we do, there's a window between the
+-					// calls to rePrepare() and getActivationClass() when the
+-					// activation class can be set to null, leading to
+-					// NullPointerException being thrown later. Therefore,
+-					// synchronize on ps to close the window.
+-					synchronized (ps) {
+-						ps.rePrepare(getLanguageConnectionContext());
++				if (needNewClass) {
++                    // The statement has been re-prepared since the last time
++                    // we executed it. Get the new activation class.
+ 						newGC = ps.getActivationClass();
++                    if (newGC == null) {
++                        // There is no class associated with the statement.
++                        // Tell the caller that the statement needs to be
++                        // recompiled.
++                        throw StandardException.newException(
++                                SQLState.LANG_STATEMENT_NEEDS_RECOMPILE);
+ 					}
+ 				} else {
+ 					// Reuse the generated class, we just want a new activation
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+index eb0e225a..b1ef36ed 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+@@ -147,6 +147,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	// true if the statement is being compiled.
+ 	boolean compilingStatement;
+ 
++    /** True if the statement was invalidated while it was being compiled. */
++    boolean invalidatedWhileCompiling;
+ 
+ 	////////////////////////////////////////////////
+ 	// STATE that is not copied by getClone()
+@@ -785,7 +787,16 @@ public void makeInvalid(int action, LanguageConnectionContext lcc)
+ 		synchronized (this) {
+ 
+ 			if (compilingStatement)
++            {
++                // Since the statement is in the process of being compiled,
++                // and at the end of the compilation it will set isValid to
++                // true and overwrite whatever we set it to here, set another
++                // flag to indicate that an invalidation was requested. A
++                // re-compilation will be triggered if this flag is set, but
++                // not until the current compilation is done.
++                invalidatedWhileCompiling = true;
+ 				return;
++            }
+ 
+ 			alreadyInvalid = !isValid;
+ 		
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericStatement.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+index 7beab656..b2e1a540 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericStatement.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+@@ -82,7 +82,7 @@ public PreparedStatement prepare(LanguageConnectionContext lcc) throws StandardE
+ 		** Note: don't reset state since this might be
+ 		** a recompilation of an already prepared statement.
+ 		*/ 
+-		return prepMinion(lcc, true, (Object[]) null, (SchemaDescriptor) null, false); 
++		return prepare(lcc, false);
+ 	}
+ 	public PreparedStatement prepare(LanguageConnectionContext lcc, boolean forMetaData) throws StandardException
+ 	{
+@@ -90,7 +90,79 @@ public PreparedStatement prepare(LanguageConnectionContext lcc, boolean forMetaD
+ 		** Note: don't reset state since this might be
+ 		** a recompilation of an already prepared statement.
+ 		*/ 
+-		return prepMinion(lcc, true, (Object[]) null, (SchemaDescriptor) null, forMetaData); 
++
++        final int depth = lcc.getStatementDepth();
++        String prevErrorId = null;
++        while (true) {
++            boolean recompile = false;
++            try {
++                return prepMinion(lcc, true, (Object[]) null,
++                                  (SchemaDescriptor) null, forMetaData);
++            } catch (StandardException se) {
++                // There is a chance that we didn't see the invalidation
++                // request from a DDL operation in another thread because
++                // the statement wasn't registered as a dependent until
++                // after the invalidation had been completed. Assume that's
++                // what has happened if we see a conglomerate does not exist
++                // error, and force a retry even if the statement hasn't been
++                // invalidated.
++                if (SQLState.STORE_CONGLOMERATE_DOES_NOT_EXIST.equals(
++                        se.getMessageId())) {
++                    // STORE_CONGLOMERATE_DOES_NOT_EXIST has exactly one
++                    // argument: the conglomerate id
++                    String conglomId = String.valueOf(se.getArguments()[0]);
++
++                    // Request a recompile of the statement if a conglomerate
++                    // disappears while we are compiling it. But if we have
++                    // already retried once because the same conglomerate was
++                    // missing, there's probably no hope that yet another retry
++                    // will help, so let's break out instead of potentially
++                    // looping infinitely.
++                    if (!conglomId.equals(prevErrorId)) {
++                        recompile = true;
++                    }
++
++                    prevErrorId = conglomId;
++                }
++                throw se;
++            } finally {
++                // Check if the statement was invalidated while it was
++                // compiled. If so, the newly compiled plan may not be
++                // up to date anymore, so we recompile the statement
++                // if this happens. Note that this is checked in a finally
++                // block, so we also retry if an exception was thrown. The
++                // exception was probably thrown because of the changes
++                // that invalidated the statement. If not, recompiling
++                // will also fail, and the exception will be exposed to
++                // the caller.
++                //
++                // invalidatedWhileCompiling and isValid are protected by
++                // synchronization on the prepared statement.
++                synchronized (preparedStmt) {
++                    if (recompile || preparedStmt.invalidatedWhileCompiling) {
++                        preparedStmt.isValid = false;
++                        preparedStmt.invalidatedWhileCompiling = false;
++                        recompile = true;
++                    }
++                }
++
++                if (recompile) {
++                    // A new statement context is pushed while compiling.
++                    // Typically, this context is popped by an error
++                    // handler at a higher level. But since we retry the
++                    // compilation, the error handler won't be invoked, so
++                    // the stack must be reset to its original state first.
++                    while (lcc.getStatementDepth() > depth) {
++                        lcc.popStatementContext(
++                                lcc.getStatementContext(), null);
++                    }
++
++                    // Don't return yet. The statement was invalidated, so
++                    // we must retry the compilation.
++                    continue;
++                }
++            }
++        }
+ 	}
+ 
+ 	private PreparedStatement prepMinion(LanguageConnectionContext lcc, boolean cacheMe, Object[] paramDefaults,

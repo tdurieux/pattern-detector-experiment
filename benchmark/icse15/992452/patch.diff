@@ -1,0 +1,235 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
+index 0ce94230..b0f3ffdd 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/Migration.java
+@@ -66,7 +66,7 @@
+  */
+ public abstract class Migration
+ {
+-    private static final Logger logger = LoggerFactory.getLogger(Migration.class);
++    protected static final Logger logger = LoggerFactory.getLogger(Migration.class);
+     
+     public static final String NAME_VALIDATOR_REGEX = "\\w+";
+     public static final String MIGRATIONS_CF = "Migrations";
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/UpdateKeyspace.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/UpdateKeyspace.java
+index e69de29b..6b41088b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/UpdateKeyspace.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/UpdateKeyspace.java
+@@ -0,0 +1,78 @@
++package org.apache.cassandra.db.migration;
++
++import org.apache.cassandra.config.CFMetaData;
++import org.apache.cassandra.config.ConfigurationException;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.config.KSMetaData;
++import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.utils.UUIDGen;
++
++import java.io.IOException;
++
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ * http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++
++public class UpdateKeyspace extends Migration
++{
++    private KSMetaData newKsm;
++    private KSMetaData oldKsm;
++    
++    /** Required no-arg constructor */
++    protected UpdateKeyspace() { }
++    
++    /** create migration based on thrift parameters */
++    public UpdateKeyspace(KSMetaData ksm) throws ConfigurationException, IOException
++    {
++        super(UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress()), DatabaseDescriptor.getDefsVersion());
++        
++        assert ksm != null;
++        assert ksm.cfMetaData() != null;
++        if (ksm.cfMetaData().size() > 0)
++            throw new ConfigurationException("Updated keyspace must not contain any column families");
++    
++        // create the new ksm by merging the one passed in with the cf defs from the exisitng ksm.
++        oldKsm = DatabaseDescriptor.getKSMetaData(ksm.name);
++        if (oldKsm == null)
++            throw new ConfigurationException(ksm.name + " cannot be updated because it doesn't exist.");
++        this.newKsm = new KSMetaData(ksm.name, ksm.strategyClass, ksm.strategyOptions, ksm.replicationFactor, oldKsm.cfMetaData().values().toArray(new CFMetaData[]{}));
++        rm = makeDefinitionMutation(newKsm, oldKsm, newVersion);
++    }
++    
++    void applyModels() throws IOException
++    {
++        DatabaseDescriptor.clearTableDefinition(oldKsm, newVersion);
++        DatabaseDescriptor.setTableDefinition(newKsm, newVersion);
++        logger.info("Keyspace updated. Please perform any manual operations.");
++    }
++
++    public void subdeflate(org.apache.cassandra.db.migration.avro.Migration mi)
++    {
++        org.apache.cassandra.db.migration.avro.UpdateKeyspace uks = new org.apache.cassandra.db.migration.avro.UpdateKeyspace();
++        uks.newKs = newKsm.deflate();
++        uks.oldKs = oldKsm.deflate();
++        mi.migration = uks;
++    }
++
++    public void subinflate(org.apache.cassandra.db.migration.avro.Migration mi)
++    {
++        org.apache.cassandra.db.migration.avro.UpdateKeyspace uks = (org.apache.cassandra.db.migration.avro.UpdateKeyspace)mi.migration;
++        newKsm = KSMetaData.inflate(uks.newKs);
++        oldKsm = KSMetaData.inflate(uks.oldKs);
++    }
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+index 9472047d..fb32e809 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+@@ -26,6 +26,8 @@
+ import java.util.concurrent.TimeoutException;
+ 
+ import org.apache.cassandra.db.migration.Migration;
++import org.apache.cassandra.db.migration.UpdateKeyspace;
++import org.apache.cassandra.utils.FBUtilities;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -476,7 +478,7 @@ public KsDef describe_keyspace(String table) throws NotFoundException
+             def.setColumn_metadata(cdef_list);
+             cfDefs.add(def);
+         }
+-        return new KsDef(ksm.name, ksm.strategyClass.toString(), ksm.replicationFactor, cfDefs);
++        return new KsDef(ksm.name, ksm.strategyClass.getName(), ksm.replicationFactor, cfDefs);
+     }
+ 
+     public List<KeySlice> get_range_slices(ColumnParent column_parent, SlicePredicate predicate, KeyRange range, ConsistencyLevel consistency_level)
+@@ -864,16 +866,47 @@ public String system_rename_keyspace(String old_name, String new_name) throws In
+         }
+     }
+ 
+-
++    /** update an existing keyspace, but do not allow column family modifications. */
+     public String system_update_keyspace(KsDef ks_def) throws InvalidRequestException, TException
+     {
+-        throw new InvalidRequestException("Not implemented");
+-    }
++        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+ 
++        if (ks_def.getCf_defs() != null && ks_def.getCf_defs().size() > 0)
++            throw new InvalidRequestException("Keyspace update must not contain any column family definitions.");
++        
++        if (StorageService.instance.getLiveNodes().size() < ks_def.replication_factor)
++            throw new InvalidRequestException("Not enough live nodes to support this keyspace");
++        if (DatabaseDescriptor.getTableDefinition(ks_def.name) == null)
++            throw new InvalidRequestException("Keyspace does not exist.");
++        
++        try
++        {
++            KSMetaData ksm = new KSMetaData(
++                    ks_def.name, 
++                    (Class<? extends AbstractReplicationStrategy>)FBUtilities.<AbstractReplicationStrategy>classForName(ks_def.strategy_class, "keyspace replication strategy"),
++                    ks_def.strategy_options,
++                    ks_def.replication_factor);
++            applyMigrationOnStage(new UpdateKeyspace(ksm));
++            return DatabaseDescriptor.getDefsVersion().toString();
++        }
++        catch (ConfigurationException e)
++        {
++            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
++            ex.initCause(e);
++            throw ex;
++        }
++        catch (IOException e)
++        {
++            InvalidRequestException ex = new InvalidRequestException(e.getMessage());
++            ex.initCause(e);
++            throw ex;
++        }
++    }
+     
+     public String system_update_column_family(CfDef cf_def) throws InvalidRequestException, TException
+     {
+-        throw new InvalidRequestException("Not implemented");
++        checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
++        return null;
+     }
+ 
+     private CFMetaData convertToCFMetaData(CfDef cf_def) throws InvalidRequestException, ConfigurationException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+index 169ee05b..ea850f7c 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -23,7 +23,7 @@
+ import java.util.*;
+ import java.util.concurrent.ExecutionException;
+ 
+-import org.apache.commons.lang.StringUtils;
++import org.apache.cassandra.locator.OldNetworkTopologyStrategy;
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.CleanupHelper;
+@@ -459,4 +459,51 @@ public void createEmptyKsAddNewCf() throws ConfigurationException, IOException,
+         IColumn col = cfam.getColumn("col0".getBytes());
+         assert Arrays.equals("value0".getBytes(), col.value());
+     }
++    
++    @Test
++    public void testUpdateKeyspace() throws ConfigurationException, IOException, ExecutionException, InterruptedException
++    {
++        // create a keyspace to serve as existing.
++        CFMetaData cf = new CFMetaData("UpdatedKeyspace", "AddedStandard1", ColumnFamilyType.Standard, ClockType.Timestamp, UTF8Type.instance, null, TimestampReconciler.instance, "A new cf for a new ks", 0, false, 1.0, 0, 864000, BytesType.instance, Collections.<byte[], ColumnDefinition>emptyMap());
++        KSMetaData oldKs = new KSMetaData(cf.tableName, SimpleStrategy.class, null, 5, cf);
++        
++        new AddKeyspace(oldKs).apply();
++        
++        assert DatabaseDescriptor.getTableDefinition(cf.tableName) != null;
++        assert DatabaseDescriptor.getTableDefinition(cf.tableName) == oldKs;
++        
++        // anything with cf defs should fail.
++        CFMetaData cf2 = new CFMetaData(cf.tableName, "AddedStandard2", ColumnFamilyType.Standard, ClockType.Timestamp, UTF8Type.instance, null, TimestampReconciler.instance, "A new cf for a new ks", 0, false, 1.0, 0, 864000, BytesType.instance, Collections.<byte[], ColumnDefinition>emptyMap());
++        KSMetaData newBadKs = new KSMetaData(cf.tableName, SimpleStrategy.class, null, 4, cf2);
++        try
++        {
++            new UpdateKeyspace(newBadKs).apply();
++            throw new AssertionError("Should not have been able to update a KS with a KS that described column families.");
++        }
++        catch (ConfigurationException ex)
++        {
++            // expected.
++        }
++        
++        // names should match.
++        KSMetaData newBadKs2 = new KSMetaData(cf.tableName + "trash", SimpleStrategy.class, null, 4);
++        try
++        {
++            new UpdateKeyspace(newBadKs2).apply();
++            throw new AssertionError("Should not have been able to update a KS with an invalid KS name.");
++        }
++        catch (ConfigurationException ex)
++        {
++            // expected.
++        }
++        
++        KSMetaData newKs = new KSMetaData(cf.tableName, OldNetworkTopologyStrategy.class, null, 1);
++        new UpdateKeyspace(newKs).apply();
++        
++        KSMetaData newFetchedKs = DatabaseDescriptor.getKSMetaData(newKs.name);
++        assert newFetchedKs.replicationFactor == newKs.replicationFactor;
++        assert newFetchedKs.replicationFactor != oldKs.replicationFactor;
++        assert newFetchedKs.strategyClass.equals(newKs.strategyClass);
++        assert !newFetchedKs.strategyClass.equals(oldKs.strategyClass);
++    }
+ }

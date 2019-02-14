@@ -1,0 +1,591 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
+index 0532b86f..865178ae 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/AbstractReplicationStrategy.java
+@@ -24,6 +24,7 @@
+ import java.util.*;
+ 
+ import com.google.common.collect.HashMultimap;
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Multimap;
+ import org.apache.cassandra.gms.Gossiper;
+ import org.slf4j.Logger;
+@@ -119,20 +120,21 @@ assert getReplicationFactor() <= endpoints.size() : String.format("endpoints %s
+      */
+     public abstract List<InetAddress> calculateNaturalEndpoints(Token searchToken, TokenMetadata tokenMetadata) throws IllegalStateException;
+ 
+-    public IWriteResponseHandler getWriteResponseHandler(Collection<InetAddress> writeEndpoints,
++    public IWriteResponseHandler getWriteResponseHandler(Iterable<InetAddress> writeEndpoints,
+                                                          Multimap<InetAddress, InetAddress> hintedEndpoints,
++                                                         Iterable<InetAddress> pendingEndpoints,
+                                                          ConsistencyLevel consistency_level)
+     {
+         if (consistency_level == ConsistencyLevel.LOCAL_QUORUM)
+         {
+             // block for in this context will be localnodes block.
+-            return DatacenterWriteResponseHandler.create(writeEndpoints, hintedEndpoints, consistency_level, table);
++            return DatacenterWriteResponseHandler.create(writeEndpoints, hintedEndpoints, pendingEndpoints, consistency_level, table);
+         }
+         else if (consistency_level == ConsistencyLevel.EACH_QUORUM)
+         {
+-            return DatacenterSyncWriteResponseHandler.create(writeEndpoints, hintedEndpoints, consistency_level, table);
++            return DatacenterSyncWriteResponseHandler.create(writeEndpoints, hintedEndpoints, pendingEndpoints, consistency_level, table);
+         }
+-        return WriteResponseHandler.create(writeEndpoints, hintedEndpoints, consistency_level, table);
++        return WriteResponseHandler.create(writeEndpoints, hintedEndpoints, pendingEndpoints, consistency_level, table);
+     }
+ 
+     /**
+@@ -148,9 +150,10 @@ else if (consistency_level == ConsistencyLevel.EACH_QUORUM)
+      * as the destination, it is a "hinted" write, and will need to be sent to
+      * the ultimate target when it becomes alive again.
+      */
+-    public Multimap<InetAddress, InetAddress> getHintedEndpoints(Collection<InetAddress> targets)
++    public Multimap<InetAddress, InetAddress> getHintedEndpoints(Iterable<InetAddress> targets)
+     {
+-        Multimap<InetAddress, InetAddress> map = HashMultimap.create(targets.size(), 1);
++        int targetSize = Iterables.size(targets);
++        Multimap<InetAddress, InetAddress> map = HashMultimap.create(targetSize, 1);
+ 
+         // first, add the live endpoints
+         for (InetAddress ep : targets)
+@@ -160,7 +163,7 @@ else if (consistency_level == ConsistencyLevel.EACH_QUORUM)
+         }
+ 
+         // if everything was alive or we're not doing HH on this keyspace, stop with just the live nodes
+-        if (map.size() == targets.size() || !StorageProxy.isHintedHandoffEnabled())
++        if (map.size() == targetSize || !StorageProxy.isHintedHandoffEnabled())
+             return map;
+ 
+         // assign dead endpoints to be hinted to the closest live one, or to the local node
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/TokenMetadata.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/TokenMetadata.java
+index 82fcacf1..6d564859 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/TokenMetadata.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/locator/TokenMetadata.java
+@@ -674,24 +674,25 @@ public void unregister(AbstractReplicationStrategy subscriber)
+      * If possible, will return the same collection it was passed, for efficiency.
+      *
+      * Only ReplicationStrategy should care about this method (higher level users should only ask for Hinted).
++     * 
++     * @return a pair with the collection of write endpoints as well as the collection of pending endpoints (a subset
++     * of the write endpoints). The later is needed to correctly compute the number of endpoint to block for in face of
++     * bootstrap/leaving node
+      */
+-    public Collection<InetAddress> getWriteEndpoints(Token token, String table, Collection<InetAddress> naturalEndpoints)
++    public Pair<? extends Iterable<InetAddress>, ? extends Iterable<InetAddress>> getWriteEndpoints(Token token, String table, Collection<InetAddress> naturalEndpoints)
+     {
+         Map<Range, Collection<InetAddress>> ranges = getPendingRanges(table);
+         if (ranges.isEmpty())
+-            return naturalEndpoints;
+-
+-        Set<InetAddress> endpoints = new HashSet<InetAddress>(naturalEndpoints);
++            return Pair.create(naturalEndpoints, Collections.<InetAddress>emptyList());
+ 
++        Set<InetAddress> pendings = new HashSet<InetAddress>();
+         for (Map.Entry<Range, Collection<InetAddress>> entry : ranges.entrySet())
+         {
+             if (entry.getKey().contains(token))
+-            {
+-                endpoints.addAll(entry.getValue());
+-            }
++                pendings.addAll(entry.getValue());
+         }
+ 
+-        return endpoints;
++        return Pair.create(Iterables.concat(naturalEndpoints, pendings), pendings);
+     }
+ 
+     /**
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/AbstractWriteResponseHandler.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/AbstractWriteResponseHandler.java
+index 942eed5c..81b750db 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/AbstractWriteResponseHandler.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/AbstractWriteResponseHandler.java
+@@ -41,14 +41,16 @@
+     protected final long startTime;
+     protected final Collection<InetAddress> writeEndpoints;
+     protected final Multimap<InetAddress, InetAddress> hintedEndpoints;
++    protected final Collection<InetAddress> pendingEndpoints;
+     protected final ConsistencyLevel consistencyLevel;
+ 
+-    protected AbstractWriteResponseHandler(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel)
++    protected AbstractWriteResponseHandler(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel)
+     {
+         startTime = System.currentTimeMillis();
+         this.consistencyLevel = consistencyLevel;
+         this.hintedEndpoints = hintedEndpoints;
+         this.writeEndpoints = writeEndpoints;
++        this.pendingEndpoints = pendingEndpoints;
+     }
+ 
+     public void get() throws TimeoutException
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
+index c0387463..34e638c8 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterSyncWriteResponseHandler.java
+@@ -57,10 +57,10 @@
+ 	private final NetworkTopologyStrategy strategy;
+     private HashMap<String, AtomicInteger> responses = new HashMap<String, AtomicInteger>();
+ 
+-    protected DatacenterSyncWriteResponseHandler(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    protected DatacenterSyncWriteResponseHandler(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+         // Response is been managed by the map so make it 1 for the superclass.
+-        super(writeEndpoints, hintedEndpoints, consistencyLevel);
++        super(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel);
+         assert consistencyLevel == ConsistencyLevel.EACH_QUORUM;
+ 
+         strategy = (NetworkTopologyStrategy) Table.open(table).getReplicationStrategy();
+@@ -70,11 +70,16 @@ protected DatacenterSyncWriteResponseHandler(Collection<InetAddress> writeEndpoi
+             int rf = strategy.getReplicationFactor(dc);
+             responses.put(dc, new AtomicInteger((rf / 2) + 1));
+         }
++        // see comment in DatacenterWriteResponseHandler.determineBlockFor()
++        for (InetAddress pending : pendingEndpoints)
++        {
++            responses.get(snitch.getDatacenter(pending)).incrementAndGet();
++        }
+     }
+ 
+-    public static IWriteResponseHandler create(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    public static IWriteResponseHandler create(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+-        return new DatacenterSyncWriteResponseHandler(writeEndpoints, hintedEndpoints, consistencyLevel, table);
++        return new DatacenterSyncWriteResponseHandler(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel, table);
+     }
+ 
+     public void response(Message message)
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
+index 990c59d4..a480f5ef 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/DatacenterWriteResponseHandler.java
+@@ -51,22 +51,31 @@
+         localdc = snitch.getDatacenter(FBUtilities.getLocalAddress());
+     }
+ 
+-    protected DatacenterWriteResponseHandler(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    protected DatacenterWriteResponseHandler(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+-        super(writeEndpoints, hintedEndpoints, consistencyLevel, table);
++        super(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel, table);
+         assert consistencyLevel == ConsistencyLevel.LOCAL_QUORUM;
+     }
+ 
+-    public static IWriteResponseHandler create(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    public static IWriteResponseHandler create(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+-        return new DatacenterWriteResponseHandler(writeEndpoints, hintedEndpoints, consistencyLevel, table);
++        return new DatacenterWriteResponseHandler(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel, table);
+     }
+ 
+     @Override
+     protected int determineBlockFor(String table)
+     {
+         NetworkTopologyStrategy strategy = (NetworkTopologyStrategy) Table.open(table).getReplicationStrategy();
+-        return (strategy.getReplicationFactor(localdc) / 2) + 1;
++        int blockFor = (strategy.getReplicationFactor(localdc) / 2) + 1;
++        // If there is any pending endpoints we went to increase blockFor to make sure we guarantee CL (see CASSANDRA-833). However, we're only
++        // intersted in endpoint in the local DC. Note that we use the fact that when a node boostrap (or leave), both the source and
++        // destination of a pending range will be in the same DC (this is true because strategy == NTS)
++        for (InetAddress pending : pendingEndpoints)
++        {
++            if (localdc.equals(snitch.getDatacenter(pending)))
++                blockFor++;
++        }
++        return blockFor;
+     }
+ 
+ 
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageProxy.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageProxy.java
+index 5a862e46..a0224f01 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -199,10 +199,12 @@ public static IWriteResponseHandler performWrite(IMutation mutation, Consistency
+         String table = mutation.getTable();
+         AbstractReplicationStrategy rs = Table.open(table).getReplicationStrategy();
+ 
+-        Collection<InetAddress> writeEndpoints = getWriteEndpoints(table, mutation.key());
++        Pair<? extends Iterable<InetAddress>, ? extends Iterable<InetAddress>> p = getWriteEndpoints(table, mutation.key());
++        Iterable<InetAddress> writeEndpoints = p.left;
++        Iterable<InetAddress> pendingEndpoints = p.right;
+         Multimap<InetAddress, InetAddress> hintedEndpoints = rs.getHintedEndpoints(writeEndpoints);
+ 
+-        IWriteResponseHandler responseHandler = rs.getWriteResponseHandler(writeEndpoints, hintedEndpoints, consistency_level);
++        IWriteResponseHandler responseHandler = rs.getWriteResponseHandler(writeEndpoints, hintedEndpoints, pendingEndpoints, consistency_level);
+ 
+         // exit early if we can't fulfill the CL at this time
+         responseHandler.assureSufficientLiveNodes();
+@@ -211,7 +213,7 @@ public static IWriteResponseHandler performWrite(IMutation mutation, Consistency
+         return responseHandler;
+     }
+ 
+-    private static Collection<InetAddress> getWriteEndpoints(String table, ByteBuffer key)
++    private static Pair<? extends Iterable<InetAddress>, ? extends Iterable<InetAddress>> getWriteEndpoints(String table, ByteBuffer key)
+     {
+         StorageService ss = StorageService.instance;
+         List<InetAddress> naturalEndpoints = ss.getNaturalEndpoints(table, key);
+@@ -387,9 +389,11 @@ public static IWriteResponseHandler mutateCounter(CounterMutation cm, String loc
+             // Exit now if we can't fulfill the CL here instead of forwarding to the leader replica
+             String table = cm.getTable();
+             AbstractReplicationStrategy rs = Table.open(table).getReplicationStrategy();
+-            Collection<InetAddress> writeEndpoints = getWriteEndpoints(table, cm.key());
++            Pair<? extends Iterable<InetAddress>, ? extends Iterable<InetAddress>> p = getWriteEndpoints(table, cm.key());
++            Iterable<InetAddress> writeEndpoints = p.left;
++            Iterable<InetAddress> pendingEndpoints = p.right;
+             Multimap<InetAddress, InetAddress> hintedEndpoints = rs.getHintedEndpoints(writeEndpoints);
+-            rs.getWriteResponseHandler(writeEndpoints, hintedEndpoints, cm.consistency()).assureSufficientLiveNodes();
++            rs.getWriteResponseHandler(writeEndpoints, hintedEndpoints, pendingEndpoints, cm.consistency()).assureSufficientLiveNodes();
+ 
+             // Forward the actual update to the chosen leader replica
+             IWriteResponseHandler responseHandler = WriteResponseHandler.create(endpoint);
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/WriteResponseHandler.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/WriteResponseHandler.java
+index ff6fb349..d19372ec 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/WriteResponseHandler.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/WriteResponseHandler.java
+@@ -21,6 +21,7 @@
+ import java.net.InetAddress;
+ import java.util.Arrays;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import com.google.common.collect.ImmutableMultimap;
+@@ -42,9 +43,9 @@
+ 
+     protected final AtomicInteger responses;
+ 
+-    protected WriteResponseHandler(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    protected WriteResponseHandler(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+-        super(writeEndpoints, hintedEndpoints, consistencyLevel);
++        super(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel);
+         responses = new AtomicInteger(determineBlockFor(table));
+     }
+ 
+@@ -52,13 +53,14 @@ protected WriteResponseHandler(InetAddress endpoint)
+     {
+         super(Arrays.asList(endpoint),
+               ImmutableMultimap.<InetAddress, InetAddress>builder().put(endpoint, endpoint).build(),
++              Collections.<InetAddress>emptyList(),
+               ConsistencyLevel.ALL);
+         responses = new AtomicInteger(1);
+     }
+ 
+-    public static IWriteResponseHandler create(Collection<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, ConsistencyLevel consistencyLevel, String table)
++    public static IWriteResponseHandler create(Iterable<InetAddress> writeEndpoints, Multimap<InetAddress, InetAddress> hintedEndpoints, Iterable<InetAddress> pendingEndpoints, ConsistencyLevel consistencyLevel, String table)
+     {
+-        return new WriteResponseHandler(writeEndpoints, hintedEndpoints, consistencyLevel, table);
++        return new WriteResponseHandler(writeEndpoints, hintedEndpoints, pendingEndpoints, consistencyLevel, table);
+     }
+ 
+     public static IWriteResponseHandler create(InetAddress endpoint)
+@@ -73,6 +75,11 @@ public void response(Message m)
+     }
+ 
+     protected int determineBlockFor(String table)
++    {
++        return blockForCL() + pendingEndpoints.size();
++    }
++
++    private int blockForCL()
+     {
+         switch (consistencyLevel)
+         {
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/locator/SimpleStrategyTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/locator/SimpleStrategyTest.java
+index 6a57a16d..e6d60263 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/locator/SimpleStrategyTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/locator/SimpleStrategyTest.java
+@@ -146,7 +146,7 @@ public void testGetEndpointsDuringBootstrap() throws UnknownHostException, Confi
+ 
+             for (int i = 0; i < keyTokens.length; i++)
+             {
+-                Collection<InetAddress> endpoints = tmd.getWriteEndpoints(keyTokens[i], table, strategy.getNaturalEndpoints(keyTokens[i]));
++                Collection<InetAddress> endpoints = tmd.getWriteEndpoints(keyTokens[i], table, strategy.getNaturalEndpoints(keyTokens[i])).left;
+                 assertTrue(endpoints.size() >= replicationFactor);
+ 
+                 for (int j = 0; j < replicationFactor; j++)
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/ConsistencyLevelTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/ConsistencyLevelTest.java
+index fd3c8915..cf126730 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/ConsistencyLevelTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/ConsistencyLevelTest.java
+@@ -23,6 +23,7 @@
+ 
+ import java.net.InetAddress;
+ import java.util.ArrayList;
++import java.util.Collections;
+ import java.util.List;
+ 
+ import com.google.common.collect.HashMultimap;
+@@ -95,7 +96,7 @@ public void testReadWriteConsistencyChecks() throws Exception
+                         hintedNodes.put(hosts.get(j), hosts.get(j));
+                     }
+ 
+-                    IWriteResponseHandler writeHandler = strategy.getWriteResponseHandler(hosts, hintedNodes, c);
++                    IWriteResponseHandler writeHandler = strategy.getWriteResponseHandler(hosts, hintedNodes, Collections.<InetAddress>emptyList(), c);
+ 
+                     IReadCommand command = new IReadCommand()
+                     {
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/LeaveAndBootstrapTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/LeaveAndBootstrapTest.java
+index 9a13ca70..48e3fcd0 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/LeaveAndBootstrapTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/LeaveAndBootstrapTest.java
+@@ -95,7 +95,7 @@ public void newTestWriteEndpointsDuringLeave() throws Exception
+             {
+                 int replicationFactor = strategy.getReplicationFactor();
+ 
+-                HashSet<InetAddress> actual = new HashSet<InetAddress>(tmd.getWriteEndpoints(token, table, strategy.calculateNaturalEndpoints(token, tmd)));
++                HashSet<InetAddress> actual = new HashSet<InetAddress>(tmd.getWriteEndpoints(token, table, strategy.calculateNaturalEndpoints(token, tmd)).left);
+                 HashSet<InetAddress> expected = new HashSet<InetAddress>();
+ 
+                 for (int i = 0; i < replicationFactor; i++)
+@@ -212,7 +212,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+ 
+             for (int i = 0; i < keyTokens.size(); i++)
+             {
+-                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i)));
++                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i))).left;
+                 assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).size() == endpoints.size());
+                 assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).containsAll(endpoints));
+             }
+@@ -223,7 +223,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             // tokens 5, 15 and 25 should go three nodes
+             for (int i=0; i<3; ++i)
+             {
+-                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i)));
++                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i))).left;
+                 assertTrue(endpoints.size() == 3);
+                 assertTrue(endpoints.contains(hosts.get(i+1)));
+                 assertTrue(endpoints.contains(hosts.get(i+2)));
+@@ -231,7 +231,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             }
+ 
+             // token 35 should go to nodes 4, 5, 6, 7 and boot1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3))).left;
+             assertTrue(endpoints.size() == 5);
+             assertTrue(endpoints.contains(hosts.get(4)));
+             assertTrue(endpoints.contains(hosts.get(5)));
+@@ -240,7 +240,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot1));
+ 
+             // token 45 should go to nodes 5, 6, 7, 0, boot1 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4))).left;
+             assertTrue(endpoints.size() == 6);
+             assertTrue(endpoints.contains(hosts.get(5)));
+             assertTrue(endpoints.contains(hosts.get(6)));
+@@ -250,7 +250,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 55 should go to nodes 6, 7, 8, 0, 1, boot1 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5))).left;
+             assertTrue(endpoints.size() == 7);
+             assertTrue(endpoints.contains(hosts.get(6)));
+             assertTrue(endpoints.contains(hosts.get(7)));
+@@ -261,7 +261,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 65 should go to nodes 7, 8, 9, 0, 1 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6))).left;
+             assertTrue(endpoints.size() == 6);
+             assertTrue(endpoints.contains(hosts.get(7)));
+             assertTrue(endpoints.contains(hosts.get(8)));
+@@ -271,7 +271,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 75 should to go nodes 8, 9, 0, 1, 2 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7))).left;
+             assertTrue(endpoints.size() == 6);
+             assertTrue(endpoints.contains(hosts.get(8)));
+             assertTrue(endpoints.contains(hosts.get(9)));
+@@ -281,7 +281,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 85 should go to nodes 9, 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8))).left;
+             assertTrue(endpoints.size() == 4);
+             assertTrue(endpoints.contains(hosts.get(9)));
+             assertTrue(endpoints.contains(hosts.get(0)));
+@@ -289,7 +289,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(hosts.get(2)));
+ 
+             // token 95 should go to nodes 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(0)));
+             assertTrue(endpoints.contains(hosts.get(1)));
+@@ -330,7 +330,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+ 
+             for (int i = 0; i < keyTokens.size(); i++)
+             {
+-                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i)));
++                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i))).left;
+                 assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).size() == endpoints.size());
+                 assertTrue(expectedEndpoints.get(table).get(keyTokens.get(i)).containsAll(endpoints));
+             }
+@@ -341,7 +341,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             // tokens 5, 15 and 25 should go three nodes
+             for (int i=0; i<3; ++i)
+             {
+-                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i)));
++                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i))).left;
+                 assertTrue(endpoints.size() == 3);
+                 assertTrue(endpoints.contains(hosts.get(i+1)));
+                 assertTrue(endpoints.contains(hosts.get(i+2)));
+@@ -349,21 +349,21 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             }
+ 
+             // token 35 goes to nodes 4, 5 and boot1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(4)));
+             assertTrue(endpoints.contains(hosts.get(5)));
+             assertTrue(endpoints.contains(boot1));
+ 
+             // token 45 goes to nodes 5, boot1 and node7
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(5)));
+             assertTrue(endpoints.contains(boot1));
+             assertTrue(endpoints.contains(hosts.get(7)));
+ 
+             // token 55 goes to boot1, 7, boot2, 8 and 0
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5))).left;
+             assertTrue(endpoints.size() == 5);
+             assertTrue(endpoints.contains(boot1));
+             assertTrue(endpoints.contains(hosts.get(7)));
+@@ -372,7 +372,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(hosts.get(0)));
+ 
+             // token 65 goes to nodes 7, boot2, 8, 0 and 1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6))).left;
+             assertTrue(endpoints.size() == 5);
+             assertTrue(endpoints.contains(hosts.get(7)));
+             assertTrue(endpoints.contains(boot2));
+@@ -381,7 +381,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(hosts.get(1)));
+ 
+             // token 75 goes to nodes boot2, 8, 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7))).left;
+             assertTrue(endpoints.size() == 5);
+             assertTrue(endpoints.contains(boot2));
+             assertTrue(endpoints.contains(hosts.get(8)));
+@@ -390,14 +390,14 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(hosts.get(2)));
+ 
+             // token 85 goes to nodes 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(0)));
+             assertTrue(endpoints.contains(hosts.get(1)));
+             assertTrue(endpoints.contains(hosts.get(2)));
+ 
+             // token 95 goes to nodes 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(0)));
+             assertTrue(endpoints.contains(hosts.get(1)));
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/MoveTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/MoveTest.java
+index 3f49071b..46ff9c26 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/MoveTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/service/MoveTest.java
+@@ -98,7 +98,7 @@ public void newTestWriteEndpointsDuringMove() throws Exception
+             {
+                 int replicationFactor = strategy.getReplicationFactor();
+ 
+-                HashSet<InetAddress> actual = new HashSet<InetAddress>(tmd.getWriteEndpoints(token, table, strategy.calculateNaturalEndpoints(token, tmd)));
++                HashSet<InetAddress> actual = new HashSet<InetAddress>(tmd.getWriteEndpoints(token, table, strategy.calculateNaturalEndpoints(token, tmd)).left);
+                 HashSet<InetAddress> expected = new HashSet<InetAddress>();
+ 
+                 for (int i = 0; i < replicationFactor; i++)
+@@ -368,7 +368,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+ 
+             for (Token token : keyTokens)
+             {
+-                endpoints = tmd.getWriteEndpoints(token, table, strategy.getNaturalEndpoints(token));
++                endpoints = tmd.getWriteEndpoints(token, table, strategy.getNaturalEndpoints(token)).left;
+                 assertTrue(expectedEndpoints.get(table).get(token).size() == endpoints.size());
+                 assertTrue(expectedEndpoints.get(table).get(token).containsAll(endpoints));
+             }
+@@ -380,7 +380,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             // tokens 5, 15 and 25 should go three nodes
+             for (int i = 0; i < 3; i++)
+             {
+-                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i)));
++                endpoints = tmd.getWriteEndpoints(keyTokens.get(i), table, strategy.getNaturalEndpoints(keyTokens.get(i))).left;
+                 assertTrue(endpoints.size() == 3);
+                 assertTrue(endpoints.contains(hosts.get(i+1)));
+                 assertTrue(endpoints.contains(hosts.get(i+2)));
+@@ -388,7 +388,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             }
+ 
+             // token 35 should go to nodes 4, 5, 6 and boot1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(3), table, strategy.getNaturalEndpoints(keyTokens.get(3))).left;
+             assertTrue(endpoints.size() == 4);
+             assertTrue(endpoints.contains(hosts.get(4)));
+             assertTrue(endpoints.contains(hosts.get(5)));
+@@ -396,7 +396,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot1));
+ 
+             // token 45 should go to nodes 5, 6, 7 boot1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(4), table, strategy.getNaturalEndpoints(keyTokens.get(4))).left;
+             assertTrue(endpoints.size() == 4);
+             assertTrue(endpoints.contains(hosts.get(5)));
+             assertTrue(endpoints.contains(hosts.get(6)));
+@@ -404,7 +404,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot1));
+ 
+             // token 55 should go to nodes 6, 7, 8 boot1 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(5), table, strategy.getNaturalEndpoints(keyTokens.get(5))).left;
+             assertTrue(endpoints.size() == 5);
+             assertTrue(endpoints.contains(hosts.get(6)));
+             assertTrue(endpoints.contains(hosts.get(7)));
+@@ -413,7 +413,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 65 should go to nodes 7, 8, 9 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(6), table, strategy.getNaturalEndpoints(keyTokens.get(6))).left;
+             assertTrue(endpoints.size() == 4);
+             assertTrue(endpoints.contains(hosts.get(7)));
+             assertTrue(endpoints.contains(hosts.get(8)));
+@@ -421,7 +421,7 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 75 should to go nodes 8, 9, 0 and boot2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(7), table, strategy.getNaturalEndpoints(keyTokens.get(7))).left;
+             assertTrue(endpoints.size() == 4);
+             assertTrue(endpoints.contains(hosts.get(8)));
+             assertTrue(endpoints.contains(hosts.get(9)));
+@@ -429,14 +429,14 @@ public void testSimultaneousMove() throws UnknownHostException, ConfigurationExc
+             assertTrue(endpoints.contains(boot2));
+ 
+             // token 85 should go to nodes 9, 0, 1
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(8), table, strategy.getNaturalEndpoints(keyTokens.get(8))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(9)));
+             assertTrue(endpoints.contains(hosts.get(0)));
+             assertTrue(endpoints.contains(hosts.get(1)));
+ 
+             // token 95 should go to nodes 0, 1 and 2
+-            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9)));
++            endpoints = tmd.getWriteEndpoints(keyTokens.get(9), table, strategy.getNaturalEndpoints(keyTokens.get(9))).left;
+             assertTrue(endpoints.size() == 3);
+             assertTrue(endpoints.contains(hosts.get(0)));
+             assertTrue(endpoints.contains(hosts.get(1)));

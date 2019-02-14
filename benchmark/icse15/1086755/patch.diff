@@ -1,0 +1,319 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+index 5d6fb6e1..c392a034 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -730,6 +730,7 @@ else if (subcolumnComparator != DatabaseDescriptor.getComparator(cf_def.subcompa
+         def.memtable_throughput_in_mb = cfm.memtableThroughputInMb;
+         def.memtable_operations_in_millions = cfm.memtableOperationsInMillions;
+         def.merge_shards_chance = cfm.mergeShardsChance;
++        def.key_validation_class = cfm.keyValidator.getClass().getName();
+         List<org.apache.cassandra.db.migration.avro.ColumnDef> column_meta = new ArrayList<org.apache.cassandra.db.migration.avro.ColumnDef>(cfm.column_metadata.size());
+         for (ColumnDefinition cd : cfm.column_metadata.values())
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/cql/QueryProcessor.java b/cassandra/trunk/src/java/org/apache/cassandra/cql/QueryProcessor.java
+index 3920c44d..f2309205 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/cql/QueryProcessor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/cql/QueryProcessor.java
+@@ -69,7 +69,7 @@
+ 
+ import static org.apache.cassandra.thrift.ThriftValidation.validateKey;
+ import static org.apache.cassandra.thrift.ThriftValidation.validateColumnFamily;
+-import static org.apache.cassandra.thrift.ThriftValidation.validateKeyType;
++import static org.apache.cassandra.thrift.ThriftValidation.validateColumnNames;
+ 
+ public class QueryProcessor
+ {
+@@ -86,7 +86,8 @@
+         assert select.getKeys().size() == 1;
+         
+         ByteBuffer key = select.getKeys().get(0).getByteBuffer(AsciiType.instance);
+-        validateKey(key);
++        CFMetaData metadata = validateColumnFamily(keyspace, select.getColumnFamily(), false);
++        validateKey(metadata, key);
+         
+         // ...of a list of column names
+         if (!select.isColumnRange())
+@@ -95,7 +96,7 @@
+             for (Term column : select.getColumnNames())
+                 columnNames.add(column.getByteBuffer(comparator));
+             
+-            validateColumnNames(keyspace, select.getColumnFamily(), columnNames);
++            validateColumnNames(metadata, null, columnNames);
+             commands.add(new SliceByNamesReadCommand(keyspace, key, queryPath, columnNames));
+         }
+         // ...a range (slice) of column names
+@@ -104,7 +105,7 @@
+             ByteBuffer start = select.getColumnStart().getByteBuffer(comparator);
+             ByteBuffer finish = select.getColumnFinish().getByteBuffer(comparator);
+             
+-            validateSliceRange(keyspace, select.getColumnFamily(), start, finish, select.isColumnsReversed());
++            validateSliceRange(metadata, start, finish, select.isColumnsReversed());
+             commands.add(new SliceFromReadCommand(keyspace,
+                                                   key,
+                                                   queryPath,
+@@ -140,10 +141,11 @@
+         IPartitioner<?> p = StorageService.getPartitioner();
+         AbstractBounds bounds = new Bounds(p.getToken(startKey), p.getToken(finishKey));
+         
+-        AbstractType<?> comparator = select.getComparator(keyspace);
++        CFMetaData metadata = validateColumnFamily(keyspace, select.getColumnFamily(), false);
++        AbstractType<?> comparator = metadata.getComparatorFor(null);
+         // XXX: Our use of Thrift structs internally makes me Sad. :(
+         SlicePredicate thriftSlicePredicate = slicePredicateFromSelect(select, comparator);
+-        validateSlicePredicate(keyspace, select.getColumnFamily(), thriftSlicePredicate);
++        validateSlicePredicate(metadata, thriftSlicePredicate);
+ 
+         try
+         {
+@@ -174,10 +176,11 @@
+     private static List<org.apache.cassandra.db.Row> getIndexedSlices(String keyspace, SelectStatement select)
+     throws TimedOutException, UnavailableException, InvalidRequestException
+     {
+-        AbstractType<?> comparator = select.getComparator(keyspace);
++        CFMetaData metadata = validateColumnFamily(keyspace, select.getColumnFamily(), false);
++        AbstractType<?> comparator = metadata.getComparatorFor(null);
+         // XXX: Our use of Thrift structs internally (still) makes me Sad. :~(
+         SlicePredicate thriftSlicePredicate = slicePredicateFromSelect(select, comparator);
+-        validateSlicePredicate(keyspace, select.getColumnFamily(), thriftSlicePredicate);
++        validateSlicePredicate(metadata, thriftSlicePredicate);
+         
+         List<IndexExpression> expressions = new ArrayList<IndexExpression>();
+         for (Relation columnRelation : select.getColumnRelations())
+@@ -225,7 +228,7 @@ private static void batchUpdate(ClientState clientState, List<UpdateStatement> u
+ 
+         for (UpdateStatement update : updateStatements)
+         {
+-            String cfname = update.getColumnFamily();
++            CFMetaData metadata = validateColumnFamily(keyspace, update.getColumnFamily(), false);
+             // Avoid unnecessary authorizations.
+             if (!(cfamsSeen.contains(update.getColumnFamily())))
+             {
+@@ -235,9 +238,7 @@ private static void batchUpdate(ClientState clientState, List<UpdateStatement> u
+             
+             // FIXME: keys as ascii is not a Real Solution
+             ByteBuffer key = update.getKey().getByteBuffer(AsciiType.instance);
+-            validateKey(key);
+-            validateColumnFamily(keyspace, update.getColumnFamily(), false);
+-            validateKeyType(key, keyspace, cfname);
++            validateKey(metadata, key);
+             AbstractType<?> comparator = update.getComparator(keyspace);
+             
+             RowMutation rm = new RowMutation(keyspace, key);
+@@ -246,7 +247,7 @@ private static void batchUpdate(ClientState clientState, List<UpdateStatement> u
+                 ByteBuffer colName = column.getKey().getByteBuffer(comparator);
+                 ByteBuffer colValue = column.getValue().getByteBuffer(update.getValueValidator(keyspace, colName));
+                 
+-                validateColumn(keyspace, update.getColumnFamily(), colName, colValue);
++                validateColumn(metadata, colName, colValue);
+                 rm.add(new QueryPath(update.getColumnFamily(), null, colName), colValue, System.currentTimeMillis());
+             }
+             
+@@ -366,31 +367,17 @@ public Object call() throws Exception
+         }
+     }
+ 
+-    private static void validateColumnNames(String keyspace, String columnFamily, Iterable<ByteBuffer> columns)
+-    throws InvalidRequestException
+-    {
+-        for (ByteBuffer name : columns)
+-        {
+-            if (name.remaining() > IColumn.MAX_NAME_LENGTH)
+-                throw new InvalidRequestException(String.format("column name is too long (%s > %s)",
+-                                                                name.remaining(),
+-                                                                IColumn.MAX_NAME_LENGTH));
+-            if (name.remaining() == 0)
+-                throw new InvalidRequestException("zero-length column name");
+-        }
+-    }
+-    
+-    private static void validateColumnName(String keyspace, String columnFamily, ByteBuffer column)
++    private static void validateColumnName(CFMetaData metadata, ByteBuffer column)
+     throws InvalidRequestException
+     {
+-        validateColumnNames(keyspace, columnFamily, Arrays.asList(column));
++        validateColumnNames(metadata, null, Arrays.asList(column));
+     }
+     
+-    private static void validateColumn(String keyspace, String columnFamily, ByteBuffer name, ByteBuffer value)
++    private static void validateColumn(CFMetaData metadata, ByteBuffer name, ByteBuffer value)
+     throws InvalidRequestException
+     {
+-        validateColumnName(keyspace, columnFamily, name);
+-        AbstractType<?> validator = DatabaseDescriptor.getValueValidator(keyspace, columnFamily, name);
++        validateColumnName(metadata, name);
++        AbstractType<?> validator = metadata.getValueValidator(name);
+         
+         try
+         {
+@@ -405,25 +392,25 @@ private static void validateColumn(String keyspace, String columnFamily, ByteBuf
+         }
+     }
+     
+-    private static void validateSlicePredicate(String keyspace, String columnFamily, SlicePredicate predicate)
++    private static void validateSlicePredicate(CFMetaData metadata, SlicePredicate predicate)
+     throws InvalidRequestException
+     {
+         if (predicate.slice_range != null)
+-            validateSliceRange(keyspace, columnFamily, predicate.slice_range);
++            validateSliceRange(metadata, predicate.slice_range);
+         else
+-            validateColumnNames(keyspace, columnFamily, predicate.column_names);
++            validateColumnNames(metadata, null, predicate.column_names);
+     }
+     
+-    private static void validateSliceRange(String keyspace, String columnFamily, SliceRange range)
++    private static void validateSliceRange(CFMetaData metadata, SliceRange range)
+     throws InvalidRequestException
+     {
+-        validateSliceRange(keyspace, columnFamily, range.start, range.finish, range.reversed);
++        validateSliceRange(metadata, range.start, range.finish, range.reversed);
+     }
+     
+-    private static void validateSliceRange(String keyspace, String columnFamily, ByteBuffer start, ByteBuffer finish, boolean reversed)
++    private static void validateSliceRange(CFMetaData metadata, ByteBuffer start, ByteBuffer finish, boolean reversed)
+     throws InvalidRequestException
+     {
+-        AbstractType<?> comparator = ColumnFamily.getComparatorFor(keyspace, columnFamily, null);
++        AbstractType<?> comparator = metadata.getComparatorFor(null);
+         Comparator<ByteBuffer> orderedComparator = reversed ? comparator.reverseComparator: comparator;
+         if (start.remaining() > 0 && finish.remaining() > 0 && orderedComparator.compare(start, finish) > 0)
+             throw new InvalidRequestException("range finish must come after start in traversal order");
+@@ -577,7 +564,8 @@ public static CqlResult process(String queryString, ClientState clientState)
+             case DELETE:
+                 DeleteStatement delete = (DeleteStatement)statement.statement;
+                 clientState.hasColumnFamilyAccess(delete.getColumnFamily(), Permission.WRITE);
+-                AbstractType<?> comparator = DatabaseDescriptor.getComparator(keyspace, delete.getColumnFamily());
++                CFMetaData metadata = validateColumnFamily(keyspace, delete.getColumnFamily(), false);
++                AbstractType<?> comparator = metadata.getComparatorFor(null);
+                 
+                 List<RowMutation> rowMutations = new ArrayList<RowMutation>();
+                 for (Term key : delete.getKeys())
+@@ -590,7 +578,7 @@ public static CqlResult process(String queryString, ClientState clientState)
+                         for (Term column : delete.getColumns())
+                         {
+                             ByteBuffer columnName = column.getByteBuffer(comparator);
+-                            validateColumnName(keyspace, delete.getColumnFamily(), columnName);
++                            validateColumnName(metadata, columnName);
+                             rm.delete(new QueryPath(delete.getColumnFamily(), null, columnName),
+                                       System.currentTimeMillis());
+                         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+index a7678699..80833da9 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+@@ -265,7 +265,7 @@ public ClientState state()
+         {
+             for (ByteBuffer key: keys)
+             {
+-                ThriftValidation.validateKey(key);
++                ThriftValidation.validateKey(metadata, key);
+                 commands.add(new SliceByNamesReadCommand(keyspace, key, column_parent, predicate.column_names));
+             }
+         }
+@@ -274,7 +274,7 @@ public ClientState state()
+             SliceRange range = predicate.slice_range;
+             for (ByteBuffer key: keys)
+             {
+-                ThriftValidation.validateKey(key);
++                ThriftValidation.validateKey(metadata, key);
+                 commands.add(new SliceFromReadCommand(keyspace, key, column_parent, range.start, range.finish, range.reversed, range.count));
+             }
+         }
+@@ -293,7 +293,7 @@ private ColumnOrSuperColumn internal_get(ByteBuffer key, ColumnPath column_path,
+ 
+         QueryPath path = new QueryPath(column_path.column_family, column_path.column == null ? null : column_path.super_column);
+         List<ByteBuffer> nameAsList = Arrays.asList(column_path.column == null ? column_path.super_column : column_path.column);
+-        ThriftValidation.validateKey(key);
++        ThriftValidation.validateKey(metadata, key);
+         ReadCommand command = new SliceByNamesReadCommand(keyspace, key, path, nameAsList);
+ 
+         Map<DecoratedKey, ColumnFamily> cfamilies = readColumnFamily(Arrays.asList(command), consistency_level);
+@@ -349,11 +349,10 @@ private void internal_insert(ByteBuffer key, ColumnParent column_parent, Column
+     {
+         state().hasColumnFamilyAccess(column_parent.column_family, Permission.WRITE);
+ 
+-        ThriftValidation.validateKey(key);
+         CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), column_parent.column_family, isCommutativeOp);
++        ThriftValidation.validateKey(metadata, key);
+         if (isCommutativeOp)
+             ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
+-        ThriftValidation.validateKeyType(key, state().getKeyspace(), column_parent.column_family);
+         ThriftValidation.validateColumnNames(metadata, column_parent, Arrays.asList(column.name));
+         ThriftValidation.validateColumnData(metadata, column);
+ 
+@@ -387,12 +386,12 @@ private void internal_batch_mutate(Map<ByteBuffer,Map<String,List<Mutation>>> mu
+         {
+             ByteBuffer key = mutationEntry.getKey();
+ 
+-            ThriftValidation.validateKey(key);
+             Map<String, List<Mutation>> columnFamilyToMutations = mutationEntry.getValue();
+             for (Map.Entry<String, List<Mutation>> columnFamilyMutations : columnFamilyToMutations.entrySet())
+             {
+                 String cfName = columnFamilyMutations.getKey();
+-                ThriftValidation.validateKeyType(key, state().getKeyspace(), cfName);
++                CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), cfName, isCommutativeOp);
++                ThriftValidation.validateKey(metadata, key);
+ 
+                 // Avoid unneeded authorizations
+                 if (!(cfamsSeen.contains(cfName)))
+@@ -401,7 +400,6 @@ private void internal_batch_mutate(Map<ByteBuffer,Map<String,List<Mutation>>> mu
+                     cfamsSeen.add(cfName);
+                 }
+ 
+-                CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), cfName, isCommutativeOp);
+                 if (isCommutativeOp)
+                     ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
+ 
+@@ -431,11 +429,11 @@ private void internal_remove(ByteBuffer key, ColumnPath column_path, long timest
+     {
+         state().hasColumnFamilyAccess(column_path.column_family, Permission.WRITE);
+ 
+-        ThriftValidation.validateKey(key);
+         CFMetaData metadata = ThriftValidation.validateColumnFamily(state().getKeyspace(), column_path.column_family, isCommutativeOp);
++        ThriftValidation.validateKey(metadata, key);
++        ThriftValidation.validateColumnPathOrParent(metadata, column_path);
+         if (isCommutativeOp)
+             ThriftValidation.validateCommutativeForWrite(metadata, consistency_level);
+-        ThriftValidation.validateKeyType(key, state().getKeyspace(), column_path.column_family);
+ 
+         RowMutation rm = new RowMutation(state().getKeyspace(), key);
+         rm.delete(new QueryPath(column_path), timestamp); 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+index 21ad7d59..1d041b54 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+@@ -47,30 +47,27 @@
+  */
+ public class ThriftValidation
+ {
+-    public static void validateKey(ByteBuffer key) throws InvalidRequestException
++    public static void validateKey(CFMetaData metadata, ByteBuffer key) throws InvalidRequestException
+     {
+         if (key == null || key.remaining() == 0)
+         {
+             throw new InvalidRequestException("Key may not be empty");
+         }
++
+         // check that key can be handled by FBUtilities.writeShortByteArray
+         if (key.remaining() > FBUtilities.MAX_UNSIGNED_SHORT)
+         {
+             throw new InvalidRequestException("Key length of " + key.remaining() +
+                                               " is longer than maximum of " + FBUtilities.MAX_UNSIGNED_SHORT);
+         }
+-    }
+ 
+-    public static void validateKeyType(ByteBuffer key, String ksname, String cfname) throws InvalidRequestException
+-    {
+         try
+         {
+-            AbstractType<?> keyValidator = DatabaseDescriptor.getCFMetaData(ksname, cfname).getKeyValidator();
+-            keyValidator.validate(key);
++            metadata.getKeyValidator().validate(key);
+         }
+         catch (MarshalException e)
+         {
+-            throw new InvalidRequestException(e.toString());
++            throw new InvalidRequestException(e.getMessage());
+         }
+     }
+ 

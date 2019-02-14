@@ -1,0 +1,262 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
+index eb2e40f6..af22345a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
+@@ -414,16 +414,20 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+                                         ConglomerateDescriptor[] cds,
+                                         boolean asBackgroundTask)
+             throws StandardException {
+-        final boolean identifyDisposableStats =
+-                (cds == null && skipDisposableStats);
++
++        // can only properly identify disposable stats if cds == null, 
++        // which means we are processing all indexes on the conglomerate.
++        final boolean identifyDisposableStats = (cds == null);
++
+         // Fetch descriptors if we're updating statistics for all indexes.
+         if (cds == null) {
+             cds = td.getConglomerateDescriptors();
+         }
++
+         // Extract/derive information from the table descriptor
+         long[] conglomerateNumber = new long[cds.length];
+         ExecIndexRow[] indexRow = new ExecIndexRow[cds.length];
+-        UUID[] objectUUID = new UUID[cds.length];
++
+ 
+         TransactionController tc = lcc.getTransactionExecute();
+         ConglomerateController heapCC =
+@@ -434,6 +438,14 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+                         ? TransactionController.ISOLATION_READ_UNCOMMITTED
+                         : TransactionController.ISOLATION_REPEATABLE_READ
+                 );
++
++
++        // create a list of indexes that should have statistics, by looking
++        // at all indexes on the conglomerate, and conditionally skipping
++        // unique single column indexes.  This set is the "non disposable
++        // stat list".
++        UUID[] non_disposable_objectUUID    = new UUID[cds.length];
++
+         try
+         {
+             for (int i = 0; i < cds.length; i++)
+@@ -444,7 +456,9 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+                     conglomerateNumber[i] = -1;
+                     continue;
+                 }
++
+                 IndexRowGenerator irg = cds[i].getIndexDescriptor();
++
+                 // Skip single-column unique indexes unless we're told not to,
+                 // or we are running in soft-upgrade-mode on a pre 10.9 db.
+                 if (skipDisposableStats) {
+@@ -454,9 +468,11 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+                     }
+                 }
+            
++                // at this point have found a stat for an existing
++                // index which is not a single column unique index, add it
++                // to the list of "non disposable stats"
+                 conglomerateNumber[i] = cds[i].getConglomerateNumber();
+-
+-                objectUUID[i] = cds[i].getUUID();
++                non_disposable_objectUUID[i] = cds[i].getUUID();
+ 
+                 indexRow[i] = irg.getNullIndexRow(
+                         td.getColumnDescriptorList(),
+@@ -468,23 +484,39 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+             heapCC.close();
+         }
+ 
+-        // Check for disposable statistics if we have the required information.
++        // Check for and drop disposable statistics if we have the required 
++        // information.
++        //
+         // Note that the algorithm would drop valid statistics entries if
+         // working on a subset of the table conglomerates/indexes.
++        // The above loop has populated "cds" with only existing indexes that
++        // are not single column unique.
++
+         if (identifyDisposableStats) {
++
++            // Note this loop is not controlled by the skipDisposableStats 
++            // flag.  The above loop controls if we drop single column unique
++            // index stats or not.  In all cases we are going to drop 
++            // stats with no associated index (orphaned stats).
++            
++
+             List<StatisticsDescriptor> existingStats = td.getStatistics();
+             StatisticsDescriptor[] stats = (StatisticsDescriptor[])
+                     existingStats.toArray(
+                         new StatisticsDescriptor[existingStats.size()]);
++
+             // For now we know that disposable stats only exist in two cases,
+             // and that we'll only get one match for both of them per table:
+             //  a) orphaned statistics entries (i.e. DERBY-5681)
+             //  b) single-column primary keys
++            //
++            //  This loop looks for statistic entries to delete.  It deletes
++            //  those entries that don't have a matching conglomerate in the
+             for (int si=0; si < stats.length; si++) {
+                 UUID referencedIndex = stats[si].getReferenceID();
+                 boolean isValid = false;
+                 for (int ci=0; ci < conglomerateNumber.length; ci++) {
+-                    if (referencedIndex.equals(objectUUID[ci])) {
++                    if (referencedIndex.equals(non_disposable_objectUUID[ci])) {
+                         isValid = true;
+                         break;
+                     }
+@@ -535,6 +567,7 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+ 
+             scanTimes[sci][0] = conglomerateNumber[indexNumber];
+             scanTimes[sci][1] = System.currentTimeMillis();
++
+             // Subtract one for the RowLocation added for indexes.
+             int numCols = indexRow[indexNumber].nColumns() - 1;
+             long[] cardinality = new long[numCols];
+@@ -605,7 +638,8 @@ private void updateIndexStatsMinion(LanguageConnectionContext lcc,
+             int retries = 0;
+             while (true) {
+                 try {
+-                    writeUpdatedStats(lcc, td, objectUUID[indexNumber],
++                    writeUpdatedStats(lcc, td, 
++                            non_disposable_objectUUID[indexNumber],
+                             cmp.getRowCount(), cardinality, asBackgroundTask);
+                     break;
+                 } catch (StandardException se) {
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+index e785ae27..b6461a35 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+@@ -1003,7 +1003,9 @@ public void testDisposableStatisticsExplicit()
+                 // version of Derby used to create the database. Some older
+                 // versions of Derby contained a bug and lacked optimizations,
+                 // causing the number of statistics entries to increase.
+-                dis.assertStatsCount(false);
++                // Just after creation and before any update statistics expect
++                // all stats to exist.
++                dis.assertStatsCount(false, false);
+                 break;
+             }
+             // boot with new version and soft-upgrade
+@@ -1016,19 +1018,28 @@ public void testDisposableStatisticsExplicit()
+                     ps.setString(1, tables[i]);
+                     ps.executeUpdate();
+                 }
+-                dis.assertStatsCount(false);
++
++                // After soft upgrade and update statistics expect the 
++                // orphaned index entry to be deleted, but the "unneeded
++                // disposable entries" are only deleted after hard upgrade.
++                dis.assertStatsCount(true, false);
+                 break;
+             }
+             // soft-downgrade: boot with old version after soft-upgrade
+             case PH_POST_SOFT_UPGRADE:
+             {
+-                dis.assertStatsCount(false);
++
++                // expect no change in entries on downgrade, should be same
++                // as they were in soft upgrade.
++                dis.assertStatsCount(true, false);
+                 break;
+             }
+             // boot with new version and hard-upgrade
+             case PH_HARD_UPGRADE:
+             {
+-                dis.assertStatsCount(false);
++                // expect no change in entries on upgrade before update
++                // statistics.
++                dis.assertStatsCount(true, false);
+                 PreparedStatement ps = prepareStatement(updateStatsSQL);
+                 String[] tables = dis.getTableNames();
+                 for (int i=0; i < tables.length; i++) {
+@@ -1038,7 +1049,7 @@ public void testDisposableStatisticsExplicit()
+                 // Confirm that we disposed of the statistics that were added
+                 // due to a bug or simply not needed by Derby.
+                 try {
+-                    dis.assertStatsCount(true);
++                    dis.assertStatsCount(true, true);
+                 } finally {
+                     for (int i=0; i < tables.length; i++) {
+                         dropTable(tables[i]);
+@@ -1049,5 +1060,4 @@ public void testDisposableStatisticsExplicit()
+             }
+         }
+     }
+-
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/helpers/DisposableIndexStatistics.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/helpers/DisposableIndexStatistics.java
+index 3b11c2cb..de06934f 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/helpers/DisposableIndexStatistics.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/helpers/DisposableIndexStatistics.java
+@@ -153,7 +153,8 @@ public void createAndPopulateTables()
+ 
+         // Several valid states here, use a relaxed range check.
+         int max = getNumTotalPossibleStats();
+-        int min = max - getNumDisposableStats();
++        int min = max - (getNumNotNeededDisposableStats() + 
++                         getNumOrphanedDisposableStats());
+         int cur = getAllRelevantStats(null);
+         Assert.assertTrue("cur=" + cur + ", min=" + min, cur >= min);
+         Assert.assertTrue("cur=" + cur + ", max=" + max, cur <= max);
+@@ -207,21 +208,35 @@ private void insertData(Connection con)
+     /**
+      * Asserts the number of statistics entries for all relevant tables.
+      *
+-     * @param disposedOf tells if the disposable statistics entries are
+-     *      expected to have been removed at this point
++     * @param orphaned_disposedOf tells if the orphaned disposable statistics 
++     *      entries are expected to have been removed at this point
++     * @param notneeded_disposedOf tells if the unneeded statistics (like 
++     *      single column unique key indexes) are expected to have been 
++     *      removed at this point
+      */
+-    public void assertStatsCount(boolean disposedOf)
++    public void assertStatsCount(
++    boolean orphaned_disposedOf,
++    boolean notneeded_disposedOf)
+             throws SQLException {
++
+         int expected = getNumTotalPossibleStats();
+-        // Adjust expected count if the disposable stats should be gone.
+-        if (disposedOf) {
+-            expected -= getNumDisposableStats();
+-        } else if (!hasDerby5681Bug(oldVersion)) {
++
++        if (!hasDerby5681Bug(oldVersion)) {
+             // Here we correct for the orphaned statistics entry, but not for
+             // entries that are considered extraneous by newer releases (for
+             // instance statistics for single column unique indexes).
+-            expected--;
++            expected -= getNumOrphanedDisposableStats();
++
++        } else if (orphaned_disposedOf) {
++            // if the bug exists and we got rid of the orphaned stat.
++            expected -= getNumOrphanedDisposableStats();
++        }
++
++        // Adjust expected count if the disposable stats should be gone.
++        if (notneeded_disposedOf) {
++            expected -= getNumNotNeededDisposableStats();
+         }
++
+         // used for reporting only
+         ArrayList<IndexStatsUtil.IdxStats> entries =
+                 new ArrayList<IndexStatsUtil.IdxStats>();
+@@ -279,8 +294,12 @@ public static int getNumTotalPossibleStats() {
+     }
+ 
+     /** Number of disposable statistics entries. */
+-    public static int getNumDisposableStats() {
+-        return 3;
++    public static int getNumNotNeededDisposableStats() {
++        return 2;
++    }
++
++    public static int getNumOrphanedDisposableStats() {
++        return 1;
+     }
+ 
+     /**

@@ -1,0 +1,244 @@
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/RowMutation.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/RowMutation.java
+index ce1193fb..b7b79ba5 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/RowMutation.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/RowMutation.java
+@@ -263,10 +263,10 @@ public void applyUnsafe() throws IOException
+ 
+     public Message getMessage(Integer version) throws IOException
+     {
+-        return makeRowMutationMessage(StorageService.Verb.MUTATION, version);
++        return getMessage(StorageService.Verb.MUTATION, version);
+     }
+ 
+-    public Message makeRowMutationMessage(StorageService.Verb verb, int version) throws IOException
++    public Message getMessage(StorageService.Verb verb, int version) throws IOException
+     {
+         return new Message(FBUtilities.getBroadcastAddress(), verb, getSerializedBuffer(version), version);
+     }
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/net/MessagingService.java
+index b97e0cc9..ad323f9d 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -27,7 +27,6 @@
+ import java.nio.channels.ServerSocketChannel;
+ import java.util.*;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Future;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -36,7 +35,6 @@
+ 
+ import com.google.common.base.Function;
+ import com.google.common.collect.Lists;
+-
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -170,9 +168,16 @@ public Object apply(Pair<String, CallbackInfo> pair)
+ 
+                 if (expiredCallbackInfo.shouldHint())
+                 {
+-                    // Trigger hints for expired mutation message.
+                     assert expiredCallbackInfo.message != null;
+-                    scheduleMutationHint(expiredCallbackInfo.message, expiredCallbackInfo.target);
++                    try
++                    {
++                        RowMutation rm = RowMutation.fromBytes(expiredCallbackInfo.message.getMessageBody(), expiredCallbackInfo.message.getVersion());
++                        return StorageProxy.scheduleLocalHint(rm, expiredCallbackInfo.target, null, null);
++                    }
++                    catch (IOException e)
++                    {
++                        logger_.error("Unable to deserialize mutation when writting hint for: " + expiredCallbackInfo.target);
++                    }
+                 }
+ 
+                 return null;
+@@ -192,21 +197,6 @@ public Object apply(Pair<String, CallbackInfo> pair)
+         }
+     }
+ 
+-
+-    private Future<?> scheduleMutationHint(Message mutationMessage, InetAddress mutationTarget)
+-    {
+-        try
+-        {
+-            RowMutation rm = RowMutation.fromBytes(mutationMessage.getMessageBody(), mutationMessage.getVersion());
+-            return StorageProxy.scheduleLocalHint(rm, mutationTarget, null, null);
+-        }
+-        catch (IOException e)
+-        {
+-            logger_.error("Unable to deserialize mutation when writting hint for: " + mutationTarget);
+-        }
+-        return null;
+-    }
+-
+     /**
+      * Track latency information for the dynamic snitch
+      * @param cb the callback associated with this message -- this lets us know if it's a message type we're interested in
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/RowRepairResolver.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/RowRepairResolver.java
+index e1d9df00..728d703f 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/RowRepairResolver.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/RowRepairResolver.java
+@@ -124,7 +124,10 @@ public Row resolve() throws DigestMismatchException, IOException
+             Message repairMessage;
+             try
+             {
+-                repairMessage = rowMutation.getMessage(Gossiper.instance.getVersion(endpoints.get(i)));
++                // use a separate verb here because we don't want these to be get the white glove hint-
++                // on-timeout behavior that a "real" mutation gets
++                repairMessage = rowMutation.getMessage(StorageService.Verb.READ_REPAIR,
++                                                       Gossiper.instance.getVersion(endpoints.get(i)));
+             }
+             catch (IOException e)
+             {
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/StorageProxy.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/StorageProxy.java
+index ce22cbfe..9eeec94f 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -30,12 +30,11 @@
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ 
++import com.google.common.base.Function;
+ import com.google.common.collect.HashMultimap;
+ import com.google.common.collect.Iterables;
++import com.google.common.collect.MapMaker;
+ import com.google.common.collect.Multimap;
+-
+-import org.apache.cassandra.config.Schema;
+-import org.apache.cassandra.net.*;
+ import org.apache.commons.lang.ArrayUtils;
+ import org.apache.commons.lang.StringUtils;
+ import org.slf4j.Logger;
+@@ -45,6 +44,7 @@
+ import org.apache.cassandra.concurrent.Stage;
+ import org.apache.cassandra.concurrent.StageManager;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.config.Schema;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.filter.QueryFilter;
+ import org.apache.cassandra.dht.AbstractBounds;
+@@ -59,10 +59,7 @@
+ import org.apache.cassandra.locator.TokenMetadata;
+ import org.apache.cassandra.net.*;
+ import org.apache.cassandra.thrift.*;
+-import org.apache.cassandra.utils.ByteBufferUtil;
+-import org.apache.cassandra.utils.FBUtilities;
+-import org.apache.cassandra.utils.LatencyTracker;
+-import org.apache.cassandra.utils.Pair;
++import org.apache.cassandra.utils.*;
+ 
+ 
+ public class StorageProxy implements StorageProxyMBean
+@@ -86,7 +83,14 @@
+     private static volatile boolean hintedHandoffEnabled = DatabaseDescriptor.hintedHandoffEnabled();
+     private static volatile int maxHintWindow = DatabaseDescriptor.getMaxHintWindow();
+     private static volatile int maxHintsInProgress = 1024 * Runtime.getRuntime().availableProcessors();
+-    private static final AtomicInteger hintsInProgress = new AtomicInteger();
++    private static final AtomicInteger totalHintsInProgress = new AtomicInteger();
++    private static final Map<InetAddress, AtomicInteger> hintsInProgress = new MapMaker().concurrencyLevel(1).makeComputingMap(new Function<InetAddress, AtomicInteger>()
++    {
++        public AtomicInteger apply(InetAddress inetAddress)
++        {
++            return new AtomicInteger(0);
++        }
++    });
+     private static final AtomicLong totalHints = new AtomicLong();
+ 
+     private StorageProxy() {}
+@@ -286,10 +290,19 @@ public static void sendToHintedEndpoints(final RowMutation rm,
+ 
+         for (InetAddress destination : targets)
+         {
+-            if (FailureDetector.instance.isAlive(destination))
++            // avoid OOMing due to excess hints.  we need to do this check even for "live" nodes, since we can
++            // still generate hints for those if it's overloaded or simply dead but not yet known-to-be-dead.
++            // The idea is that if we have over maxHintsInProgress hints in flight, this is probably due to
++            // a small number of nodes causing problems, so we should avoid shutting down writes completely to
++            // healthy nodes.  Any node with no hintsInProgress is considered healthy.
++            if (totalHintsInProgress.get() > maxHintsInProgress
++                && (hintsInProgress.get(destination).get() > 0 && shouldHint(destination)))
+             {
+-                String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(destination);
++                throw new TimeoutException();
++            }
+ 
++            if (FailureDetector.instance.isAlive(destination))
++            {
+                 if (destination.equals(FBUtilities.getBroadcastAddress()) && OPTIMIZE_LOCAL_REQUESTS)
+                 {
+                     insertLocal(rm, responseHandler);
+@@ -300,6 +313,7 @@ public static void sendToHintedEndpoints(final RowMutation rm,
+                     if (logger.isDebugEnabled())
+                         logger.debug("insert writing key " + ByteBufferUtil.bytesToHex(rm.key()) + " to " + destination);
+ 
++                    String dc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(destination);
+                     Multimap<Message, InetAddress> messages = dcMessages.get(dc);
+                     if (messages == null)
+                     {
+@@ -315,11 +329,6 @@ public static void sendToHintedEndpoints(final RowMutation rm,
+                 if (!shouldHint(destination))
+                     continue;
+ 
+-                // Avoid OOMing from hints waiting to be written.  (Unlike ordinary mutations, hint
+-                // not eligible to drop if we fall behind.)
+-                if (hintsInProgress.get() > maxHintsInProgress)
+-                    throw new TimeoutException();
+-
+                 // Schedule a local hint and let the handler know it needs to wait for the hint to complete too
+                 Future<Void> hintfuture = scheduleLocalHint(rm, destination, responseHandler, consistency_level);
+                 responseHandler.addFutureForHint(new CreationTimeAwareFuture<Void>(hintfuture));
+@@ -337,12 +346,13 @@ public static void sendToHintedEndpoints(final RowMutation rm,
+     {
+         // Hint of itself doesn't make sense.
+         assert !target.equals(FBUtilities.getBroadcastAddress()) : target;
+-        hintsInProgress.incrementAndGet();
++        totalHintsInProgress.incrementAndGet();
++        final AtomicInteger targetHints = hintsInProgress.get(target);
++        targetHints.incrementAndGet();
+ 
+-        Runnable runnable = new Runnable()
++        Runnable runnable = new WrappedRunnable()
+         {
+-
+-            public void run()
++            public void runMayThrow() throws IOException
+             {
+                 if (logger.isDebugEnabled())
+                     logger.debug("Adding hint for " + target);
+@@ -360,14 +370,10 @@ public void run()
+                     if (responseHandler != null && consistencyLevel == ConsistencyLevel.ANY)
+                         responseHandler.response(null);
+                 }
+-                catch (IOException e)
+-                {
+-                    throw new RuntimeException(e);
+-                }
+                 finally
+                 {
+-                    // Decrement the current hint in the execution after the task is done.
+-                    hintsInProgress.decrementAndGet();
++                    totalHintsInProgress.decrementAndGet();
++                    targetHints.decrementAndGet();
+                 }
+             }
+         };
+@@ -730,6 +736,8 @@ public void runMayThrow() throws IOException, TimeoutException
+                 {
+                     ReadCommand command = repairCommands.get(i);
+                     RepairCallback handler = repairResponseHandlers.get(i);
++                    // wait for the repair writes to be acknowledged, to minimize impact on any replica that's
++                    // behind on writes in case the out-of-sync row is read multiple times in quick succession
+                     FBUtilities.waitOnFutures(handler.resolver.repairResults, DatabaseDescriptor.getRpcTimeout());
+ 
+                     Row row;
+@@ -1279,7 +1287,7 @@ public void setMaxHintsInProgress(int qs)
+ 
+     public int getHintsInProgress()
+     {
+-        return hintsInProgress.get();
++        return totalHintsInProgress.get();
+     }
+ 
+     public void verifyNoHintsInProgress()

@@ -1,0 +1,206 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 5c7a9647..c7c2650a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -1660,6 +1660,10 @@ public synchronized void drain() throws IOException, InterruptedException, Execu
+      */
+     public void loadSchemaFromYAML() throws ConfigurationException, IOException
+     { 
++        Callable<Migration> call = new Callable<Migration>()
++        {
++            public Migration call() throws Exception
++            {
+         // blow up if there is a schema saved.
+         if (DatabaseDescriptor.getDefsVersion().timestamp() > 0 || Migration.getLastMigrationId() != null)
+             throw new ConfigurationException("Cannot load from XML on top of pre-existing schemas.");
+@@ -1670,6 +1674,29 @@ public void loadSchemaFromYAML() throws ConfigurationException, IOException
+             migration = new AddKeyspace(table); 
+             migration.apply();
+         }
++                return migration;
++            }
++        };
++        Migration migration = null;
++        try
++        {
++            migration = StageManager.getStage(StageManager.MIGRATION_STAGE).submit(call).get();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        catch (ExecutionException e)
++        {
++            if (e.getCause() instanceof ConfigurationException)
++                throw (ConfigurationException)e.getCause();
++            else if (e.getCause() instanceof IOException)
++                throw (IOException)e.getCause();
++            else if (e.getCause() instanceof Exception)
++                throw new ConfigurationException(e.getCause().getMessage(), (Exception)e.getCause());
++            else
++                throw new RuntimeException(e);
++        }
+         
+         assert DatabaseDescriptor.getDefsVersion().timestamp() > 0;
+         DefsTable.dumpToStorage(DatabaseDescriptor.getDefsVersion());
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+index 3f349376..d97abff9 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+@@ -20,8 +20,12 @@
+ 
+ import java.io.IOException;
+ import java.util.*;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
+ import java.util.concurrent.TimeoutException;
+ 
++import org.apache.cassandra.db.migration.Migration;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -751,19 +755,51 @@ private void release()
+         requestScheduler.release();
+     }
+ 
++    // helper method to apply migration on the migration stage. typical migration failures will throw an 
++    // InvalidRequestException. atypical failures will throw a RuntimeException.
++    private static void applyMigrationOnStage(final Migration m) throws InvalidRequestException
++    {
++        Future f = StageManager.getStage(StageManager.MIGRATION_STAGE).submit(new Callable()
++        {
++            public Object call() throws Exception
++            {
++                m.apply();
++                m.announce();
++                return null;
++            }
++        });
++        try
++        {
++            f.get();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        catch (ExecutionException e)
++        {
++            // this means call() threw an exception. deal with it directly.
++            if (e.getCause() != null)
++            {
++                InvalidRequestException ex = new InvalidRequestException(e.getCause().getMessage());
++                ex.initCause(e.getCause());
++                throw ex;
++            }
++            else
++            {
++                InvalidRequestException ex = new InvalidRequestException(e.getMessage());
++                ex.initCause(e);
++                throw ex;
++            }
++        }
++    }
++
+     public String system_add_column_family(CfDef cf_def) throws InvalidRequestException, TException
+     {
+         checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+-
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-        
+         try
+         {
+-            AddColumnFamily add = new AddColumnFamily(convertToCFMetaData(cf_def));
+-            add.apply();
+-            add.announce();
++            applyMigrationOnStage(new AddColumnFamily(convertToCFMetaData(cf_def)));
+             return DatabaseDescriptor.getDefsVersion().toString();
+         }
+         catch (ConfigurationException e)
+@@ -784,15 +820,9 @@ public String system_drop_column_family(String column_family) throws InvalidRequ
+     {
+         checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+         
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-
+         try
+         {
+-            DropColumnFamily drop = new DropColumnFamily(keySpace.get(), column_family, true);
+-            drop.apply();
+-            drop.announce();
++            applyMigrationOnStage(new DropColumnFamily(keySpace.get(), column_family, true));
+             return DatabaseDescriptor.getDefsVersion().toString();
+         }
+         catch (ConfigurationException e)
+@@ -813,15 +843,9 @@ public String system_rename_column_family(String old_name, String new_name) thro
+     {
+         checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+         
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-
+         try
+         {
+-            RenameColumnFamily rename = new RenameColumnFamily(keySpace.get(), old_name, new_name);
+-            rename.apply();
+-            rename.announce();
++            applyMigrationOnStage(new RenameColumnFamily(keySpace.get(), old_name, new_name));
+             return DatabaseDescriptor.getDefsVersion().toString();
+         }
+         catch (ConfigurationException e)
+@@ -846,10 +870,6 @@ public String system_add_keyspace(KsDef ks_def) throws InvalidRequestException,
+         if (!(DatabaseDescriptor.getAuthenticator() instanceof AllowAllAuthenticator))
+             throw new InvalidRequestException("Unable to create new keyspace while authentication is enabled.");
+ 
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-
+         try
+         {
+             Collection<CFMetaData> cfDefs = new ArrayList<CFMetaData>(ks_def.cf_defs.size());
+@@ -863,9 +883,7 @@ public String system_add_keyspace(KsDef ks_def) throws InvalidRequestException,
+                     (Class<? extends AbstractReplicationStrategy>)Class.forName(ks_def.strategy_class), 
+                     ks_def.replication_factor, 
+                     cfDefs.toArray(new CFMetaData[cfDefs.size()]));
+-            AddKeyspace add = new AddKeyspace(ksm);
+-            add.apply();
+-            add.announce();
++            applyMigrationOnStage(new AddKeyspace(ksm));
+             return DatabaseDescriptor.getDefsVersion().toString();
+         }
+         catch (ClassNotFoundException e)
+@@ -892,15 +910,9 @@ public String system_drop_keyspace(String keyspace) throws InvalidRequestExcepti
+     {
+         checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+         
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-
+         try
+         {
+-            DropKeyspace drop = new DropKeyspace(keyspace, true);
+-            drop.apply();
+-            drop.announce();
++            applyMigrationOnStage(new DropKeyspace(keyspace, true));
+             return DatabaseDescriptor.getDefsVersion().toString();
+         }
+         catch (ConfigurationException e)
+@@ -921,10 +933,6 @@ public String system_rename_keyspace(String old_name, String new_name) throws In
+     {
+         checkKeyspaceAndLoginAuthorized(AccessLevel.FULL);
+         
+-        // if there is anything going on in the migration stage, fail.
+-        if (StageManager.getStage(StageManager.MIGRATION_STAGE).getQueue().size() > 0)
+-            throw new InvalidRequestException("This node appears to be handling gossiped migrations.");
+-
+         try
+         {
+             RenameKeyspace rename = new RenameKeyspace(old_name, new_name);

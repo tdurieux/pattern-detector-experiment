@@ -1,0 +1,149 @@
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/index/FieldInfos.java b/lucene/java/trunk/src/java/org/apache/lucene/index/FieldInfos.java
+index cd5d27f7..e01b5419 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/index/FieldInfos.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/index/FieldInfos.java
+@@ -35,6 +35,14 @@
+  */
+ final class FieldInfos {
+   
++  // Used internally (ie not written to *.fnm files) for pre-2.9 files
++  public static final int FORMAT_PRE = -1;
++
++  // First used in 2.9; prior to 2.9 there was no format header
++  public static final int FORMAT_START = -2;
++
++  static final int CURRENT_FORMAT = FORMAT_START;
++  
+   static final byte IS_INDEXED = 0x1;
+   static final byte STORE_TERMVECTOR = 0x2;
+   static final byte STORE_POSITIONS_WITH_TERMVECTOR = 0x4;
+@@ -45,6 +53,7 @@
+   
+   private ArrayList byNumber = new ArrayList();
+   private HashMap byName = new HashMap();
++  private int format;
+ 
+   FieldInfos() { }
+ 
+@@ -58,7 +67,25 @@
+   FieldInfos(Directory d, String name) throws IOException {
+     IndexInput input = d.openInput(name);
+     try {
+-      read(input);
++      try {
++        read(input, name);
++      } catch (IOException ioe) {
++        if (format == FORMAT_PRE) {
++          // LUCENE-1623: FORMAT_PRE (before there was a
++          // format) may be 2.3.2 (pre-utf8) or 2.4.x (utf8)
++          // encoding; retry with input set to pre-utf8
++          input.seek(0);
++          input.setModifiedUTF8StringsMode();
++          byNumber = new ArrayList();
++          byName = new HashMap();
++          try {
++            read(input, name);
++          } catch (Throwable t) {
++            // Ignore any new exception & throw original IOE
++            throw ioe;
++          }
++        }
++      }
+     } finally {
+       input.close();
+     }
+@@ -279,6 +306,7 @@ public void write(Directory d, String name) throws IOException {
+   }
+ 
+   public void write(IndexOutput output) throws IOException {
++    output.writeVInt(CURRENT_FORMAT);
+     output.writeVInt(size());
+     for (int i = 0; i < size(); i++) {
+       FieldInfo fi = fieldInfo(i);
+@@ -296,8 +324,27 @@ public void write(IndexOutput output) throws IOException {
+     }
+   }
+ 
+-  private void read(IndexInput input) throws IOException {
+-    int size = input.readVInt();//read in the size
++  private void read(IndexInput input, String fileName) throws IOException {
++    int firstInt = input.readVInt();
++
++    if (firstInt < 0) {
++      // This is a real format
++      format = firstInt;
++    } else {
++      format = FORMAT_PRE;
++    }
++
++    if (format != FORMAT_PRE & format != FORMAT_START) {
++      throw new CorruptIndexException("unrecognized format " + format + " in file \"" + fileName + "\"");
++    }
++
++    int size;
++    if (format == FORMAT_PRE) {
++      size = firstInt;
++    } else {
++      size = input.readVInt(); //read in the size
++    }
++
+     for (int i = 0; i < size; i++) {
+       String name = input.readString().intern();
+       byte bits = input.readByte();
+@@ -311,6 +358,10 @@ private void read(IndexInput input) throws IOException {
+       
+       addInternal(name, isIndexed, storeTermVector, storePositionsWithTermVector, storeOffsetWithTermVector, omitNorms, storePayloads, omitTermFreqAndPositions);
+     }    
++
++    if (input.getFilePointer() != input.length()) {
++      throw new CorruptIndexException("did not read all bytes from file \"" + fileName + "\": read " + input.getFilePointer() + " vs size " + input.length());
++    }    
+   }
+ 
+ }
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java b/lucene/java/trunk/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
+index 9655271d..c87456eb 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/index/TestBackwardsCompatibility.java
+@@ -125,6 +125,8 @@ public void testCreateNoCFS() throws IOException {
+                              "22.nocfs",
+                              "23.cfs",
+                              "23.nocfs",
++                             "24.cfs",
++                             "24.nocfs",
+   };
+ 
+   public void testOptimizeOldIndex() throws IOException {
+@@ -203,8 +205,12 @@ public void searchIndex(String dirName, String oldName) throws IOException {
+       if (!reader.isDeleted(i)) {
+         Document d = reader.document(i);
+         List fields = d.getFields();
+-        if (oldName.startsWith("23.")) {
+-          assertEquals(4, fields.size());
++        if (!oldName.startsWith("19.") &&
++            !oldName.startsWith("20.") &&
++            !oldName.startsWith("21.") &&
++            !oldName.startsWith("22.")) {
++          // Test on indices >= 2.3
++          assertEquals(5, fields.size());
+           Field f = (Field) d.getField("id");
+           assertEquals(""+i, f.stringValue());
+ 
+@@ -216,6 +222,9 @@ public void searchIndex(String dirName, String oldName) throws IOException {
+         
+           f = (Field) d.getField("content2");
+           assertEquals("here is more content with aaa aaa aaa", f.stringValue());
++
++          f = (Field) d.getField("fie\u2C77ld");
++          assertEquals("field with non-ascii name", f.stringValue());
+         }        
+       } else
+         // Only ID 7 is deleted
+@@ -479,6 +488,7 @@ private void addDoc(IndexWriter writer, int id) throws IOException
+     doc.add(new Field("autf8", "Lu\uD834\uDD1Ece\uD834\uDD60ne \u0000 \u2620 ab\ud917\udc17cd", Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+     doc.add(new Field("utf8", "Lu\uD834\uDD1Ece\uD834\uDD60ne \u0000 \u2620 ab\ud917\udc17cd", Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+     doc.add(new Field("content2", "here is more content with aaa aaa aaa", Field.Store.YES, Field.Index.ANALYZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
++    doc.add(new Field("fie\u2C77ld", "field with non-ascii name", Field.Store.YES, Field.Index.TOKENIZED, Field.TermVector.WITH_POSITIONS_OFFSETS));
+     writer.addDocument(doc);
+   }
+ 

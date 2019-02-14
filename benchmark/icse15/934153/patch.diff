@@ -1,0 +1,408 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+index e9d75995..931e47d0 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+@@ -36,6 +36,7 @@
+ 
+ import com.google.common.base.Predicate;
+ import com.google.common.collect.AbstractIterator;
++import org.apache.cassandra.utils.FBUtilities;
+ 
+ /**
+  *  A Column Iterator over SSTable
+@@ -72,7 +73,7 @@ public SSTableSliceIterator(SSTableReader ssTable, FileDataInput file, Decorated
+                 return;
+             try
+             {
+-                DecoratedKey keyInDisk = ssTable.getPartitioner().convertFromDiskFormat(file.readUTF());
++                DecoratedKey keyInDisk = ssTable.getPartitioner().convertFromDiskFormat(FBUtilities.readShortByteArray(file));
+                 assert keyInDisk.equals(decoratedKey)
+                        : String.format("%s != %s in %s", keyInDisk, decoratedKey, file.getPath());
+                 file.readInt(); // row size
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/RowIndexedReader.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/RowIndexedReader.java
+index 06a9c9cd..271ba998 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/RowIndexedReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/RowIndexedReader.java
+@@ -121,8 +121,17 @@
+     public static RowIndexedReader open(Descriptor desc, IPartitioner partitioner) throws IOException
+     {
+         RowIndexedReader sstable = new RowIndexedReader(desc, partitioner);
+-        sstable.loadIndexFile();
++
++        if (desc.versionCompareTo("c") < 0)
++        {
++            // versions before 'c' encoded keys as utf-16 before hashing to the filter
++            sstable.loadIndexFile(true);
++        }
++        else
++        {
++            sstable.loadIndexFile(false);
+         sstable.loadBloomFilter();
++        }
+ 
+         return sstable;
+     }
+@@ -156,13 +165,22 @@ void loadBloomFilter() throws IOException
+         }
+     }
+ 
+-    void loadIndexFile() throws IOException
++    /**
++     * @param recreatebloom If true, rebuild the bloom filter based on keys from the index.
++     */
++    void loadIndexFile(boolean recreatebloom) throws IOException
+     {
++
+         // we read the positions in a BRAF so we don't have to worry about an entry spanning a mmap boundary.
+         // any entries that do, we force into the in-memory sample so key lookup can always bsearch within
+         // a single mmapped segment.
+         indexSummary = new IndexSummary();
+         BufferedRandomAccessFile input = new BufferedRandomAccessFile(indexFilename(), "r");
++        if (recreatebloom)
++        {
++            // estimate key count based on index length
++            bf = BloomFilter.getFilter((int)(input.length() / 32), 15);
++        }
+         try
+         {
+             long indexSize = input.length();
+@@ -174,6 +192,10 @@ void loadIndexFile() throws IOException
+                     break;
+                 }
+                 DecoratedKey decoratedKey = partitioner.convertFromDiskFormat(FBUtilities.readShortByteArray(input));
++                if (recreatebloom)
++                {
++                    bf.add(decoratedKey.key);
++                }
+                 long dataPosition = input.readLong();
+                 long nextIndexPosition = input.getFilePointer();
+                 // read the next index entry to see how big the row is
+@@ -231,8 +253,7 @@ public void setTrackedBy(SSTableTracker tracker)
+     public PositionSize getPosition(DecoratedKey decoratedKey)
+     {
+         // first, check bloom filter
+-        // FIXME: expecting utf8
+-        if (!bf.isPresent(new String(partitioner.convertToDiskFormat(decoratedKey), FBUtilities.UTF8)))
++        if (!bf.isPresent(partitioner.convertToDiskFormat(decoratedKey)))
+             return null;
+ 
+         // next, the key cache
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+index 619fafa7..54e3c877 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTable.java
+@@ -232,7 +232,7 @@ public PositionSize(long position, long size)
+     public static class Descriptor
+     {
+         public static final String LEGACY_VERSION = "a";
+-        public static final String CURRENT_VERSION = "b";
++        public static final String CURRENT_VERSION = "c";
+ 
+         public final File directory;
+         public final String version;
+@@ -344,6 +344,14 @@ private static boolean versionValidate(String ver)
+             return true;
+         }
+ 
++        /**
++         * @return Compares the version for this descriptor to the given version.
++         */
++        public int versionCompareTo(String ver)
++        {
++            return version.compareTo(ver);
++        }
++
+         @Override
+         public String toString()
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+index e278798a..401bbbe6 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableWriter.java
+@@ -16,6 +16,24 @@
+  * specific language governing permissions and limitations
+  * under the License.
+  */
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
+ 
+ package org.apache.cassandra.io.sstable;
+ 
+@@ -75,8 +93,7 @@ private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+     private void afterAppend(DecoratedKey decoratedKey, long dataPosition, int dataSize) throws IOException
+     {
+         byte[] diskKey = partitioner.convertToDiskFormat(decoratedKey);
+-        // FIXME: needs format change
+-        bf.add(new String(diskKey, FBUtilities.UTF8));
++        bf.add(diskKey);
+         lastWrittenKey = decoratedKey;
+         long indexPosition = indexFile.getFilePointer();
+         FBUtilities.writeShortByteArray(diskKey, indexFile);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/BloomFilter.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/BloomFilter.java
+index 372f22c9..1b43acc2 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/BloomFilter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/BloomFilter.java
+@@ -116,18 +116,6 @@ BitSet filter()
+         return filter_;
+     }
+ 
+-    public boolean isPresent(String key)
+-    {
+-        for (int bucketIndex : getHashBuckets(key))
+-        {
+-            if (!filter_.get(bucketIndex))
+-            {
+-                return false;
+-            }
+-        }
+-        return true;
+-    }
+-
+     public boolean isPresent(byte[] key)
+     {
+         for (int bucketIndex : getHashBuckets(key))
+@@ -145,14 +133,6 @@ public boolean isPresent(byte[] key)
+      the filter_.
+      This is a general purpose API.
+      */
+-    public void add(String key)
+-    {
+-        for (int bucketIndex : getHashBuckets(key))
+-        {
+-            filter_.set(bucketIndex);
+-        }
+-    }
+-
+     public void add(byte[] key)
+     {
+         for (int bucketIndex : getHashBuckets(key))
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/Filter.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/Filter.java
+index 473e041a..8bce5a0c 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/Filter.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/Filter.java
+@@ -34,22 +34,16 @@ int getHashCount()
+         return hashCount;
+     }
+ 
+-    public int[] getHashBuckets(String key)
+-    {
+-        return Filter.getHashBuckets(key, hashCount, buckets());
+-    }
+-
+     public int[] getHashBuckets(byte[] key)
+     {
+         return Filter.getHashBuckets(key, hashCount, buckets());
+     }
+ 
+-
+     abstract int buckets();
+ 
+-    public abstract void add(String key);
++    public abstract void add(byte[] key);
+ 
+-    public abstract boolean isPresent(String key);
++    public abstract boolean isPresent(byte[] key);
+ 
+     // for testing
+     abstract int emptyBuckets();
+@@ -73,20 +67,6 @@ int getHashCount()
+     // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+     // does prove to work in actual tests, and is obviously faster
+     // than performing further iterations of murmur.
+-    static int[] getHashBuckets(String key, int hashCount, int max)
+-    {
+-        byte[] b;
+-        try
+-        {
+-            b = key.getBytes("UTF-16");
+-        }
+-        catch (UnsupportedEncodingException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-        return getHashBuckets(b, hashCount, max);
+-    }
+-
+     static int[] getHashBuckets(byte[] b, int hashCount, int max)
+     {
+         int[] result = new int[hashCount];
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/utils/BloomFilterTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/utils/BloomFilterTest.java
+index 5af1652e..e10e6d14 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/utils/BloomFilterTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/utils/BloomFilterTest.java
+@@ -54,9 +54,9 @@ public void testBloomLimits1()
+     @Test
+     public void testOne()
+     {
+-        bf.add("a");
+-        assert bf.isPresent("a");
+-        assert !bf.isPresent("b");
++        bf.add("a".getBytes());
++        assert bf.isPresent("a".getBytes());
++        assert !bf.isPresent("b".getBytes());
+     }
+ 
+     @Test
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/utils/FilterTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/utils/FilterTest.java
+index 1f906ab3..ede6e067 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/utils/FilterTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/utils/FilterTest.java
+@@ -31,7 +31,7 @@
+ 
+ public class FilterTest
+ {
+-    public void testManyHashes(Iterator<String> keys)
++    public void testManyHashes(Iterator<byte[]> keys)
+     {
+         int MAX_HASH_COUNT = 128;
+         Set<Integer> hashes = new HashSet<Integer>();
+@@ -60,22 +60,22 @@ public void testManyRandom()
+     public static final BloomCalculations.BloomSpecification spec = BloomCalculations.computeBloomSpec(15, MAX_FAILURE_RATE);
+     static final int ELEMENTS = 10000;
+ 
+-    static final ResetableIterator<String> intKeys()
++    static final ResetableIterator<byte[]> intKeys()
+     {
+         return new KeyGenerator.IntGenerator(ELEMENTS);
+     }
+ 
+-    static final ResetableIterator<String> randomKeys()
++    static final ResetableIterator<byte[]> randomKeys()
+     {
+         return new KeyGenerator.RandomStringGenerator(314159, ELEMENTS);
+     }
+ 
+-    static final ResetableIterator<String> randomKeys2()
++    static final ResetableIterator<byte[]> randomKeys2()
+     {
+         return new KeyGenerator.RandomStringGenerator(271828, ELEMENTS);
+     }
+ 
+-    public static void testFalsePositives(Filter f, ResetableIterator<String> keys, ResetableIterator<String> otherkeys)
++    public static void testFalsePositives(Filter f, ResetableIterator<byte[]> keys, ResetableIterator<byte[]> otherkeys)
+     {
+         assert keys.size() == otherkeys.size();
+ 
+@@ -99,15 +99,15 @@ public static void testFalsePositives(Filter f, ResetableIterator<String> keys,
+ 
+     public static Filter testSerialize(Filter f) throws IOException
+     {
+-        f.add("a");
++        f.add("a".getBytes());
+         DataOutputBuffer out = new DataOutputBuffer();
+         f.getSerializer().serialize(f, out);
+ 
+         ByteArrayInputStream in = new ByteArrayInputStream(out.getData(), 0, out.getLength());
+         Filter f2 = f.getSerializer().deserialize(new DataInputStream(in));
+ 
+-        assert f2.isPresent("a");
+-        assert !f2.isPresent("b");
++        assert f2.isPresent("a".getBytes());
++        assert !f2.isPresent("b".getBytes());
+         return f2;
+     }
+ 
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/utils/KeyGenerator.java b/cassandra/trunk/test/unit/org/apache/cassandra/utils/KeyGenerator.java
+index fcaebd73..c0ba2752 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/utils/KeyGenerator.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/utils/KeyGenerator.java
+@@ -22,15 +22,13 @@
+ import java.util.Random;
+ 
+ public class KeyGenerator {
+-    private static String randomKey(Random r) {
+-        StringBuilder buffer = new StringBuilder();
+-        for (int j = 0; j < 16; j++) {
+-            buffer.append((char)r.nextInt());
+-        }
+-        return buffer.toString();
++    private static byte[] randomKey(Random r) {
++        byte[] bytes = new byte[48];
++        r.nextBytes(bytes);
++        return bytes;
+     }
+ 
+-    static class RandomStringGenerator implements ResetableIterator<String> {
++    static class RandomStringGenerator implements ResetableIterator<byte[]> {
+         int i, n, seed;
+         Random random;
+ 
+@@ -53,7 +51,7 @@ public boolean hasNext() {
+             return i < n;
+         }
+ 
+-        public String next() {
++        public byte[] next() {
+             i++;
+             return randomKey(random);
+         }
+@@ -63,7 +61,7 @@ public void remove() {
+         }
+     }
+ 
+-    static class IntGenerator implements ResetableIterator<String> {
++    static class IntGenerator implements ResetableIterator<byte[]> {
+         private int i, start, n;
+ 
+         IntGenerator(int n) {
+@@ -88,8 +86,8 @@ public boolean hasNext() {
+             return i < n;
+         }
+ 
+-        public String next() {
+-            return Integer.toString(i++);
++        public byte[] next() {
++            return Integer.toString(i++).getBytes();
+         }
+ 
+         public void remove() {
+@@ -97,7 +95,7 @@ public void remove() {
+         }
+     }
+ 
+-    static class WordGenerator implements ResetableIterator<String> {
++    static class WordGenerator implements ResetableIterator<byte[]> {
+         static int WORDS;
+ 
+         static {
+@@ -115,7 +113,7 @@ public void remove() {
+         BufferedReader reader;
+         private int modulo;
+         private int skip;
+-        String next;
++        byte[] next;
+ 
+         WordGenerator(int skip, int modulo) {
+             this.skip = skip;
+@@ -147,11 +145,12 @@ public boolean hasNext() {
+             return next != null;
+         }
+ 
+-        public String next() {
++        public byte[] next() {
+             try {
+-                String s = next;
++                byte[] s = next;
+                 for (int i = 0; i < modulo; i++) {
+-                    next = reader.readLine();
++                    String line = reader.readLine();
++                    next = line == null ? null : line.getBytes();
+                 }
+                 return s;
+             } catch (IOException e) {

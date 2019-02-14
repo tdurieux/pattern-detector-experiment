@@ -1,0 +1,153 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/IResponseResolver.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/IResponseResolver.java
+index 9e514ecb..0b5b54f6 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/IResponseResolver.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/IResponseResolver.java
+@@ -37,4 +37,5 @@
+ 	public T resolve(Collection<Message> responses) throws DigestMismatchException, IOException;
+ 	public boolean isDataPresent(Collection<Message> responses);
+ 
++    public void preprocess(Message message);
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/QuorumResponseHandler.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/QuorumResponseHandler.java
+index c33a1ac4..61681981 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/QuorumResponseHandler.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/QuorumResponseHandler.java
+@@ -89,6 +89,7 @@ public T get() throws TimeoutException, DigestMismatchException, IOException
+     public void response(Message message)
+     {
+         responses.add(message);
++        responseResolver.preprocess(message);
+         if (responseResolver.isDataPresent(responses))
+         {
+             condition.signal();
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+index 4f230d85..5fe54b23 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+@@ -108,6 +108,10 @@ protected Row getReduced()
+         return resolvedRows;
+     }
+ 
++    public void preprocess(Message message)
++    {
++    }
++
+     public boolean isDataPresent(Collection<Message> responses)
+     {
+         return responses.size() >= sources.size();
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ReadResponseResolver.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ReadResponseResolver.java
+index 42c61431..e743ce1f 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ReadResponseResolver.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/ReadResponseResolver.java
+@@ -22,10 +22,7 @@
+ import java.io.DataInputStream;
+ import java.io.IOError;
+ import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collection;
+-import java.util.List;
++import java.util.*;
+ 
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.ReadResponse;
+@@ -37,6 +34,7 @@
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.cliffc.high_scale_lib.NonBlockingHashMap;
+ 
+ import org.apache.log4j.Logger;
+ 
+@@ -49,6 +47,7 @@
+ 	private static Logger logger_ = Logger.getLogger(ReadResponseResolver.class);
+     private final String table;
+     private final int responseCount;
++    private final Map<Message, ReadResponse> results = new NonBlockingHashMap<Message, ReadResponse>();
+ 
+     public ReadResponseResolver(String table, int responseCount)
+     {
+@@ -84,11 +83,11 @@ public Row resolve(Collection<Message> responses) throws DigestMismatchException
+          * query exists then we need to compare the digest with 
+          * the digest of the data that is received.
+         */
+-		for (Message response : responses)
++		for (Message message : responses)
+ 		{					            
+-            byte[] body = response.getMessageBody();
+-            ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+-            ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
++            ReadResponse result = results.get(message);
++            if (result == null)
++                continue; // arrived after quorum already achieved
+             if (result.isDigestQuery())
+             {
+                 digest = result.digest();
+@@ -97,14 +96,11 @@ public Row resolve(Collection<Message> responses) throws DigestMismatchException
+             else
+             {
+                 versions.add(result.row().cf);
+-                endPoints.add(response.getFrom());
++                endPoints.add(message.getFrom());
+                 key = result.row().key;
+             }
+         }
+ 
+-        if (logger_.isDebugEnabled())
+-            logger_.debug("responses deserialized");
+-
+ 		// If there was a digest query compare it with all the data digests
+ 		// If there is a mismatch then throw an exception so that read repair can happen.
+         if (isDigestQuery)
+@@ -190,30 +186,36 @@ static ColumnFamily resolveSuperset(List<ColumnFamily> versions)
+         return resolved;
+     }
+ 
+-	public boolean isDataPresent(Collection<Message> responses)
+-	{
+-        if (responses.size() < responseCount)
+-            return false;
+-
+-        boolean isDataPresent = false;
+-        for (Message response : responses)
++    public void preprocess(Message message)
+         {
+-            byte[] body = response.getMessageBody();
++        byte[] body = message.getMessageBody();
+             ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+             try
+             {
+                 ReadResponse result = ReadResponse.serializer().deserialize(new DataInputStream(bufIn));
+-                if (!result.isDigestQuery())
++            results.put(message, result);
++        }
++        catch (IOException e)
+                 {
+-                    isDataPresent = true;
++            throw new IOError(e);
+                 }
+-                bufIn.close();
+             }
+-            catch (IOException ex)
++
++    public boolean isDataPresent(Collection<Message> responses)
+             {
+-                throw new RuntimeException(ex);
+-            }
++        int digests = 0;
++        int data = 0;
++        for (Message message : responses)
++        {
++            ReadResponse result = results.get(message);
++            if (result == null)
++                continue; // arrived concurrently
++            if (result.isDigestQuery())
++                digests++;
++            else
++                data++;
+         }
+-        return isDataPresent;
++        return data > 0 && (data + digests >= responseCount);
+     }
++
+ }

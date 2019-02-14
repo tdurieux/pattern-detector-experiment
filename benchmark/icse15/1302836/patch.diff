@@ -1,0 +1,1219 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDescriptorGenerator.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDescriptorGenerator.java
+index 5da8e415..2d790197 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDescriptorGenerator.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDescriptorGenerator.java
+@@ -45,6 +45,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.catalog.Statistics;
+ import java.sql.Timestamp;
+ import java.io.InputStream;
++import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.types.DataTypeDescriptor;
+ 
+ /**
+@@ -425,17 +426,28 @@ protected UUIDFactory getUUIDFactory()
+ 	}
+ 
+ 	/**
+-	  @see DataDescriptorGenerator#newFileInfoDescriptor
++     * Create  a new {@code FileInfoDescriptor} using the supplied arguments.
++     * 
++     * id unique id to be used for the new file descriptor
++     * sd schema of the new file to be stored in the database
++     * SQLName the SQL name of the new schema object representing the file
++     * generationID version numberof the file the descriptor describes
++     * 
++     * @return the newly created file info descriptor
+ 	  */
+ 	public FileInfoDescriptor newFileInfoDescriptor(
+ 								UUID             id,
+ 								SchemaDescriptor sd,
+-								String           SQLName,
++                                String           sqlName,
+ 								long              generationId
+ 								)
+ 	{
+-		if (id == null) id = getUUIDFactory().createUUID();
+-		return new FileInfoDescriptor(dataDictionary, id,sd,SQLName,generationId);
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(id != null);
++        }
++
++        return new FileInfoDescriptor(
++                dataDictionary, id, sd, sqlName, generationId);
+ 	}
+ 
+ 	public UserDescriptor newUserDescriptor
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/FileResource.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/FileResource.java
+index 8bec886a..35377ae1 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/FileResource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/FileResource.java
+@@ -88,6 +88,14 @@ public void remove(String name, long currentGenerationId)
+ 		throws StandardException;
+ 
+ 	/**
++     * During hard upgrade to >= 10.9, remove a jar directory (at post-commit 
++     * time) from the database.
++     * @param f
++     * @exception standard error policy
++     */
++    public void removeJarDir(String f) throws StandardException;
++    
++	/**
+ 	  Replace a file resource with a new version.
+ 
+ 	  <P>The InputStream will be closed by this method.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/BasicDatabase.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/BasicDatabase.java
+index 1c87ce5d..b6a20896 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/BasicDatabase.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/db/BasicDatabase.java
+@@ -821,7 +821,8 @@ public StorageFile getJarFile(String schemaName, String sqlName)
+         ContextManager cm = ContextService.getFactory().getCurrentContextManager();
+ 		FileResource fr = af.getTransaction(cm).getFileHandler();
+ 
+-		String externalName = JarUtil.mkExternalName(schemaName, sqlName, fr.getSeparatorChar());
++        String externalName = JarUtil.mkExternalName(
++            fid.getUUID(), schemaName, sqlName, fr.getSeparatorChar());
+ 
+ 		return fr.getAsFile(externalName, generationId);
+ 	}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DD_Version.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DD_Version.java
+index 3195afd8..10b5ce29 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DD_Version.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DD_Version.java
+@@ -502,6 +502,13 @@ private	void	doFullUpgrade(TransactionController tc, int fromMajorVersionNumber,
+             // On upgrade from versions before 10.9, create system catalogs
+             // added in 10.9
+             bootingDictionary.upgradeMakeCatalog(tc, DataDictionary.SYSUSERS_CATALOG_NUM );
++
++            // On upgrade from versions before 10.9, upgrade the way we store
++            // jars: we now use UUID as part of the file name and sanitize the
++            // sql (schema, schema object) parts of the file name to remove
++            // path delimiters. ALso, we now use no schema subdirectories since
++            // there is no chance of name collision with the UUID.
++            bootingDictionary.upgradeJarStorage(tc);
+         }
+ 
+         // Grant PUBLIC access to some system routines
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index f6d23611..2489501f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.impl.sql.catalog;
+ 
++import java.io.File;
+ import org.apache.derby.iapi.reference.Attribute;
+ import org.apache.derby.iapi.reference.EngineType;
+ import org.apache.derby.iapi.reference.JDBC30Translation;
+@@ -179,6 +180,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.security.NoSuchAlgorithmException;
+ 
+ import java.sql.Types;
++import java.util.Map;
++import org.apache.derby.iapi.services.io.FileUtil;
++import org.apache.derby.iapi.store.access.FileResource;
++import org.apache.derby.impl.sql.execute.JarUtil;
++import org.apache.derby.io.StorageFile;
+ 
+ /**
+  * Standard database implementation of the data dictionary
+@@ -8343,6 +8349,69 @@ protected void upgradeMakeCatalog(TransactionController tc, int catalogNumber)
+ 								getSystemSchemaDescriptor(), tc);
+ 	}
+ 
++
++    /**
++     * Called by the upgrade code to upgrade the way we store jar files in the
++     * database.<p/>
++     * We now use UUID as part of the file name to avoid problems with path
++     * delimiters. Also, we henceforth use no schema subdirectories since there
++     * is no chance of name collision with the UUID.
++     *
++     * @param tc TransactionController to use.
++     */
++    protected void upgradeJarStorage(TransactionController tc)
++        throws StandardException
++    {
++        TabInfoImpl             ti = getNonCoreTI(SYSFILES_CATALOG_NUM);
++        SYSFILESRowFactory rf = (SYSFILESRowFactory)ti.getCatalogRowFactory();
++
++        ExecRow outRow = rf.makeEmptyRow();
++
++        /*
++        ** Table scan
++        */
++        ScanController scanController = tc.openScan(
++                ti.getHeapConglomerate(),     // conglomerate to open
++                false,                        // don't hold open across commit
++                0,                            // for read
++                TransactionController.MODE_TABLE,
++                TransactionController.ISOLATION_REPEATABLE_READ,
++                (FormatableBitSet) null,      // all fields as objects
++                (DataValueDescriptor[]) null, // start position - first row
++                0,                            // startSearchOperation - none
++                (Qualifier[][]) null,         // scanQualifier,
++                (DataValueDescriptor[]) null, // stop position -through last row
++                0);                           // stopSearchOperation - none
++
++        Map schemas = new HashMap();
++
++        try
++        {
++            while (scanController.fetchNext(outRow.getRowArray()))
++            {
++                FileInfoDescriptor fid = (FileInfoDescriptor)rf.
++                    buildDescriptor(outRow, null, this);
++                schemas.put(fid.getSchemaDescriptor().getSchemaName(), null);
++                JarUtil.upgradeJar(tc, fid);
++            }
++        }
++        finally
++        {
++            scanController.close();
++        }
++
++        Iterator i = schemas.keySet().iterator();
++        FileResource fh = tc.getFileHandler();
++
++        // remove those directories with their contents
++        while(i.hasNext()) {
++            fh.removeJarDir(
++                    FileResource.JAR_DIRECTORY_NAME +
++                    File.separatorChar +
++                    (String)i.next());
++        }
++    }
++
+ 	/**
+ 	 *	The dirty work of creating a catalog.
+ 	 *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
+index 21fec3a7..b70f8522 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.impl.sql.execute;
+ 
++import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+@@ -28,11 +29,18 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.net.URL;
+ import java.security.AccessController;
+ import java.security.PrivilegedActionException;
+-
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import org.apache.derby.catalog.UUID;
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.reference.Property;
+ import org.apache.derby.iapi.reference.SQLState;
++import org.apache.derby.iapi.services.context.ContextService;
++import org.apache.derby.iapi.services.io.FileUtil;
+ import org.apache.derby.iapi.services.loader.ClassFactory;
++import org.apache.derby.iapi.services.monitor.Monitor;
+ import org.apache.derby.iapi.services.property.PropertyUtil;
+ import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+ import org.apache.derby.iapi.sql.depend.DependencyManager;
+@@ -41,8 +49,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.dictionary.FileInfoDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.SchemaDescriptor;
+ import org.apache.derby.iapi.store.access.FileResource;
++import org.apache.derby.iapi.store.access.TransactionController;
+ import org.apache.derby.iapi.util.IdUtil;
+-
++import org.apache.derby.io.StorageFile;
+ 
+ public class JarUtil
+ {
+@@ -127,12 +136,13 @@ private long add(final InputStream is) throws StandardException
+         try {
+             notifyLoader(false);
+             dd.invalidateAllSPSPlans();
+-            final String jarExternalName = JarUtil.mkExternalName(schemaName,
+-                    sqlName, fr.getSeparatorChar());
++            UUID id = Monitor.getMonitor().getUUIDFactory().createUUID();
++            final String jarExternalName = JarUtil.mkExternalName(
++                id, schemaName, sqlName, fr.getSeparatorChar());
+ 
+             long generationId = setJar(jarExternalName, is, true, 0L);
+ 
+-            fid = ddg.newFileInfoDescriptor(/*DJD*/null, sd, sqlName, generationId);
++            fid = ddg.newFileInfoDescriptor(id, sd, sqlName, generationId);
+             dd.addDescriptor(fid, sd, DataDictionary.SYSFILES_CATALOG_NUM,
+                     false, lcc.getTransactionExecute());
+             return generationId;
+@@ -205,9 +215,11 @@ private void drop() throws StandardException
+ 			DependencyManager dm = dd.getDependencyManager();
+ 			dm.invalidateFor(fid, DependencyManager.DROP_JAR, lcc);
+ 
++            UUID id = fid.getUUID();
+ 			dd.dropFileInfoDescriptor(fid);
+-
+-			fr.remove(JarUtil.mkExternalName(schemaName, sqlName, fr.getSeparatorChar()),
++            fr.remove(
++                JarUtil.mkExternalName(
++                    id, schemaName, sqlName, fr.getSeparatorChar()),
+ 				fid.getGenerationId());
+ 		} finally {
+ 			notifyLoader(true);
+@@ -276,7 +288,8 @@ private long replace(InputStream is) throws StandardException
+ 			dd.invalidateAllSPSPlans();
+ 			dd.dropFileInfoDescriptor(fid);
+             final String jarExternalName =
+-                JarUtil.mkExternalName(schemaName, sqlName, fr.getSeparatorChar());
++                JarUtil.mkExternalName(
++                    fid.getUUID(), schemaName, sqlName, fr.getSeparatorChar());
+ 
+ 			//
+ 			//Replace the file.
+@@ -385,16 +398,91 @@ public Object run() throws StandardException {
+     /**
+       Make an external name for a jar file stored in the database.
+       */
+-    public static String mkExternalName(String schemaName, String sqlName, char separatorChar)
++    public static String mkExternalName(
++            UUID id, 
++            String schemaName, 
++            String sqlName, 
++            char separatorChar) throws StandardException
+     {
+-        StringBuffer sb = new StringBuffer(30);
++        return mkExternalNameInternal(
++            id, schemaName, sqlName, separatorChar, false, false);
++    }
+ 
++    private static String mkExternalNameInternal(
++            UUID id,
++            String schemaName,
++            String sqlName,
++            char separatorChar,
++            boolean upgrading,
++            boolean newStyle) throws StandardException
++    {
++        StringBuffer sb = new StringBuffer(30);
+         sb.append(FileResource.JAR_DIRECTORY_NAME);
+         sb.append(separatorChar);
++
++        boolean uuidSupported = false;
++
++        if (!upgrading) {
++            LanguageConnectionContext lcc =
++                (LanguageConnectionContext)ContextService.getContextOrNull(
++                    LanguageConnectionContext.CONTEXT_ID);
++
++            // DERBY-5357 UUIDs introduced in jar file names in 10.9
++            uuidSupported =
++                lcc.getDataDictionary().
++                checkVersion(DataDictionary.DD_VERSION_DERBY_10_9, null);
++        }
++
++
++        if (!upgrading && uuidSupported || upgrading && newStyle) {
++            sb.append(id.toString());
++            sb.append(".jar");
++        } else {
+         sb.append(schemaName);
+         sb.append(separatorChar);
+         sb.append(sqlName);
+         sb.append(".jar");
++        }
++
+         return sb.toString();
+     }
++
++    /**
++     * Upgrade code: upgrade one jar file to new style (>= 10.9)
++     *
++     * @param tc transaction controller
++     * @param fid the jar file to be upgraded
++     * @throws StandardException
++     */
++    public static void upgradeJar(
++            TransactionController tc,
++            FileInfoDescriptor fid)
++            throws StandardException {
++
++        FileResource fh = tc.getFileHandler();
++
++        StorageFile oldFile = fh.getAsFile(
++            mkExternalNameInternal(
++                fid.getUUID(),
++                fid.getSchemaDescriptor().getSchemaName(),
++                fid.getName(),
++                File.separatorChar,
++                true,
++                false),
++            fid.getGenerationId());
++
++        StorageFile newFile = fh.getAsFile(
++            mkExternalNameInternal(
++                fid.getUUID(),
++                fid.getSchemaDescriptor().getSchemaName(),
++                fid.getName(),
++                File.separatorChar,
++                true,
++                true),
++            fid.getGenerationId());
++
++        FileUtil.copyFile(
++                new File(oldFile.getPath()),
++                new File(newFile.getPath()), null);
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+index 003e85c9..18a5a3ba 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+@@ -72,7 +72,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.util.Properties;
+ import java.io.Serializable;
+ import java.io.File;
+-import java.io.FileNotFoundException;
+ import java.io.IOException;
+ import java.io.OutputStreamWriter;
+ 
+@@ -81,6 +80,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.security.PrivilegedExceptionAction;
+ import java.lang.SecurityException;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ 
+ import org.apache.derby.iapi.store.replication.master.MasterFactory;
+ import org.apache.derby.iapi.store.replication.slave.SlaveFactory;
+@@ -805,7 +806,7 @@ public synchronized void backup(Transaction t, File backupDir)
+                 // copy will fail while copying the backup dir onto itself in 
+                 // recursion
+ 
+-                String [] jarSchemaList = privList(jarDir);
++                String [] jarDirContents = privList(jarDir);
+                 File backupJarDir = new File(backupcopy, 
+                                              FileResource.JAR_DIRECTORY_NAME);
+                 // Create the backup jar directory
+@@ -816,22 +817,60 @@ public synchronized void backup(Transaction t, File backupDir)
+                           (File) backupJarDir);
+                 }
+ 
+-                for (int i = 0; i < jarSchemaList.length; i++)
+-                {
++                LanguageConnectionContext lcc = 
++                    (LanguageConnectionContext)ContextService.getContextOrNull(
++                        LanguageConnectionContext.CONTEXT_ID);
++        
++                // DERBY-5357 UUIDs introduced in jar file names in 10.9
++                boolean uuidSupported =
++                    lcc.getDataDictionary().
++                    checkVersion(DataDictionary.DD_VERSION_DERBY_10_9, null);
++
++                if (uuidSupported) {
++                    // no subdirectories
++                    for (int i = 0; i < jarDirContents.length; i++) {
++                        StorageFile jar = storageFactory.newStorageFile(
++                            jarDir, jarDirContents[i]);
++                        File backupJar =
++                            new File(backupJarDir, jarDirContents[i]);
++
++                        if (privIsDirectory(new File(jar.getPath()))) {
++                            continue; // We no longer expect directories inside
++                                      // 'jar'. Need check to make the weird
++                                      // test #2 in BackupPathTests.java work:
++                                      // it does a backup of the db into its
++                                      // own(!) jar file directory, so trying
++                                      // to copy that db file into itself two
++                                      // levels down would fail.
++                        }
++
++                        if (!privCopyFile(jar, backupJar)) {
++                            throw StandardException.
++                                newException(
++                                    SQLState.RAWSTORE_ERROR_COPYING_FILE,
++                                    jar, backupJar);
++                        }
++                    }
++                } else {
++                    for (int i = 0; i < jarDirContents.length; i++) {
+                     StorageFile jarSchemaDir = 
+-                        storageFactory.newStorageFile(jarDir, jarSchemaList[i]);
++                            storageFactory.newStorageFile(
++                                jarDir, jarDirContents[i]);
++
+                     File backupJarSchemaDir = 
+-                        new File(backupJarDir, jarSchemaList[i]);
++                            new File(backupJarDir, jarDirContents[i]);
+ 
+-                    if (!privCopyDirectory(jarSchemaDir, backupJarSchemaDir, 
+-                                           (byte[])null, null, false)) 
+-                    {
++                        if (!privCopyDirectory(
++                                    jarSchemaDir, backupJarSchemaDir,
++                                    (byte[])null, null, false)) {
+                         throw StandardException.
+-                            newException(SQLState.RAWSTORE_ERROR_COPYING_FILE,
++                                newException(
++                                    SQLState.RAWSTORE_ERROR_COPYING_FILE,
+                                          jarSchemaDir, backupJarSchemaDir);  
+                     }
+                 }
+             }
++            }
+ 
+ 
+             // save service properties into the backup, Read in property 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
+index f0fb7746..c9a8df19 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
+@@ -149,6 +149,35 @@ public long add(String name, InputStream source)
+ 	}
+ 
+ 	/**
++     * @see FileResource#removeJarDir
++     */
++    public void removeJarDir(String f) throws StandardException {
++        if (factory.isReadOnly())
++            throw StandardException.newException(SQLState.FILE_READ_ONLY);
++
++        ContextManager cm =
++            ContextService.getFactory().getCurrentContextManager();
++
++        RawTransaction tran =
++            factory.getRawStoreFactory().getXactFactory().findUserTransaction(
++                        factory.getRawStoreFactory(),
++                        cm,
++                        AccessFactoryGlobals.USER_TRANS_NAME);
++
++        StorageFile ff = factory.storageFactory.newStorageFile(f);
++        Serviceable s = new RemoveFile(ff);
++
++        // Since this code is only used during upgrade to post-10.8 databases
++        // we do no bother to build code for a special RemoveDirOperation and
++        // do tran.logAndDo (cf. logic in #remove). If the post-commit removal
++        // doesn't get completed, that is no big issue, the dirs can be removed
++        // by hand if need be. A prudent DBA will rerun the upgrade from a
++        // backup if something crashes anyway..
++
++        tran.addPostCommitWork(s);
++    }
++
++    /**
+ 	  @see FileResource#remove
+ 	  @exception StandardException Oops
+ 	  */
+@@ -256,11 +285,18 @@ public boolean serviceImmediately()
+     public Object run() throws StandardException {
+         // SECURITY PERMISSION - MP1, OP5
+         if (fileToGo.exists()) {
++            if (fileToGo.isDirectory()) {
++                if (!fileToGo.deleteAll()) {
++                    throw StandardException.newException(
++                            SQLState.FILE_CANNOT_REMOVE_FILE, fileToGo);
++                }
++            } else {
+             if (!fileToGo.delete()) {
+                 throw StandardException.newException(
+                         SQLState.FILE_CANNOT_REMOVE_FILE, fileToGo);
+             }
+         }
++        }
+         return null;
+     }	
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+index 6da0ff91..3b744304 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/Changes10_9.java
+@@ -20,12 +20,17 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ */
+ package org.apache.derbyTesting.functionTests.tests.upgradeTests;
+ 
++import java.io.File;
++import java.net.MalformedURLException;
++import java.net.URL;
+ import java.sql.CallableStatement;
+ import java.sql.Connection;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.Statement;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ import javax.sql.DataSource;
+ 
+@@ -35,6 +40,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.JDBCDataSource;
+ import org.apache.derbyTesting.junit.SupportFilesSetup;
++import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+ 
+ /**
+@@ -66,6 +72,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     public Changes10_9(String name)
+     {
+         super(name);
++        initPattern();
+     }
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+@@ -74,6 +81,14 @@ public Changes10_9(String name)
+     //
+     ///////////////////////////////////////////////////////////////////////////////////
+ 
++    private static final String[] SUPPORT_FILES_SOURCE =
++    {
++        "functionTests/tests/lang/dcl_java.jar",
++        "functionTests/tests/lang/dcl_emc1.jar",
++        "functionTests/tests/lang/dcl_emc2.jar",
++    };
++    
++    
+     /**
+      * Return the suite of tests to test the changes made in 10.7.
+      * @param phase an integer that indicates the current phase in
+@@ -84,7 +99,9 @@ public static Test suite(int phase) {
+         TestSuite suite = new TestSuite("Upgrade test for 10.9");
+ 
+         suite.addTestSuite(Changes10_9.class);
+-        return new SupportFilesSetup((Test) suite);
++        
++        return new SupportFilesSetup(
++                (Test)suite, SUPPORT_FILES_SOURCE);
+     }
+ 
+     ///////////////////////////////////////////////////////////////////////////////////
+@@ -493,4 +510,336 @@ private void verifyCanConnect(DataSource ds) throws SQLException {
+             c.close();
+         }
+     }
++
++
++    /**
++     * For 10.9 and later storage of jar files changed. DERBY-5357.
++     */
++    public void testJarStorage()  throws Exception
++    {
++        Statement s = createStatement();
++
++        switch (getPhase()) {
++        case PH_CREATE: // create with old version
++            createSchema("EMC");
++            createSchema("FOO");
++
++            s.executeUpdate(
++                "create procedure EMC.ADDCONTACT(id INT, e_mail VARCHAR(30)) " +
++                "MODIFIES SQL DATA " +
++                "external name " +
++                "'org.apache.derbyTesting.databaseclassloader.emc.addContact'" +
++                " language java parameter style java");
++            s.executeUpdate(
++                "create table EMC.CONTACTS " +
++                "    (id int, e_mail varchar(30))");
++
++            installJar("dcl_emc1.jar", "EMC.MAIL_APP");
++            installJar("dcl_java.jar", "EMC.MY_JAVA");
++            installJar("dcl_emc2.jar", "FOO.BAR");
++
++            setDBClasspath("EMC.MAIL_APP");
++            tryCall();
++            setDBClasspath(null);
++
++            break;
++
++        case PH_SOFT_UPGRADE:
++            // boot with new version and soft-upgrade
++        case PH_POST_SOFT_UPGRADE:
++            // soft-downgrade: boot with old version after soft-upgrade
++
++            setDBClasspath("EMC.MAIL_APP");
++            tryCall();
++            setDBClasspath(null);
++            
++            // if we can do this, it hasn't moved already:
++            replaceJar("dcl_emc1.jar", "EMC.MAIL_APP");
++
++            setDBClasspath("EMC.MAIL_APP");
++            tryCall();
++            setDBClasspath(null);
++
++            break;
++            
++        case PH_HARD_UPGRADE: // boot with new version and hard-upgrade
++
++            setDBClasspath("EMC.MAIL_APP");
++            tryCall();
++            setDBClasspath(null);
++
++            installJar("dcl_emc1.jar", "FOO.\"BAR/..\\../\"");
++
++            verifyNewLocations(4);
++            
++            removeJar("EMC.MAIL_APP");
++            installJar("dcl_emc1.jar", "EMC.MAIL_APP");
++            
++            setDBClasspath("EMC.MAIL_APP");
++            tryCall();
++            setDBClasspath(null);
++            
++            // finally, check that all the rest are also here
++            replaceJar("dcl_java.jar", "EMC.MY_JAVA");
++            replaceJar("dcl_emc2.jar", "FOO.BAR");
++            replaceJar("dcl_emc1.jar", "FOO.\"BAR/..\\../\"");
++
++            // clean up
++            removeJar("EMC.MY_JAVA");
++            removeJar("FOO.BAR");
++            removeJar("FOO.\"BAR/..\\../\"");
++            removeJar("EMC.MAIL_APP");
++            s.executeUpdate("drop table EMC.CONTACTS");
++            s.executeUpdate("drop procedure EMC.ADDCONTACT");
++            s.executeUpdate("drop schema FOO restrict");
++            s.executeUpdate("drop schema EMC restrict");
++
++            break;
++        }
++        
++        s.close();
++    }
++
++    private void createSchema(String name) throws SQLException {
++        Statement s = createStatement();
++        s.executeUpdate("create schema " + name);
++        s.close();
++    }
++
++    private void installJar(String resource, String jarName)
++            throws SQLException, MalformedURLException {        
++
++        URL jar = SupportFilesSetup.getReadOnlyURL(resource);
++        
++        CallableStatement cs = prepareCall("CALL SQLJ.INSTALL_JAR(?, ?, 0)");
++        cs.setString(1, jar.toExternalForm());
++        cs.setString(2, jarName);
++        cs.executeUpdate();
++        cs.close();
++    }
++    
++    private void replaceJar(String resource, String jarName)
++            throws SQLException, MalformedURLException {        
++
++        URL jar = SupportFilesSetup.getReadOnlyURL(resource);
++        CallableStatement cs = prepareCall("CALL SQLJ.REPLACE_JAR(?, ?)");
++        cs.setString(1, jar.toExternalForm());
++        cs.setString(2, jarName);
++        cs.executeUpdate();
++        cs.close();
++    }
++    
++    private void removeJar(String jarName) throws SQLException {
++        CallableStatement cs = prepareCall("CALL SQLJ.REMOVE_JAR(?, 0)");       
++        cs.setString(1, jarName);       
++        cs.executeUpdate();        
++        cs.close();
++    }
++
++    private void setDBClasspath(String cp) throws SQLException {
++        CallableStatement cs = prepareCall(
++          "CALL SYSCS_UTIL.SYSCS_SET_DATABASE_PROPERTY(" +
++          "'derby.database.classpath', ?)");
++
++        cs.setString(1, cp);
++        cs.executeUpdate();
++        cs.close();
++    }
++
++    private void tryCall() throws SQLException {
++        if (JDBC.vmSupportsJSR169()) {
++            return; // skip, EMC uses DriverManager
++        }
++
++        CallableStatement cs = prepareCall("CALL EMC.ADDCONTACT(?, ?)");
++        cs.setInt(1, 0);
++        cs.setString(2, "now@classpathchange.com");
++        cs.executeUpdate();
++        cs.close();
++    }
++
++    private void verifyNewLocations(int noOfObjects)
++            throws SQLException {
++        TestConfiguration tc = TestConfiguration.getCurrent();
++        String dbPath = tc.getPhysicalDatabaseName(tc.getDefaultDatabaseName());
++        String jarDirName =
++            "system" + File.separator + dbPath + File.separator + "jar";
++        File jarDir = new File(jarDirName);
++
++        assertTrue(jarDir.isDirectory());
++
++        File[] contents = jarDir.listFiles();
++        
++        // <db>/jar should now contain this no of files, none of which are
++        // directories
++        assertEquals(noOfObjects, contents.length);
++        
++        // assert that all the old style directories are gone
++        for (int i=0; i < contents.length; i++) {
++            File f = contents[i];
++            assertTrue(f.isFile());
++            assertFileNameShape(f.getName());
++        }
++    }
++
++
++    /**
++     * Regexp pattern to match the file name of a jar file stored in the
++     * database (version >= 10.9).
++     */
++    private Goal[] pattern;
++    
++    /**
++     * Initialize a pattern corresponding to:
++     * <p/>
++     * &lt;Derby uuid string&gt;[.]jar[.]G[0-9]+
++     * <p/>
++     * where:
++     * <p/>
++     * &lt;Derby uuid string&gt; has the form
++     * hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh
++     * <p/>
++     * where <em>h</em> id a lower case hex digit.
++     */
++    private void initPattern() {
++        List l = new ArrayList(100);
++        // The UUID format is determined by
++        // org.apache.derby.impl.services.uuid.BasicUUID#toString
++
++        for (int i=0; i < 8; i++) {
++            l.add(new CharRange(new char[][]{{'0','9'},{'a','f'}}));
++        }
++
++        l.add(new SingleChar('-'));
++        
++        for (int j = 0; j < 3; j++) {
++            for (int i=0; i < 4; i++) {
++                l.add(new CharRange(new char[][]{{'0','9'},{'a','f'}}));
++            }
++            
++            l.add(new SingleChar('-'));
++        }
++        
++        for (int i=0; i < 12; i++) {
++            l.add(new CharRange(new char[][]{{'0','9'},{'a','f'}}));
++        }
++        
++        l.add(new SingleChar('.'));
++        l.add(new SingleChar('j'));
++        l.add(new SingleChar('a'));
++        l.add(new SingleChar('r'));
++        l.add(new SingleChar('.'));
++        l.add(new SingleChar('G'));
++        l.add(new CharRange(new char[][]{{'0','9'}}, Goal.REPEAT));
++        this.pattern = new Goal[l.size()];
++        System.arraycopy(l.toArray(), 0, this.pattern, 0, l.size());
++    }
++
++    /**
++     * assert that fName has the expected shape of a jar file
++     * in the database (version >= 10.9).
++     */
++    private void assertFileNameShape(String fName) {
++        assertTrue(matches(fName, pattern));
++    }
++    
++    /**
++     * Poor man's regexp matcher: can match patterns of type below, where
++     * start "^" and end "$" is implied: must match whole string.
++     * <p/>
++     * reg.exp: ( '[' &lt;fromchar&gt;-&lt;tochar&gt; ] '+'? ']' |
++     *            &lt;char&gt; '+'? )*
++     */
++    private boolean matches(String fName, Goal[] pattern) {
++        int patIdx = 0;
++        for (int i = 0; i < fName.length(); i++) {
++            Goal p = pattern[patIdx];
++            char c = fName.charAt(i);
++
++            if (p.matches(c)) {
++                if (!p.isRepeatable()) {
++                    patIdx++;
++                } 
++                p.setFoundOnce();
++                continue;
++            } 
++                
++            // Goal did not match: if we have a repeatable goal and we already
++            // found one occurence it's ok, to step on to next goal in pattern
++            // and see it that matches.
++            patIdx++;
++            if (p.matches(c)) {
++                if (!p.isRepeatable()) {
++                    patIdx++;
++                } 
++                p.setFoundOnce();
++                continue;
++            }
++
++            return false;
++            
++        }
++        
++        return patIdx >= (pattern.length - 1); // exact match
++    }
++    
++    abstract class Goal {
++        public abstract boolean matches(char c);
++        
++        public final static int REPEAT = 0; // optional goal property
++        int option = -1;
++        boolean foundOnce = false;
++
++        public boolean isRepeatable () {
++            return option == REPEAT;
++        }
++        
++        public void setFoundOnce() {
++            this.foundOnce = true;
++        }
++        
++        public boolean foundOnce () {
++            return this.foundOnce;
++        }
++    }
++
++    private class CharRange extends Goal {
++        private char[][] ranges;
++        
++        public CharRange(char[][]ranges) {
++            this.ranges = (char[][])ranges.clone();
++        }
++        
++        public CharRange(char[][]ranges, int option) {
++            this.ranges = (char[][])ranges.clone();
++            this.option = option;
++        }
++        
++        public boolean matches(char c) {
++            for (int i = 0; i < ranges.length; i++) {
++                if (c >= ranges[i][0] && c <= ranges[i][1]) {
++                    return true;
++                }
++            }
++            return false;
++        }
++    }
++
++    private class SingleChar extends Goal {
++        private char c;
++        private int option = -1;
++        private boolean foundOnce = false;
++        
++        public SingleChar(char c) {
++            this.c = c;
++        }
++    
++        public SingleChar(char c, int option) {
++            this.c = c;
++            this.option = option;
++        }
++        public boolean matches(char c) {
++            return c == this.c;
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/tools/org/apache/derby/impl/tools/dblook/DB_Jar.java b/db/derby/code/trunk/java/tools/org/apache/derby/impl/tools/dblook/DB_Jar.java
+index a73fb6cb..1e2e1275 100644
+--- a/db/derby/code/trunk/java/tools/org/apache/derby/impl/tools/dblook/DB_Jar.java
++++ b/db/derby/code/trunk/java/tools/org/apache/derby/impl/tools/dblook/DB_Jar.java
+@@ -21,20 +21,14 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.impl.tools.dblook;
+ 
+-import java.sql.Connection;
+-import java.sql.Statement;
+-import java.sql.PreparedStatement;
+-import java.sql.ResultSet;
+-import java.sql.SQLException;
+-
+-import java.util.HashMap;
+-
+ import java.io.File;
+-import java.io.FileOutputStream;
+ import java.io.FileInputStream;
+-import java.io.FileNotFoundException;
++import java.io.FileOutputStream;
+ import java.io.IOException;
+-
++import java.sql.Connection;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
+ import org.apache.derby.tools.dblook;
+ 
+ public class DB_Jar {
+@@ -44,39 +38,96 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 * database.
+ 	 * @param dbName Name of the database (for locating the jar).
+ 	 * @param conn Connection to the source database.
++     * @param at10_9 Dictionary is at 10.9 or higher
+ 	 * @return The DDL for the jars has been written
+ 	 *  to output via Logs.java.
+ 	 ****/
+ 
+-	public static void doJars(String dbName, Connection conn)
++	public static void doJars(
++        String dbName, Connection conn, boolean at10_9)
+ 		throws SQLException
+ 	{
+ 
+ 		String separator = System.getProperty("file.separator");
+ 		Statement stmt = conn.createStatement();
+-		ResultSet rs = stmt.executeQuery("SELECT FILENAME, SCHEMAID, " +
+-			"GENERATIONID FROM SYS.SYSFILES");
++        ResultSet rs = stmt.executeQuery(
++            "SELECT FILENAME, SCHEMAID, " +
++            "GENERATIONID, FILEID FROM SYS.SYSFILES");
+ 
+ 		boolean firstTime = true;
+ 		while (rs.next()) {
+ 
+-			String jarName = dblook.addQuotes(
+-				dblook.expandDoubleQuotes(rs.getString(1)));
++            StringBuffer loadJarString = new StringBuffer();
++
++            String jarName    = rs.getString(1);
+ 			String schemaId = rs.getString(2);
+-			String schemaName = dblook.lookupSchemaId(schemaId);
+-			if (dblook.isIgnorableSchema(schemaName))
++            String genID      = rs.getString(3);
++            String UUIDstring = rs.getString(4);
++
++            String schemaNameSQL = dblook.lookupSchemaId(schemaId);
++
++            if (dblook.isIgnorableSchema(schemaNameSQL))
+ 				continue;
+ 
+-			if (firstTime) {
+-				Logs.reportString("----------------------------------------------");
+-				Logs.reportMessage("DBLOOK_JarsHeader");
+-				Logs.reportMessage("DBLOOK_Jar_Note");
+-				Logs.reportString("----------------------------------------------\n");
++            doHeader(firstTime);
++
++            if (at10_9) {
++                String schemaNameCNF =
++                    dblook.unExpandDoubleQuotes(
++                        dblook.stripQuotes(dblook.lookupSchemaId(schemaId)));;
++
++                StringBuffer jarFullName = new StringBuffer();
++                jarFullName.append(UUIDstring);
++                jarFullName.append(".jar.G");
++                jarFullName.append(genID);
++
++                StringBuffer oldJarPath = new StringBuffer();
++                oldJarPath.append(dbName);
++                oldJarPath.append(separator);
++                oldJarPath.append("jar");
++                oldJarPath.append(separator);
++                oldJarPath.append(jarFullName.toString());
++
++                // Copy jar file to DBJARS directory.
++                String absJarDir = null;
++                try {
++
++                    // Create the DBJARS directory.
++                    File jarDir = new File(System.getProperty("user.dir") +
++                                           separator + "DBJARS");
++                    absJarDir = jarDir.getAbsolutePath();
++                    jarDir.mkdirs();
++
++                    doCopy(oldJarPath.toString(), absJarDir + separator + jarFullName);
++                } catch (Exception e) {
++                    Logs.debug("DBLOOK_FailedToLoadJar",
++                               absJarDir + separator + jarFullName.toString());
++                    Logs.debug(e);
++                    firstTime = false;
++                    continue;
+ 			}
+ 
+-			String genID = rs.getString(3);
++                // Now, add the DDL to read the jar from DBJARS.
++                loadJarString.append("CALL SQLJ.INSTALL_JAR('file:");
++                loadJarString.append(absJarDir);
++                loadJarString.append(separator);
++                loadJarString.append(jarFullName);
++                loadJarString.append("', '");
++                loadJarString.append(
++                    dblook.addQuotes(
++                        dblook.expandDoubleQuotes(schemaNameCNF)));
+ 
+-			String schemaWithoutQuotes = dblook.stripQuotes(schemaName);
++                loadJarString.append(".");
++
++                loadJarString.append(
++                    dblook.addQuotes(
++                        dblook.expandDoubleQuotes(jarName)));
++
++            } else {
++                jarName = dblook.addQuotes(
++                    dblook.expandDoubleQuotes(jarName));
++
++                String schemaWithoutQuotes = dblook.stripQuotes(schemaNameSQL);
+ 			StringBuffer jarFullName = new StringBuffer(separator);
+ 			jarFullName.append(dblook.stripQuotes(jarName));
+ 			jarFullName.append(".jar.G");
+@@ -95,30 +146,13 @@ public static void doJars(String dbName, Connection conn)
+ 			try {
+ 
+ 				// Create the DBJARS directory.
+-				File jarDir = new File(System.getProperty("user.dir") +
++                    File jarDir = new File(
++                        System.getProperty("user.dir") +
+ 					separator + "DBJARS" + separator + schemaWithoutQuotes);
+ 				absJarDir = jarDir.getAbsolutePath();
+ 				jarDir.mkdirs();
+ 
+-				// Create streams.
+-				FileInputStream oldJarFile =
+-					new FileInputStream(oldJarPath.toString());
+-				FileOutputStream newJarFile =
+-					new FileOutputStream(absJarDir + jarFullName);
+-
+-				// Copy.
+-				int st = 0;
+-				while (true) {
+-					if (oldJarFile.available() == 0)
+-						break;
+-					byte[] bAr = new byte[oldJarFile.available()];
+-					oldJarFile.read(bAr);
+-					newJarFile.write(bAr);
+-				}
+-
+-				newJarFile.close();
+-				oldJarFile.close();
+-
++                    doCopy(oldJarPath.toString(), absJarDir + jarFullName);
+ 			} catch (Exception e) {
+ 				Logs.debug("DBLOOK_FailedToLoadJar",
+ 					absJarDir + jarFullName.toString());
+@@ -128,21 +162,21 @@ public static void doJars(String dbName, Connection conn)
+ 			}
+ 
+ 			// Now, add the DDL to read the jar from DBJARS.
+-			StringBuffer loadJarString = new StringBuffer();
+ 			loadJarString.append("CALL SQLJ.INSTALL_JAR('file:");
+ 			loadJarString.append(absJarDir);
+ 			loadJarString.append(jarFullName);
+ 			loadJarString.append("', '");
+-			loadJarString.append(schemaName);
++                loadJarString.append(schemaNameSQL);
+ 			loadJarString.append(".");
+ 			loadJarString.append(jarName);
++            }
++            
+ 			loadJarString.append("', 0)");
+ 
+ 			Logs.writeToNewDDL(loadJarString.toString());
+ 			Logs.writeStmtEndToNewDDL();
+ 			Logs.writeNewlineToNewDDL();
+ 			firstTime = false;
+-
+ 		}
+ 
+ 		stmt.close();
+@@ -150,4 +184,33 @@ public static void doJars(String dbName, Connection conn)
+ 
+ 	}
+ 
++    private static void  doHeader(boolean firstTime) {
++        if (firstTime) {
++            Logs.reportString(
++                "----------------------------------------------");
++            Logs.reportMessage("DBLOOK_JarsHeader");
++            Logs.reportMessage("DBLOOK_Jar_Note");
++            Logs.reportString(
++                "----------------------------------------------\n");
++        }
++    }
++
++    private static void doCopy(
++        String oldJarFileName,
++        String newJarFileName) throws IOException {
++
++        FileInputStream oldJarFile = new FileInputStream(oldJarFileName);
++        FileOutputStream newJarFile = new FileOutputStream(newJarFileName);
++        int st = 0;
++        while (true) {
++            if (oldJarFile.available() == 0)
++                break;
++            byte[] bAr = new byte[oldJarFile.available()];
++            oldJarFile.read(bAr);
++            newJarFile.write(bAr);
++        }
++
++        oldJarFile.close();
++        newJarFile.close();
++    }
+ }
+diff --git a/db/derby/code/trunk/java/tools/org/apache/derby/tools/dblook.java b/db/derby/code/trunk/java/tools/org/apache/derby/tools/dblook.java
+index 54bc65ba..361a267e 100644
+--- a/db/derby/code/trunk/java/tools/org/apache/derby/tools/dblook.java
++++ b/db/derby/code/trunk/java/tools/org/apache/derby/tools/dblook.java
+@@ -518,6 +518,7 @@ private void go()
+ 			prepForDump();
+ 
+             boolean at10_6 = atVersion( conn, 10, 6 );
++            boolean at10_9 = atVersion( conn, 10, 9 );
+ 
+ 			// Generate DDL.
+ 
+@@ -530,7 +531,7 @@ private void go()
+ 
+ 			if (tableList == null) {
+ 			// Don't do these if user just wants table-related objects.
+-				DB_Jar.doJars(sourceDBName, this.conn);
++                DB_Jar.doJars(sourceDBName, this.conn, at10_9);
+ 				DB_Alias.doProceduresFunctionsAndUDTs(this.conn, at10_6 );
+ 			}
+ 
+@@ -1014,6 +1015,36 @@ public static String expandDoubleQuotes(String name) {
+ 
+ 	}
+ 
++    /**
++     * inverse of expandDoubleQuotes
++     */
++    public static String unExpandDoubleQuotes(String name) {
++
++        if ((name == null) || (name.indexOf("\"") < 0))
++        // nothing to do.
++            return name;
++
++        char [] cA = name.toCharArray();
++
++        char [] result = new char[cA.length];
++
++        int j = 0;
++        for (int i = 0; i < cA.length; i++) {
++
++            if (cA[i] == '"') {
++                result[j++] = cA[i];
++                j++; // skip next char which must be " also
++            }
++            else
++                result[j++] = cA[i];
++
++        }
++
++        return new String(result, 0, j);
++
++    }
++
++
+ 	/* ************************************************
+ 	 * lookupSchemaId:
+ 	 * Return the schema name corresponding to the

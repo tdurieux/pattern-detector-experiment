@@ -1,0 +1,175 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+index 8965db46..18ac9668 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+@@ -539,6 +539,25 @@ public void	dropAllTableAndColPermDescriptors(UUID tableID, TransactionControlle
+ 	public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionController tc)
+ 	throws StandardException;
+ 	
++	/**
++	 * Update SYSCOLPERMS to reflect the dropping of a column from a table.
++	 *
++	 * This method rewrites SYSCOLPERMS rows to update the COLUMNS bitmap
++	 * to reflect the removal of a column from a table.
++	 *
++	 * Currently, this code gets called during execution phase of
++	 * ALTER TABLE .. DROP COLUMN .. 
++	 *
++	 * @param tableID	The UUID of the table whose column has been dropped
++	 * @param tc		TransactionController for the transaction
++	 * @param columnDescriptor   Info about the dropped column
++	 *
++	 * @exception StandardException		Thrown on error
++	 */
++	public void	updateSYSCOLPERMSforDropColumn(UUID tableID,
++			TransactionController tc, ColumnDescriptor columnDescriptor)
++	throws StandardException;
++	
+ 	
+ 	/**
+ 	 * Drops all routine permission descriptors for the given routine.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index a31f61cd..2e83db73 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -2363,6 +2363,45 @@ public void	dropAllTableAndColPermDescriptors(UUID tableID, TransactionControlle
+ 	 */
+ 	public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionController tc)
+ 	throws StandardException
++	{
++		rewriteSYSCOLPERMSforAlterTable(tableID, tc, null);
++	}
++	/**
++	 * Update SYSCOLPERMS due to dropping a column from a table.
++	 *
++	 * Since ALTER TABLE .. DROP COLUMN .. has removed a column from the
++	 * table, we need to shrink COLUMNS by removing the corresponding bit
++	 * position, and shifting all the subsequent bits "left" one position.
++	 *
++	 * @param tableID	The UUID of the table from which a col has been dropped
++	 * @param tc		TransactionController for the transaction
++	 * @param columnDescriptor   Information about the dropped column
++	 *
++	 * @exception StandardException		Thrown on error
++	 */
++	public void updateSYSCOLPERMSforDropColumn(UUID tableID, 
++			TransactionController tc, ColumnDescriptor columnDescriptor)
++		throws StandardException
++	{
++		rewriteSYSCOLPERMSforAlterTable(tableID, tc, columnDescriptor);
++	}
++	/**
++	 * Workhorse for ALTER TABLE-driven mods to SYSCOLPERMS
++	 *
++	 * This method finds all the SYSCOLPERMS rows for this table. Then it
++	 * iterates through each row, either adding a new column to the end of
++	 * the table, or dropping a column from the table, as appropriate. It
++	 * updates each SYSCOLPERMS row to store the new COLUMNS value.
++	 *
++	 * @param tableID	The UUID of the table being altered
++	 * @param tc		TransactionController for the transaction
++	 * @param columnDescriptor   Dropped column info, or null if adding
++	 *
++	 * @exception StandardException		Thrown on error
++	 */
++	private void rewriteSYSCOLPERMSforAlterTable(UUID tableID,
++			TransactionController tc, ColumnDescriptor columnDescriptor)
++		throws StandardException
+ 	{
+ 		// In Derby authorization mode, permission catalogs may not be present
+ 		if (!usesSqlAuthorization)
+@@ -2395,8 +2434,8 @@ public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionCo
+ 			false);
+ 
+ 		/* Next, using each of the ColPermDescriptor's uuid, get the unique row 
+-		in SYSCOLPERMS and expand the "COLUMNS" column in SYSCOLPERMS to 
+-		accomodate the newly added column to the tableid*/
++		in SYSCOLPERMS and adjust the "COLUMNS" column in SYSCOLPERMS to 
++		accomodate the added or dropped column in the tableid*/
+ 		ColPermsDescriptor colPermsDescriptor;
+ 		ExecRow curRow;
+ 		ExecIndexRow uuidKey;
+@@ -2411,8 +2450,34 @@ public void	updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID, TransactionCo
+ 			curRow=ti.getRow(tc, uuidKey, rf.COLPERMSID_INDEX_NUM);
+ 	        FormatableBitSet columns = (FormatableBitSet) curRow.getColumn( 
+ 					  SYSCOLPERMSRowFactory.COLUMNS_COL_NUM).getObject();
++			// See whether this is ADD COLUMN or DROP COLUMN. If ADD, then
++			// add a new bit to the bit set. If DROP, then remove the bit
++			// for the dropped column.
++			if (columnDescriptor == null)
++			{
+ 	        int currentLength = columns.getLength();
+ 	        columns.grow(currentLength+1);
++			}
++			else
++			{
++				FormatableBitSet modifiedColumns=new FormatableBitSet(columns);
++				modifiedColumns.shrink(columns.getLength()-1);
++				// All the bits from 0 ... colPosition-2 are OK. The bits from
++				// colPosition to the end need to be shifted 1 to the left.
++				// The bit for colPosition-1 simply disappears from COLUMNS.
++				// ColumnPosition values count from 1, while bits in the
++				// FormatableBitSet count from 0.
++				for (int i = columnDescriptor.getPosition()-1;
++						i < modifiedColumns.getLength();
++						i++)
++				{
++					if (columns.isSet(i+1))
++						modifiedColumns.set(i);
++					else
++						modifiedColumns.clear(i);
++				}
++				columns = modifiedColumns;
++			}
+ 	        curRow.setColumn(SYSCOLPERMSRowFactory.COLUMNS_COL_NUM,
+ 					  dvf.getDataValue((Object) columns));
+ 			ti.updateRow(uuidKey, curRow,
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+index 6b654353..d0dd719f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+@@ -673,17 +673,6 @@ private void addNewColumnToTable(Activation activation,
+ 	 * fixup of schema objects (such as triggers and column
+ 	 * privileges) which refer to columns by column position number.
+ 	 * 
+-	 * Currently, column privileges are not repaired when
+-	 * dropping a column. This is bug DERBY-1909, and for the
+-	 * time being we simply reject DROP COLUMN if it is specified
+-	 * when sqlAuthorization is true (that check occurs in the
+-	 * parser, not here). When DERBY-1909 is fixed:
+-	 *  - Update this comment
+-	 *  - Remove the check in dropColumnDefinition() in the parser
+-	 *  - consolidate all the tests in altertableDropColumn.sql
+-	 *    back into altertable.sql and remove the separate
+-	 *    altertableDropColumn files
+-	 * 
+ 	 * Indexes are a bit interesting. The official SQL spec
+ 	 * doesn't talk about indexes; they are considered to be
+ 	 * an imlementation-specific performance optimization.
+@@ -957,6 +946,9 @@ else if (referencedCols[j] == columnPosition)
+ 								 true, tc);
+ 			}
+ 		}
++		// Adjust the column permissions rows in SYSCOLPERMS to reflect the
++		// changed column positions due to the dropped column:
++		dd.updateSYSCOLPERMSforDropColumn(td.getUUID(), tc, columnDescriptor);
+ 	}
+ 
+ 	private void modifyColumnType(Activation activation,
+diff --git a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+index 36d1b4b4..186c2168 100644
+--- a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
++++ b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+@@ -225,6 +225,12 @@ public void updateSYSCOLPERMSforAddColumnToUserTable(UUID tableID,
+ 
+ 	}
+ 
++	public void updateSYSCOLPERMSforDropColumn(UUID tableID,
++		TransactionController tc, ColumnDescriptor columnDescriptor)
++	    throws StandardException
++	{
++	}
++
+ 	public void dropAllRoutinePermDescriptors(UUID routineID,
+ 			TransactionController tc) throws StandardException {
+ 		// TODO Auto-generated method stub

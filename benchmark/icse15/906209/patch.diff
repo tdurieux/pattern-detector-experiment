@@ -1,0 +1,350 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 164a7d2b..0b34cb2d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -415,7 +415,7 @@ public void forceFlushIfExpired() throws IOException
+         return switchMemtable(memtable_, true);
+     }
+ 
+-    void forceBlockingFlush() throws IOException, ExecutionException, InterruptedException
++    public void forceBlockingFlush() throws IOException, ExecutionException, InterruptedException
+     {
+         Future<?> future = forceFlush();
+         if (future != null)
+@@ -937,9 +937,11 @@ private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore) throws
+        range_slice.  still opens one randomaccessfile per key, which sucks.  something like compactioniterator
+        would be better.
+      */
+-    private RangeReply getKeyRange(final DecoratedKey startWith, final DecoratedKey stopAt, int maxResults)
++    private boolean getKeyRange(List<String> keys, final DecoratedKey startWith, final DecoratedKey stopAt, int maxResults)
+     throws IOException, ExecutionException, InterruptedException
+     {
++        // getKeyRange requires start <= stop.  getRangeSlice handles range wrapping if necessary.
++        assert stopAt.isEmpty() || startWith.compareTo(stopAt) <= 0;
+         // create a CollatedIterator that will return unique keys from different sources
+         // (current memtable, historical memtables, and SSTables) in the correct order.
+         List<Iterator<DecoratedKey>> iterators = new ArrayList<Iterator<DecoratedKey>>();
+@@ -1009,23 +1011,20 @@ protected DecoratedKey getReduced()
+         try
+         {
+             // pull keys out of the CollatedIterator
+-            List<String> keys = new ArrayList<String>();
+             boolean rangeCompletedLocally = false;
+             for (DecoratedKey current : reduced)
+             {
+                 if (!stopAt.isEmpty() && stopAt.compareTo(current) < 0)
+                 {
+-                    rangeCompletedLocally = true;
+-                    break;
++                    return true;
+                 }
+                 keys.add(current.key);
+                 if (keys.size() >= maxResults)
+                 {
+-                    rangeCompletedLocally = true;
+-                    break;
++                    return true;
+                 }
+             }
+-            return new RangeReply(keys, rangeCompletedLocally);
++            return false;
+         }
+         finally
+         {
+@@ -1054,19 +1053,34 @@ protected DecoratedKey getReduced()
+     public RangeSliceReply getRangeSlice(byte[] super_column, final DecoratedKey startKey, final DecoratedKey finishKey, int keyMax, SliceRange sliceRange, List<byte[]> columnNames)
+     throws IOException, ExecutionException, InterruptedException
+     {
+-        RangeReply rr = getKeyRange(startKey, finishKey, keyMax);
+-        List<Row> rows = new ArrayList<Row>(rr.keys.size());
++        List<String> keys = new ArrayList<String>();
++        boolean completed;
++        if (finishKey.isEmpty() || startKey.compareTo(finishKey) <= 0)
++        {
++            completed = getKeyRange(keys, startKey, finishKey, keyMax);
++        }
++        else
++        {
++            // wrapped range
++            DecoratedKey emptyKey = new DecoratedKey(StorageService.getPartitioner().getMinimumToken(), null);
++            completed = getKeyRange(keys, startKey, emptyKey, keyMax);
++            if (!completed)
++            {
++                completed = getKeyRange(keys, emptyKey, finishKey, keyMax);
++            }
++        }
++        List<Row> rows = new ArrayList<Row>(keys.size());
+         final QueryPath queryPath =  new QueryPath(columnFamily_, super_column, null);
+         final SortedSet<byte[]> columnNameSet = new TreeSet<byte[]>(getComparator());
+         if (columnNames != null)
+             columnNameSet.addAll(columnNames);
+-        for (String key : rr.keys)
++        for (String key : keys)
+         {
+             QueryFilter filter = sliceRange == null ? new NamesQueryFilter(key, queryPath, columnNameSet) : new SliceQueryFilter(key, queryPath, sliceRange.start, sliceRange.finish, sliceRange.reversed, sliceRange.count);
+             rows.add(new Row(key, getColumnFamily(filter)));
+         }
+ 
+-        return new RangeSliceReply(rows, rr.rangeCompletedLocally);
++        return new RangeSliceReply(rows, completed);
+     }
+ 
+     public AbstractType getComparator()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
+index 69a2fcf8..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
+@@ -1,80 +0,0 @@
+-/*
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*    http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing,
+-* software distributed under the License is distributed on an
+-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-* KIND, either express or implied.  See the License for the
+-* specific language governing permissions and limitations
+-* under the License.
+-*/
+-package org.apache.cassandra.db;
+-
+-import java.util.*;
+-import java.io.ByteArrayInputStream;
+-import java.io.DataInputStream;
+-import java.io.IOException;
+-
+-import org.apache.commons.lang.StringUtils;
+-
+-import org.apache.cassandra.io.util.DataOutputBuffer;
+-import org.apache.cassandra.net.Message;
+-import org.apache.cassandra.utils.FBUtilities;
+-
+-public class RangeReply
+-{
+-    public final List<String> keys;
+-    public final boolean rangeCompletedLocally;
+-
+-    public RangeReply(List<String> keys, boolean rangeCompletedLocally)
+-    {
+-        this.keys = keys;
+-        this.rangeCompletedLocally = rangeCompletedLocally;
+-    }
+-
+-    public Message getReply(Message originalMessage) throws IOException
+-    {
+-        DataOutputBuffer dob = new DataOutputBuffer();
+-        dob.writeBoolean(rangeCompletedLocally);
+-
+-        for (String key : keys)
+-        {
+-            dob.writeUTF(key);
+-        }
+-        byte[] data = Arrays.copyOf(dob.getData(), dob.getLength());
+-        return originalMessage.getReply(FBUtilities.getLocalAddress(), data);
+-    }
+-
+-    @Override
+-    public String toString()
+-    {
+-        return "RangeReply(" +
+-               "keys=[" + StringUtils.join(keys, ", ") +
+-               "], completed=" + rangeCompletedLocally +
+-               ')';
+-    }
+-
+-    public static RangeReply read(byte[] body) throws IOException
+-    {
+-        ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+-        boolean rangeCompletedLocally;
+-        DataInputStream dis = new DataInputStream(bufIn);
+-        rangeCompletedLocally = dis.readBoolean();
+-
+-        List<String> keys = new ArrayList<String>();
+-        while (dis.available() > 0)
+-        {
+-            keys.add(dis.readUTF());
+-        }
+-
+-        return new RangeReply(keys, rangeCompletedLocally);
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/Util.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+index 57385bfe..cd3a7f2e 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/Util.java
+@@ -71,4 +71,26 @@ public static RangeSliceReply getRangeSlice(ColumnFamilyStore cfs) throws IOExce
+                                  new SliceRange(ArrayUtils.EMPTY_BYTE_ARRAY, ArrayUtils.EMPTY_BYTE_ARRAY, false, 10000),
+                                  null);
+     }
++
++    /**
++     * Writes out a bunch of rows for a single column family.
++     *
++     * @param rows A group of RowMutations for the same table and column family.
++     * @return The ColumnFamilyStore that was used.
++     */
++    public static ColumnFamilyStore writeColumnFamily(List<RowMutation> rms) throws IOException, ExecutionException, InterruptedException
++    {
++        RowMutation first = rms.get(0);
++        String tablename = first.getTable();
++        String cfname = first.columnFamilyNames().iterator().next();
++
++        Table table = Table.open(tablename);
++        ColumnFamilyStore store = table.getColumnFamilyStore(cfname);
++
++        for (RowMutation rm : rms)
++            rm.apply();
++
++        store.forceBlockingFlush();
++        return store;
++    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+index 547d580d..a0286cb0 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+@@ -28,6 +28,9 @@
+ 
+ import static junit.framework.Assert.assertEquals;
+ import org.apache.cassandra.CleanupHelper;
++import org.apache.cassandra.Util;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.thrift.SliceRange;
+ import org.apache.cassandra.utils.WrappedRunnable;
+ 
+ import java.net.InetAddress;
+@@ -62,7 +65,7 @@ public void testGetColumnWithWrongBF() throws IOException, ExecutionException, I
+         rm.add(new QueryPath("Standard1", null, "Column1".getBytes()), "asdf".getBytes(), 0);
+         rm.add(new QueryPath("Standard1", null, "Column2".getBytes()), "asdf".getBytes(), 0);
+         rms.add(rm);
+-        ColumnFamilyStore store = ColumnFamilyStoreUtils.writeColumnFamily(rms);
++        ColumnFamilyStore store = Util.writeColumnFamily(rms);
+ 
+         Table table = Table.open("Keyspace1");
+         List<SSTableReader> ssTables = table.getAllSSTablesOnDisk();
+@@ -111,7 +114,7 @@ private void testAntiCompaction(String columnFamilyName, int insertsPerTable) th
+             rm.add(new QueryPath(columnFamilyName, null, "0".getBytes()), new byte[0], j);
+             rms.add(rm);
+         }
+-        ColumnFamilyStore store = ColumnFamilyStoreUtils.writeColumnFamily(rms);
++        ColumnFamilyStore store = Util.writeColumnFamily(rms);
+ 
+         List<Range> ranges  = new ArrayList<Range>();
+         IPartitioner partitioner = new CollatingOrderPreservingPartitioner();
+@@ -127,4 +130,24 @@ public void testAntiCompaction1() throws IOException, ExecutionException, Interr
+     {
+         testAntiCompaction("Standard1", 100);
+     }    
++
++    @Test
++    public void testWrappedRangeQuery() throws IOException, ExecutionException, InterruptedException
++    {
++        List<RowMutation> rms = new LinkedList<RowMutation>();
++        RowMutation rm;
++        rm = new RowMutation("Keyspace2", "key1");
++        rm.add(new QueryPath("Standard1", null, "Column1".getBytes()), "asdf".getBytes(), 0);
++        rms.add(rm);
++        Util.writeColumnFamily(rms);
++
++        rm = new RowMutation("Keyspace2", "key2");
++        rm.add(new QueryPath("Standard1", null, "Column1".getBytes()), "asdf".getBytes(), 0);
++        rms.add(rm);
++        ColumnFamilyStore cfs = Util.writeColumnFamily(rms);
++
++        IPartitioner p = StorageService.getPartitioner();
++        RangeSliceReply result = cfs.getRangeSlice(ArrayUtils.EMPTY_BYTE_ARRAY, p.decorateKey("key2"), p.decorateKey("key1"), 10, null, Arrays.asList("asdf".getBytes()));
++        assertEquals(2, result.rows.size());
++    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreUtils.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreUtils.java
+index f920fad4..e69de29b 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreUtils.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/ColumnFamilyStoreUtils.java
+@@ -1,48 +0,0 @@
+-/*
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*    http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing,
+-* software distributed under the License is distributed on an
+-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-* KIND, either express or implied.  See the License for the
+-* specific language governing permissions and limitations
+-* under the License.
+-*/
+-package org.apache.cassandra.db;
+-
+-import java.io.IOException;
+-import java.util.List;
+-import java.util.concurrent.ExecutionException;
+-
+-public class ColumnFamilyStoreUtils
+-{
+-    /**
+-     * Writes out a bunch of rows for a single column family.
+-     *
+-     * @param rows A group of RowMutations for the same table and column family.
+-     * @return The ColumnFamilyStore that was used.
+-     */
+-    public static ColumnFamilyStore writeColumnFamily(List<RowMutation> rms) throws IOException, ExecutionException, InterruptedException
+-    {
+-        RowMutation first = rms.get(0);
+-        String tablename = first.getTable();
+-        String cfname = first.columnFamilyNames().iterator().next();
+-
+-        Table table = Table.open(tablename);
+-        ColumnFamilyStore store = table.getColumnFamilyStore(cfname);
+-
+-        for (RowMutation rm : rms)
+-            rm.apply();
+-
+-        store.forceBlockingFlush();
+-        return store;
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+index 48bbce96..0c1bb0f0 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+@@ -38,6 +38,7 @@
+ 
+ import org.apache.cassandra.CleanupHelper;
+ import org.apache.cassandra.config.DatabaseDescriptorTest;
++import org.apache.cassandra.Util;
+ 
+ import org.junit.Before;
+ import org.junit.Test;
+@@ -111,7 +112,7 @@ public void testValidatorPrepare() throws Throwable
+         rm = new RowMutation(tablename, "key1");
+         rm.add(new QueryPath(cfname, null, "Column1".getBytes()), "asdf".getBytes(), 0);
+         rms.add(rm);
+-        ColumnFamilyStoreUtils.writeColumnFamily(rms);
++        Util.writeColumnFamily(rms);
+ 
+         // sample
+         validator = new Validator(new CFPair(tablename, cfname));
+@@ -170,8 +171,8 @@ public void testTreeStore() throws Throwable
+         rm.add(new QueryPath(cfname, null, "Column1".getBytes()), "asdf".getBytes(), 0);
+         rms.add(rm);
+         // with two SSTables
+-        ColumnFamilyStoreUtils.writeColumnFamily(rms);
+-        ColumnFamilyStore store = ColumnFamilyStoreUtils.writeColumnFamily(rms);
++        Util.writeColumnFamily(rms);
++        ColumnFamilyStore store = Util.writeColumnFamily(rms);
+         
+         TreePair old = aes.getRendezvousPair(tablename, cfname, REMOTE);
+         // force a readonly compaction, and wait for it to finish

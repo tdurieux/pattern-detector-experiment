@@ -1,0 +1,359 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/FileLogger.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/FileLogger.java
+index fba538df..6c78bcd2 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/FileLogger.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/FileLogger.java
+@@ -1508,6 +1508,15 @@ protected long redo(
+ 
+ 					recoveryTransaction.commit();
+ 				}
++			} // while redoScan.getNextRecord() != null
++
++            // If the scan ended in an empty file, update logEnd to reflect that
++            // in order to avoid to continue logging to an older file
++            long end = redoScan.getLogRecordEnd(); 
++            if (end != LogCounter.INVALID_LOG_INSTANT
++                && (LogCounter.getLogFileNumber(logEnd) 
++                    < LogCounter.getLogFileNumber(end))) {
++                logEnd = end;
+ 			}
+ 		}
+ 		catch (StandardException se)
+@@ -1557,10 +1566,12 @@ protected long redo(
+ 			if (instant != LogCounter.INVALID_LOG_INSTANT)	
+             {
+ 				SanityManager.ASSERT(
+-                    LogCounter.getLogFileNumber(instant) ==
++                    LogCounter.getLogFileNumber(instant) <
++                         LogCounter.getLogFileNumber(logEnd) ||
++                    (LogCounter.getLogFileNumber(instant) ==
+                          LogCounter.getLogFileNumber(logEnd) &&
+                      LogCounter.getLogFilePosition(instant) <=
+-                         LogCounter.getLogFilePosition(logEnd));
++                         LogCounter.getLogFilePosition(logEnd)));
+             }
+ 			else
+             {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/Scan.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/Scan.java
+index ea69c689..4f1e1851 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/Scan.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/Scan.java
+@@ -706,6 +706,37 @@ private LogRecord getNextRecordForward(ArrayInputStream input,
+ 					return null;
+ 				}
+ 
++				// scan is position just past the log header
++				recordStartPosition = scan.getFilePointer();
++
++                // Verify that the header of the new log file refers
++                // to the end of the log record of the previous file
++                // (Rest of header has been verified by getLogFileAtBeginning)
++				scan.seek(LogToFile
++                          .LOG_FILE_HEADER_PREVIOUS_LOG_INSTANT_OFFSET);
++                long previousLogInstant = scan.readLong();
++                if (previousLogInstant != knownGoodLogEnd) {
++                    // If there is a mismatch, something is wrong and
++                    // we return null to stop the scan.  The same
++                    // behavior occurs when getLogFileAtBeginning
++                    // detects an error in the other fields of the header.
++                    if (SanityManager.DEBUG) {
++                        if (SanityManager.DEBUG_ON(LogToFile.DBG_FLAG)) {
++                            SanityManager.DEBUG(LogToFile.DBG_FLAG, 
++                                                "log file " 
++                                                + currentLogFileNumber  
++                                                + ": previous log record: "
++                                                + previousLogInstant
++                                                + " known previous log record: "
++                                                + knownGoodLogEnd);
++                        }
++                    }
++                    return null;
++				}
++
++
++				scan.seek(recordStartPosition);
++
+ 				if (SanityManager.DEBUG) 
+                 {
+                     if (SanityManager.DEBUG_ON(LogToFile.DBG_FLAG))
+@@ -716,8 +747,11 @@ private LogRecord getNextRecordForward(ArrayInputStream input,
+                     }
+                 }
+ 
+-				// scan is position just past the log header
+-				recordStartPosition = scan.getFilePointer();
++                // Advance knownGoodLogEnd to make sure that if this
++                // log file is the last log file and empty, logging
++                // continues in this file, not the old file.
++                knownGoodLogEnd = LogCounter.makeLogInstantAsLong
++                    (currentLogFileNumber, recordStartPosition);
+ 
+ 				// set this.currentLogFileLength
+ 				currentLogFileLength = scan.length();
+@@ -734,14 +768,6 @@ private LogRecord getNextRecordForward(ArrayInputStream input,
+                         }
+                     }
+ 
+-					// ideally, we would want to start writing on this new
+-					// empty log file, but the scan is closed and there is
+-					// no way to tell the difference between an empty log
+-					// file and a log file which is not there.  We will be
+-					// writing to the end of the previous log file instead
+-					// but when we next switch the log, the empty log file
+-					// will be written over.
+-
+ 					return null;
+ 				}
+ 
+@@ -1173,7 +1199,12 @@ public long getInstant()
+ 
+ 	/**
+ 		Return the log instant at the end of the log record on the current
+-		LogFile in the form of a log instant
++		LogFile in the form of a log instant.
++        After the scan has been closed, the end of the last log record will be
++        returned except when the scan ended in an empty log file.  In that
++        case, the start of this empty log file will be returned.  (This is
++        done to make sure new log records are inserted into the newest log
++        file.)
+ 	*/
+ 	public long getLogRecordEnd()
+ 	{
+@@ -1222,7 +1253,8 @@ public void close()
+ 		logFactory = null;
+ 		currentLogFileNumber = -1;
+ 		currentLogFileLength = -1;
+-		knownGoodLogEnd = LogCounter.INVALID_LOG_INSTANT;
++        // Do not reset knownGoodLogEnd, it needs to be available after the
++        // scan has closed.
+ 		currentInstant = LogCounter.INVALID_LOG_INSTANT;
+ 		stopAt = LogCounter.INVALID_LOG_INSTANT;
+ 		scanDirection = 0;
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/RunTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/RunTest.java
+index 044a83bc..6b6ce234 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/RunTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/harness/RunTest.java
+@@ -1853,15 +1853,13 @@ private static void doCleanup(String javaVersion)
+ 			        //System.out.println(logfile.getPath());
+ 			        //status = logfile.delete();
+ 		        }
+-            }
+ 
+-			//delete the directories where external input/output files were created
+-			if(extInDir!=null)
+-				deleteFile(extInDir);
+-			if(extOutDir!=null)
+-				deleteFile(extOutDir);
+-			if(extInDir!=null)
+-				deleteFile(extInOutDir);
++                // delete the directories where external input/output files 
++                // were created
++                if (extInDir!=null) deleteFile(extInDir);
++                if (extOutDir!=null) deleteFile(extOutDir);
++                if (extInDir!=null) deleteFile(extInOutDir);
++            }
+         }
+ 	    // reset for next test
+ 	    // the next line is a bug fix to get cleanup working correctly when
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackup.java
+index e69de29b..f95eb948 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackup.java
+@@ -0,0 +1,118 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.store.LogChecksumSetup
++
++   Copyright 2005 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.store;
++
++import java.sql.Connection;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.util.Properties;
++
++import javax.sql.DataSource;
++
++import org.apache.derby.tools.ij;
++import org.apache.derbyTesting.functionTests.util.TestUtil;
++
++/*
++ * This test contains a recovery for a database that did recovery just
++ * before it went down. After recovery more records are inserted into
++ * the database before the database is shutdown.  Then, roll-forward
++ * recovery of the database from the backup is performed.  It is then
++ * checked that the records inserted after the first recovery is still
++ * present.  This test was made to recreate the problem in DERBY-298.
++ * The test should be run after store/RecoveryAfterBackupSetup.java.
++ * 
++ * @author oystein.grovlen@sun.com
++ * @see RecoveryAfterBackupSetup
++ */
++public class RecoveryAfterBackup
++{
++
++    public static void main(String[] argv) throws Throwable 
++    {
++        try {
++            ij.getPropertyArg(argv); 
++            Connection conn = ij.startJBMS();
++            conn.setAutoCommit(true);
++            
++            // After recovery table should contain two records with
++            // values 0 and 1
++            Statement s = conn.createStatement();
++            ResultSet rs = s.executeQuery("SELECT COUNT(a), SUM(a) FROM t1");
++            while (rs.next()) {
++                int count = rs.getInt(1);
++                int sum = rs.getInt(2);
++                if (count!=2 || sum!=1) {
++                    System.out.print("Unexpected initial database state: ");
++                }
++                System.out.println("Count: " + count + " Sum: " + sum);
++            }
++
++            // Insert some more records
++            System.out.println("Inserting records ...");
++            s.execute ("INSERT INTO t1 SELECT a+2 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+4 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+8 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+16 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+32 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+64 FROM t1");
++            s.execute ("INSERT INTO t1 SELECT a+128 FROM t1");
++
++            // Shut down database
++            Properties shutdownAttrs = new Properties();
++            shutdownAttrs.setProperty("shutdownDatabase", "shutdown");
++            System.out.println("Shutting down database ...");
++            try {
++                DataSource ds = TestUtil.getDataSource(shutdownAttrs);
++                ds.getConnection();
++            } catch (Throwable ith) {
++                ith.printStackTrace();
++            }
++
++            // Start up with rollforward-recovery
++            System.out.println("Starting restore with roll-forward recovery..");
++            Properties restoreAttrs = new Properties();
++            restoreAttrs.setProperty("DatabaseName", "hairynosedwombat");
++            restoreAttrs.setProperty("connectionAttributes", 
++                  "rollForwardRecoveryFrom=extinout/mybackup/hairynosedwombat");
++            DataSource ds = TestUtil.getDataSource(restoreAttrs);
++            conn = ds.getConnection();
++
++            // After restore table should contain all records inserted above
++            System.out.println("Verifying database ...");
++            s = conn.createStatement();
++            rs = s.executeQuery("SELECT COUNT(a), SUM(a) FROM t1");
++            while (rs.next()) {
++                int count = rs.getInt(1);
++                int sum = rs.getInt(2);
++                if (count!=256 || sum!=256*255/2) { // sum 0..n = n*(n-1)/2
++                    System.out.print("Test FAILED: ");
++                }
++                System.out.println("Count: " + count + " Sum: " + sum);
++            }
++
++        } catch (SQLException sqle) {
++            org.apache.derby.tools.JDBCDisplayUtil.ShowSQLException(System.out, 
++                                                                    sqle);
++            sqle.printStackTrace(System.out);
++        }
++    }
++}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackupSetup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackupSetup.java
+index e69de29b..45cdf8bc 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackupSetup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/RecoveryAfterBackupSetup.java
+@@ -0,0 +1,75 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.store.LogChecksumSetup
++
++   Copyright 2005 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.store;
++
++import java.sql.Connection;
++import java.sql.SQLException;
++import java.sql.Statement;
++
++import org.apache.derby.tools.ij;
++
++/*
++ * This class will do the setup for testing recovery after backup.
++ * This test will insert some records into a table, do a backup and
++ * end without shutting down the database.  The succeeding test,
++ * RecoveryAfterBackup, will then do recovery of the database.
++ * 
++ * @author oystein.grovlen@sun.com
++ * @see RecoveryAfterBackup
++ */
++
++public class RecoveryAfterBackupSetup
++{
++    
++    public static void main(String[] argv) throws Throwable 
++    {
++        try {
++            ij.getPropertyArg(argv); 
++            Connection conn = ij.startJBMS();
++            conn.setAutoCommit(true);
++
++            System.out.println("Connection has been opened.");
++            Statement s = conn.createStatement();
++            try { // Drop table if it exists
++                s.execute("DROP TABLE t1");
++            } catch (SQLException e) {
++                if (e.getSQLState().equals("42Y55")) {
++                    // IGNORE. Table did not exist. That is our target.
++                } else {
++                    throw e;
++                }
++            }
++
++            System.out.println("Creating table and inserting two records.");
++            s.execute("CREATE TABLE t1(a INT)");
++            s.execute("INSERT INTO t1 VALUES(0)");
++            s.execute("INSERT INTO t1 VALUES(1)");
++
++            System.out.println("Performing backup...");
++            s.execute("CALL SYSCS_UTIL.SYSCS_BACKUP_DATABASE_AND_ENABLE_LOG_ARCHIVE_MODE('extinout/mybackup', 0)");
++            System.out.println("Backup completed.  Test finished.");
++        } catch (SQLException sqle) {
++            org.apache.derby.tools.JDBCDisplayUtil.ShowSQLException(System.out, 
++                                                                    sqle);
++            sqle.printStackTrace(System.out);
++        }
++    }
++}

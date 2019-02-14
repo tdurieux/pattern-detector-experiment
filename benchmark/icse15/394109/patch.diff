@@ -1,0 +1,253 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/RawToBinaryFormatStream.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/RawToBinaryFormatStream.java
+index 52e3960c..2656e46c 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/RawToBinaryFormatStream.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/RawToBinaryFormatStream.java
+@@ -31,13 +31,33 @@
+ /**
+ 	Stream that takes a raw input stream and converts it
+ 	to the on-disk format of the binary types by prepending the
+-	length of the value. In this case 0 is always written.
++	length of the value.
++    <P>
++    If the length of the stream is known then it is encoded
++    as the first bytes in the stream in the defined format.
++    <BR>
++    If the length is unknown then the first four bytes will
++    be zero, indicating unknown length.
++    <BR>
+     Note: This stream cannot be re-used. Once end of file is
+     reached, the next read call will throw an EOFException
++    
++    @see SQLBinary
+ */
+-public class RawToBinaryFormatStream extends LimitInputStream {
++public final class RawToBinaryFormatStream extends LimitInputStream {
+ 
+-	private int dummyBytes = 4;
++    /**
++     * Number of bytes of length encoding.
++     * 
++     */
++	private int encodedOffset;
++    
++    /**
++     * Encoding of the length in bytes which will be
++     * seen as the first encodedLength.length bytes of
++     * this stream.
++     */
++    private byte[] encodedLength;
+     
+     // flag to indicate the stream has already been read
+     // and eof reached
+@@ -49,8 +69,36 @@
+ 	*/
+ 	public RawToBinaryFormatStream(InputStream in, int length) {
+ 		super(in);
++
+ 		if (length >= 0) {
+ 			setLimit(length);
++            
++            if (length <= 31)
++            {
++                encodedLength = new byte[1];               
++                encodedLength[0] = (byte) (0x80 | (length & 0xff));
++            }
++            else if (length <= 0xFFFF)
++            {
++                encodedLength = new byte[3];
++                encodedLength[0] = (byte) 0xA0;
++                encodedLength[1] = (byte)(length >> 8);
++                encodedLength[2] = (byte)(length);    
++            }
++            else
++            {
++                encodedLength = new byte[5];
++                encodedLength[0] = (byte) 0xC0;
++                encodedLength[1] = (byte)(length >> 24);
++                encodedLength[2] = (byte)(length >> 16);
++                encodedLength[3] = (byte)(length >> 8);
++                encodedLength[4] = (byte)(length);
++            }
++		}
++        else
++        {
++            // unknown length, four zero bytes
++            encodedLength = new byte[4];
+ 		}
+ 	}
+ 
+@@ -65,14 +113,13 @@ public int read() throws IOException {
+             throw new EOFException(MessageService.getTextMessage
+                         (SQLState.STREAM_EOF));
+         
+-		if (dummyBytes != 0) {
+-			dummyBytes--;
+-			return 0;
++		if (encodedOffset < encodedLength.length) {
++            return encodedLength[encodedOffset++] & 0xff;
+ 		}
+ 
+ 		int ret = super.read();
+ 
+-		if (ret < 0)
++		if (ret == -1)
+ 			checkSufficientData();
+ 
+ 		return ret;
+@@ -109,7 +156,7 @@ private void checkSufficientData() throws IOException
+ 			catch (IOException ioe) {
+ 				c = -1;
+ 			}
+-			if (c >= 0)
++			if (c != -1)
+ 				throw new IOException(MessageService.getTextMessage(SQLState.SET_STREAM_INEXACT_LENGTH_DATA));
+ 		}
+ 	}
+@@ -124,31 +171,34 @@ public int read(byte b[], int off, int len) throws IOException {
+         if ( eof )
+             throw new EOFException(MessageService.getTextMessage(SQLState.STREAM_EOF));
+ 
+-		int dlen = dummyBytes;
++		int elen = encodedLength.length - encodedOffset;
+ 
+-		if (dlen != 0) {
+-			if (len < dlen)
+-				dlen = len;
+-			for (int i = 0; i < dlen; i++) {
+-				b[off+i] = 0;
+-			}
+-			dummyBytes -= dlen;
++		if (elen != 0) {
++			if (len < elen)
++				elen = len;
++            System.arraycopy(encodedLength, encodedOffset,
++                    b, off, elen);
++
++            encodedOffset += elen;
++
++			off += elen;
++			len -= elen;
+ 
+-			off += dlen;
+-			len -= dlen;
++            if (len == 0)
++                return elen;
+ 		}
+ 
+ 		int realRead = super.read(b, off, len);
+ 
+ 		if (realRead < 0)
+ 		{
+-			if (dlen != 0)
+-				return dlen;
++			if (elen != 0)
++				return elen;
+ 
+ 			checkSufficientData();
+ 			return realRead;
+ 		}
+ 
+-		return dlen + realRead;
++		return elen + realRead;
+ 	}
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBinary.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBinary.java
+index 98189e95..d03c9b79 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBinary.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBinary.java
+@@ -208,14 +208,6 @@ public final InputStream	getStream()
+ 
+ 				if (stream instanceof FormatIdInputStream) {
+ 					readExternal((FormatIdInputStream) stream);
+-				} else if ( stream instanceof NewByteArrayInputStream )
+-				{
+-					// this piece of code handles the case that a stream has been
+-					// opened on the bit value. the stream will have already called
+-					// readExternal() on the underlying FormatableBitSet. we just need to
+-					// retrieve the byte array from that stream.
+-					NewByteArrayInputStream	nbais = (NewByteArrayInputStream) stream;
+-					dataValue = nbais.getData();
+ 				}
+ 				else {
+ 					readExternal(new FormatIdInputStream(stream));
+@@ -347,24 +339,27 @@ private static int readBinaryLength(ObjectInput in) throws IOException {
+ 		if (bl == -1)
+ 			throw new java.io.EOFException();
+ 
++        byte li = (byte) bl;
++
+         int len;
+-		if ((bl & 0x80) != 0)
++		if ((li & ((byte) 0x80)) != 0)
+ 		{
+-			if (bl == 0xC0)
++			if (li == ((byte) 0xC0))
+ 			{
+ 				len = in.readInt();
+ 			}
+-			else if (bl == 0xA0)
++			else if (li == ((byte) 0xA0))
+ 			{
+ 				len = in.readUnsignedShort();
+ 			}
+ 			else
+ 			{
+-				len = bl & 0x1F;
++				len = li & 0x1F;
+ 			}
+ 		}
+ 		else
+ 		{
++            
+ 			// old length in bits
+ 			int v2 = in.read();
+ 			int v3 = in.read();
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBlob.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBlob.java
+index e50c24de..07bb2e77 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBlob.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/SQLBlob.java
+@@ -164,14 +164,17 @@ public int getTypeFormatId()
+ 	 * @see DataValueDescriptor#setValueFromResultSet 
+ 	 *
+ 	 * @exception SQLException		Thrown on error
++	 * @throws StandardException 
+ 	 */
+ 	public void setValueFromResultSet(ResultSet resultSet, int colNumber,
+ 									  boolean isNullable)
+-		throws SQLException
++		throws SQLException, StandardException
+ 	{
+-			stream = resultSet.getBinaryStream(colNumber);
+-			streamValueLength = -1; // unknown
+-			dataValue = null;
++        Blob blob = resultSet.getBlob(colNumber);
++        if (blob == null)
++            setToNull();
++        else
++            setObject(blob);
+ 	}
+ 
+ 
+@@ -205,13 +208,19 @@ final void setObject(Object theValue)
+         throws StandardException
+     {
+         Blob vb = (Blob) theValue;
++        
+         try {
+-            stream = vb.getBinaryStream();
++            long vbl = vb.length();
++            if (vbl < 0L || vbl > Integer.MAX_VALUE)
++                throw this.outOfRange();
++            
++            setValue(new RawToBinaryFormatStream(
++                    vb.getBinaryStream(), (int) vbl),
++                    (int) vbl);
++            
+         } catch (SQLException e) {
+             throw dataTypeConversion("DAN-438-tmp");
+        }
+-        streamValueLength = -1; // unknown
+-        dataValue = null;
+     }
+ }
+ 

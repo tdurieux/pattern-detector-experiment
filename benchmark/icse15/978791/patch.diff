@@ -1,0 +1,182 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 64279733..cb75e598 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -26,6 +26,7 @@
+ import org.apache.cassandra.io.DeletionService;
+ import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+ import org.apache.cassandra.io.util.FileUtils;
++import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.WrappedRunnable;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.log4j.Logger;
+@@ -69,6 +70,7 @@
+  */
+ public class CommitLog
+ {
++    private static final int MAX_OUTSTANDING_REPLAY_COUNT = 1024;
+     private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
+ 
+     private static final Logger logger = Logger.getLogger(CommitLog.class);
+@@ -177,7 +179,7 @@ public boolean accept(File dir, String name)
+     public static void recover(File[] clogs) throws IOException
+     {
+         Set<Table> tablesRecovered = new HashSet<Table>();
+-        final AtomicInteger counter = new AtomicInteger(0);
++        List<Future<?>> futures = new ArrayList<Future<?>>();
+         for (File file : clogs)
+         {
+             int bufferSize = (int)Math.min(file.length(), 32 * 1024 * 1024);
+@@ -261,47 +263,29 @@ public void runMayThrow() throws IOException
+                         {
+                             Table.open(rm.getTable()).apply(rm, null, false);
+                         }
+-                        counter.decrementAndGet();
+                     }
+                 };
+-                counter.incrementAndGet();
+-                StageManager.getStage(StageManager.MUTATION_STAGE).submit(runnable);
++                futures.add(StageManager.getStage(StageManager.MUTATION_STAGE).submit(runnable));
++                if (futures.size() > MAX_OUTSTANDING_REPLAY_COUNT)
++                {
++                    FBUtilities.waitOnFutures(futures);
++                    futures.clear();
++                }
+             }
+             reader.close();
+             logger.info("Finished reading " + file);
+         }
+ 
+         // wait for all the writes to finish on the mutation stage
+-        while (counter.get() > 0)
+-        {
+-            try
+-            {
+-                Thread.sleep(10);
+-            }
+-            catch (InterruptedException e)
+-            {
+-                throw new AssertionError(e);
+-            }
+-        }
++        FBUtilities.waitOnFutures(futures);
++        logger.debug("Finished waiting on mutations from recovery");
+ 
+         // flush replayed tables
+-        List<Future<?>> futures = new ArrayList<Future<?>>();
++        futures.clear();
+         for (Table table : tablesRecovered)
+-        {
+             futures.addAll(table.flush());
+-        }
+-        // wait for flushes to finish
+-        for (Future<?> future : futures)
+-        {
+-            try
+-            {
+-                future.get();
+-            }
+-            catch (Exception e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-        }
++        FBUtilities.waitOnFutures(futures);
++        logger.info("Recovery complete");
+     }
+ 
+     private CommitLogSegment currentSegment()
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
+index 86e512f1..01e931da 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
+@@ -22,38 +22,35 @@
+ import java.io.DataInputStream;
+ import java.io.IOException;
+ 
+-import org.apache.cassandra.net.sink.SinkManager;
+-
+ import org.apache.log4j.Logger;
+ 
+-class MessageDeserializationTask implements Runnable
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.net.sink.SinkManager;
++import org.apache.cassandra.utils.WrappedRunnable;
++
++class MessageDeserializationTask extends WrappedRunnable
+ {
+-    private static Logger logger_ = Logger.getLogger(MessageDeserializationTask.class);
++    private static Logger logger = Logger.getLogger(MessageDeserializationTask.class);
+     
+-    private ByteArrayInputStream bytes;
++    private final ByteArrayInputStream bytes;
++    private final long constructionTime = System.currentTimeMillis();
+     
+     MessageDeserializationTask(ByteArrayInputStream bytes)
+     {
+         this.bytes = bytes;
+     }
+     
+-    public void run()
++    public void runMayThrow() throws IOException
+     {
+-        Message message = null;
+-        try
++        if (System.currentTimeMillis() >  constructionTime + DatabaseDescriptor.getRpcTimeout())
+         {
+-            message = Message.serializer().deserialize(new DataInputStream(bytes));
+-        }
+-        catch (IOException e)
+-        {
+-            throw new RuntimeException(e);
++            logger.warn(String.format("dropping message (%,dms past timeout)",
++                                      System.currentTimeMillis() - (constructionTime + DatabaseDescriptor.getRpcTimeout())));
++            return;
+         }
+ 
+-        if ( message != null )
+-        {
++        Message message = Message.serializer().deserialize(new DataInputStream(bytes));
+             message = SinkManager.processServerMessageSink(message);
+             MessagingService.receive(message);
+         }
+-    }
+-
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/utils/FBUtilities.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/utils/FBUtilities.java
+index 6439308c..24153efd 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/utils/FBUtilities.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/utils/FBUtilities.java
+@@ -25,6 +25,8 @@
+ import java.nio.ByteBuffer;
+ import java.security.MessageDigest;
+ import java.util.*;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicLong;
+ import java.util.zip.DataFormatException;
+@@ -487,4 +489,23 @@ else if (c > 0x07FF)
+         ByteBuffer.wrap(bytes).putLong(n);
+         return bytes;
+     }
++
++    public static void waitOnFutures(Collection<Future<?>> futures)
++    {
++        for (Future f : futures)
++        {
++            try
++            {
++                f.get();
++            }
++            catch (ExecutionException ee)
++            {
++                throw new RuntimeException(ee);
++            }
++            catch (InterruptedException ie)
++            {
++                throw new AssertionError(ie);
++            }
++        }
++    }
+ }

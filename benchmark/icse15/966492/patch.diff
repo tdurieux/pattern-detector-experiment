@@ -1,0 +1,101 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 18ce0aff..5a634005 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -833,6 +833,18 @@ private ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+             if (cached == null)
+                 return null;
+             
++            return filterColumnFamily(cached, filter, gcBefore);
++        }
++        finally
++        {
++            readStats_.addNano(System.nanoTime() - start);
++        }
++    }
++
++    /** filter a cached row, which will not be modified by the filter, but may be modified by throwing out
++     *  tombstones that are no longer relevant. */
++    ColumnFamily filterColumnFamily(ColumnFamily cached, QueryFilter filter, int gcBefore)
++    {
+             // special case slicing the entire row:
+             // we can skip the filter step entirely, and we can help out removeDeleted by re-caching the result
+             // if any tombstones have aged out since last time.  (This means that the row cache will treat gcBefore as
+@@ -870,20 +882,19 @@ private ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore)
+             }
+             
+             IColumnIterator ci = filter.getMemtableColumnIterator(cached, null, getComparator());
+-            ColumnFamily cf = ci.getColumnFamily().cloneMeShallow();
+-            filter.collectCollatedColumns(cf, ci, gcBefore);
+-            // TODO this is necessary because when we collate supercolumns together, we don't check
+-            // their subcolumns for relevance, so we need to do a second prune post facto here.
+-            return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
++        ColumnFamily cf = null;
++        try
++        {
++            cf = ci.getColumnFamily().cloneMeShallow();
+         }
+         catch (IOException e)
+         {
+             throw new IOError(e);
+         }
+-        finally
+-        {
+-            readStats_.addNano(System.nanoTime() - start);
+-        }
++        filter.collectCollatedColumns(cf, ci, gcBefore);
++        // TODO this is necessary because when we collate supercolumns together, we don't check
++        // their subcolumns for relevance, so we need to do a second prune post facto here.
++        return cf.isSuper() ? removeDeleted(cf, gcBefore) : removeDeletedCF(cf, gcBefore);
+     }
+ 
+     private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore)
+@@ -982,7 +993,7 @@ private boolean getRangeRows(List<Row> rows, byte[] superColumn, final AbstractB
+         Collection<SSTableReader> sstables = new ArrayList<SSTableReader>();
+         Iterables.addAll(sstables, ssTables_);
+ 
+-        RowIterator iterator = RowIteratorFactory.getIterator(memtables, sstables, startWith, stopAt, filter, getComparator(), gcBefore);
++        RowIterator iterator = RowIteratorFactory.getIterator(memtables, sstables, startWith, stopAt, filter, getComparator(), this, gcBefore);
+ 
+         try
+         {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/RowIteratorFactory.java b/cassandra/trunk/src/java/org/apache/cassandra/db/RowIteratorFactory.java
+index 8f8522e7..fd5a03b7 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/RowIteratorFactory.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/RowIteratorFactory.java
+@@ -71,6 +71,7 @@ public static RowIterator getIterator(final Collection<Memtable> memtables,
+                                           final DecoratedKey stopAt,
+                                           final QueryFilter filter,
+                                           final AbstractType comparator,
++                                          final ColumnFamilyStore cfs,
+                                           final int gcBefore)
+     {
+         // fetch data from current memtable, historical memtables, and SSTables in the correct order.
+@@ -128,7 +129,18 @@ protected Row getReduced()
+                 Comparator<IColumn> colComparator = QueryFilter.getColumnComparator(comparator);
+                 Iterator<IColumn> colCollated = IteratorUtils.collatedIterator(colComparator, colIters);
+ 
+-                ColumnFamily returnCF = firstMemtable.getColumnFamily(key);
++                ColumnFamily returnCF = null;
++                
++                // First check if this row is in the rowCache. If it is we can skip the rest
++                ColumnFamily cached = cfs.getRawCachedRow(key);
++                if (cached != null)
++                {
++                    QueryFilter keyFilter = new QueryFilter(key, filter.path, filter.filter);
++                    returnCF = cfs.filterColumnFamily(cached, keyFilter, CompactionManager.getDefaultGCBefore());
++                }
++                else
++                {
++                    returnCF = firstMemtable.getColumnFamily(key);            
+                 // TODO this is a little subtle: the Memtable ColumnIterator has to be a shallow clone of the source CF,
+                 // with deletion times set correctly, so we can use it as the "base" CF to add query results to.
+                 // (for sstable ColumnIterators we do not care if it is a shallow clone or not.)
+@@ -143,6 +155,7 @@ protected Row getReduced()
+                 {
+                     returnCF = null;
+                 }
++                }
+ 
+                 Row rv = new Row(key, returnCF);
+                 colIters.clear();

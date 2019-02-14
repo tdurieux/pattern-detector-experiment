@@ -1,0 +1,165 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/DataType.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/DataType.java
+index 0d3d7ed4..3dd8eb3b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/DataType.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/types/DataType.java
+@@ -976,23 +976,37 @@ public BooleanDataValue in(DataValueDescriptor left,
+ 
+ 		/* Do a binary search if the list is ordered until the 
+ 		 * range of values to search is 3 or less.
+-		 * NOTE: We've ensured that the IN list and the left all have
+-		 * the same precedence at compile time.  If we don't enforce 
+-		 * the same precendence then
+-		 * we could get the wrong result when doing a binary search.
++		 *
++		 * NOTE: We may have sorted the IN-lst values at compile time using
++		 * a specific (dominant) type, but we did *not* actually cast the
++		 * values to that type.  So it's possible that different IN-list
++		 * values have different precedences (verses each other and also
++		 * verses the type of the left operand) when we get here.  Thus
++		 * when we do any comparisons here we have to make sure we always
++		 * compare using the dominant type of the two values being compared.
++		 * Otherwise we can end up with wrong results when doing the binary
++		 * search (ex. as caused by incorrect truncation).  DERBY-2256.
+ 		 */
++		int leftPrecedence = left.typePrecedence();
++		DataValueDescriptor comparator = null;
+ 		if (orderedList)
+ 		{
+ 			while (finish - start > 2)
+ 			{
+ 				int mid = ((finish - start) / 2) + start;
++				comparator =
++					(leftPrecedence < inList[mid].typePrecedence())
++						? inList[mid]
++						: left;
++
+ 				// Search left
+-				retval = equals(left, inList[mid]);
++				retval = comparator.equals(left, inList[mid]);
+ 				if (retval.equals(true))
+ 				{
+ 					return retval;
+ 				}
+-				BooleanDataValue goLeft = greaterThan(inList[mid], left);
++				BooleanDataValue goLeft =
++					comparator.greaterThan(inList[mid], left);
+ 				if (goLeft.equals(true))
+ 				{
+ 					// search left
+@@ -1009,10 +1023,19 @@ public BooleanDataValue in(DataValueDescriptor left,
+ 		/* Walk the in list comparing the values.  Return as soon as we
+ 		 * find a match.  If the list is ordered, return as soon as the left
+ 		 * value is greater than an element in the in list.
++		 *
++		 * Note: for the same reasons outlined above we must be sure to always
++		 * do the comparisons using the dominant type of the two values being
++		 * compared.
+ 		 */
+ 		for (int index = start; index < finish; index++)
+ 		{
+-			retval = equals(left, inList[index]);
++			comparator =
++				(leftPrecedence < inList[index].typePrecedence())
++					? inList[index]
++					: left;
++
++			retval = comparator.equals(left, inList[index]);
+ 			if (retval.equals(true))
+ 			{
+ 				break;
+@@ -1021,7 +1044,8 @@ public BooleanDataValue in(DataValueDescriptor left,
+ 			// Can we stop searching?
+ 			if (orderedList)
+ 			{
+-				BooleanDataValue stop = greaterThan(inList[index], left);
++				BooleanDataValue stop =
++					comparator.greaterThan(inList[index], left);
+ 				if (stop.equals(true))
+ 				{
+ 					break;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/InListOperatorNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/InListOperatorNode.java
+index d50a6081..93d93af8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/InListOperatorNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/InListOperatorNode.java
+@@ -36,7 +36,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.services.compiler.MethodBuilder;
+ import org.apache.derby.iapi.services.compiler.LocalField;
+-
++import org.apache.derby.iapi.services.loader.ClassFactory;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ 
+ import org.apache.derby.iapi.sql.compile.Optimizable;
+@@ -222,19 +222,45 @@ else if ((leftOperand instanceof ColumnReference) &&
+ 			if (allConstants)
+ 			{
+ 				/* When sorting or choosing min/max in the list, if types
+-				 * are not an exact match, we use the left operand's type
+-				 * as the "judge", assuming that they are compatible, as
+-				 * also the case with DB2.
++				 * are not an exact match then we have to use the *dominant*
++				 * type across all values, where "all values" includes the
++				 * left operand.  Otherwise we can end up with incorrect
++				 * results.
++				 *
++				 * Note that it is *not* enough to just use the left operand's
++				 * type as the judge because we have no guarantee that the
++				 * left operand has the dominant type.  If, for example, the
++				 * left operand has type INTEGER and all (or any) values in
++				 * the IN list have type DECIMAL, use of the left op's type
++				 * would lead to comparisons with truncated values and could
++				 * therefore lead to an incorrect sort order. DERBY-2256.
+ 				 */
+-				TypeId judgeTypeId = leftOperand.getTypeServices().getTypeId();
+-				DataValueDescriptor judgeODV = null;  //no judge, no argument
++				DataTypeDescriptor targetType = leftOperand.getTypeServices();
++				TypeId judgeTypeId = targetType.getTypeId();
++
+ 				if (!rightOperandList.allSamePrecendence(
+ 					judgeTypeId.typePrecedence()))
+ 				{
+-					judgeODV = (DataValueDescriptor) judgeTypeId.getNull();
++					/* Iterate through the entire list of values to find out
++					 * what the dominant type is.
++					 */
++					ClassFactory cf = getClassFactory();
++					int sz = rightOperandList.size();
++					for (int i = 0; i < sz; i++)
++					{
++						ValueNode vn = (ValueNode)rightOperandList.elementAt(i);
++						targetType =
++							targetType.getDominantType(
++								vn.getTypeServices(), cf);
++				}
+ 				}
+  
+-				// Sort the list in ascending order
++				/* Now wort the list in ascending order using the dominant
++				 * type found above.
++				 */
++				DataValueDescriptor judgeODV =
++					(DataValueDescriptor)targetType.getTypeId().getNull();
++ 
+ 				rightOperandList.sortInAscendingOrder(judgeODV);
+ 				isOrdered = true;
+ 
+@@ -244,16 +270,15 @@ else if ((leftOperand instanceof ColumnReference) &&
+ 						rightOperandList.size() - 1);
+ 
+ 				/* Handle the degenerate case where the min and the max
+-				 * are the same value.
++				 * are the same value.  Note (again) that we need to do
++				 * this comparison using the dominant type found above.
+ 				 */
+ 				DataValueDescriptor minODV =
+ 					((ConstantNode) minValue).getValue();
+ 				DataValueDescriptor maxODV =
+ 					 ((ConstantNode) maxValue).getValue();
+ 
+-				if (((judgeODV == null) && (minODV.compare(maxODV) == 0)) ||
+-					((judgeODV != null)
+-						&& judgeODV.equals(minODV, maxODV).equals(true)))
++				if (judgeODV.equals(minODV, maxODV).equals(true))
+ 				{
+ 					BinaryComparisonOperatorNode equal = 
+ 						(BinaryComparisonOperatorNode)getNodeFactory().getNode(

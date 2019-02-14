@@ -1,0 +1,133 @@
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/DefinitionsUpdateResponseVerbHandler.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/DefinitionsUpdateResponseVerbHandler.java
+index 77a0ae37..fadf3cfa 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/DefinitionsUpdateResponseVerbHandler.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/DefinitionsUpdateResponseVerbHandler.java
+@@ -72,6 +72,8 @@ else if (DatabaseDescriptor.getDefsVersion().timestamp() > version.timestamp())
+                                 try
+                                 {
+                                     m.apply();
++                                    // update gossip, but don't contact nodes directly
++                                    m.passiveAnnounce();
+                                 }
+                                 catch (ConfigurationException ex)
+                                 {
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+index b6624f70..4d00f2b1 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -28,6 +28,8 @@
+ import java.util.concurrent.TimeoutException;
+ 
+ import static com.google.common.base.Charsets.UTF_8;
++
++import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.commons.lang.ArrayUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -42,6 +44,7 @@
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.gms.FailureDetector;
+ import org.apache.cassandra.gms.Gossiper;
++import org.apache.cassandra.gms.ApplicationState;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.service.*;
+@@ -234,9 +237,40 @@ public static ByteBuffer makeCombinedName(String tableName, String columnFamily)
+                             };
+     }
+             
+-    private void deliverHintsToEndpoint(InetAddress endpoint) throws IOException, DigestMismatchException, InvalidRequestException, TimeoutException
++    private int waitForSchemaAgreement(InetAddress endpoint) throws InterruptedException
++    {
++        Gossiper gossiper = Gossiper.instance;
++        int waited = 0;
++        while (!gossiper.getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.SCHEMA).value.equals(
++                gossiper.getEndpointStateForEndpoint(FBUtilities.getLocalAddress()).getApplicationState(ApplicationState.SCHEMA).value))
++        {
++            Thread.sleep(1000);
++            waited += 1000;
++            if (waited > 2 * StorageService.RING_DELAY)
++                throw new RuntimeException("Could not reach schema agreement with " + endpoint + " in " + 2 * StorageService.RING_DELAY + "ms");
++        }
++        logger_.debug("schema for {} matches local schema", endpoint);
++        return waited;
++    }
++            
++    private void deliverHintsToEndpoint(InetAddress endpoint) throws IOException, DigestMismatchException, InvalidRequestException, TimeoutException, InterruptedException
+     {
++        logger_.info("Checking remote schema before delivering hints");
++        int waited = waitForSchemaAgreement(endpoint);
++        // sleep a random amount to stagger handoff delivery from different replicas.
++        // (if we had to wait, then gossiper randomness took care of that for us already.)
++        if (waited == 0) {
++            int sleep = new Random().nextInt(60000);
++            logger_.info("Sleeping {}ms to stagger hint delivery", sleep);
++            Thread.sleep(sleep);
++        }
++        if (!Gossiper.instance.getEndpointStateForEndpoint(endpoint).isAlive())
++        {
++            logger_.info("Endpoint {} died before hint delivery, aborting", endpoint);
++            return;
++        }
+         logger_.info("Started hinted handoff for endpoint " + endpoint);
++
+         queuedDeliveries.remove(endpoint);
+ 
+         // 1. Get the key of the endpoint we need to handoff
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+index 4e2812b0..e86efe78 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+@@ -175,10 +175,15 @@ public final void announce()
+         if (StorageService.instance.isClientMode())
+             return;
+         
+-        // immediate notification for esiting nodes.
++        // immediate notification for existing nodes.
+         MigrationManager.announce(newVersion, Gossiper.instance.getLiveMembers());
+     }
+     
++    public final void passiveAnnounce()
++    {
++        MigrationManager.passiveAnnounce(newVersion);
++    }
++
+     public static UUID getLastMigrationId()
+     {
+         DecoratedKey dkey = StorageService.getPartitioner().decorateKey(LAST_MIGRATION_KEY);
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
+index 1e7bc1fb..34037b29 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
+@@ -89,15 +89,21 @@ else if (theirVersion.timestamp() > myVersion.timestamp())
+         }
+     }
+ 
+-    /** announce my version to a set of hosts.  They may culminate with them sending me migrations. */
++    /** actively announce my version to a set of hosts via rpc.  They may culminate with them sending me migrations. */
+     public static void announce(UUID version, Set<InetAddress> hosts)
+     {
+         Message msg = makeVersionMessage(version);
+         for (InetAddress host : hosts)
+             MessagingService.instance().sendOneWay(msg, host);
+-        // this is for notifying nodes as they arrive in the cluster.
++        passiveAnnounce(version);
++    }
++
++    /** announce my version passively over gossip **/
++    public static void passiveAnnounce(UUID version)
++    {
+         if (!StorageService.instance.isClientMode())
+             Gossiper.instance.addLocalApplicationState(ApplicationState.SCHEMA, StorageService.instance.valueFactory.migration(version));
++        logger.debug("Announcing my schema is " + version);
+     }
+ 
+     /**
+@@ -152,6 +158,7 @@ public void run()
+                 throw new IOException(e);
+             }
+         }
++        passiveAnnounce(to); // we don't need to send rpcs, but we need to update gossip
+     }
+     
+     /** pushes migrations from this host to another host */

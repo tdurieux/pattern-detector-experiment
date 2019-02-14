@@ -1,0 +1,384 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+index 24fa048b..33ceea69 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/DataDictionary.java
+@@ -1125,18 +1125,13 @@ public SPSDescriptor getSPSDescriptor(String name, SchemaDescriptor sd)
+ 	 * @param spsd	The descriptor to add
+ 	 * @param tc			The transaction controller
+ 	 * @param recompile		whether to recompile or invalidate
+-	 * @param updateSYSCOLUMNS indicate whether syscolumns needs to be updated
+-	 *							or not.
+-	 * @param firstCompilation  first time SPS is getting compiled.
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+ 	public void	updateSPS(
+ 			SPSDescriptor		spsd,
+ 			TransactionController	tc,
+-			boolean                 recompile,
+-			boolean					updateSYSCOLUMNS,
+-			boolean                 firstCompilation)
++            boolean                 recompile)
+ 						throws StandardException;
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
+index b1bc763e..506040b4 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
+@@ -137,7 +137,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 * Old code - never used.
+ 	 */
+ 	private Object			paramDefaults[];
+-	private	boolean					initiallyCompilable;
++    private final boolean   initiallyCompilable;
+ 	private	boolean					lookedUpParams;
+ 	
+ 	private UUIDFactory				uuidFactory;
+@@ -696,6 +696,8 @@ public final synchronized ExecPreparedStatement getPreparedStatement(boolean rec
+ 
+ 			if (!lcc.getDataDictionary().isReadOnlyUpgrade()) {
+ 
++                final String savepoint = lcc.getUniqueSavepointName();
++
+ 				// First try compiling in a nested transaction so we can 
+                 // release the locks after the compilation, and not have them
+                 // sit around in the parent transaction. But if we get lock 
+@@ -719,6 +721,11 @@ public final synchronized ExecPreparedStatement getPreparedStatement(boolean rec
+                     // When retrying in the user transaction, we'll wait for
+                     // locks if necessary.
+                     nestedTC.setNoLockWait(true);
++
++                    // Set a savepoint so that the work in the nested
++                    // transaction can be rolled back on error without
++                    // aborting the parent transaction.
++                    nestedTC.setSavePoint(savepoint, null);
+ 				}
+ 				catch (StandardException se)
+ 				{
+@@ -727,12 +734,6 @@ public final synchronized ExecPreparedStatement getPreparedStatement(boolean rec
+ 					nestedTC = null;
+ 				}
+ 
+-				// DERBY-2584: If the first attempt to compile the query fails,
+-				// we need to reset initiallyCompilable to make sure the
+-				// prepared plan is fully stored to disk. Save the initial
+-				// value here.
+-				final boolean compilable = initiallyCompilable;
+-
+ 				try
+ 				{
+ 					prepareAndRelease(lcc, null, nestedTC);
+@@ -740,7 +741,16 @@ public final synchronized ExecPreparedStatement getPreparedStatement(boolean rec
+ 				}
+ 				catch (StandardException se)
+ 				{
+-					if (se.isLockTimeout())
++                    if (nestedTC != null)
++                    {
++                        // Roll back to savepoint to undo any work done by
++                        // the nested transaction. We cannot abort the nested
++                        // transaction in order to achieve the same, since
++                        // that would also abort the parent transaction.
++                        nestedTC.rollbackToSavePoint(savepoint, false, null);
++                    }
++
++                    if (nestedTC != null && se.isLockTimeout())
+ 					{
+                         // Locks were set nowait, so a lock timeout here
+                         // means that some lock request in the nested 
+@@ -748,18 +758,14 @@ public final synchronized ExecPreparedStatement getPreparedStatement(boolean rec
+                         // with a parent lock would lead to a undetected 
+                         // deadlock so must give up trying in the nested
+                         // transaction and retry with parent transaction.
+-						if (nestedTC != null)
+-						{
+                             nestedTC.commit();
+                             nestedTC.destroy();
+                             nestedTC = null;
+-						}
+ 
+ 						// if we couldn't do this with a nested transaction, 
+                         // retry with parent-- we need to wait this time!
+                         // Lock conflicts at this point are with other 
+                         // transactions, so must wait.
+-						initiallyCompilable = compilable;
+ 						prepareAndRelease(lcc, null, null);
+ 						updateSYSSTATEMENTS(lcc, RECOMPILE, null);
+ 					}
+@@ -1106,24 +1112,6 @@ public void loadGeneratedClass() throws StandardException
+ 	private void updateSYSSTATEMENTS(LanguageConnectionContext lcc, int mode, TransactionController tc)
+ 		throws StandardException
+ 	{
+-		boolean					updateSYSCOLUMNS,  recompile;
+-		boolean firstCompilation = false;
+-		if (mode == RECOMPILE)
+-		{
+-			recompile = true;
+-			updateSYSCOLUMNS = true;
+-			if(!initiallyCompilable)
+-			{
+-				firstCompilation = true;
+-				initiallyCompilable = true;
+-			}
+-		}
+-		else
+-		{
+-			recompile = false;
+-			updateSYSCOLUMNS = false;
+-		}
+-
+ 		DataDictionary dd = getDataDictionary();
+ 
+ 		if (dd.isReadOnlyUpgrade())
+@@ -1139,11 +1127,7 @@ private void updateSYSSTATEMENTS(LanguageConnectionContext lcc, int mode, Transa
+ 			tc = lcc.getTransactionExecute();
+ 		}
+ 
+-		dd.updateSPS(this,
+-					 tc, 
+-					 recompile,
+-					 updateSYSCOLUMNS,
+-					 firstCompilation);
++        dd.updateSPS(this, tc, (mode == RECOMPILE));
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index 741cab16..3d16c038 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -4405,19 +4405,14 @@ private void addSPSParams(SPSDescriptor spsd, TransactionController tc)
+ 	 * @param spsd	The descriptor to add
+ 	 * @param tc			The transaction controller
+      * @param recompile Whether to recompile or invalidate
+-	 * @param updateParamDescriptors If true, will update the
+-	 *						parameter descriptors in SYS.SYSCOLUMNS.
+-	 * @param firstCompilation  true, if Statement is getting compiled for first
+-	 *                          time and SPS was created with NOCOMPILE option.
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+ 	 */
++    @Override
+ 	public void	updateSPS(
+ 			SPSDescriptor			spsd,
+ 			TransactionController	tc,
+-			boolean                 recompile,
+-			boolean					updateParamDescriptors,
+-			boolean                 firstCompilation)
++            boolean                 recompile)
+ 						throws StandardException
+ 	{
+ 		ExecIndexRow				keyRow1 = null;
+@@ -4428,23 +4423,13 @@ public void	updateSPS(
+ 		int[] updCols;
+ 		if (recompile)
+ 		{
+-			if(firstCompilation)
+-			{
+-				updCols = new int[] {SYSSTATEMENTSRowFactory.SYSSTATEMENTS_VALID,
++            updCols = new int[] {
++                SYSSTATEMENTSRowFactory.SYSSTATEMENTS_VALID,
+ 						 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_TEXT,
+ 									 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_LASTCOMPILED,
+ 									 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_USINGTEXT,
+ 									 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_CONSTANTSTATE,
+-									 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_INITIALLY_COMPILABLE};
+-			}else
+-			{
+-
+-				updCols = new int[] {SYSSTATEMENTSRowFactory.SYSSTATEMENTS_VALID,
+-						 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_TEXT,
+-										 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_LASTCOMPILED,
+-										 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_USINGTEXT,
+-										 SYSSTATEMENTSRowFactory.SYSSTATEMENTS_CONSTANTSTATE };
+-			}
++            };
+ 		}
+ 		else 
+ 		{
+@@ -4480,11 +4465,9 @@ public void	updateSPS(
+ 					 tc);
+ 
+ 
+-		/*
+-		** If we don't need to update the parameter
+-		** descriptors, we are done.
+-		*/
+-		if (!updateParamDescriptors)
++        // If this is an invalidation request, we don't need to update the
++        // parameter descriptors, so we are done.
++        if (!recompile)
+ 		{
+ 			return;
+ 		}
+@@ -4499,59 +4482,12 @@ public void	updateSPS(
+ 			return;
+ 		}
+ 
+-		if(firstCompilation)
+-		{
+-			/*beetle:5119, reason for doing add here instead of update
+-			 *is with NOCOMPILE option of create statement/boot time SPS,
+-			 *SPS statement is not compiled to find out the parameter info.
+-			 *Because of the parameter info was not inserted at SPSDescriptor 
+-			 *creation time. As this is the first time we are compiling parameter
+-			 *infor should be inserted instead of the update.
+-			 */
++        // Update the parameter descriptors by dropping the existing ones
++        // and recreating them. If this is the first time the SPS is being
++        // compiled, the drop operation will be a no-op.
++        dropAllColumnDescriptors(spsd.getUUID(), tc);
+ 			addSPSParams(spsd, tc);
+ 		}
+-		else
+-		{
+-			Object[] parameterDefaults = spsd.getParameterDefaults();
+-
+-			/* 
+-			** Update each column with the new defaults and with
+-			** the new datatypes.  It is possible that someone has
+-			** done a drop/create on the underlying table and 
+-			** changed the type of a column, which has changed
+-			** the type of a parameter to our statement.
+-			*/
+-			int[] columnsToSet = new int[2];
+-			columnsToSet[0] = SYSCOLUMNSRowFactory.SYSCOLUMNS_COLUMNDATATYPE;
+-			columnsToSet[1] = SYSCOLUMNSRowFactory.SYSCOLUMNS_COLUMNDEFAULT;
+-
+-			UUID uuid = spsd.getUUID();
+-
+-			for (int index = 0; index < params.length; index++)
+-			{
+-				int parameterId = index + 1;
+-
+-			//RESOLVEAUTOINCREMENT
+-				ColumnDescriptor cd = new ColumnDescriptor("PARAM" + parameterId,
+-										  parameterId,	// position
+-										  params[index],
+-										  ((parameterDefaults == null) || // default
+-										   (index >= parameterDefaults.length)) ? 
+-										  (DataValueDescriptor)null :
+-										  (DataValueDescriptor)parameterDefaults[index],
+-										  (DefaultInfo) null,
+-										  uuid,
+-										  (UUID) null,
+-										  0, 0, 0);
+-										
+-				updateColumnDescriptor(cd,
+-									   cd.getReferencingUUID(), 
+-									   cd.getColumnName(),
+-									   columnsToSet, 
+-									   tc);
+-			}
+-		}
+-	}
+ 
+ 	/**
+ 	 * @see DataDictionary#invalidateAllSPSPlans
+diff --git a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+index ec65ffd9..561cc8b5 100644
+--- a/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
++++ b/db/derby/code/trunk/java/storeless/org/apache/derby/impl/storeless/EmptyDictionary.java
+@@ -479,8 +479,7 @@ public void addSPSDescriptor(SPSDescriptor descriptor,
+ 	}
+ 
+ 	public void updateSPS(SPSDescriptor spsd, TransactionController tc,
+-			boolean recompile, boolean updateSYSCOLUMNS,
+-			boolean firstCompilation) throws StandardException {
++            boolean recompile) throws StandardException {
+ 		// Auto-generated method stub
+ 
+ 	}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DatabaseMetaDataTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DatabaseMetaDataTest.java
+index 37e3bc71..d92b0a3e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DatabaseMetaDataTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/DatabaseMetaDataTest.java
+@@ -62,6 +62,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ //import org.apache.derby.shared.common.reference.JDBC40Translation;
+ import org.apache.derbyTesting.functionTests.tests.upgradeTests.Version;
++import org.apache.derbyTesting.functionTests.util.Barrier;
+ 
+ /**
+  * Test the DatabaseMetaData api.
+@@ -235,6 +236,11 @@ public static Test suite() {
+             TestConfiguration.singleUseDatabaseDecorator(
+                 new DatabaseMetaDataTest("initialCompilationTest")));
+ 
++        // The test for DERBY-4160 needs a fresh database to ensure that the
++        // meta-data queries haven't already been compiled.
++        suite.addTest(TestConfiguration.singleUseDatabaseDecorator(
++                new DatabaseMetaDataTest("concurrentCompilationTest")));
++
+         // Test for DERBY-3693 needs a fresh database to ensure that the size
+         // of SYSTABLES is so small that creating a relatively small number of
+         // tables will cause the query plan for getTables() to be invalidated.
+@@ -330,6 +336,67 @@ public void initialCompilationTest() throws SQLException {
+         getDMD().getIndexInfo(null, null, "T", false, false).close();
+     }
+ 
++    /**
++     * Test that a meta-data query is compiled and stored correctly even when
++     * there's a lock conflict that causes the first attempt to store it to
++     * stop midway (DERBY-4160). This test needs a fresh database so that the
++     * meta-data calls are not already compiled.
++     */
++    public void concurrentCompilationTest() throws Exception {
++        // Create a barrier that can be used to synchronize the two threads
++        // so they perform the meta-data compilation at the same time.
++        final Barrier barrier = new Barrier(2);
++
++        // Create a thread thread that attempts to compile meta-data queries.
++        final DatabaseMetaData dmd = getDMD();
++        final Exception[] exception = new Exception[1];
++        Thread th = new Thread() {
++            @Override
++            public void run() {
++                try {
++                    concurrentCompilationTestHelper(barrier, dmd);
++                } catch (Exception e) {
++                    exception[0] = e;
++                }
++            }
++        };
++        th.start();
++
++        // At the same time, in the main thread, attempt to compile the same
++        // meta-data queries.
++        Connection c2 = openDefaultConnection();
++        concurrentCompilationTestHelper(barrier, c2.getMetaData());
++        c2.close();
++
++        // Wait until both threads are done.
++        th.join();
++
++        // Check if the helper thread got any exceptions.
++        if (exception[0] != null) {
++            fail("Exception in other thread", exception[0]);
++        }
++
++        // Finally, verify that the two meta-data methods used in the test
++        // are working.
++        testGetBestRowIdentifier();
++        testGetIndexInfo();
++    }
++
++    private void concurrentCompilationTestHelper(
++            Barrier barrier, DatabaseMetaData dmd) throws Exception {
++        // Wait until the other thread is ready to start, so that the
++        // compilation happens at the same time in both threads.
++        barrier.await();
++
++        // Often, but not always, the getIndexInfo() call would fail
++        // in one of the threads with the following error message:
++        // ERROR X0Y68: Column 'PARAM1' already exists.
++        ResultSet rs1 = dmd.getBestRowIdentifier(null, null, "", 0, true);
++        ResultSet rs2 = dmd.getIndexInfo(null, null, "", true, true);
++        JDBC.assertDrainResults(rs1);
++        JDBC.assertDrainResults(rs2);
++    }
++
+     /**
+      * Tests that we don't get an internal timeout when a meta-data statement
+      * is recompiled because the size of the tables it queries has changed

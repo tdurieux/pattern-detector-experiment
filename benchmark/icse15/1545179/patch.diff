@@ -1,0 +1,828 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/TriggerDescriptor.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/TriggerDescriptor.java
+index a433d566..759d038d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/TriggerDescriptor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/TriggerDescriptor.java
+@@ -773,7 +773,8 @@ public synchronized boolean isValid()
+ 		switch (action)
+ 		{
+ 			/*
+-			** We are only dependent on the underlying table, and our spses and 
++            ** We are dependent on the underlying table, our SPSs, any tables
++            ** or other SQL objects that are referenced from the trigger, and
+ 			** privileges on various objects.  (we should be dropped before our 
+ 			** table is dropped. Also, we should be dropped before revoke 
+ 			** RESTRICT privilege is issued otherwise revoke RESTRICT will  
+@@ -791,8 +792,10 @@ public synchronized boolean isValid()
+ 		    case DependencyManager.DROP_TABLE:
+ 		    case DependencyManager.DROP_SYNONYM:
+ 		    case DependencyManager.DROP_SPS:
++            case DependencyManager.DROP_VIEW:
+ 		    case DependencyManager.RENAME:
+ 		    case DependencyManager.REVOKE_PRIVILEGE_RESTRICT:
++            case DependencyManager.DROP_METHOD_ALIAS:
+ 				DependencyManager dm = getDataDictionary().getDependencyManager();
+ 				throw StandardException.newException(SQLState.LANG_PROVIDER_HAS_DEPENDENT_OBJECT, 
+ 									dm.getActionString(action), 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
+index e1b12108..4bf8ce38 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTriggerNode.java
+@@ -36,6 +36,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.compile.Visitable;
+ import org.apache.derby.iapi.sql.conn.Authorizer;
+ import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++import org.apache.derby.iapi.sql.depend.DependencyManager;
++import org.apache.derby.iapi.sql.depend.ProviderInfo;
++import org.apache.derby.iapi.sql.depend.ProviderList;
+ import org.apache.derby.iapi.sql.dictionary.ColumnDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.ColumnDescriptorList;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+@@ -69,6 +72,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private final String        originalActionText;
+     private final int           whenOffset;
+     private final int           actionOffset;
++    private ProviderInfo[]      providerInfo;
+ 
+ 	private SchemaDescriptor	triggerSchemaDescriptor;
+ 	private SchemaDescriptor	compSchemaDescriptor;
+@@ -370,9 +374,15 @@ public void bindStatement() throws StandardException
+ 		*/
+ 		boolean needInternalSQL = bindReferencesClause(dd);
+ 
++        ProviderList prevAPL =
++                compilerContext.getCurrentAuxiliaryProviderList();
++        ProviderList apl = new ProviderList();
++
+ 		lcc.pushTriggerTable(triggerTableDescriptor);
+ 		try
+ 		{	
++            compilerContext.setCurrentAuxiliaryProviderList(apl);
++
+ 			/*
+ 			** Bind the trigger action and the trigger
+ 			** when clause to make sure that they are
+@@ -406,6 +416,7 @@ public void bindStatement() throws StandardException
+ 		finally
+ 		{
+ 			lcc.popTriggerTable(triggerTableDescriptor);
++            compilerContext.setCurrentAuxiliaryProviderList(prevAPL);
+ 		}
+ 
+ 		/* 
+@@ -445,6 +456,11 @@ public void bindStatement() throws StandardException
+         if (referencesSessionSchema()) {
+ 			throw StandardException.newException(SQLState.LANG_OPERATION_NOT_ALLOWED_ON_SESSION_SCHEMA_TABLES);
+         }
++
++        DependencyManager dm = dd.getDependencyManager();
++        providerInfo = dm.getPersistentProviderInfos(apl);
++        dm.clearColumnInfoInProviders(apl);
++
+ 	}
+ 
+ 	/**
+@@ -934,7 +950,8 @@ public ConstantAction makeConstantAction() throws StandardException
+ 											oldTableInReferencingClause,
+ 											newTableInReferencingClause,
+ 											oldReferencingName,
+-											newReferencingName
++                                            newReferencingName,
++                                            providerInfo
+ 											);
+ 	}
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+index 363116f1..0dc79bb6 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+@@ -34,19 +34,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.dictionary.TableDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.TriggerDescriptor;
+ 
+-import org.apache.derby.iapi.types.DataValueFactory;
+-
+ import org.apache.derby.iapi.sql.depend.DependencyManager;
+-
+-import org.apache.derby.iapi.sql.execute.ExecutionFactory;
++import org.apache.derby.iapi.sql.depend.Provider;
++import org.apache.derby.iapi.sql.depend.ProviderInfo;
+ 
+ import org.apache.derby.iapi.sql.Activation;
+ 
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.reference.SQLState;
+ 
+-import org.apache.derby.iapi.services.context.ContextService;
+-
+ import org.apache.derby.shared.common.sanity.SanityManager;
+ 
+ import org.apache.derby.catalog.UUID;
+@@ -83,6 +79,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	private Timestamp				creationTimestamp;
+ 	private int[]					referencedCols;
+ 	private int[]					referencedColsInTriggerAction;
++    private final ProviderInfo[]    providerInfo;
+ 
+ 	// CONSTRUCTORS
+ 
+@@ -115,6 +112,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 * @param referencingNew whether or not NEW appears in REFERENCING clause
+ 	 * @param oldReferencingName old referencing table name, if any, that appears in REFERENCING clause
+ 	 * @param newReferencingName new referencing table name, if any, that appears in REFERENCING clause
++     * @param providerInfo  array of providers that the trigger depends on
+ 	 */
+ 	CreateTriggerConstantAction
+ 	(
+@@ -138,7 +136,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		boolean				referencingOld,
+ 		boolean				referencingNew,
+ 		String				oldReferencingName,
+-		String				newReferencingName
++        String              newReferencingName,
++        ProviderInfo[]      providerInfo
+ 	)
+ 	{
+ 		super(triggerTable.getUUID());
+@@ -163,6 +162,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		this.referencingNew = referencingNew;
+ 		this.oldReferencingName = oldReferencingName;
+ 		this.newReferencingName = newReferencingName;
++        this.providerInfo = providerInfo;
+ 		if (SanityManager.DEBUG)
+ 		{
+ 			SanityManager.ASSERT(triggerSchemaName != null, "triggerSchemaName sd is null");
+@@ -359,6 +359,15 @@ public void	executeConstantAction(Activation activation)
+ 		}
+ 		dm.addDependency(triggerd, actionspsd, lcc.getContextManager());
+ 		dm.addDependency(triggerd, triggerTable, lcc.getContextManager());
++
++        // Make the TriggerDescriptor dependent on all objects referenced
++        // from the triggered statement or the WHEN clause.
++        for (ProviderInfo info : providerInfo) {
++            Provider provider = (Provider) info.getDependableFinder()
++                    .getDependable(dd, info.getObjectId());
++            dm.addDependency(triggerd, provider, lcc.getContextManager());
++        }
++
+ 		//store trigger's dependency on various privileges in the dependeny system
+ 		storeViewTriggerDependenciesOnPrivileges(activation, triggerd);		
+ 	}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
+index 0a914701..27ae5fb5 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/GenericConstantActionFactory.java
+@@ -1002,6 +1002,7 @@ static protected Authorizer getAuthorizer()
+ 	 * @param referencingNew whether or not NEW appears in REFERENCING clause
+ 	 * @param oldReferencingName old referencing table name, if any, that appears in REFERCING clause
+ 	 * @param newReferencingName new referencing table name, if any, that appears in REFERCING clause
++     * @param providerInfo array of providers that the trigger depends on
+ 	 */
+ 	public ConstantAction getCreateTriggerConstantAction
+ 	(
+@@ -1025,7 +1026,8 @@ static protected Authorizer getAuthorizer()
+ 		boolean				referencingOld,
+ 		boolean				referencingNew,
+ 		String				oldReferencingName,
+-		String				newReferencingName
++        String              newReferencingName,
++        ProviderInfo[]      providerInfo
+ 	)
+ 	{
+ 		return new CreateTriggerConstantAction(triggerSchemaName, triggerName, 
+@@ -1033,7 +1035,8 @@ static protected Authorizer getAuthorizer()
+ 				whenText, actionSPSId, actionText, spsCompSchemaId, creationTimestamp,
+                 referencedCols, referencedColsInTriggerAction,
+                 originalWhenText, originalActionText,
+-				referencingOld, referencingNew, oldReferencingName, newReferencingName);
++                referencingOld, referencingNew,
++                oldReferencingName, newReferencingName, providerInfo);
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+index 8b54d7b6..cff4fbbd 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+@@ -1594,41 +1594,32 @@ public void testAlterColumn() throws Exception {
+         st.executeUpdate(
+                 "create trigger renc_5_tr1 after update of c2, c3, " +
+                 "c6 on renc_4 for each row mode db2sql insert into " +
+-                "renc_5 (c6) values (1)");
++                "renc_5 (unq_c5, c6) values (1, 2)");
+ 
+         // This fails, because the tigger is dependent on it:
+         assertStatementError(
+                 "X0Y25", st,
+                 "rename column renc_4.c6 to some_name");
+ 
+-        // This succeeds, because the trigger is not dependent on 
+-        // renc_5.c6. DERBY-2041 requests that triggers should be 
+-        // marked as dependent on tables and columns in their body. 
+-        // If that improvement is made, this test will need to be 
+-        // changed, as the next rename would fail, and the insert 
+-        // after it would then succeed.
+-
+-        st.executeUpdate(
++        // This also fails because a trigger action references renc_5.c6.
++        // It didn't fail before DERBY-2041.
++        assertStatementError(
++                "X0Y25", st,
+                 "rename column renc_5.c6 to new_name");
+ 
+-        // The update statement will fail, because column c6 no 
+-        // longer exists. See DERBY-2041 for a discussion of this 
+-        // topic.
+-
+         st.executeUpdate(
+                 "insert into renc_4 values(1, 2, 3, 4, 5, 6)");
+ 
+-        assertStatementError(
+-                "42X14", st, "update renc_4 set c6 = 92");
++        st.executeUpdate("update renc_4 set c6 = 92");
+ 
++        // Verify that the update caused renc_5_tr1 to fire.
+         rs = st.executeQuery("select * from renc_5");
+-
+         JDBC.assertColumnNames(rs,
+                 new String[]{"C1",
+-                    "C2", "C3", "C4", "UNQ_C5", "NEW_NAME"
++                    "C2", "C3", "C4", "UNQ_C5", "C6"
+                 });
+-        JDBC.assertDrainResults(rs,
+-                0);
++        JDBC.assertFullResultSet(rs,
++                new String[][] {{null, null, null, null, "1", "2"}});
+ 
+         // Rename a column which has a granted privilege, show 
+         // that the grant is properly processed and now applies to 
+@@ -1838,7 +1829,7 @@ public void testAlterTableAndSysdepends() throws Exception {
+         int sysdependsRowCountBeforeTestStart;
+ 
+         sysdependsRowCountBeforeTestStart = numberOfRowsInSysdepends(st);
+-        //Following trigger will add 5 rows to sysdepends. Trigger creation
++        // Following trigger will add 7 rows to sysdepends. Trigger creation
+         // will send CREATE TRIGGER invalidation to trigger table but there
+         // are no other persistent dependents on trigger table at this point.
+         st.executeUpdate(
+@@ -1847,9 +1838,10 @@ public void testAlterTableAndSysdepends() throws Exception {
+                 "old_table as old for each statement insert into " +
+                 "Derby5120_tab_bkup1 select * from old");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++                sysdependsRowCountBeforeTestStart + 7,
++                numberOfRowsInSysdepends(st));
+ 
+-        //Following trigger will add 5 rows to sysdepends. Trigger creation
++        // Following trigger will add 7 rows to sysdepends. Trigger creation
+         // will send CREATE TRIGGER invalidation to trigger table which will
+         // invalidate trigger created earlier (Derby5120_tr1). Because of
+         // this, when Derby5120_tr1 trigger fires next, it will be recompiled.
+@@ -1859,21 +1851,24 @@ public void testAlterTableAndSysdepends() throws Exception {
+                 "old as oldrow for each row insert into  " +
+                 "Derby5120_tab_bkup2(c211) values (oldrow.c11)");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++                sysdependsRowCountBeforeTestStart + 14,
++                numberOfRowsInSysdepends(st));
+ 
+         //Following will fire the 2 triggers created above. During the firing,
+         // we will find that Derby5120_tr1 has been marked invalid. As a result
+         // we will recompile it's trigger action.
+         st.executeUpdate("update Derby5120_tab set c11=2");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++                sysdependsRowCountBeforeTestStart + 14,
++                numberOfRowsInSysdepends(st));
+ 
+         //Following alter table on trigger table will mark the two triggers 
+         // created above invalid. As a result, when they are fired next
+         // time, their trigger action sps will be regenerated.
+         st.executeUpdate("alter table Derby5120_tab add column c113 int");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++                sysdependsRowCountBeforeTestStart + 14,
++                numberOfRowsInSysdepends(st));
+ 
+         //Following will cause the 2 triggers to fire because they were marked
+         // invalid by alter table. During the trigger action sps regeneration
+@@ -1887,12 +1882,14 @@ public void testAlterTableAndSysdepends() throws Exception {
+         //Drop the errorneous trigger
+         st.executeUpdate("drop trigger Derby5120_tr1");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS will be less",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++                sysdependsRowCountBeforeTestStart + 7,
++                numberOfRowsInSysdepends(st));
+ 
+         //Following update will succeed this time
+         st.executeUpdate("update Derby5120_tab set c11=2");
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+-        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++                sysdependsRowCountBeforeTestStart + 7,
++                numberOfRowsInSysdepends(st));
+     }
+     
+     //A test for ALTER TABLE DROP COLUMN with synonyms and trigger combination.
+@@ -2728,10 +2725,10 @@ public void testDropColumn() throws Exception {
+             	{"ATDC_13_TAB1_TRIGGER_4"}});
+         Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
+         		numberOfRowsInSysdepends(st),sysdependsRowCountAfterCreateTrigger);
+-        st.executeUpdate("drop table ATDC_13_TAB1_BACKUP");
+         st.executeUpdate("drop table ATDC_13_TAB1");
+         st.executeUpdate("drop table ATDC_13_TAB2");
+         st.executeUpdate("drop table ATDC_13_TAB3");
++        st.executeUpdate("drop table ATDC_13_TAB1_BACKUP");
+         
+         // Start of another test for DERBY-5044. Test INSERT/DELETE/UPDATE
+         // inside the trigger action from base tables
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DropTableTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DropTableTest.java
+index 01463c20..4b95a536 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DropTableTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DropTableTest.java
+@@ -210,15 +210,19 @@ public void testDropTableWithTriggers() throws SQLException{
+             " create trigger t2trig after insert on t2 for each "
+             + "row insert into t1 values(1)");
+         
+-        // this should work
+-        
+-        st.executeUpdate( "drop table t1");
++        // this should fail because t2trig depends on t1 (used to work
++        // before DERBY-2041)
++        assertStatementError("X0Y25", st, "drop table t1");
+         
+-        // the following should get an error when trying to 
+-        // recompile the trigger action
++        // trigger should still work
++        st.executeUpdate("insert into t2 values(1)");
++        JDBC.assertSingleValueResultSet(
++                st.executeQuery("select * from t1"), "1");
++        JDBC.assertSingleValueResultSet(
++                st.executeQuery("select * from t2"), "1");
+         
+-        assertStatementError("42X05", st, "insert into t2 values(1)");
+         st.executeUpdate( " drop table t2");
++        st.executeUpdate( " drop table t1");
+     }
+     
+     public void testDropTableDropView() throws SQLException{
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+index 9df0b8e4..76e5128d 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GrantRevokeDDLTest.java
+@@ -4123,6 +4123,9 @@ public void testGrantRevokeDDL() throws Exception
+         
+         JDBC.assertFullResultSet(rs, expRS, true);
+         
++        st_mamta2.executeUpdate(
++            " drop trigger tr21t21TriggerTest");
++
+         st_mamta1.executeUpdate(
+             " drop table t11TriggerTest");
+         
+@@ -4960,6 +4963,9 @@ public void testGrantRevokeDDL() throws Exception
+         
+         JDBC.assertFullResultSet(rs, expRS, true);
+         
++        st_mamta2.executeUpdate(
++            " drop trigger tr11t11");
++
+         st_mamta2.executeUpdate(
+             " drop table t21TriggerRevokeTest");
+         
+@@ -5125,6 +5131,9 @@ public void testGrantRevokeDDL() throws Exception
+         
+         JDBC.assertFullResultSet(rs, expRS, true);
+         
++        st_mamta2.executeUpdate(
++            " drop trigger tr11t11");
++
+         st_mamta2.executeUpdate(
+             " drop table t21TriggerRevokeTest");
+         
+@@ -6481,7 +6490,6 @@ public void testGrantRevokeDDL() throws Exception
+         st.executeUpdate("DROP VIEW MAMTA2.V28");
+         st.executeUpdate("DROP VIEW MAMTA3.V21VIEWTEST");
+         st.executeUpdate("DROP FUNCTION MAMTA1.SELECTFROMSPECIFICSCHEMA");
+-        st.executeUpdate("DROP TRIGGER MAMTA2.TR21T21TRIGGERTEST");
+         st.executeUpdate("DROP TABLE MAMTA4.T41TRIGGERTEST");
+         st.executeUpdate("DROP TABLE MAMTA3.D1589T31CONSTRAINTTEST");
+         st.executeUpdate("DROP TABLE MAMTA3.T31");
+@@ -9955,8 +9963,6 @@ public void testGrantRevokeDDL2() throws SQLException {
+         st.executeUpdate("DROP PROCEDURE USER1.REVOKE_SELECT_PROC2");
+         st.executeUpdate("DROP PROCEDURE USER1.REVOKE_SELECT_PROC3");
+         st.executeUpdate("DROP PROCEDURE USER1.REVOKE_SELECT_PROC4");
+-        st.executeUpdate("DROP FUNCTION USER1.F_ABS1");
+-        st.executeUpdate("DROP FUNCTION USER1.F_ABS2");
+         st.executeUpdate("DROP TRIGGER USER2.TT1");
+         st.executeUpdate("DROP TRIGGER USER2.TT2");
+         st.executeUpdate("DROP TRIGGER USER2.TT3");
+@@ -9964,6 +9970,8 @@ public void testGrantRevokeDDL2() throws SQLException {
+         st.executeUpdate("DROP TRIGGER USER2.TT8");
+         st.executeUpdate("DROP TRIGGER USER5.TT9");
+         st.executeUpdate("DROP TRIGGER USER5.TT10");
++        st.executeUpdate("DROP FUNCTION USER1.F_ABS1");
++        st.executeUpdate("DROP FUNCTION USER1.F_ABS2");
+         st.executeUpdate("DROP VIEW USER4.VSHARED4");
+         st.executeUpdate("DROP VIEW USER4.VSHARED3");
+         st.executeUpdate("DROP VIEW USER4.VSHARED2");
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ProcedureInTriggerTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ProcedureInTriggerTest.java
+index 524f2776..82a2ea2f 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ProcedureInTriggerTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ProcedureInTriggerTest.java
+@@ -57,12 +57,8 @@ public void testTriggerNoSql() throws SQLException {
+         checkAndResetZeroArgCount(1);
+         ResultSet rs = s.executeQuery("SELECT * FROM T2");
+         JDBC.assertFullResultSet(rs, new String[][] {{"1","2"},{"2","4"}});
+-        //--- check that trigger firing and database event fail if the procedure referred
+-        //--- in the triggered sql statement is dropped
+-        s.execute("drop procedure proc_no_sql");
+-        assertStatementError("42Y03",s,"insert into t2 values (1,2), (2,4)");
+-        //--- after recreating the procedure, the trigger should work
+-        s.execute("create procedure proc_no_sql() parameter style java language java NO SQL external name 'org.apache.derbyTesting.functionTests.tests.lang.ProcedureInTriggerTest.zeroArg'");
++        // Check that a procedure used by a trigger cannot be dropped.
++        assertStatementError("X0Y25", s, "drop procedure proc_no_sql");
+         s.execute("insert into t2 values (3,6)");
+         checkAndResetZeroArgCount(1);
+         rs = s.executeQuery("SELECT * FROM T2");  
+@@ -81,13 +77,8 @@ public void testTriggerNoSql() throws SQLException {
+         checkAndResetZeroArgCount(1);
+         rs = s.executeQuery("select * from t2");
+         JDBC.assertFullResultSet(rs, new String[][] {{"1","2"},{"2","4"}});
+-        //--- check that trigger firing and database event fail if the procedure referred
+-        //--- in the triggered sql statement is dropped
+-        s.execute("drop procedure proc_no_sql");
+-        // --- should fail
+-        assertStatementError("42Y03",s,"insert into t2 values (1,2), (2,4)");
+-        //after recreating the procedure, the trigger should work
+-        s.execute("create procedure proc_no_sql() parameter style java language java NO SQL external name 'org.apache.derbyTesting.functionTests.tests.lang.ProcedureInTriggerTest.zeroArg'");
++        // Check that a procedure used by a trigger cannot be dropped.
++        assertStatementError("X0Y25", s, "drop procedure proc_no_sql");
+         s.execute("insert into t2 values (3,6)");
+         checkAndResetZeroArgCount(1);
+         // check inserts are successful
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RenameTableTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RenameTableTest.java
+index 1dea5d9b..9205ff14 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RenameTableTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RenameTableTest.java
+@@ -29,6 +29,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import junit.framework.Test;
+ 
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+ /**
+@@ -202,13 +203,17 @@ public void testRenameTableWithTriggersOnIt() throws SQLException {
+         ResultSet rs = s.executeQuery("select * from t7");
+         rs.next();
+         rs.close();
+-        s.executeUpdate("rename table t6 to t6r");
+-        assertStatementError("42X05", s, "insert into t7 values(3)");
+-        rs = s.executeQuery("select * from t6r");
++        // DERBY-2041: Rename of table referenced in a trigger action
++        // should fail and leave trigger intact.
++        assertStatementError("X0Y25", s, "rename table t6 to t6r");
++        s.execute("insert into t7 values(3)");
++        JDBC.assertFullResultSet(
++                s.executeQuery("select * from t6 order by c61"),
++                new String[][] {{"1"}, {"3"}});
+         assertStatementError("42X05", s, "select * from t7r");
+         // Clean Up
+-        s.executeUpdate("drop table t6r");
+         s.executeUpdate("drop table t7");
++        s.executeUpdate("drop table t6");
+     }
+ 
+     /**
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesConferredPrivilegesTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesConferredPrivilegesTest.java
+index 7161b871..463ab581 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesConferredPrivilegesTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/RolesConferredPrivilegesTest.java
+@@ -1603,9 +1603,9 @@ public void testCurrentRoleInWeirdContexts() throws SQLException {
+         s.execute("revoke h from DonaldDuck");
+         s.execute("revoke insert on t from DonaldDuck");
+         setRole(dboConn, "none");
+-        s.execute("drop table trackCreds");
+         s.execute("drop table t");
+         s.execute("drop table strange");
++        s.execute("drop table trackCreds");
+         s.close();
+ 
+         c.close();
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerTest.java
+index f64439fc..4fc98b05 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerTest.java
+@@ -61,6 +61,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  */
+ public class TriggerTest extends BaseJDBCTestCase {
+    
++    private static final String SYNTAX_ERROR = "42X01";
++    private static final String HAS_DEPENDENT_SPS = "X0Y24";
++    private static final String HAS_DEPENDENT_TRIGGER = "X0Y25";
++    private static final String TRIGGER_DROPPED = "01502";
++   
+     /**
+      * Thread local that a trigger can access to
+      * allow recording information about the firing.
+@@ -783,7 +788,6 @@ public static void logTriggerInfo(String info)
+      * Test for DERBY-3718 NPE when a trigger is fired
+      * 
+      * @throws SQLException
+-     * @throws IOException
+      */
+     public void testNPEinTriggerFire() throws SQLException
+     {
+@@ -2122,4 +2126,202 @@ public void testDerby6348() throws SQLException {
+         // DERBY-6348.
+         s.execute("insert into d6348 values 1");
+     }
++
++    /**
++     * Test that DROP operations detect if there are triggers depending on
++     * the object being dropped, and either fail (if RESTRICT semantics) or
++     * drop the trigger (if CASCADE semantics).
++     */
++    public void testDerby2041DropDependencies() throws SQLException {
++        Statement s = createStatement();
++        s.execute("create table t1(x int, y int, z int)");
++        s.execute("create table t2(x int, y int, z int)");
++        s.execute("create table syn_table(x int, y int, z int)");
++        s.execute("create table view_table(x int, y int, z int)");
++
++        s.execute("create function f(x int) returns int language java "
++                + "parameter style java external name 'java.lang.Math.abs'");
++        s.execute("create procedure p() language java parameter style java "
++                + "external name '" + getClass().getName()
++                + ".dummyProc' no sql");
++        s.execute("create function tf() returns table (x int) "
++                + "language java parameter style derby_jdbc_result_set "
++                + "external name '" + getClass().getName()
++                + ".dummyTableFunction' no sql");
++        s.execute("create derby aggregate intmode for int external name '"
++                + ModeAggregate.class.getName() + "'");
++        s.execute("create sequence seq");
++        s.execute("create synonym syn for syn_table");
++        s.execute("create view v(x) as select x from view_table");
++        s.execute("create type tp external name 'java.util.List' language java");
++
++        s.execute("create trigger tr_t2 after insert on t1 select x from t2");
++        s.execute("create trigger tr_f after insert on t1 values f(1)");
++        s.execute("create trigger tr_p after insert on t1 call p()");
++        s.execute("create trigger tr_tf after insert on t1 "
++                + "select * from table(tf()) t");
++        s.execute("create trigger tr_intmode after insert on t1 "
++                + "select intmode(x) from (values 1,2,3) v(x)");
++        s.execute("create trigger tr_seq after insert on t1 "
++                + "values next value for seq");
++        s.execute("create trigger tr_syn after insert on t1 select * from syn");
++        s.execute("create trigger tr_v after insert on t1 select * from v");
++        s.execute("create trigger tr_tp after insert on t1 "
++                + "values cast(null as tp)");
++
++        PreparedStatement checkTrigger = prepareStatement(
++            "select triggername from sys.systriggers join sys.sysschemas "
++            + "using (schemaid) where triggername = ? and schemaname = ?");
++        checkTrigger.setString(2, getTestConfiguration().getUserName());
++
++        // DROP TABLE should fail because T2 is used in TR_T2.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop table t2");
++        checkTrigger.setString(1, "TR_T2");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_T2");
++
++        // DROP FUNCTION should fail because F is used in TR_F.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop function f");
++        checkTrigger.setString(1, "TR_F");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_F");
++
++        // DROP PROCEDURE should fail because P is used in TR_P.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop procedure p");
++        checkTrigger.setString(1, "TR_P");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_P");
++
++        // DROP FUNCTION should fail because the table function TF is
++        // used in TR_TF.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop function tf");
++        checkTrigger.setString(1, "TR_TF");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_TF");
++
++        // DROP DERBY AGGREGATE only supports RESTRICT for now.
++        assertStatementError(SYNTAX_ERROR, s,
++                             "drop derby aggregate intmode cascade");
++        assertStatementError(HAS_DEPENDENT_SPS, s,
++                             "drop derby aggregate intmode restrict");
++        checkTrigger.setString(1, "TR_INTMODE");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(),
++                                        "TR_INTMODE");
++
++        // DROP SEQUENCE only supports RESTRICT for now.
++        assertStatementError(SYNTAX_ERROR, s, "drop sequence seq cascade");
++        assertStatementError(HAS_DEPENDENT_SPS, s, "drop sequence seq restrict");
++        checkTrigger.setString(1, "TR_SEQ");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_SEQ");
++
++        // DROP SYNONYM should fail because SYN is used in TR_SYN.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop synonym syn");
++        checkTrigger.setString(1, "TR_SYN");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_SYN");
++
++        // DROP VIEW should fail because V is used in TR_V.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop view v");
++        checkTrigger.setString(1, "TR_V");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_V");
++
++        // DROP TYPE only supports RESTRICT for now.
++        assertStatementError(SYNTAX_ERROR, s, "drop type tp cascade");
++        assertStatementError(HAS_DEPENDENT_SPS, s, "drop type tp restrict");
++        checkTrigger.setString(1, "TR_TP");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_TP");
++
++        // DROP COLUMN should fail because TR_T2 uses column X.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s,
++                             "alter table t2 drop column x restrict");
++        checkTrigger.setString(1, "TR_T2");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_T2");
++
++        // DROP COLUMN should succeed in this case, since no trigger uses
++        // column Y.
++        s.execute("alter table t2 drop column y restrict");
++        assertNull(s.getWarnings());
++        checkTrigger.setString(1, "TR_T2");
++        JDBC.assertSingleValueResultSet(checkTrigger.executeQuery(), "TR_T2");
++        JDBC.assertColumnNames(s.executeQuery("select * from t2"),
++                               new String[] {"X", "Z"});
++
++        // DROP COLUMN should succeed because CASCADE is specified. Should
++        // also remove the dependent trigger and produce a warning.
++        s.execute("alter table t2 drop column x cascade");
++        assertSQLState(TRIGGER_DROPPED, s.getWarnings());
++        checkTrigger.setString(1, "TR_T2");
++        JDBC.assertEmpty(checkTrigger.executeQuery());
++        JDBC.assertColumnNames(s.executeQuery("select * from t2"),
++                               new String[] {"Z"});
++    }
++
++    /**
++     * Test that the fix for DERBY-2041 isn't too strict. Verify that some
++     * operations only cause the dependent triggered statement to get
++     * recompiled, and don't fail or cascade.
++     */
++    public void testDerby2041RecompileOnly() throws SQLException {
++        Statement s = createStatement();
++
++        PreparedStatement spsValid = prepareStatement("select valid from "
++            + "sys.sysschemas join sys.systriggers using (schemaid) "
++            + "join sys.sysstatements on stmtid = actionstmtid "
++            + "where schemaname = ? and triggername = ?");
++        spsValid.setString(1, getTestConfiguration().getUserName());
++        spsValid.setString(2, "TR");
++
++        // Dropping an index used by a trigger should not fail, and the
++        // trigger should not be dropped.
++        s.execute("create table t1(x int not null)");
++        s.execute("create table t2(x int not null)");
++        s.execute("create index idx on t2(x)");
++        s.execute("create trigger tr after insert on t1 "
++                + "insert into t2 values 1");
++        // SPS should be valid before index is dropped.
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "true");
++        s.execute("drop index idx");
++        // SPS should be invalid after index is dropped, but the trigger
++        // should still exist and work.
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "false");
++        s.execute("insert into t1 values 1");
++        JDBC.assertSingleValueResultSet(
++                s.executeQuery("select * from t2"), "1");
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "true");
++
++        // Truncating a table referenced by a trigger should also be OK.
++        s.execute("truncate table t2");
++        assertTableRowCount("T2", 0);
++        // SPS should be invalid after truncation, but the trigger should
++        // still exist and work.
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "false");
++        s.execute("insert into t1 values 1");
++        JDBC.assertSingleValueResultSet(
++                s.executeQuery("select * from t2"), "1");
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "true");
++
++        // Now create a table T3 that has a foreign key constraint referencing
++        // T2. Create a trigger on T1 that deletes from T2. The triggered
++        // statement depends on T3 because it needs to check that the foreign
++        // key constraint is not violated when rows are deleted from T2. Since
++        // the trigger doesn't reference T3 directly, it should be possible to
++        // drop T3 and simply recompile the triggered statement. Currently,
++        // dropping the table fails because of the triggered statement's
++        // dependency.
++        s.execute("drop trigger tr");
++        s.execute("alter table t2 add constraint t2_pk primary key (x)");
++        s.execute("create table t3(x int, "
++                + "y int references t2 on delete cascade)");
++        s.execute("create trigger tr after delete on t1 delete from t2");
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "true");
++        // Ideally, dropping T3 should be allowed, and the triggered
++        // statement should have been marked as not valid (needs recompile).
++        // Currently, it fails.
++        assertStatementError(HAS_DEPENDENT_TRIGGER, s, "drop table t3");
++        JDBC.assertSingleValueResultSet(spsValid.executeQuery(), "true");
++    }
++
++    /** Used as stored procedure in testDerby2041DropDependencies(). */
++    public static void dummyProc() {
++    }
++
++    /** Used as table function in testDerby2041DropDependencies(). */
++    public static ResultSet dummyTableFunction() {
++        return null;
++    }
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerWhenClauseTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerWhenClauseTest.java
+index e4b0e8e6..4de5df7f 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerWhenClauseTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/TriggerWhenClauseTest.java
+@@ -527,16 +527,14 @@ public void testDependencies() throws SQLException {
+                 "alter table t2 drop column y restrict");
+         s.execute("alter table t2 drop column z restrict");
+ 
+-        // Because of DERBY-2041, dropping the whole table silently succeeds
+-        // and leaves the trigger around. It should have caused a warning and
+-        // dropped the trigger.
+-        s.execute("drop table t2");
++        // Dropping a table referenced in a WHEN clause should fail and leave
++        // the trigger intact. Before DERBY-2041, DROP TABLE would succeed
++        // and leave the trigger in an invalid state so that subsequent
++        // INSERT statements would fail when trying to fire the trigger.
++        assertStatementError(HAS_DEPENDENTS, s, "drop table t2");
+         JDBC.assertSingleValueResultSet(
+             s.executeQuery("select triggername from sys.systriggers"), "TR");
+-        // The trigger wasn't dropped, but it is now invalid and causes the
+-        // triggering insert to fail.
+-        assertStatementError(TABLE_DOES_NOT_EXIST, s,
+-                "insert into t1 values (1, 2, 3)");
++        s.executeUpdate("insert into t1 values (1, 2, 3)");
+         getConnection().rollback(sp);
+ 
+         // Test references to columns in both the WHEN clause and the
+@@ -550,9 +548,9 @@ public void testDependencies() throws SQLException {
+                 "alter table t2 drop column y restrict");
+         s.execute("alter table t2 drop column z restrict");
+ 
+-        // Again, because of DERBY-2041, DROP TABLE fails to cascade and
+-        // drop the trigger.
+-        s.execute("drop table t2");
++        // DROP TABLE should fail because of the dependencies (didn't before
++        // DERBY-2041).
++        assertStatementError(HAS_DEPENDENTS, s, "drop table t2");
+         JDBC.assertSingleValueResultSet(
+             s.executeQuery("select triggername from sys.systriggers"), "TR");
+         getConnection().rollback(sp);
+@@ -720,10 +718,10 @@ public void testGrantRevoke() throws SQLException {
+         s1.close();
+         s2.close();
+ 
+-        c1.setAutoCommit(false);
+-        JDBC.dropSchema(c1.getMetaData(), "U1");
+         c2.setAutoCommit(false);
+         JDBC.dropSchema(c2.getMetaData(), "U2");
++        c1.setAutoCommit(false);
++        JDBC.dropSchema(c1.getMetaData(), "U1");
+     }
+ 
+     /**
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+index 7152ed82..8a0f935d 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+@@ -677,8 +677,8 @@ private void preapreForDERBY5044_And_DERBY5120() throws Exception
+         Statement s = createStatement();
+         boolean modeDb2SqlOptional = oldAtLeast(10, 3);
+ 
+-        dropTable("BKUP1_5044_5120");
+         dropTable("TAB1_5044_5120");
++        dropTable("BKUP1_5044_5120");
+         s.execute("create table TAB1_5044_5120(c11 int, c12 int)");
+         s.execute("insert into TAB1_5044_5120 values (1,11)");
+         s.execute("create table BKUP1_5044_5120(c111 int, c112 int)");
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/JDBC.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/JDBC.java
+index d64e17c1..6bda21f1 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/JDBC.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/JDBC.java
+@@ -301,6 +301,19 @@ public static void dropSchema(DatabaseMetaData dmd, String schema) throws SQLExc
+ 		Assert.assertFalse(conn.getAutoCommit());
+ 		Statement s = dmd.getConnection().createStatement();
+         
++        // Triggers
++        PreparedStatement pstr = conn.prepareStatement(
++                "SELECT TRIGGERNAME FROM SYS.SYSSCHEMAS S, SYS.SYSTRIGGERS T "
++                + "WHERE S.SCHEMAID = T.SCHEMAID AND SCHEMANAME = ?");
++        pstr.setString(1, schema);
++        ResultSet trrs = pstr.executeQuery();
++        while (trrs.next()) {
++            String trigger = trrs.getString(1);
++            s.execute("DROP TRIGGER " + JDBC.escape(schema, trigger));
++        }
++        trrs.close();
++        pstr.close();
++
+         // Functions - not supported by JDBC meta data until JDBC 4
+         // Need to use the CHAR() function on A.ALIASTYPE
+         // so that the compare will work in any schema.

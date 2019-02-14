@@ -1,0 +1,124 @@
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 43703881..1fa93789 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -763,6 +763,13 @@ public static String getColumnType(String tableName, String cfName)
+         return tables_;
+     }
+ 
++    public static List<String> getNonSystemTables()
++    {
++        List<String> tables = new ArrayList<String>(tables_);
++        tables.remove(Table.SYSTEM_TABLE);
++        return Collections.unmodifiableList(tables);
++    }
++
+     public static String getTable(String tableName)
+     {
+         assert tableName != null;
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/dht/BootStrapper.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/dht/BootStrapper.java
+index 85a46fc8..47ea7ea9 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/dht/BootStrapper.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/dht/BootStrapper.java
+@@ -87,7 +87,8 @@ public void run()
+                 for (Map.Entry<InetAddress, Collection<Range>> entry : getWorkMap(rangesWithSourceTarget).asMap().entrySet())
+                 {
+                     InetAddress source = entry.getKey();
+-                    StorageService.instance().addBootstrapSource(source);
++                    for (String table : DatabaseDescriptor.getNonSystemTables())
++                        StorageService.instance().addBootstrapSource(source, table);
+                     if (logger.isDebugEnabled())
+                         logger.debug("Requesting from " + source + " ranges " + StringUtils.join(entry.getValue(), ", "));
+                     Streaming.requestRanges(source, entry.getValue());
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
+index a6f32f10..fa816d1b 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/io/Streaming.java
+@@ -50,6 +50,7 @@
+ public class Streaming
+ {
+     private static Logger logger = Logger.getLogger(Streaming.class);
++    private static String TABLE_NAME = "STREAMING-TABLE-NAME";
+     public static final long RING_DELAY = 30 * 1000; // delay after which we assume ring has stablized
+ 
+     /**
+@@ -126,6 +127,7 @@ public static void transferSSTables(InetAddress target, List<SSTableReader> ssta
+         StreamManager.instance(target).addFilesToStream(streamContexts);
+         StreamInitiateMessage biMessage = new StreamInitiateMessage(streamContexts);
+         Message message = StreamInitiateMessage.makeStreamInitiateMessage(biMessage);
++        message.addHeader(Streaming.TABLE_NAME, table.getBytes());
+         if (logger.isDebugEnabled())
+           logger.debug("Sending a stream initiate message to " + target + " ...");
+         MessagingService.instance().sendOneWay(message, target);
+@@ -163,6 +165,8 @@ public void doVerb(Message message)
+             byte[] body = message.getMessageBody();
+             DataInputBuffer bufIn = new DataInputBuffer();
+             bufIn.reset(body, body.length);
++            if (logger.isDebugEnabled())
++                logger.debug(String.format("StreamInitiateVerbeHandler.doVerb %s %s %s", message.getVerb(), message.getMessageId(), message.getMessageType()));
+ 
+             try
+             {
+@@ -173,7 +177,7 @@ public void doVerb(Message message)
+                 {
+                     if (logger.isDebugEnabled())
+                         logger.debug("no data needed from " + message.getFrom());
+-                    StorageService.instance().removeBootstrapSource(message.getFrom());
++                    StorageService.instance().removeBootstrapSource(message.getFrom(), new String(message.getHeader(Streaming.TABLE_NAME)));
+                     return;
+                 }
+ 
+@@ -315,7 +319,7 @@ public void onStreamCompletion(InetAddress host, StreamContextManager.StreamCont
+             /* If we're done with everything for this host, remove from bootstrap sources */
+             if (StreamContextManager.isDone(host) && StorageService.instance().isBootstrapMode())
+             {
+-                StorageService.instance().removeBootstrapSource(host);
++                StorageService.instance().removeBootstrapSource(host, streamContext.getTable());
+             }
+         }
+     }
+diff --git a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
+index 6ad376e5..d3cc67ad 100644
+--- a/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/branches/cassandra-0.5/src/java/org/apache/cassandra/service/StorageService.java
+@@ -158,22 +158,25 @@ public static StorageService instance()
+     private AbstractReplicationStrategy replicationStrategy_;
+     /* Are we starting this node in bootstrap mode? */
+     private boolean isBootstrapMode;
+-    private Set<InetAddress> bootstrapSet;
++    private Multimap<InetAddress, String> bootstrapSet;
+     /* when intialized as a client, we shouldn't write to the system table. */
+     private boolean isClientMode;
+   
+-    public synchronized void addBootstrapSource(InetAddress s)
++    public synchronized void addBootstrapSource(InetAddress s, String table)
+     {
+         if (logger_.isDebugEnabled())
+             logger_.debug("Added " + s + " as a bootstrap source");
+-        bootstrapSet.add(s);
++        bootstrapSet.put(s, table);
+     }
+     
+-    public synchronized void removeBootstrapSource(InetAddress s)
++    public synchronized void removeBootstrapSource(InetAddress s, String table)
+     {
+-        bootstrapSet.remove(s);
++        if (table == null)
++            bootstrapSet.removeAll(s);
++        else
++            bootstrapSet.remove(s, table);
+         if (logger_.isDebugEnabled())
+-            logger_.debug("Removed " + s + " as a bootstrap source; remaining is [" + StringUtils.join(bootstrapSet, ", ") + "]");
++            logger_.debug("Removed " + s + " as a bootstrap source; remaining is [" + StringUtils.join(bootstrapSet.keySet(), ", ") + "]");
+ 
+         if (bootstrapSet.isEmpty())
+         {
+@@ -211,7 +214,7 @@ public StorageService()
+             throw new RuntimeException(e);
+         }
+ 
+-        bootstrapSet = new HashSet<InetAddress>();
++        bootstrapSet = HashMultimap.create();
+         endPointSnitch_ = DatabaseDescriptor.getEndPointSnitch();
+ 
+         /* register the verb handlers */

@@ -1,0 +1,904 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
+index 232c4e04..9b5bff50 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/RawStoreFactory.java
+@@ -215,12 +215,19 @@ Maximum container cache size we will accept (MAXINT).
+ 	/**
+ 		Default value for MINIMUM_RECORD_SIZE_PARAMETER	for heap tables that 
+         allow overflow.  By setting minimumRecordSize to 12 bytes, we 
+-        guarantee there is enough space to update the row even there is not
+-        enough space on the page.  The 12 bytes will guarantee there is room
+-        for an overflow pointer (page + id).
++        guarantee there is enough space to update the a head row even if there 
++        is not enough space on the page.  The 12 bytes of user data along with
++        the existing space in the record header will guarantee there is room
++        to write an overflow row header which will use the same initial portion
++        of the record header and at most 12 additional bytes for an overflow 
++        pointer (page + id).  Note that this is the "user"
++        portion of the record.  The record also will contain space for the
++        "non-user" portion which includes the offset table and the record
++        header.
+ 	*/
+ 	public static final int MINIMUM_RECORD_SIZE_DEFAULT = 12;
+ 
++
+ 	/**
+ 		Minimum value for MINIMUM_RECORD_SIZE_PARAMETER (1).
+ 	*/
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
+index 05cd6ef5..54e46a54 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredPage.java
+@@ -289,7 +289,7 @@ public int getTypeFormatId()
+     /**
+      * OVERFLOW_PTR_FIELD_SIZE - Number of bytes of an overflow field
+      * 
+-     * This is the length to reserve for either an column or row overflow
++     * This is the length to reserve for either a column or row overflow
+      * pointer field.  It includes the size of the field header plus the 
+      * maxium length of the overflow pointer (it could be shorter due to
+      * compressed storage).
+@@ -397,7 +397,7 @@ public int getTypeFormatId()
+      * Minimum space to reserve for record portion length of row.
+      * <p>
+      * minimumRecordSize is stored in the container handle.  It is used to 
+-     * reserved minimum space for recordPortionLength.  Default is 1.  To
++     * reserve minimum space for recordPortionLength.  Default is 1.  To
+      * get the value from the container handle: 
+      * myContainer.getMinimumRecordSize();
+      *
+@@ -969,7 +969,9 @@ protected void writePage(PageKey identity)
+                 // make sure free space is not negative and does not overlap
+                 // used space.
+ 
+-				SanityManager.THROWASSERT("slotsInUse = " + slotsInUse
++				SanityManager.THROWASSERT(
++                      "writePage detected problem in freespace and used space."
++                    + "slotsInUse = " + slotsInUse
+ 					+ ", firstFreeByte = " + firstFreeByte
+ 					+ ", freeSpace = " + freeSpace 
+ 					+ ", slotOffset = " + (getSlotOffset(slotsInUse - 1))
+@@ -1296,8 +1298,11 @@ public boolean allowInsert()
+ 
+ 		spaceAvailable -= slotEntrySize;	// need to account new slot entry
+ 
+-		if (spaceAvailable < minimumRecordSize)
++		if ((spaceAvailable < minimumRecordSize) ||
++            (spaceAvailable < StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE))
++        {
+ 			return false;
++        }
+ 
+ 		// see that we reserve enough space for existing rows to grow on page
+ 		if (((spaceAvailable * 100) / totalSpace) < spareSpace)
+@@ -2192,16 +2197,28 @@ private void initSlotTable(
+             {
+ 				if (SanityManager.DEBUG) 
+                 {
+-					if (!isOverflowPage() && 
+-                        minimumRecordSize > getTotalSpace(slot))
++                    int total_space    = getTotalSpace(slot);
++
++					if ((!isOverflowPage() && 
++                         (minimumRecordSize > total_space)) ||
++                        (isOverflowPage() &&
++                         (StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE >
++                         total_space)))
+                     {
++                        // head rows including reserved space must be larger 
++                        // than minimumRecordSize.  
++                        //
++                        // Overflow rows including reserved space must be 
++                        // larger than MAX_OVERFLOW_ONLY_REC_SIZE.
++
+ 						SanityManager.THROWASSERT(
++                            "initSlotTable consistency check failed: " +
+ 							" slot " + slot +
+ 							" minimumRecordSize = " + minimumRecordSize + 
+-							" totalSpace = " + getTotalSpace(slot) + 
+-							"recordPortionLength = " + 
+-                                getRecordPortionLength(slot) 
+-							+ " reservedCount = " + getReservedCount(slot));
++							" totalSpace = " + total_space +
++							" recordPortionLength = " + 
++                                getRecordPortionLength(slot) + 
++                            " reservedCount = " + getReservedCount(slot));
+                     }
+ 				}
+ 
+@@ -2238,8 +2255,9 @@ private void initSlotTable(
+ 			if (SanityManager.DEBUG) 
+             {
+ 				if ((freeSpace < 0) || 
++                    (firstFreeByte > getSlotOffset(slotsInUse - 1))   ||
+                     ((firstFreeByte + freeSpace) != 
+-                         (getSlotOffset(slotsInUse - 1)))) 
++                         getSlotOffset(slotsInUse - 1))) 
+                 {
+ 					SanityManager.THROWASSERT(
+                         "firstFreeByte = " + firstFreeByte
+@@ -3552,15 +3570,6 @@ protected  boolean getIsOverflow(int slot) throws IOException
+ 	}
+ 
+ 	/**
+-		Log a row into the StoreOuput stream.
+-
+-		<P>
+-
+-		@exception StandardException	Standard Derby error policy
+-		@exception IOException			RESOLVE
+-
+-	*/
+-    /**
+      * Log a row into the StoreOuput stream.
+      * <p>
+      * Write the row in its record format to the stream. Record format is a 
+@@ -4103,6 +4112,46 @@ else if (!forInsert)
+ 							// not enough room for the overflow recordheader,
+                             // and this is the first column on this page so 
+                             // need to try another page.
++                            //
++
++                            if (SanityManager.DEBUG)
++                            {
++                                if (!forInsert)
++                                {
++                                    // should not get into this path on an 
++                                    // update, only on an insert.  Update should
++                                    // reserve space on page so you can always
++                                    // at least update the row with a single
++                                    // overflow pointer.
++                                    SanityManager.THROWASSERT(
++                                        "no space to update a field on page. " +
++                                        "i = " + i +
++                                        "; startColumn = " + startColumn + 
++                                        "; lastColumnPositionAllowOverflow = " +
++                                            lastColumnPositionAllowOverflow +
++                                        "; spaceAvailable = " + 
++                                            spaceAvailable +
++                                        "; isOverflowPage() = " + 
++                                            isOverflowPage() +
++                                        "; OVERFLOW_POINTER_SIZE = " + 
++                                            OVERFLOW_POINTER_SIZE +
++                                        "\npage = \n" + this);
++                                }
++                            }
++
++                            // DERBY-4577, on an update this bug may cause
++                            // the following to be thrown on an update.  Update
++                            // code never expects this error to be thrown, and
++                            // does not handle it.  The fix to DERBY-4577 was
++                            // to fix insert code to make sure enough space is
++                            // always reserved on overflow pages such that 
++                            // updates will never fail.  But the fix does not
++                            // affect existing problem overflow pages.  If 
++                            // this error is encountered in a table created 
++                            // by software before the fix, run compress to 
++                            // upgrade all data in table so that error will
++                            // not be encountered in future.
++
+ 							throw new NoSpaceOnPage(isOverflowPage());
+ 						} 
+                         else 
+@@ -4200,7 +4249,6 @@ else if (newSize > oldSize)
+             {
+ 				throw new NoSpaceOnPage(isOverflowPage()); 
+             }
+-
+ 		} 
+         finally 
+         {
+@@ -7173,21 +7221,45 @@ private void storeRecordForInsert(int slot, ObjectInput in)
+ 			}
+ 		}
+ 
++        if (isOverflowPage())
++        {
++            // The total length of the row including the row header, field
++            // headers, user data, and unused reserve space must be at least
++            // as big as the worst case overflow row pointer.  This is so that
++            // it always possible to do an expanding update on a row piece that
++            // in the worst case results in just using the existing space to
++            // put in an overflow pointer to another row segment on some other
++            // page.
++            int additional_space_needed = 
++                StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE - 
++                    (dataWritten + reservedSpace);
++
++            if (additional_space_needed > 0)
++            {
++                // need to reserve more space for the row to handle worst case
++                // update of the row to an overflow row piece.
++                freeSpace     -= additional_space_needed;
++                firstFreeByte += additional_space_needed;
++                reservedSpace += additional_space_needed;
++            }
++        }
++
+ 		// update the slot table
+ 		addSlotEntry(slot, recordOffset, dataWritten, reservedSpace);
+ 
+         if (SanityManager.DEBUG)
+         {
+-            if ((firstFreeByte > getSlotOffset(slot)) ||
+-                (freeSpace < 0))
++            if ((freeSpace < 0)                         || 
++                (firstFreeByte > getSlotOffset(slotsInUse - 1))   ||
++                ((firstFreeByte + freeSpace) != getSlotOffset(slotsInUse - 1)))
+             {
+                 SanityManager.THROWASSERT(
+-                        " firstFreeByte = " + firstFreeByte + 
+-                        " dataWritten = "        + dataWritten        +
+-                        " getSlotOffset(slot) = "   + getSlotOffset(slot)   + 
++                        " inconsistency in space management during insert: " +
+ 						" slot = " + slot +
+-                        " firstFreeByte = "      + firstFreeByte + 
++                        " getSlotOffset(slot) = " + getSlotOffset(slot)      + 
++                        " dataWritten = "         + dataWritten              +
+                         " freeSpace = "          + freeSpace  + 
++                        " firstFreeByte = "       + firstFreeByte            + 
+                         " page = "               + this);
+             }
+         }
+@@ -8051,7 +8123,9 @@ private String recordToString(int slot)
+                          "," + getReservedCount(slot) + ")"+
+                          recordHeader.toString();
+ 
+-				rawDataIn.setPosition(offset + recordHeader.size());
++                // move offset past record header to begin of first field.
++                offset += recordHeader.size();
++				rawDataIn.setPosition(offset);
+ 
+ 				for (int i = 0; i < numberFields; i++)
+ 				{
+@@ -8727,8 +8801,8 @@ else if (i < endFieldExclusive)
+ 					// After the update is done, see if this row piece has
+ 					// shrunk in curPage if no other row pieces have shrunk so
+ 					// far.  In head page, need to respect minimumRecordSize.
+-					// In overflow page, only need to respect
+-					// RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT
++					// In overflow page entire row needs to respect
++                    // StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE.
+ 					// Don't bother with temp container.
+ 					if (!rowHasReservedSpace && headRowHandle != null &&
+ 						curPage != null && !owner.isTemporaryContainer())
+@@ -8866,41 +8940,69 @@ else if (i < endFieldExclusive)
+ 	}
+ 
+ 	/**
+-		See if the row on this page has reserved space that can be shrunk once
+-		the update commits.
+ 	 */
++
++    /**
++     * See if reserved space should be reclaimed for the input row.
++     * <p>
++     * See if the row on this page has reserved space that should be shrunk 
++     * once the update commits.  Will only indicate space should be reclaimed
++     * if at least RawTransaction.MINIMUM_RECORD_SIZE_DEFAULT bytes can be
++     * reclaimed.  
++     * <p>
++     *
++     * @return true if space should be reclaimed from this row post commit.
++     **/
+ 	private boolean checkRowReservedSpace(int slot) throws StandardException
+ 	{
+ 		boolean rowHasReservedSpace = false;
+-		try {
++
++		try 
++        {
+ 			int shrinkage = getReservedCount(slot);
+ 
+-			// Only reclaim reserved space if it is
+-			// "reasonably" sized, i.e., we can reclaim at
+-			// least MININUM_RECORD_SIZE_DEFAULT
++			// Only reclaim reserved space if it is "reasonably" sized, i.e., 
++            // we can reclaim at least MINIMUM_RECORD_SIZE_DEFAULT.  Note
++            // any number could be used for "reasonable", not sure why
++            // MINIMUM_RECORD_SIZE_DEFAULT was chosen.
+ 			int reclaimThreshold = RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT;
+ 			
+-			if (shrinkage > reclaimThreshold) {
++			if (shrinkage > reclaimThreshold) 
++            {
++                // reserved space for row exceeds the threshold.
++
+ 				int totalSpace = getRecordPortionLength(slot) + shrinkage; 
+ 
+-				if (isOverflowPage()) {
++				if (isOverflowPage()) 
++                {
++                    // For overflow pages the total row size, including 
++                    // reserved space must be at least 
++                    // StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE
++
+ 					if (totalSpace >
+-						RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT+reclaimThreshold)
++                        (StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE +
++                         reclaimThreshold))
++                    {
++                        // row can reclaim at least the threshold space
+ 						rowHasReservedSpace = true;
++                    }
++				} 
++                else 
++                {
++					// this is a head page.  The total space of the row 
++                    // including reserved space must total at least
++                    // minimumRecordSize.
+ 
+-					// Otherwise, I can at most reclaim less than
+-					// MINIMUM_RECORD_SIZE_DEFAULT, forget about that.
+-				} else {
+-					// this is a head page
+-					if (totalSpace > (minimumRecordSize +
+-									  RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT)) 
++					if (totalSpace > (minimumRecordSize + reclaimThreshold))
++                    {
++                        // row can reclaim at least the threshold space
+ 						rowHasReservedSpace = true;
+-
+-					// Otherwise, I can at most reclaim less than
+-					// MINIMUM_RECORD_SIZE_DEFAULT, forget about that.
+ 				}
+ 			}
+-		} catch (IOException ioe) {
++			}
++		} 
++        catch (IOException ioe) 
++        {
+ 			throw StandardException.newException(
+                 SQLState.DATA_UNEXPECTED_EXCEPTION, ioe);
+ 		}
+@@ -8915,28 +9017,37 @@ private boolean checkRowReservedSpace(int slot) throws StandardException
+ 	protected void compactRecord(RawTransaction t, int slot, int id) 
+ 		 throws StandardException 
+ 	{
+-		// If this is a head row piece, first take care of the entire overflow
+-		// row chain.  Don't need to worry about long column because they are
+-		// not in place updatable.
+-		if (isOverflowPage() == false) {
++		if (!isOverflowPage()) 
++        {
++            // If this is a head row piece, first take care of the entire 
++            // overflow row chain.  Don't need to worry about long column 
++            // because they are not in place updatable.
++
+ 			StoredRecordHeader recordHeader = getHeaderAtSlot(slot);
+ 
+-			while (recordHeader.hasOverflow()) {
++			while (recordHeader.hasOverflow()) 
++            {
++                // loop calling compact on each piece of the overflow chain.
++
+ 				StoredPage nextPageInRowChain =
+ 					getOverflowPage(recordHeader.getOverflowPage());
+ 
+ 				if (SanityManager.DEBUG)
+ 					SanityManager.ASSERT(nextPageInRowChain != null);
+ 
+-				try {
++				try 
++                {
+ 					int nextId = recordHeader.getOverflowId();
+-					int nextSlot = getOverflowSlot(nextPageInRowChain, recordHeader);
++					int nextSlot = 
++                        getOverflowSlot(nextPageInRowChain, recordHeader);
+ 
+ 					nextPageInRowChain.compactRecord(t, nextSlot, nextId);
+ 
+ 					// Follow the next long row pointer.
+ 					recordHeader = nextPageInRowChain.getHeaderAtSlot(nextSlot);
+-				} finally {
++				} 
++                finally 
++                {
+ 					nextPageInRowChain.unlatch();
+ 				}
+ 			}
+@@ -8946,33 +9057,64 @@ protected void compactRecord(RawTransaction t, int slot, int id)
+ 		// Try to only reclaim space larger than MINIMUM_RECORD_SIZE_DEFAULT
+ 		// because otherwise it is probably not worth the effort.
+ 		int reclaimThreshold = RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT;
++
+ 		try
+ 		{
+ 			int reserve = getReservedCount(slot);
+-			if (reserve > reclaimThreshold) {
++
++			if (reserve > reclaimThreshold) 
++            {
++                // unused space exceeds the reclaim threshold.
++
+ 				int recordLength = getRecordPortionLength(slot);
+ 				int correctReservedSpace = reserve;
++                int totalSpace           = recordLength + reserve;
+ 
+-				if (isOverflowPage()) {
+-					if ((reserve + recordLength) > 
+-						(RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT+reclaimThreshold))
++				if (isOverflowPage()) 
+ 					{ 
++                    // On an overflow page the total space of a record must
++                    // be at least MAX_OVERFLOW_ONLY_REC_SIZE.
++
++                    if (totalSpace > 
++                        (StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE +
++                         reclaimThreshold))
++                    {
++                        // possible to reclaim more than threshold.
++
+ 						// calculate what the correct reserved space is
+-						if (recordLength >= RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT)
++						if (recordLength >= 
++                            StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE)
++                        {
+ 							correctReservedSpace = 0;
+-						else	// make sure record takes up minimum_record_size 
++                        }
++						else
++                        {
++                            // make sure record takes up max overflow rec size 
+ 							correctReservedSpace = 
+-								RawStoreFactory.MINIMUM_RECORD_SIZE_DEFAULT - recordLength; 
++                                StoredRecordHeader.MAX_OVERFLOW_ONLY_REC_SIZE -
++                                recordLength;
+ 					}
+-				} else {
+-					// this is a head page
+-					if ((reserve + recordLength) > 
+-						(minimumRecordSize+reclaimThreshold)) {
++					}
++				} 
++                else 
++                {
++					// this is a head page.  The total space of the row 
++                    // including reserved space must total at least
++                    // minimumRecordSize.
++
++					if (totalSpace > (minimumRecordSize + reclaimThreshold))
++                    {
+ 						// calculate what the correct reserved space is
++
+ 						if (recordLength >= minimumRecordSize)
++                        {
+ 							correctReservedSpace = 0;
++                        }
+ 						else
+-							correctReservedSpace = minimumRecordSize - recordLength;
++                        {
++							correctReservedSpace = 
++                                minimumRecordSize - recordLength;
++                        }
+ 					}
+ 				}
+ 
+@@ -8983,16 +9125,18 @@ protected void compactRecord(RawTransaction t, int slot, int id)
+ 				}
+ 
+ 				// A shrinkage has occured.
+-				if (correctReservedSpace < reserve) {
++				if (correctReservedSpace < reserve) 
++                {
+ 					owner.getActionSet().
+-						actionShrinkReservedSpace(t, this, slot, id,
+-										correctReservedSpace, reserve);
++						actionShrinkReservedSpace(
++                            t, this, slot, id, correctReservedSpace, reserve);
++				}
+ 				}
+ 			}
+-		} catch (IOException ioe) {
++        catch (IOException ioe) 
++        {
+ 			throw StandardException.newException(
+                 SQLState.DATA_UNEXPECTED_EXCEPTION, ioe);
+ 		}
+ 	}
+ }
+-
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredRecordHeader.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredRecordHeader.java
+index f18123e6..615efb13 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredRecordHeader.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/StoredRecordHeader.java
+@@ -85,6 +85,22 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private static final byte RECORD_HAS_FIRST_FIELD = 0x04;
+     private static final byte RECORD_VALID_MASK = 0x0f;
+ 
++    /**
++     * maximum length for row containing just an overflow pointer.
++     * <p>
++     * The maximum stored length of a row that just contains an overflow pointer
++     * is 17 bytes:
++     *   stored sizeof(status byte)       :  1 +
++     *   stored sizeof(record id)         :  4 +
++     *   max stored size overflow page ptr:  8 +
++     *   max stored size overflow record id: 4  
++     **/
++    public static final int MAX_OVERFLOW_ONLY_REC_SIZE = 
++            1 +                                     // stored status byte
++            CompressedNumber.MAX_INT_STORED_SIZE  + // max stored record id size
++            CompressedNumber.MAX_LONG_STORED_SIZE + // max stored overflow page 
++            CompressedNumber.MAX_INT_STORED_SIZE;   // max stored overflow id
++
+ 
+     /**************************************************************************
+      * Fields of the class
+@@ -760,6 +776,7 @@ public String toString()
+ 			str += "\n  firstField    = " + getFirstField();
+ 			str += "\n  overflowPage  = " + getOverflowPage();
+ 			str += "\n  overflowId    = " + getOverflowId();
++			str += "\n  header length = " + size();
+ 
+ 			return str;
+ 		}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby4577Test.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby4577Test.java
+index e69de29b..5cbd794e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby4577Test.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby4577Test.java
+@@ -0,0 +1,352 @@
++package org.apache.derbyTesting.functionTests.tests.store;
++
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
++import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++import org.apache.derby.shared.common.sanity.SanityManager;
++
++import junit.framework.Assert;
++import junit.framework.Test;
++import junit.framework.TestSuite;
++
++import java.sql.CallableStatement;
++import java.sql.Connection;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.Statement;
++import java.sql.SQLException;
++
++
++/*
++Class org.apache.derbyTesting.functionTests.tests.store.Derby4577Test
++
++Licensed to the Apache Software Foundation (ASF) under one or more
++contributor license agreements.  See the NOTICE file distributed with
++this work for additional information regarding copyright ownership.
++The ASF licenses this file to you under the Apache License, Version 2.0
++(the "License"); you may not use this file except in compliance with
++the License.  You may obtain a copy of the License at
++
++   http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++*/
++
++
++/**
++
++Test to reproduce DERBY-4577, An expanding update fails with an nospc.U error.
++
++**/
++
++public class Derby4577Test extends StoreBaseTest
++{
++    /**************************************************************************
++     * Fields of the class
++     **************************************************************************
++     */
++
++    /**************************************************************************
++     * Constructors for This class:
++     **************************************************************************
++     */
++
++    /**************************************************************************
++     * Private/Protected methods of This class:
++     **************************************************************************
++     */
++
++    /**************************************************************************
++     * Public Methods of This class:
++     **************************************************************************
++     */
++
++    /**************************************************************************
++     * Public Methods of XXXX class:
++     **************************************************************************
++     */
++
++    public Derby4577Test(String name) 
++    {
++        super(name);
++    }
++
++    
++    /**
++     * DERBY-4577 test case
++     * <p>
++     * The update error occurs with the following:
++     *   o update of a long row which requires an update on it's overflow page
++     *   o The portion of the long row on the overflow page needs to have 
++     *     max(row size, reserved space) + free space on page <= 12  
++     *     (12 causes the error, other values might also).
++     *
++     * In order to get to this one needs multiple rows on the overflow page,
++     * so that they can eat up the free space on the page.  This test 
++     * simulates the overflow page state that I got from running the test case 
++     * associated with DERBY-2286.  I could only repro on a fast dual core
++     * linux machine.  I repro'd a few times and it always had 3 rows on
++     * the page: one that had a long column pointer, one that had a long
++     * row pointer, and one that had the blob on the page eating up most of
++     * the space on the overflow page.  
++     *
++     * The test does the following:
++     * o drop/create table
++     * o insert 3 rows of interest that will all fit on 1st page, with 1 byte
++     *     blob columns.
++     * o insert a dummy row that will fill up the rest of the 1st page.
++     * o update 1st 3 rows so that they are now all long rows that share the
++     *   same overflow page.
++     * o update row 1 so that it now has a long column, this actually shrinks
++     *   it on this overflow page.
++     * o update row 2 so that blob column is bigger, but still less than a page
++     *   this results in row 2 getting another long row pointer to a page that
++     *   holds the new blob value.  Again this actually shrinks the row piece
++     *   on the overflow page in question.
++     * o update row 3 so that it's overflow piece fills up all the remaining
++     *   space on the overflow page.
++     * o finally update row 1's long column, this update causes the bug.  The
++     *   no space error should never be thrown to a user on an update.  The only
++     *   time an error of this type is allowed is if the actual disk is full.
++     *
++     **/
++    public void testDERBY_4577()
++        throws SQLException
++    {
++
++        // page 0 - container info/bit map, does not affect test
++
++        // page 1 - 
++        // row on it that can never be deleted so this page never can be
++        // made free.
++
++        Statement stmt = createStatement();
++
++        PreparedStatement insert_stmt = 
++            prepareStatement("INSERT INTO testBadUpdate VALUES(?, ?)");
++
++        PreparedStatement update_stmt = 
++            prepareStatement("UPDATE testBadUpdate set value = ? where id = ?");
++
++        // insert 3 rows that will fit on same main page.
++        byte[] pad_blob = new byte[1];
++
++        for (int i = 0; i < 3; i++)
++        {
++            insert_stmt.setInt(     1, i);
++            insert_stmt.setBytes(   2, pad_blob);
++            insert_stmt.executeUpdate();
++        }
++
++        commit();
++
++        // insert a row that fills rest of main page
++        pad_blob = new byte[32000];
++        insert_stmt.setInt(     1, 3);
++        insert_stmt.setBytes(   2, pad_blob);
++        insert_stmt.executeUpdate();
++
++        // now expand each of the rows so that each becomes a "long row", with
++        // first column on main page with a pointer to overflow page, and each
++        // 2nd column exists in full on the overflow page.  Want
++        // each overflow to end up on same page.  
++        pad_blob = new byte[4000];
++        for (int i = 0; i < 3; i++)
++        {
++            update_stmt.setBytes(   1, pad_blob);
++            update_stmt.setInt(     2, i);
++            update_stmt.executeUpdate();
++        }
++
++        commit();
++
++        // eat up the rest of space on main page, by expanding the 4th row.
++        pad_blob = new byte[32566];
++        update_stmt.setBytes(   1, pad_blob);
++        update_stmt.setInt(     2, 3);
++        update_stmt.executeUpdate();
++        commit();
++
++        // expand row 1 so that it's blob column becomes a long column
++        pad_blob = new byte[60000];
++        update_stmt.setBytes(   1, pad_blob);
++        update_stmt.setInt(     2, 0);
++        update_stmt.executeUpdate();
++        commit();
++
++        // expand row 2 so that it's blob column becomes another long row
++        // pointer.
++        pad_blob = new byte[32500];
++        update_stmt.setBytes(   1, pad_blob);
++        update_stmt.setInt(     2, 1);
++        update_stmt.executeUpdate();
++        commit();
++        
++        // expand row 3 so that it's blob column becomes 32649 long.
++        //  was 32000
++        pad_blob = new byte[32646];
++        update_stmt.setBytes(   1, pad_blob);
++        update_stmt.setInt(     2, 2);
++        update_stmt.executeUpdate();
++        commit();
++
++        // see if we can update the long column of row 1
++        pad_blob = new byte[120000];
++        update_stmt.setBytes(   1, pad_blob);
++        update_stmt.setInt(     2, 0);
++        update_stmt.executeUpdate();
++        commit();
++
++        stmt.close();
++        insert_stmt.close();
++        update_stmt.close();
++    }
++
++    public void testSmallRow1()
++        throws SQLException
++    {
++        Statement stmt = createStatement();
++
++        // setup has created:
++        // CREATE TABLE testSmallRow1 (id char(1))
++        //     should be a 4k page size.
++
++        PreparedStatement insert_stmt = 
++            prepareStatement("INSERT INTO testSmallRow1 VALUES(?)");
++
++        // insert more than 3 pages of rows.
++        insert_stmt.setString(1, "a");
++
++        for (int i = 0; i < 4000; i++)
++        {
++            insert_stmt.executeUpdate();
++        }
++        insert_stmt.close();
++        commit();
++
++        // create an index to test btree handling of short key.
++        stmt.executeUpdate("CREATE INDEX idx1 on testSmallRow1(id)");
++
++        // Check the consistency of the indexes
++        ResultSet rs = stmt.executeQuery(
++            "VALUES SYSCS_UTIL.SYSCS_CHECK_TABLE('APP', 'TESTSMALLROW1')");
++        String [][] expRS = new String [][] {{"1"}};
++        JDBC.assertFullResultSet(rs, expRS, true);
++
++        // now test on new table with an index during the inserts.
++
++        // create an index to test btree handling of short key.
++        stmt.executeUpdate("CREATE INDEX idx2 on testSmallRow2(id)");
++
++        insert_stmt = 
++            prepareStatement("INSERT INTO testSmallRow2 VALUES(?)");
++
++        // insert more than 3 pages of rows.
++        insert_stmt.setString(1, "a");
++
++        for (int i = 0; i < 4000; i++)
++        {
++            insert_stmt.executeUpdate();
++        }
++        insert_stmt.close();
++        commit();
++
++        // Check the consistency of the indexes
++        rs = stmt.executeQuery(
++            "VALUES SYSCS_UTIL.SYSCS_CHECK_TABLE('APP', 'TESTSMALLROW2')");
++        expRS = new String [][] {{"1"}};
++        JDBC.assertFullResultSet(rs, expRS, true);
++
++        // DDL that caused a bug while trying to fix derby 4577, data is null
++
++        // create an index to test btree handling of short key.
++        stmt.executeUpdate("CREATE INDEX idx3 on testSmallRow3(id)");
++
++        insert_stmt = 
++            prepareStatement("INSERT INTO testSmallRow3 VALUES(?, ?)");
++
++        // insert more than 3 pages of rows.
++        insert_stmt.setString(1, null);
++
++        for (int i = 0; i < 100; i++)
++        {
++            insert_stmt.setInt(2, i);
++            insert_stmt.executeUpdate();
++        }
++        commit();
++
++        stmt.executeUpdate("UPDATE testSmallRow3 set id = null where id2 > 1");
++
++        // Deleting rows from root of btree which will then force purges on the
++        // page before it does a split.  The purges force the raw store 
++        // through reclaim space on page code path.
++        stmt.executeUpdate("DELETE from testSmallRow3 where id2 = 40 or id2 = 41 or id2 = 80 or id2 = 81");
++        commit();
++
++        insert_stmt.setString(1, null);
++        for (int i = 101; i < 600; i++)
++        {
++            insert_stmt.executeUpdate();
++            insert_stmt.setInt(2, i);
++        }
++        
++        insert_stmt.close();
++        commit();
++
++        // Check the consistency of the indexes
++        rs = stmt.executeQuery(
++            "VALUES SYSCS_UTIL.SYSCS_CHECK_TABLE('APP', 'TESTSMALLROW3')");
++        expRS = new String [][] {{"1"}};
++        JDBC.assertFullResultSet(rs, expRS, true);
++
++        stmt.close();
++    }
++    
++    protected static Test baseSuite(String name) 
++    {
++        TestSuite suite = new TestSuite(name);
++        suite.addTestSuite(Derby4577Test.class);
++        return new CleanDatabaseTestSetup(
++                DatabasePropertyTestSetup.setLockTimeouts(suite, 2, 4)) 
++        {
++            /**
++             * Creates the tables used in the test cases.
++             * @exception SQLException if a database error occurs
++             */
++            protected void decorateSQL(Statement stmt) throws SQLException
++            {
++                Connection conn = stmt.getConnection();
++
++                // create a table, with blob it will be 32k page size
++                stmt.executeUpdate(
++                    "CREATE TABLE testBadUpdate (id int, value blob(1M))");
++
++                stmt.executeUpdate(
++                    "CREATE TABLE testSmallRow1 (id char(1))");
++
++                stmt.executeUpdate(
++                    "CREATE TABLE testSmallRow2 (id char(1))");
++
++                stmt.executeUpdate(
++                    "CREATE TABLE testSmallRow3 (id char(20), id2 int)");
++
++                conn.setAutoCommit(false);
++            }
++        };
++    }
++
++    public static Test suite() 
++    {
++        TestSuite suite = new TestSuite("Derby4577Test");
++        suite.addTest(baseSuite("Derby4577Test:embedded"));
++        return suite;
++    }
++}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/_Suite.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/_Suite.java
+index e0268295..7e2dfd90 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/_Suite.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/_Suite.java
+@@ -56,6 +56,7 @@ public static Test suite() {
+         suite.addTest(ClassLoaderBootTest.suite());
+         suite.addTest(StreamingColumnTest.suite());
+         suite.addTest(Derby3625Test.suite());
++        suite.addTest(Derby4577Test.suite());
+         suite.addTest(Derby151Test.suite());
+         suite.addTest(Derby4676Test.suite());
+         suite.addTest(BootLockTest.suite());

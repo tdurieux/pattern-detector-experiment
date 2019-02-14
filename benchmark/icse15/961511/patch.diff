@@ -1,0 +1,353 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+index 9141ba06..0a3bfff8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+@@ -664,14 +664,29 @@ private void tempTablesReleaseSavepointLevels()
+     }
+ 
+     /**
+-     * do the necessary work at commit time for temporary tables
++     * Do the necessary work at commit time for temporary tables
++     * <p>
+      * 1)If a temporary table was marked as dropped in this transaction, then 
+      *   remove it from the list of temp tables for this connection
+      * 2)If a temporary table was not dropped in this transaction, then mark 
+      *   it's declared savepoint level and modified savepoint level as -1
+-     */
+-    private void tempTablesAndCommit() 
++     * 3)After savepoint fix up, then handle all ON COMMIT DELETE ROWS with
++     *   no open held cursor temp tables.
++     * <p>
++     *
++     * @param in_xa_transaction if true, then transaction is an XA transaction,
++     *                          and special nested transaction may be necessary
++     *                          to cleanup internal containers supporting the
++     *                          temp tables at commit time.
++     *
++     * @exception  StandardException  Standard exception policy.
++     **/
++    private void tempTablesAndCommit(boolean in_xa_transaction) 
++        throws StandardException
+     {
++        // loop through all declared global temporary tables and determine
++        // what to do at commit time based on if they were dropped during
++        // the current savepoint level.
+         for (int i = allDeclaredGlobalTempTables.size()-1; i >= 0; i--) 
+         {
+             TempTableInfo tempTableInfo = 
+@@ -694,6 +709,65 @@ private void tempTablesAndCommit()
+                 tempTableInfo.setModifiedInSavepointLevel(-1);
+             }
+         }
++
++        // at commit time, for all the temp tables declared with 
++        // ON COMMIT DELETE ROWS, make sure there are no held cursor open
++        // on them.
++        // If there are no held cursors open on ON COMMIT DELETE ROWS, 
++        // drop those temp tables and redeclare them to get rid of all the 
++        // data in them
++
++        // in XA use nested user updatable transaction.  Delay creating
++        // the transaction until loop below finds one it needs to 
++        // process.
++        TransactionController xa_tran       = null; 
++        TransactionController tran_for_drop = 
++            (in_xa_transaction ? null : getTransactionExecute());
++
++        try
++        {
++            for (int i=0; i<allDeclaredGlobalTempTables.size(); i++)
++            {
++                TableDescriptor td = 
++                    ((TempTableInfo) (allDeclaredGlobalTempTables.
++                                          get(i))).getTableDescriptor();
++                if (td.isOnCommitDeleteRows() == false) 
++                {
++                    // do nothing for temp table with ON COMMIT PRESERVE ROWS
++                    continue;
++                }
++                else if (checkIfAnyActivationHasHoldCursor(td.getName()) == 
++                            false)
++                {
++                    // temp tables with ON COMMIT DELETE ROWS and 
++                    // no open held cursors
++                    getDataDictionary().getDependencyManager().invalidateFor(
++                        td, DependencyManager.DROP_TABLE, this);
++
++                    // handle delayed creation of nested xact for XA.
++                    if (in_xa_transaction)
++                    {
++                        if (xa_tran == null)
++                        {
++                            xa_tran = 
++                                getTransactionExecute().
++                                    startNestedUserTransaction(false);
++                            tran_for_drop = xa_tran;
++                        }
++                    }
++
++                    cleanupTempTableOnCommitOrRollback(tran_for_drop, td, true);
++                }
++            }
++        }
++        finally
++        {
++            // if we created a nested user transaction for XA get rid of it.
++            if (xa_tran != null)
++            {
++                xa_tran.destroy();
++            }
++        }
+     }
+ 
+     /**
+@@ -870,7 +944,8 @@ else if (tempTableInfo.getDroppedInSavepointLevel() >=
+                 // restore the old definition of temp table because drop is 
+                 // being rolledback
+                 TableDescriptor td = tempTableInfo.getTableDescriptor();
+-                td = cleanupTempTableOnCommitOrRollback(td, false);
++                td = cleanupTempTableOnCommitOrRollback(
++                        getTransactionExecute(), td, false);
+ 
+                 // In order to store the old conglomerate information for the 
+                 // temp table, we need to replace the existing table descriptor
+@@ -901,7 +976,8 @@ else if (tempTableInfo.getModifiedInSavepointLevel() >=
+                 getDataDictionary().getDependencyManager().invalidateFor(
+                         td, DependencyManager.DROP_TABLE, this);
+ 
+-                cleanupTempTableOnCommitOrRollback(td, true);
++                cleanupTempTableOnCommitOrRollback(
++                    getTransactionExecute(), td, true);
+             } 
+             // there is no else here because there is no special processing 
+             // required for temp tables declares in earlier work of 
+@@ -1357,12 +1433,14 @@ protected void doCommit(boolean commitStore,
+          throws StandardException
+     {
+         StatementContext statementContext = getStatementContext();
++
+         if (requestedByUser  &&
+             (statementContext != null) &&
+             statementContext.inUse() &&
+             statementContext.isAtomic())
+         {
+-            throw StandardException.newException(SQLState.LANG_NO_COMMIT_IN_NESTED_CONNECTION);
++            throw StandardException.newException(
++                    SQLState.LANG_NO_COMMIT_IN_NESTED_CONNECTION);
+         }
+ 
+         // Log commit to error log, if appropriate
+@@ -1389,50 +1467,12 @@ protected void doCommit(boolean commitStore,
+ 
+         endTransactionActivationHandling(false);
+ 
+-        // do the clean up work required for temporary tables at the commit 
+-        // time.  This cleanup work can possibly remove entries from 
+-        // allDeclaredGlobalTempTables and that's why we need to check
+-        // again later to see if we there are still any entries in 
+-        // allDeclaredGlobalTempTables
++        // Do clean up work required for temporary tables at commit time.  
+         if (allDeclaredGlobalTempTables != null)
+         {
+-            tempTablesAndCommit();
+-
+-            // at commit time, for all the temp tables declared with 
+-            // ON COMMIT DELETE ROWS, make sure there are no held cursor open
+-            // on them.
+-            // If there are no held cursors open on ON COMMIT DELETE ROWS, 
+-            // drop those temp tables and redeclare them to get rid of all the 
+-            // data in them
+-
+-            if (allDeclaredGlobalTempTables != null) 
+-            {
+-                for (int i=0; i<allDeclaredGlobalTempTables.size(); i++)
+-                {
+-                    TableDescriptor td = 
+-                        ((TempTableInfo)
+-                         (allDeclaredGlobalTempTables.get(i))).getTableDescriptor();
+-                    if (td.isOnCommitDeleteRows() == false) 
+-                    {
+-                        //do nothing for temp table with ON COMMIT PRESERVE ROWS
+-                        continue;
++            tempTablesAndCommit(commitflag != NON_XA);
+                     }
+ 
+-                    if (checkIfAnyActivationHasHoldCursor(td.getName()) == 
+-                            false)
+-                    {
+-                        // temp tables with ON COMMIT DELETE ROWS and 
+-                        // no open held cursors
+-                        getDataDictionary().getDependencyManager().invalidateFor(
+-                            td, DependencyManager.DROP_TABLE, this);
+-
+-                        cleanupTempTableOnCommitOrRollback(td, true);
+-                    }
+-                }
+-            }
+-        }
+-
+-
+         //reset the current savepoint level for the connection to 0 at the end 
+         //of commit work for temp tables
+         currentSavepointLevel = 0; 
+@@ -1505,6 +1545,7 @@ protected void doCommit(boolean commitStore,
+      * temp table (because the drop on it is being rolled back).
+      */
+     private TableDescriptor cleanupTempTableOnCommitOrRollback(
++    TransactionController   tc,
+     TableDescriptor td, 
+     boolean         dropAndRedeclare)
+          throws StandardException
+@@ -1512,7 +1553,7 @@ private TableDescriptor cleanupTempTableOnCommitOrRollback(
+         //create new conglomerate with same properties as the old conglomerate 
+         //and same row template as the old conglomerate
+         long conglomId = 
+-            tran.createConglomerate(
++            tc.createConglomerate(
+                 "heap", // we're requesting a heap conglomerate
+                 td.getEmptyExecRow().getRowArray(), // row template
+                 null, //column sort order - not required for heap
+@@ -1542,7 +1583,7 @@ private TableDescriptor cleanupTempTableOnCommitOrRollback(
+         if(dropAndRedeclare)
+         {
+             //remove the old conglomerate from the system
+-            tran.dropConglomerate(cid); 
++            tc.dropConglomerate(cid); 
+ 
+             replaceDeclaredGlobalTempTable(td.getName(), td);
+         }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
+index c7b69e60..66e6156e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
+@@ -290,10 +290,16 @@ public final synchronized int prepare(Xid xid) throws XAException {
+                 } else {
+                     
+                     returnConnectionToResource(tranState, xid_im);
++
+ 					if (SanityManager.DEBUG) {
+-						if (con.realConnection != null)
+-							SanityManager.ASSERT(con.realConnection.transactionIsIdle(),
+-									"real connection should have been idle at this point"); 			
++						if (con.realConnection != null) {
++							SanityManager.ASSERT(
++                                con.realConnection.transactionIsIdle(),
++                                "real connection should have been idle." +
++                                "tranState = " + tranState +
++                                "ret = " + ret +
++                                "con.realConnection = " + con.realConnection);
++                        }
+ 					}
+                     return XAResource.XA_RDONLY;
+                 }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+index eac41e41..6ebf33dc 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+@@ -1080,45 +1080,57 @@ public void testDerby966() throws SQLException, XAException {
+ 
+     /**
+      * DERBY-4731
+-     * test using a GLOBAL TEMPORARY TABLE  table in an
+-     * XA transaction adn leaving it active during two phase commit 
++     * Test using a GLOBAL TEMPORARY TABLE  table in an
++     * XA transaction and leaving it active during two phase commit.
++     * Before the fix this test would throw the following at commit
++     * time:
++     * ERROR 40XT0: An internal error was identified by RawStore module. 
++     *
++     *
+      * @throws XAException 
+      * @throws SQLException 
+      * 
+      */
+-    public void xtestXATempTableD4731_RawStore() throws SQLException, XAException {
+-        doXATempTableD4731Work(true);
++    public void testXATempTableD4731_RawStore() 
++        throws SQLException, XAException {
++        doXATempTableD4731Work(true, XATestUtil.getXid(997, 9, 49));
+     }
+     
+ 
+     /**
+-     * DERBY-4731 Temp tables with XA transactions
++     * DERBY-XXXX Temp tables with XA transactions
+      * an Assert will occur on prepare if only
+      * temp table work is done in the xact.
++     *
+      * @throws XAException 
+      * @throws SQLException 
+      * 
+      */
+-    public void xtestXATempTableD4731_Assert() throws SQLException, XAException {
+-        doXATempTableD4731Work(false);
++    public void xtestXATempTableDXXXX_Assert() 
++        throws SQLException, XAException {
++
++          doXATempTableD4731Work(false, XATestUtil.getXid(998, 10, 50));
+     }
+  
+     
+     /**
+      * The two cases for DERBY-4371 do essentially the same thing. Except doing
+-     * logged work causes the RawStore error and doing only temp table operations
+-     * causes the assert.
++     * logged work causes the RawStore error and doing only temp table 
++     * operations causes the assert.
+      *  
+      * @param doLoggedWorkInXact
+      * @throws SQLException
+      * @throws XAException
+      */
+-    private void doXATempTableD4731Work(boolean doLoggedWorkInXact) throws SQLException, XAException{
++    private void doXATempTableD4731Work(
++    boolean doLoggedWorkInXact,
++    Xid     xid)
++        throws SQLException, XAException{
++
+         XADataSource xads = J2EEDataSource.getXADataSource();
+         XAConnection xaconn = xads.getXAConnection();
+         XAResource xar = xaconn.getXAResource();
+ 
+-        Xid xid = XATestUtil.getXid(996, 9, 48);
+         xar.start(xid, XAResource.TMNOFLAGS);
+         Connection conn = xaconn.getConnection();
+         Statement s = conn.createStatement(); 
+@@ -1130,8 +1142,10 @@ private void doXATempTableD4731Work(boolean doLoggedWorkInXact) throws SQLExcept
+         
+         // make the temp table
+         s.executeUpdate("DECLARE GLOBAL TEMPORARY TABLE SESSION.T1 ( XWSID INT, XCTID INT, XIID CHAR(26), XVID SMALLINT, XLID CHAR(8) FOR BIT DATA) ON COMMIT DELETE ROWS NOT LOGGED ON ROLLBACK DELETE ROWS");
++
+         // insert a row
+-        PreparedStatement ps = conn.prepareStatement("INSERT INTO SESSION.T1 VALUES (?,?,?,?,?)");
++        PreparedStatement ps = 
++            conn.prepareStatement("INSERT INTO SESSION.T1 VALUES (?,?,?,?,?)");
+         ps.setInt(1,1);
+         ps.setInt(2,1);
+         ps.setString(3,"hello");
+@@ -1140,10 +1154,14 @@ private void doXATempTableD4731Work(boolean doLoggedWorkInXact) throws SQLExcept
+         ps.executeUpdate();
+         ResultSet rs = s.executeQuery("SELECT count(*) FROM SESSION.t1");
+         JDBC.assertFullResultSet(rs, new String[][] {{"1"}});
+-        // You could work arond the issue by dropping the TEMP table
++        // You could work around the issue by dropping the TEMP table
+         //s.executeUpdate("DROP TABLE SESSION.T1");
+         xar.end(xid, XAResource.TMSUCCESS);
+-        assertEquals(XAResource.XA_OK,xar.prepare(xid));
++
++        assertEquals(
++            (doLoggedWorkInXact ? XAResource.XA_OK : XAResource.XA_RDONLY),
++            xar.prepare(xid));
++
+         xar.commit(xid,false); 
+         s.close();
+         conn.close();
+@@ -1160,8 +1178,6 @@ private void makeARealTable(Statement s) throws SQLException {
+         }
+     }
+     
+-
+-    
+     /**
+      * Check the held state of a ResultSet by fetching one row, executing a
+      * commit and then fetching the next. Checks the held state matches the

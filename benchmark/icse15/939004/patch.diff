@@ -1,0 +1,835 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/Table.java
+index 652dea58..fe61b079 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/Table.java
+@@ -397,18 +397,7 @@ public void apply(RowMutation mutation, Object serializedMutation, boolean write
+         {
+             if (writeCommitLog)
+             {
+-                Future<CommitLogSegment.CommitLogContext> future = CommitLog.instance().add(mutation, serializedMutation);
+-                if (waitForCommitLog)
+-                {
+-                    try
+-                    {
+-                        future.get();
+-                    }
+-                    catch (Exception e)
+-                    {
+-                        throw new RuntimeException(e);
+-                    }
+-                }
++                CommitLog.instance().add(mutation, serializedMutation);
+             }
+         
+             for (ColumnFamily columnFamily : mutation.getColumnFamilies())
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogExecutorService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogExecutorService.java
+index e69de29b..d776cbbe 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogExecutorService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/AbstractCommitLogExecutorService.java
+@@ -0,0 +1,69 @@
++package org.apache.cassandra.db.commitlog;
++
++import java.lang.management.ManagementFactory;
++import java.util.List;
++import java.util.concurrent.AbstractExecutorService;
++import java.util.concurrent.TimeUnit;
++import javax.management.MBeanServer;
++import javax.management.ObjectName;
++
++public abstract class AbstractCommitLogExecutorService extends AbstractExecutorService implements ICommitLogExecutorService
++{
++    protected volatile long completedTaskCount = 0;
++
++    protected static void registerMBean(Object o)
++    {
++        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
++        try
++        {
++            mbs.registerMBean(o, new ObjectName("org.apache.cassandra.db:type=Commitlog"));
++        }
++        catch (Exception e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    /**
++     * Get the current number of running tasks
++     */
++    public int getActiveCount()
++    {
++        return 1;
++    }
++
++    /**
++     * Get the number of completed tasks
++     */
++    public long getCompletedTasks()
++    {
++        return completedTaskCount;
++    }
++
++    // cassandra is crash-only so there's no need to implement the shutdown methods
++
++    public boolean isShutdown()
++    {
++        return false;
++    }
++
++    public boolean isTerminated()
++    {
++        return false;
++    }
++
++    public void shutdown()
++    {
++        throw new UnsupportedOperationException();
++    }
++
++    public List<Runnable> shutdownNow()
++    {
++        throw new UnsupportedOperationException();
++    }
++
++    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException
++    {
++        throw new UnsupportedOperationException();
++    }
++}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
+index e69de29b..a5448579 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorService.java
+@@ -0,0 +1,172 @@
++package org.apache.cassandra.db.commitlog;
++/*
++ * 
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ * 
++ */
++
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.concurrent.*;
++
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.utils.WrappedRunnable;
++
++class BatchCommitLogExecutorService extends AbstractCommitLogExecutorService implements ICommitLogExecutorService, BatchCommitLogExecutorServiceMBean
++{
++    private final BlockingQueue<CheaterFutureTask> queue;
++
++    public BatchCommitLogExecutorService()
++    {
++        this(DatabaseDescriptor.getConcurrentWriters());
++    }
++
++    public BatchCommitLogExecutorService(int queueSize)
++    {
++        queue = new LinkedBlockingQueue<CheaterFutureTask>(queueSize);
++        Runnable runnable = new WrappedRunnable()
++        {
++            public void runMayThrow() throws Exception
++            {
++                while (true)
++                {
++                    processWithSyncBatch();
++                    completedTaskCount++;
++                }
++            }
++        };
++        new Thread(runnable, "COMMIT-LOG-WRITER").start();
++
++        registerMBean(this);
++    }
++
++    public long getPendingTasks()
++    {
++        return queue.size();
++    }
++
++    private final ArrayList<CheaterFutureTask> incompleteTasks = new ArrayList<CheaterFutureTask>();
++    private final ArrayList taskValues = new ArrayList(); // TODO not sure how to generify this
++    private void processWithSyncBatch() throws Exception
++    {
++        CheaterFutureTask firstTask = queue.take();
++        if (!(firstTask.getRawCallable() instanceof CommitLog.LogRecordAdder))
++        {
++            firstTask.run();
++            return;
++        }
++
++        // attempt to do a bunch of LogRecordAdder ops before syncing
++        // (this is a little clunky since there is no blocking peek method,
++        //  so we have to break it into firstTask / extra tasks)
++        incompleteTasks.clear();
++        taskValues.clear();
++        long end = System.nanoTime() + (long)(1000000 * DatabaseDescriptor.getCommitLogSyncBatchWindow());
++
++        // it doesn't seem worth bothering future-izing the exception
++        // since if a commitlog op throws, we're probably screwed anyway
++        incompleteTasks.add(firstTask);
++        taskValues.add(firstTask.getRawCallable().call());
++        while (!queue.isEmpty()
++               && queue.peek().getRawCallable() instanceof CommitLog.LogRecordAdder
++               && System.nanoTime() < end)
++        {
++            CheaterFutureTask task = queue.remove();
++            incompleteTasks.add(task);
++            taskValues.add(task.getRawCallable().call());
++        }
++
++        // now sync and set the tasks' values (which allows thread calling get() to proceed)
++        try
++        {
++            CommitLog.instance().sync();
++        }
++        catch (IOException e)
++        {
++            throw new RuntimeException(e);
++        }
++        for (int i = 0; i < incompleteTasks.size(); i++)
++        {
++            incompleteTasks.get(i).set(taskValues.get(i));
++        }
++    }
++
++
++    @Override
++    protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T value)
++    {
++        return newTaskFor(Executors.callable(runnable, value));
++    }
++
++    @Override
++    protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable)
++    {
++        return new CheaterFutureTask(callable);
++    }
++
++    public void execute(Runnable command)
++    {
++        try
++        {
++            queue.put((CheaterFutureTask)command);
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    public void add(CommitLog.LogRecordAdder adder)
++    {
++        try
++        {
++            submit((Callable)adder).get();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        catch (ExecutionException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    private static class CheaterFutureTask<V> extends FutureTask<V>
++    {
++        private final Callable rawCallable;
++
++        public CheaterFutureTask(Callable<V> callable)
++        {
++            super(callable);
++            rawCallable = callable;
++        }
++
++        public Callable getRawCallable()
++        {
++            return rawCallable;
++        }
++
++        @Override
++        public void set(V v)
++        {
++            super.set(v);
++        }
++    }
++}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorServiceMBean.java
+index e69de29b..06d9bf79 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/BatchCommitLogExecutorServiceMBean.java
+@@ -0,0 +1,25 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++package org.apache.cassandra.db.commitlog;
++
++import org.apache.cassandra.concurrent.IExecutorMBean;
++
++public interface BatchCommitLogExecutorServiceMBean extends IExecutorMBean
++{
++}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 41985954..6adc9a3a 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -98,7 +98,7 @@ public int getSegmentCount()
+         return segments.size();
+     }
+ 
+-    private final ExecutorService executor = new CommitLogExecutorService();
++    private final ICommitLogExecutorService executor;
+ 
+     /**
+      * param @ table - name of table for which we are maintaining
+@@ -115,11 +115,13 @@ private CommitLog()
+         
+         if (DatabaseDescriptor.getCommitLogSync() == DatabaseDescriptor.CommitLogSync.periodic)
+         {
+-            final Runnable syncer = new WrappedRunnable()
++            executor = new PeriodicCommitLogExecutorService();
++            final Callable syncer = new Callable()
+             {
+-                public void runMayThrow() throws IOException
++                public Object call() throws Exception
+                 {
+                     sync();
++                    return null;
+                 }
+             };
+ 
+@@ -146,6 +148,10 @@ public void run()
+                 }
+             }, "PERIODIC-COMMIT-LOG-SYNCER").start();
+         }
++        else
++        {
++            executor = new BatchCommitLogExecutorService();
++        }
+     }
+ 
+     public static void recover() throws IOException
+@@ -323,10 +329,9 @@ private CommitLogSegment currentSegment()
+      * of any problems. This way we can assume that the subsequent commit log
+      * entry will override the garbage left over by the previous write.
+     */
+-    public Future<CommitLogSegment.CommitLogContext> add(RowMutation rowMutation, Object serializedRow) throws IOException
++    public void add(RowMutation rowMutation, Object serializedRow) throws IOException
+     {
+-        Callable<CommitLogSegment.CommitLogContext> task = new LogRecordAdder(rowMutation, serializedRow);
+-        return executor.submit(task);
++        executor.add(new LogRecordAdder(rowMutation, serializedRow));
+     }
+ 
+     /*
+@@ -451,7 +456,9 @@ public Object call() throws Exception
+         }
+     }
+ 
+-    class LogRecordAdder implements Callable<CommitLogSegment.CommitLogContext>
++    // TODO this should be a Runnable since it doesn't actually return anything, but it's difficult to do that
++    // without breaking the fragile CheaterFutureTask in BatchCLES.
++    class LogRecordAdder implements Callable, Runnable
+     {
+         final RowMutation rowMutation;
+         final Object serializedRow;
+@@ -462,18 +469,28 @@ public Object call() throws Exception
+             this.serializedRow = serializedRow;
+         }
+ 
+-        public CommitLogSegment.CommitLogContext call() throws Exception
++        public void run()
+         {
+-            CommitLogSegment.CommitLogContext context = currentSegment().write(rowMutation, serializedRow);
+-
++            try
++            {
++                currentSegment().write(rowMutation, serializedRow);
+             // roll log if necessary
+             if (currentSegment().length() >= SEGMENT_SIZE)
+             {
+                 sync();
+                 segments.add(new CommitLogSegment(currentSegment().getHeader().getColumnFamilyCount()));
+             }
++            }
++            catch (IOException e)
++            {
++                throw new IOError(e);
++            }
++        }
+ 
+-            return context;
++        public Object call() throws Exception
++        {
++            run();
++            return null;
+         }
+     }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorService.java
+index 996d856b..e69de29b 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorService.java
+@@ -1,234 +0,0 @@
+-package org.apache.cassandra.db.commitlog;
+-/*
+- * 
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- * 
+- *   http://www.apache.org/licenses/LICENSE-2.0
+- * 
+- * Unless required by applicable law or agreed to in writing,
+- * software distributed under the License is distributed on an
+- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+- * KIND, either express or implied.  See the License for the
+- * specific language governing permissions and limitations
+- * under the License.
+- * 
+- */
+-
+-
+-import java.io.IOException;
+-import java.lang.management.ManagementFactory;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.concurrent.*;
+-import javax.management.MBeanServer;
+-import javax.management.ObjectName;
+-
+-import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.utils.WrappedRunnable;
+-
+-class CommitLogExecutorService extends AbstractExecutorService implements CommitLogExecutorServiceMBean
+-{
+-    private final BlockingQueue<CheaterFutureTask> queue;
+-
+-    private volatile long completedTaskCount = 0;
+-
+-    public CommitLogExecutorService()
+-    {
+-        this(DatabaseDescriptor.getCommitLogSync() == DatabaseDescriptor.CommitLogSync.batch
+-             ? DatabaseDescriptor.getConcurrentWriters()
+-             : 1024 * Runtime.getRuntime().availableProcessors());
+-    }
+-
+-    public CommitLogExecutorService(int queueSize)
+-    {
+-        queue = new LinkedBlockingQueue<CheaterFutureTask>(queueSize);
+-        Runnable runnable = new WrappedRunnable()
+-        {
+-            public void runMayThrow() throws Exception
+-            {
+-                if (DatabaseDescriptor.getCommitLogSync() == DatabaseDescriptor.CommitLogSync.batch)
+-                {
+-                    while (true)
+-                    {
+-                        processWithSyncBatch();
+-                        completedTaskCount++;
+-                    }
+-                }
+-                else
+-                {
+-                    while (true)
+-                    {
+-                        process();
+-                        completedTaskCount++;
+-                    }
+-                }
+-            }
+-        };
+-        new Thread(runnable, "COMMIT-LOG-WRITER").start();
+-
+-        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+-        try
+-        {
+-            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.db:type=Commitlog"));
+-        }
+-        catch (Exception e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-    }
+-
+-
+-    /**
+-     * Get the current number of running tasks
+-     */
+-    public int getActiveCount()
+-    {
+-        return 1;
+-    }
+-
+-    /**
+-     * Get the number of completed tasks
+-     */
+-    public long getCompletedTasks()
+-    {
+-        return completedTaskCount;
+-    }
+-
+-    /**
+-     * Get the number of tasks waiting to be executed
+-     */
+-    public long getPendingTasks()
+-    {
+-        return queue.size();
+-    }
+-
+-    private void process() throws InterruptedException
+-    {
+-        queue.take().run();
+-    }
+-
+-    private final ArrayList<CheaterFutureTask> incompleteTasks = new ArrayList<CheaterFutureTask>();
+-    private final ArrayList taskValues = new ArrayList(); // TODO not sure how to generify this
+-    private void processWithSyncBatch() throws Exception
+-    {
+-        CheaterFutureTask firstTask = queue.take();
+-        if (!(firstTask.getRawCallable() instanceof CommitLog.LogRecordAdder))
+-        {
+-            firstTask.run();
+-            return;
+-        }
+-
+-        // attempt to do a bunch of LogRecordAdder ops before syncing
+-        // (this is a little clunky since there is no blocking peek method,
+-        //  so we have to break it into firstTask / extra tasks)
+-        incompleteTasks.clear();
+-        taskValues.clear();
+-        long end = System.nanoTime() + (long)(1000000 * DatabaseDescriptor.getCommitLogSyncBatchWindow());
+-
+-        // it doesn't seem worth bothering future-izing the exception
+-        // since if a commitlog op throws, we're probably screwed anyway
+-        incompleteTasks.add(firstTask);
+-        taskValues.add(firstTask.getRawCallable().call());
+-        while (!queue.isEmpty()
+-               && queue.peek().getRawCallable() instanceof CommitLog.LogRecordAdder
+-               && System.nanoTime() < end)
+-        {
+-            CheaterFutureTask task = queue.remove();
+-            incompleteTasks.add(task);
+-            taskValues.add(task.getRawCallable().call());
+-        }
+-
+-        // now sync and set the tasks' values (which allows thread calling get() to proceed)
+-        try
+-        {
+-            CommitLog.instance().sync();
+-        }
+-        catch (IOException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-        for (int i = 0; i < incompleteTasks.size(); i++)
+-        {
+-            incompleteTasks.get(i).set(taskValues.get(i));
+-        }
+-    }
+-
+-
+-    @Override
+-    protected <T> RunnableFuture<T> newTaskFor(Runnable runnable, T value)
+-    {
+-        return newTaskFor(Executors.callable(runnable, value));
+-    }
+-
+-    @Override
+-    protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable)
+-    {
+-        return new CheaterFutureTask(callable);
+-    }
+-
+-    public void execute(Runnable command)
+-    {
+-        try
+-        {
+-            queue.put((CheaterFutureTask)command);
+-        }
+-        catch (InterruptedException e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-    }
+-
+-    public boolean isShutdown()
+-    {
+-        return false;
+-    }
+-
+-    public boolean isTerminated()
+-    {
+-        return false;
+-    }
+-
+-    // cassandra is crash-only so there's no need to implement the shutdown methods
+-    public void shutdown()
+-    {
+-        throw new UnsupportedOperationException();
+-    }
+-
+-    public List<Runnable> shutdownNow()
+-    {
+-        throw new UnsupportedOperationException();
+-    }
+-
+-    public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException
+-    {
+-        throw new UnsupportedOperationException();
+-    }
+-
+-    private static class CheaterFutureTask<V> extends FutureTask<V>
+-    {
+-        private final Callable rawCallable;
+-
+-        public CheaterFutureTask(Callable<V> callable)
+-        {
+-            super(callable);
+-            rawCallable = callable;
+-        }
+-
+-        public Callable getRawCallable()
+-        {
+-            return rawCallable;
+-        }
+-
+-        @Override
+-        public void set(V v)
+-        {
+-            super.set(v);
+-        }
+-    }
+-}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorServiceMBean.java
+index 44385b94..e69de29b 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/CommitLogExecutorServiceMBean.java
+@@ -1,25 +0,0 @@
+-/*
+-* Licensed to the Apache Software Foundation (ASF) under one
+-* or more contributor license agreements.  See the NOTICE file
+-* distributed with this work for additional information
+-* regarding copyright ownership.  The ASF licenses this file
+-* to you under the Apache License, Version 2.0 (the
+-* "License"); you may not use this file except in compliance
+-* with the License.  You may obtain a copy of the License at
+-*
+-*    http://www.apache.org/licenses/LICENSE-2.0
+-*
+-* Unless required by applicable law or agreed to in writing,
+-* software distributed under the License is distributed on an
+-* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-* KIND, either express or implied.  See the License for the
+-* specific language governing permissions and limitations
+-* under the License.
+-*/
+-package org.apache.cassandra.db.commitlog;
+-
+-import org.apache.cassandra.concurrent.IExecutorMBean;
+-
+-public interface CommitLogExecutorServiceMBean extends IExecutorMBean
+-{
+-}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/ICommitLogExecutorService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/ICommitLogExecutorService.java
+index 3f24d583..cec6057b 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/ICommitLogExecutorService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/ICommitLogExecutorService.java
+@@ -1 +1,21 @@
+   + native
++package org.apache.cassandra.db.commitlog;
++
++import java.util.concurrent.Callable;
++import java.util.concurrent.Future;
++
++import org.apache.cassandra.concurrent.IExecutorMBean;
++
++/**
++ * Like ExecutorService, but customized for batch and periodic commitlog execution.
++ */
++public interface ICommitLogExecutorService extends IExecutorMBean
++{
++    public <T> Future<T> submit(Callable<T> task);
++
++    /**
++     * submits the adder for execution and blocks for it to be synced, if necessary
++     */
++    public void add(CommitLog.LogRecordAdder adder);
++
++}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorService.java
+index e69de29b..e61cc30e 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorService.java
+@@ -0,0 +1,102 @@
++package org.apache.cassandra.db.commitlog;
++/*
++ * 
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ * 
++ */
++
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.List;
++import java.util.concurrent.*;
++
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.utils.WrappedRunnable;
++
++class PeriodicCommitLogExecutorService implements ICommitLogExecutorService, PeriodicCommitLogExecutorServiceMBean
++{
++    private final BlockingQueue<Runnable> queue;
++    protected volatile long completedTaskCount = 0;
++
++    public PeriodicCommitLogExecutorService()
++    {
++        this(1024 * Runtime.getRuntime().availableProcessors());
++    }
++
++    public PeriodicCommitLogExecutorService(int queueSize)
++    {
++        queue = new LinkedBlockingQueue<Runnable>(queueSize);
++        Runnable runnable = new WrappedRunnable()
++        {
++            public void runMayThrow() throws Exception
++            {
++                while (true)
++                {
++                    queue.take().run();
++                    completedTaskCount++;
++                }
++            }
++        };
++        new Thread(runnable, "COMMIT-LOG-WRITER").start();
++
++        AbstractCommitLogExecutorService.registerMBean(this);
++    }
++
++    public void add(CommitLog.LogRecordAdder adder)
++    {
++        try
++        {
++            queue.put(adder);
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    public <T> Future<T> submit(Callable<T> task)
++    {
++        FutureTask<T> ft = new FutureTask<T>(task);
++        try
++        {
++            queue.put(ft);
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++        return ft;
++    }
++
++    public long getPendingTasks()
++    {
++        return queue.size();
++    }
++
++    public int getActiveCount()
++    {
++        return 1;
++    }
++
++    public long getCompletedTasks()
++    {
++        return completedTaskCount;
++    }
++}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorServiceMBean.java
+index 3f24d583..7e27e47a 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/commitlog/PeriodicCommitLogExecutorServiceMBean.java
+@@ -1 +1,26 @@
+   + native
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++package org.apache.cassandra.db.commitlog;
++
++import org.apache.cassandra.concurrent.IExecutorMBean;
++
++public interface PeriodicCommitLogExecutorServiceMBean extends IExecutorMBean
++{
++}

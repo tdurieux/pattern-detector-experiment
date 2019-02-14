@@ -1,0 +1,919 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/reference/Property.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/reference/Property.java
+index f9935cb7..c9f8692b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/reference/Property.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/reference/Property.java
+@@ -76,6 +76,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	String LOG_SEVERITY_LEVEL = "derby.stream.error.logSeverityLevel";
+ 
+ 	/**
++      * derby.stream.error.ExtendedDiagSeverityLevel=integerValue
++      * <BR>
++      * Indicates the minimum level of severity for errors that are reported thread dump information
++      * and diagnosis information depends on jvm vender.
++      * Default to SESSION_SEVERITY(40000).
++      *
++     */
++    String EXT_DIAG_SEVERITY_LEVEL = "derby.stream.error.extendedDiagSeverityLevel";
++    /**
+ 	 * derby.stream.error.logBootTrace
+ 	 * <BR>
+ 	 * defaults to false. If set to true logs a stack trace to 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/ContextManager.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/ContextManager.java
+index d232305c..0a5514ac 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/ContextManager.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/context/ContextManager.java
+@@ -37,6 +37,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.error.ExceptionSeverity;
+ import org.apache.derby.iapi.services.i18n.LocaleFinder;
++import org.apache.derby.iapi.services.info.JVMInfo;
+ 
+ import java.sql.SQLException;
+ import java.util.HashMap;
+@@ -237,11 +238,20 @@ public final List getContextStack(String contextId) {
+ 		return (cs==null?Collections.EMPTY_LIST:cs.getUnmodifiableList());
+ 	}
+ 
+-
+ 	/**
+-		@return true if the context manager is shutdown, false otherwise.
++     * clean up error and print it to derby.log. Extended diagnosis including
++     * thread dump to derby.log and javaDump if available, will print if the
++     * database is active and severity is greater than or equals to
++     * SESSTION_SEVERITY or as configured by
++     * derby.stream.error.extendedDiagSeverityLevel property
++     * 
++     * @param error the error we want to clean up
++     * @param diagActive
++     *        true if extended diagnostics should be considered, 
++     *        false not interested of extended diagnostic information
++     * @return true if the context manager is shutdown, false otherwise.
+ 	 */
+-	public boolean cleanupOnError(Throwable error)
++    public boolean cleanupOnError(Throwable error, boolean diagActive)
+ 	{
+ 		if (shutdown)
+ 			return true;
+@@ -331,8 +341,14 @@ public boolean cleanupOnError(Throwable error)
+ 					lastHandler = ctx.isLastHandler(errorSeverity);
+ 
+ 					ctx.cleanupOnError(error);
+-                    if (reportError
+-                            && errorSeverity >= ExceptionSeverity.SESSION_SEVERITY) {
++                    //When errorSeverity greater or equals Property.EXT_DIAG_SEVERITY_LEVEL,
++                    //the threadDump information will be in derby.log and 
++                    //the diagnosis information will be prepared.
++                    //If Property.EXT_DIAG_SEVERITY_LEVEL is not set in JVM property or
++                    //derby property, we will only handle threadDump information and diagnosis
++                    //information for errorSeverity = ExceptionSeverity.SESSION_SEVERITY.
++                    if (reportError && diagActive
++                            && (errorSeverity >= extDiagSeverityLevel)) {
+                         threadDump = ExceptionUtil.dumpThreads();
+                     } else {
+                         threadDump = null;
+@@ -407,8 +423,11 @@ public boolean cleanupOnError(Throwable error)
+ 				}
+ 			}
+ 
+-            if (threadDump != null)
++            if (threadDump != null) {
+                 errorStream.println(threadDump);
++                JVMInfo.javaDump();
++            }
++
+ 			if (reportError) {
+ 				errorStream.println("Cleanup action completed");
+ 				errorStream.flush();
+@@ -549,11 +568,16 @@ public int getErrorSeverity(Throwable error) {
+ 
+ 		logSeverityLevel = PropertyUtil.getSystemInt(Property.LOG_SEVERITY_LEVEL,
+ 			SanityManager.DEBUG ? 0 : ExceptionSeverity.SESSION_SEVERITY);
++        extDiagSeverityLevel = PropertyUtil.getSystemInt(
++                Property.EXT_DIAG_SEVERITY_LEVEL,
++                ExceptionSeverity.SESSION_SEVERITY);
+ 	}
+ 
+ 	final ContextService owningCsf;
+ 
+ 	private int		logSeverityLevel;
++    // DERBY-4856 track extendedDiagSeverityLevel variable
++    private int extDiagSeverityLevel;
+ 
+ 	private HeaderPrintWriter errorStream;
+ 	private ErrorStringBuilder errorStringBuilder;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/info/JVMInfo.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/info/JVMInfo.java
+index c009033c..e55c5bcf 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/info/JVMInfo.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/services/info/JVMInfo.java
+@@ -21,6 +21,14 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.iapi.services.info;
+ 
++import java.lang.reflect.InvocationTargetException;
++import java.lang.reflect.Method;
++import java.net.MalformedURLException;
++import java.security.AccessController;
++import java.security.PrivilegedExceptionAction;
++
++import org.apache.derby.shared.common.sanity.SanityManager;
++
+ /**
+ 	This class is used to determine which Java specification Derby will run at.
+     For a useful discussion of how this class is used, please see DERBY-3176.
+@@ -161,4 +169,71 @@ public static String derbyVMLevel()
+ 		}
+ 	}
+ 
++    /**
++     * Get system property.
++     *
++     * @param name name of the property
++     */
++    private static String getSystemProperty(final String name) {
++        
++        return (String) AccessController
++                .doPrivileged(new java.security.PrivilegedAction() {
++                    
++                    public Object run() {
++                        return System.getProperty(name);
++                        
++                    }
++                    
++                });
++    }
++    
++    /**
++     * Check whether this is sun jvm.
++     *
++     * @return true if it is sun jvm, false if it is not sun jvm
++     */
++    public static final boolean isSunJVM() {
++        String vendor = getSystemProperty("java.vendor");
++        return "Sun Microsystems Inc.".equals(vendor)
++                || "Oracle Corporation".equals(vendor);
++    }
++    
++    /**
++     * Check whether this is IBM jvm.
++     *
++     * @return true if it is IBM jvm, false if it is not IBM jvm
++     */
++    public static final boolean isIBMJVM() {
++        return ("IBM Corporation".equals(getSystemProperty("java.vendor")));
++    }
++    
++    /**
++     * For IBM jvm, this method will dump more diagnostic information to file.
++     * JVM specific code for other vender can be added. DERBY-4856 
++     *  
++     */
++    public static void javaDump() {
++        if (isIBMJVM()) {
++            Class ibmc = null;
++            try {
++                ibmc = Class.forName("com.ibm.jvm.Dump");
++                final Method ibmm = ibmc.getMethod("JavaDump", new Class[] {});
++                
++                AccessController.doPrivileged(new PrivilegedExceptionAction() {
++                    public Object run() throws IllegalAccessException,
++                            MalformedURLException, InstantiationException,
++                            InvocationTargetException {
++                        return ibmm.invoke(null, new Object[] {});
++                    }
++                });
++            } catch (Exception e) {
++                if (SanityManager.DEBUG) {
++                    SanityManager
++                            .THROWASSERT(
++                                    "Failed to execute com.ibm.jvm.Dump.JavaDump in IBM JVM",
++                                    e);
++                }
++            }
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+index 0b48e5da..990eaf64 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+@@ -628,7 +628,8 @@ else if (!shutdown)
+                 if (se.getSeverity() < ExceptionSeverity.SESSION_SEVERITY)
+                     se.setSeverity(ExceptionSeverity.SESSION_SEVERITY);
+             }
+-			tr.cleanupOnError(t);
++            //DERBY-4856, assume database is not up
++            tr.cleanupOnError(t, false);
+ 			throw handleException(t);
+ 		} finally {
+ 			restoreContextStack();
+@@ -1912,7 +1913,8 @@ private void close(StandardException e) throws SQLException {
+ 							// on how long the client program wants to hold on to
+ 							// the Connection object.
+ 							tr.clearLcc(); 
+-							tr.cleanupOnError(e);
++                            // DERBY-4856, assume database is not up
++                            tr.cleanupOnError(e, false);
+ 							
+ 						} catch (Throwable t) {
+ 							throw handleException(t);
+@@ -1925,7 +1927,8 @@ private void close(StandardException e) throws SQLException {
+ 						// the cleanup has not been done yet.
+                         InterruptStatus.restoreIntrFlagIfSeen();
+ 						tr.clearLcc(); 
+-						tr.cleanupOnError(e);
++                        // DERBY-4856, assume database is not up
++                        tr.cleanupOnError(e, false);
+ 					}
+ 				}
+ 			}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
+index c98028b5..00dac8dc 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
+@@ -336,7 +336,7 @@ final SQLException handleException(Throwable thrownException,
+ 			// it was already removed.  all that's left to cleanup is
+ 			// JDBC objects.
+ 			if (cm!=null) {
+-				boolean isShutdown = cleanupOnError(thrownException);
++				boolean isShutdown = cleanupOnError(thrownException, database != null ? database.isActive() : false);
+ 				if (checkForShutdown && isShutdown) {
+ 					// Change the error message to be a known shutdown.
+ 					thrownException = shutdownDatabaseException();
+@@ -349,8 +349,8 @@ final SQLException handleException(Throwable thrownException,
+ 
+ 		} catch (Throwable t) {
+ 
+-			if (cm!=null) { // something to let us cleanup?
+-				cm.cleanupOnError(t);
++            if (cm != null) { // something to let us cleanup?
++                cm.cleanupOnError(t, database != null ? isActive() : false);
+ 			}
+ 
+             InterruptStatus.restoreIntrFlagIfSeen();
+@@ -416,12 +416,21 @@ String getUserName() {
+ 		return  username;
+ 	}
+ 
+-	boolean cleanupOnError(Throwable e)
++    /**
++     * clean up error and print it to derby.log if diagActive is true
++     * @param error the error we want to clean up
++     * @param diagActive
++     *        true if extended diagnostics should be considered, 
++     *        false not interested of extended diagnostic information
++     * @return true if the context manager is shutdown, false otherwise.
++     */
++    boolean cleanupOnError(Throwable e, boolean diagActive)
+ 	{
+ 		if (SanityManager.DEBUG)
+ 			SanityManager.ASSERT(cm != null, "cannot cleanup on error with null context manager");
+ 
+-		return cm.cleanupOnError(e);
++        //DERBY-4856 thread dump
++        return cm.cleanupOnError(e, diagActive);
+ 	}
+ 
+ 	boolean isIdle()
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/BasicDaemon.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/BasicDaemon.java
+index fcf12285..b1b9a92a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/BasicDaemon.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/BasicDaemon.java
+@@ -356,7 +356,9 @@ protected void serviceClient(ServiceRecord clientRecord)
+ 		{
+ 			if (SanityManager.DEBUG)
+ 				SanityManager.showTrace(e);
+-			cm.cleanupOnError(e);
++
++            //Assume database is not active. DERBY-4856 thread dump
++            cm.cleanupOnError(e, false);
+ 		}
+ 	}
+ 
+@@ -399,7 +401,10 @@ public void run()
+ 			running = false;
+ 			stopped = true;
+ 		}
+-		contextMgr.cleanupOnError(StandardException.normalClose());
++        
++        //Assume database is not active. DERBY-4856 thread dump 
++        contextMgr.cleanupOnError(StandardException.normalClose(), false);
++
+ 		contextService.resetCurrentContextManager(contextMgr);
+ 	}
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
+index a5263eb1..584841df 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/daemon/IndexStatisticsDaemonImpl.java
+@@ -758,7 +758,7 @@ public void run() {
+             // Do nothing, just let the thread die.
+         } catch (ShutdownException se) {
+             stop(); // Call stop to log activity statistics.
+-            ctxMgr.cleanupOnError(se);
++            ctxMgr.cleanupOnError(se, db.isActive());
+         } finally {
+             synchronized (queue) {
+                 runningThread = null;
+@@ -851,7 +851,7 @@ private boolean handleFatalErrors(ContextManager cm, StandardException se) {
+             // The database or system is going down. Probably handled elsewhere
+             // but disable daemon anyway.
+             disable = true;
+-            cm.cleanupOnError(se);
++            cm.cleanupOnError(se, db.isActive());
+         }
+ 
+         if (disable) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/monitor/BaseMonitor.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/monitor/BaseMonitor.java
+index 12c3a1be..84a42099 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/monitor/BaseMonitor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/services/monitor/BaseMonitor.java
+@@ -1822,8 +1822,10 @@ protected Object bootService(PersistentService provider,
+ 				usProperties.setServiceBooted();
+ 			}
+             
+-            if (cm != previousCM)
+-                cm.cleanupOnError(StandardException.closeException());
++            if (cm != previousCM) {
++                //Assume database is not active. DERBY-4856 thread dump
++                cm.cleanupOnError(StandardException.closeException(), false);
++            }
+             
+ 		} catch (Throwable t) {
+ 
+@@ -1835,7 +1837,8 @@ protected Object bootService(PersistentService provider,
+ 				se = Monitor.exceptionStartingModule(t);
+ 
+ 			if (cm != previousCM) {
+-				cm.cleanupOnError(se);
++                //Assume database is not active. DERBY-4856 thread dump
++                cm.cleanupOnError(se, false);
+ 			}
+ 
+ 			if (ts != null) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+index ac945aa2..de2d89c3 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+@@ -20,6 +20,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  */
+ package org.apache.derby.impl.sql.catalog;
+ 
++import org.apache.derby.iapi.db.Database;
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.reference.SQLState;
+ import org.apache.derby.iapi.services.cache.Cacheable;
+@@ -211,7 +212,11 @@ public void clearIdentity()
+             clean( false );
+         } catch (StandardException se)
+         {
+-            getLCC().getContextManager().cleanupOnError( se );
++            //Doing check for lcc and db to be certain
++            LanguageConnectionContext lcc = getLCC();
++            Database db = (lcc != null ? lcc.getDatabase() : null);
++            boolean isactive = (db != null ? db.isActive() : false);
++            lcc.getContextManager().cleanupOnError(se, isactive);
+         }
+     }
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
+index f70c7bf5..e96026d2 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
+@@ -98,7 +98,16 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ 	protected boolean isActive;
+     
+-	EmbedPooledConnection(ReferenceableDataSource ds, String u, String p, boolean requestPassword) throws SQLException
++    /**
++     * getter function for isActive
++     * @return boolean is isActive is true
++     **/
++    public boolean isActive() {
++        return isActive;
++    }
++    
++    EmbedPooledConnection(ReferenceableDataSource ds, String u, String p,
++            boolean requestPassword) throws SQLException
+ 	{
+ 		dataSource = ds;
+ 		username = u;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
+index 66e6156e..fc19417a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAResource.java
+@@ -100,14 +100,15 @@ public final synchronized void commit(Xid xid, boolean onePhase)
+                 rm.commit(inDoubtCM, xid_im, onePhase);
+                 
+                 // close the connection/transaction since it can never
+-                // be used again.
+-                inDoubtCM.cleanupOnError(StandardException.closeException());
++                // be used again. DERBY-4856 No extended diagnostic information needed.
++                inDoubtCM.cleanupOnError(StandardException.closeException(),
++                        false);
+                 return;
+             } catch (StandardException se) {
+                 // The rm threw an exception, clean it up in the approprate
+                 // context.  There is no transactionResource to handle the
+                 // exception for us.
+-                inDoubtCM.cleanupOnError(se);
++                inDoubtCM.cleanupOnError(se, con.isActive());
+                 throw wrapInXAException(se);
+             } finally {
+                 csf.resetCurrentContextManager(inDoubtCM);
+@@ -404,13 +405,14 @@ public final synchronized void forget(Xid xid) throws XAException {
+                 rm.forget(inDoubtCM, xid_im);
+                 
+                 // close the connection/transaction since it can never be used again.
+-                inDoubtCM.cleanupOnError(StandardException.closeException());
++                inDoubtCM.cleanupOnError(StandardException.closeException(),
++                        false);
+                 return;
+             } catch (StandardException se) {
+                 // The rm threw an exception, clean it up in the approprate
+                 // context.  There is no transactionResource to handle the
+                 // exception for us.
+-                inDoubtCM.cleanupOnError(se);
++                inDoubtCM.cleanupOnError(se, con.isActive());
+                 throw wrapInXAException(se);
+             } finally {
+                 csf.resetCurrentContextManager(inDoubtCM);
+@@ -454,13 +456,14 @@ public final synchronized void rollback(Xid xid) throws XAException {
+                 rm.rollback(inDoubtCM, xid_im);
+                 
+                 // close the connection/transaction since it can never be used again.
+-                inDoubtCM.cleanupOnError(StandardException.closeException());
++                inDoubtCM.cleanupOnError(StandardException.closeException(),
++                        false);
+                 return;
+             } catch (StandardException se) {
+                 // The rm threw an exception, clean it up in the approprate
+                 // context.  There is no transactionResource to handle the
+                 // exception for us.
+-                inDoubtCM.cleanupOnError(se);
++                inDoubtCM.cleanupOnError(se, con.isActive());
+                 throw wrapInXAException(se);
+             } finally {
+                 csf.resetCurrentContextManager(inDoubtCM);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/AuthenticationTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/AuthenticationTest.java
+index 17a9596f..534444e6 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/AuthenticationTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/AuthenticationTest.java
+@@ -89,6 +89,8 @@ public static Test suite() {
+     }
+     
+     public static Test baseSuite(String name) {
++        setSystemProperty("derby.stream.error.extendedDiagSeverityLevel","50000");
++        
+         TestSuite suite = new TestSuite("AuthenticationTest");
+         
+         Test test = new AuthenticationTest(
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby3980DeadlockTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby3980DeadlockTest.java
+index 8b8bca92..d9ccb8d2 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby3980DeadlockTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/Derby3980DeadlockTest.java
+@@ -20,19 +20,25 @@
+ package org.apache.derbyTesting.functionTests.tests.store;
+ 
+ 
++import java.io.File;
+ import java.sql.Connection;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ import java.util.Iterator;
+ import java.util.LinkedList;
++import java.util.Properties;
+ 
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ 
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.BaseTestCase;
+ import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+ import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
++import org.apache.derbyTesting.junit.SecurityManagerSetup;
++import org.apache.derbyTesting.junit.SupportFilesSetup;
++import org.apache.derbyTesting.junit.SystemPropertyTestSetup;
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+ /**
+@@ -46,6 +52,8 @@
+     private LinkedList  listExceptions = new LinkedList();
+     private Object syncObject = new Object();
+     private int startedCount = 0;
++    private String fprefix = "javacore";
++    private static String TARGET_POLICY_FILE_NAME="derby3980deadlock.policy";
+     
+     public Derby3980DeadlockTest(String name) {
+         super(name);
+@@ -64,6 +72,8 @@ public void test3980Deadlock() {
+      * Check we have one deadlock exception.
+      */
+     private void checkExceptions() {        
++        //Due to timing, you might see ERROR 40XL1: A lock could not be obtained
++        //instead of ERROR 40001 (DERBY-3980)
+         for( Iterator i = listExceptions.iterator(); i.hasNext(); ) {
+             SQLException e = (SQLException) i.next();
+             assertSQLState("40001",e);
+@@ -71,6 +81,57 @@ private void checkExceptions() {
+         assertEquals("Expected 1 exception, got" + listExceptions.size(),
+                 1,listExceptions.size());
+     }
++    /**
++     * Decorate a test with SecurityManagerSetup, clientServersuite, and
++     * SupportFilesSetup.
++     * 
++     * @return the decorated test
++     */
++    private static Test decorateTest() {
++        String policyName = new Derby3980DeadlockTest("test").makePolicyName();
++        Test test = TestConfiguration.clientServerSuite(Derby3980DeadlockTest.class);
++        Properties diagProperties = new Properties();
++        diagProperties.setProperty("derby.stream.error.extendedDiagSeverityLevel", "30000");
++        diagProperties.setProperty("derby.infolog.append", "true");
++        test = new SystemPropertyTestSetup(test, diagProperties, true);
++     
++        // Install a security manager using the initial policy file.
++        test = new SecurityManagerSetup(test, policyName);
++
++        // Copy over the policy file we want to use.
++        String POLICY_FILE_NAME=
++            "functionTests/tests/store/Derby3980DeadlockTest.policy";
++
++        test = new SupportFilesSetup
++        (
++                test,
++                null,
++                new String[] { POLICY_FILE_NAME },
++                null,
++                new String[] { TARGET_POLICY_FILE_NAME}
++        );
++        return test;
++    }
++    /**
++     * Generate the name of the local policy file
++     * @return the name of the local testing policy file
++     **/
++    private String makePolicyName() {
++        try {
++            String  userDir = getSystemProperty( "user.dir" );
++            String  fileName = userDir + File.separator + 
++            SupportFilesSetup.EXTINOUT + File.separator + TARGET_POLICY_FILE_NAME;
++            File      file = new File( fileName );
++            String  urlString = file.toURL().toExternalForm();
++
++            return urlString;
++        }
++        catch (Exception e) {
++            fail("Unexpected exception caught by " +
++                    "makePolicyName(): " + e );
++            return null;
++        }
++    }
+ 
+     private void waitForThreads(Thread[] t) {
+         for (int i = 0; i < THREAD_COUNT; i++)
+@@ -121,7 +182,7 @@ private void threadWorker() {
+                     ResultSet rs = stmt.executeQuery("select * from t where i = 456");
+                     while (rs.next());
+                     
+-                    //stmt.executeUpdate("update t set i = 456 where i = 456");
++                    //stmt.executeUpdate("update t set i = 456 where i = 456")
+                     stmt.executeUpdate("delete from t  where i = 456");
+                     threadConnection.commit();
+                     } catch (Exception e) {
+@@ -138,8 +199,8 @@ private void threadWorker() {
+     }
+ 
+     public static Test suite() {
++    Test suite = decorateTest();
+ 
+-	Test suite = TestConfiguration.embeddedSuite(Derby3980DeadlockTest.class);
+     return new  CleanDatabaseTestSetup(
+                 DatabasePropertyTestSetup.setLockTimeouts(suite, 5, 10)) {
+          /**
+@@ -155,5 +216,20 @@ protected void decorateSQL(Statement s) throws SQLException {
+ 	
+     }
+ 
++    /**
++     * Use tearDown to cleanup some of the diagnostic information files
++     */
++    protected void tearDown() throws Exception {
++        String dsh = BaseTestCase.getSystemProperty("user.dir");
++        try {
++          File basedir = new File(dsh);
++          String[] list = BaseTestCase.getFilesWith(basedir, fprefix);
++          removeFiles(list);
++        } catch (IllegalArgumentException e) {
++            fail("open directory");
++        }   
++        
++        super.tearDown();
++    }
+ }
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/MaxLogNumberRecovery.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/MaxLogNumberRecovery.java
+index 43d7fcca..c8116133 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/MaxLogNumberRecovery.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/MaxLogNumberRecovery.java
+@@ -20,6 +20,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  */
+ 
+ package org.apache.derbyTesting.functionTests.tests.store;
++import java.security.AccessController;
+ import java.sql.Connection;
+ import java.sql.SQLException;
+ import org.apache.derby.tools.ij;
+@@ -85,10 +86,36 @@ private void runTest(Connection conn) throws SQLException {
+ 	}
+ 
+ 	
++    /**
++     * Set system property
++     *
++     * @param name name of the property
++     * @param value value of the property
++     */
++    private static void setSystemProperty(final String name, 
++                        final String value)
++    {
++    
++    AccessController.doPrivileged
++        (new java.security.PrivilegedAction(){
++            
++            public Object run(){
++            System.setProperty( name, value);
++            return null;
++            
++            }
++            
++        }
++         );
++    
++    }
+ 	public static void main(String[] argv) throws Throwable {
+ 		
+         MaxLogNumberRecovery test = new MaxLogNumberRecovery();
+    		ij.getPropertyArg(argv); 
++        //DERBY -4856 will cause XSLAK create diagnostic information set the
++        //extenedDiagSeverityLevel higher so no thread dump or diagnostic info
++        setSystemProperty("derby.stream.error.extendedDiagSeverityLevel","50000");
+         Connection conn = ij.startJBMS();
+         conn.setAutoCommit(false);
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseTestCase.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseTestCase.java
+index 3cfa3d87..33e8caf2 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseTestCase.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseTestCase.java
+@@ -29,6 +29,7 @@
+ import java.io.FileInputStream;
+ import java.io.FileNotFoundException;
+ import java.io.FileOutputStream;
++import java.io.FilenameFilter;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+@@ -289,6 +290,32 @@ public Object run(){
+ 	     );
+     }
+     
++    /**
++     * Get files in a directory which contain certain prefix
++     * 
++     * @param dir
++     *        The directory we are checking for files with certain prefix
++     * @param prefix
++     *        The prefix pattern we are interested.
++     * @retrun String[] The list indicates files with certain prefix.
++     */
++    protected static String[] getFilesWith(final File dir, String prefix) {
++        return (String[]) AccessController
++                .doPrivileged(new java.security.PrivilegedAction() {
++                    public Object run() {
++                        //create a FilenameFilter and override its accept-method to file
++                        //files start with "javacore"*
++                        FilenameFilter filefilter = new FilenameFilter() {
++                            public boolean accept(File dir, String name) {
++                                //if the file has prefix javacore return true, else false
++                                return name.startsWith("javacore");
++                            }
++                        };
++                        return dir.list(filefilter);
++                    }
++                });
++    }
++    
+     /**
+      * Obtain the URL for a test resource, e.g. a policy
+      * file or a SQL script.
+@@ -624,6 +651,14 @@ public static void removeDirectory(File dir)
+         DropDatabaseSetup.removeDirectory(dir);
+     }
+ 
++    /**
++     * Remove all the files in the list
++     * @param list the list contains all the files
++     */
++    public static void removeFiles(String[] list)
++    {
++        DropDatabaseSetup.removeFiles(list);
++    }
+     /**
+      * Fail; attaching an exception for more detail on cause.
+      *
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/DropDatabaseSetup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/DropDatabaseSetup.java
+index 4fe24fb2..b87c9a38 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/DropDatabaseSetup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/DropDatabaseSetup.java
+@@ -134,4 +134,19 @@ private static void removeDir(File dir) {
+ 
+         assertTrue(dir.getPath(), dir.delete());
+     }
++    
++    /**
++     * Remove all the files in the list
++     * @param list the list of files that will be deleted
++     **/
++    static void removeFiles(String[] list) {
++        for (int i = 0; i < list.length; i++) {
++             try {
++                 File dfile = new File(list[i].toString());            
++                 assertTrue(list[i].toString(), dfile.delete());
++             } catch (IllegalArgumentException e) {
++                 fail("open file error");
++             }
++        }
++    }
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_FileSystemData.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_FileSystemData.java
+index 70a45812..a84cff89 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_FileSystemData.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_FileSystemData.java
+@@ -183,7 +183,8 @@ protected void runTestSet() throws T_Fail {
+ 
+ 		} catch (StandardException se) {
+ 
+-			cm1.cleanupOnError(se);
++            //Assume database is not active. DERBY-4856 thread dump
++            cm1.cleanupOnError(se, false);
+ 			throw T_Fail.exceptionFail(se);
+ 		}
+ 		finally {
+@@ -209,7 +210,8 @@ private long commonContainer() throws T_Fail
+ 		}
+ 		catch (StandardException se) {
+ 
+-			cm1.cleanupOnError(se);
++            //Assume database is not active. DERBY-4856 thread dump
++            cm1.cleanupOnError(se, false);
+ 			throw T_Fail.exceptionFail(se);
+ 		}
+ 		finally {
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_RawStoreFactory.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_RawStoreFactory.java
+index 0f299c97..a92b693a 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_RawStoreFactory.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_RawStoreFactory.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derbyTesting.unitTests.store;
+ 
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+ import org.apache.derby.iapi.store.raw.*;
+ 
+ // impl imports are the preferred way to create unit tests.
+@@ -34,6 +35,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.services.uuid.UUIDFactory;
+ import org.apache.derby.catalog.UUID;
++import org.apache.derby.iapi.db.Database;
+ import org.apache.derby.iapi.services.property.PropertyUtil;
+ import org.apache.derby.iapi.error.ExceptionSeverity;
+ import org.apache.derby.iapi.error.StandardException;
+@@ -258,7 +260,8 @@ protected void runTestSet() throws T_Fail {
+ 
+ 		} catch (StandardException se) {
+ 
+-			cm1.cleanupOnError(se);
++            //Assume database is not active. DERBY-4856 thread dump
++            cm1.cleanupOnError(se, false);
+ 			throw T_Fail.exceptionFail(se);
+ 		}
+ 		finally {
+@@ -5480,7 +5483,8 @@ protected void P054()
+ 			catch (StandardException se)
+ 			{
+ 				REPORT("cleanup on error");
+-				cm1.cleanupOnError(se);
++                //Assume database is not active. DERBY-4856 thread dump
++                cm1.cleanupOnError(se, false);
+ 				REPORT("done cleanup on error");
+ 			}
+ 
+@@ -7255,11 +7259,12 @@ protected void CP001()
+ 			t.printStackTrace(System.err);
+ 
+ 			if (cm1 != null)
+-				cm1.cleanupOnError(t);
++                //Assume database is not active. DERBY-4856 thread dump
++                cm1.cleanupOnError(t, false);
+ 			if (cm2 != null)
+-				cm2.cleanupOnError(t);
++                cm2.cleanupOnError(t, false);
+ 			//		if (cpm != null)
+-			//			cpm.cleanupOnError(t);
++            //			cpm.cleanupOnError(t, false);
+ 
+ 		} finally {
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_StreamFile.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_StreamFile.java
+index 7d85b6cf..af22630e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_StreamFile.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_StreamFile.java
+@@ -216,7 +216,8 @@ protected void runTestSet() throws T_Fail {
+ 
+ 		} catch (StandardException se) {
+ 
+-			cm1.cleanupOnError(se);
++            //Assume database is not active. DERBY-4856 thread dump
++            cm1.cleanupOnError(se, false);
+ 			throw T_Fail.exceptionFail(se);
+ 		}
+ 		finally {
+@@ -241,7 +242,8 @@ private long commonContainer() throws T_Fail {
+ 		}
+ 		catch (StandardException se) {
+ 
+-			cm1.cleanupOnError(se);
++            //Assume database is not active. DERBY-4856 thread dump
++            cm1.cleanupOnError(se, false);
+ 			throw T_Fail.exceptionFail(se);
+ 		}
+ 		finally {
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_b2i.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_b2i.java
+index 6debab66..81bf2bce 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_b2i.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/unitTests/store/T_b2i.java
+@@ -43,7 +43,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.context.ContextManager;
+ import org.apache.derby.iapi.services.io.FormatIdUtil;
+ 
++import org.apache.derby.iapi.db.Database;
+ import org.apache.derby.iapi.error.StandardException;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+ import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+ import org.apache.derby.iapi.store.access.AccessFactory;
+ import org.apache.derby.iapi.store.access.ConglomerateController;
+@@ -208,7 +210,7 @@ protected void runTestSet() throws T_Fail
+ 			REPORT(msg);
+ 
+             e.printStackTrace(out.getPrintWriter());
+-            cm1.cleanupOnError(e);
++            cm1.cleanupOnError(e, isdbActive());
+ 
+             pass = false;
+ 		}
+@@ -220,7 +222,7 @@ protected void runTestSet() throws T_Fail
+ 			REPORT(msg);
+ 
+             t.printStackTrace(out.getPrintWriter());
+-            cm1.cleanupOnError(t);
++            cm1.cleanupOnError(t, isdbActive());
+ 
+             pass = false;
+         }
+@@ -861,7 +863,7 @@ protected boolean t_002(TransactionController tc)
+                 if (SanityManager.DEBUG)
+                     SanityManager.ASSERT(cm != null);
+ 
+-                cm.cleanupOnError(e);
++                cm.cleanupOnError(e, isdbActive());
+                 
+                 // RESOLVE (mikem) - when split abort works come up with 
+                 // a good sanity check here.
+@@ -3267,7 +3269,7 @@ protected boolean t_016(TransactionController tc)
+                 if (SanityManager.DEBUG)
+                     SanityManager.ASSERT(cm != null);
+ 
+-                cm.cleanupOnError(e);
++                cm.cleanupOnError(e, isdbActive());
+             }
+         }
+ 
+@@ -5090,6 +5092,16 @@ public static String repeatString(String data, int repeat) {
+ 		return s;
+ 	}
+ 
++    /** Check wheather the database is active or not
++     * @return {@code true} if the database is active, {@code false} otherwise
++     */
++    public boolean isdbActive() {
++        LanguageConnectionContext lcc = (LanguageConnectionContext) ContextService
++                .getContextOrNull(LanguageConnectionContext.CONTEXT_ID);
++        Database db = (Database) (lcc != null ? lcc.getDatabase() : null);
++        return (db != null ? db.isActive() : false);
++    }
++
+ }
+ 
+ class T_CreateConglomRet 

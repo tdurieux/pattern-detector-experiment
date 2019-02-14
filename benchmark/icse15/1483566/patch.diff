@@ -1,0 +1,143 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+index 25b98b70..ca5570d0 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+@@ -176,8 +176,6 @@ void runLeaderProcess(boolean weAreReplacement) throws KeeperException,
+       
+       log.info("I may be the new leader - try and sync");
+       
+-      UpdateLog ulog = core.getUpdateHandler().getUpdateLog();
+- 
+       
+       // we are going to attempt to be the leader
+       // first cancel any current recovery
+@@ -190,13 +188,29 @@ void runLeaderProcess(boolean weAreReplacement) throws KeeperException,
+         success = false;
+       }
+       
+-      if (!success && ulog.getRecentUpdates().getVersions(1).isEmpty()) {
++      UpdateLog ulog = core.getUpdateHandler().getUpdateLog();
++
++      if (!success) {
++        boolean hasRecentUpdates = false;
++        if (ulog != null) {
++          // TODO: we could optimize this if necessary
++          UpdateLog.RecentUpdates recentUpdates = ulog.getRecentUpdates();
++          try {
++            hasRecentUpdates = !recentUpdates.getVersions(1).isEmpty();
++          } finally {
++            recentUpdates.close();
++          }
++        }
++
++        if (!hasRecentUpdates) {
+         // we failed sync, but we have no versions - we can't sync in that case
+         // - we were active
+         // before, so become leader anyway
+         log.info("We failed sync, but we have no versions - we can't sync in that case - we were active before, so become leader anyway");
+         success = true;
+       }
++      }
++
+       
+       // if !success but no one else is in active mode,
+       // we are the leader anyway
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/handler/component/RealTimeGetComponent.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/handler/component/RealTimeGetComponent.java
+index ba42f38b..3f9e6ded 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/handler/component/RealTimeGetComponent.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/handler/component/RealTimeGetComponent.java
+@@ -552,13 +552,13 @@ public void processGetUpdates(ResponseBuilder rb) throws IOException
+ 
+     List<String> versions = StrUtils.splitSmart(versionsStr, ",", true);
+ 
+-    // TODO: get this from cache instead of rebuilding?
+-    UpdateLog.RecentUpdates recentUpdates = ulog.getRecentUpdates();
+ 
+     List<Object> updates = new ArrayList<Object>(versions.size());
+ 
+     long minVersion = Long.MAX_VALUE;
+     
++    // TODO: get this from cache instead of rebuilding?
++    UpdateLog.RecentUpdates recentUpdates = ulog.getRecentUpdates();
+     try {
+       for (String versionStr : versions) {
+         long version = Long.parseLong(versionStr);
+diff --git a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+index 41e60bbc..b2c6b7bb 100644
+--- a/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
++++ b/lucene/dev/branches/lucene_solr_4_3/solr/core/src/java/org/apache/solr/update/UpdateLog.java
+@@ -989,7 +989,7 @@ public void close() {
+     }
+   }
+ 
+-
++  /** The RecentUpdates object returned must be closed after use */
+   public RecentUpdates getRecentUpdates() {
+     Deque<TransactionLog> logList;
+     synchronized (this) {
+@@ -1009,9 +1009,21 @@ public RecentUpdates getRecentUpdates() {
+ 
+     // TODO: what if I hand out a list of updates, then do an update, then hand out another list (and
+     // one of the updates I originally handed out fell off the list).  Over-request?
+-    RecentUpdates recentUpdates = new RecentUpdates();
++
++    boolean success = false;
++    RecentUpdates recentUpdates = null;
++    try {
++      recentUpdates = new RecentUpdates();
+     recentUpdates.logList = logList;
+     recentUpdates.update();
++      success = true;
++    } finally {
++      // defensive: if some unknown exception is thrown,
++      // make sure we close so that the tlogs are decref'd
++      if (!success && recentUpdates != null) {
++        recentUpdates.close();
++      }
++    }
+ 
+     return recentUpdates;
+   }
+@@ -1132,14 +1144,15 @@ public String toString() {
+   class LogReplayer implements Runnable {
+     private Logger loglog = log;  // set to something different?
+ 
+-    List<TransactionLog> translogs;
++    Deque<TransactionLog> translogs;
+     TransactionLog.LogReader tlogReader;
+     boolean activeLog;
+     boolean finishing = false;  // state where we lock out other updates and finish those updates that snuck in before we locked
+     boolean debug = loglog.isDebugEnabled();
+ 
+     public LogReplayer(List<TransactionLog> translogs, boolean activeLog) {
+-      this.translogs = translogs;
++      this.translogs = new LinkedList<TransactionLog>();
++      this.translogs.addAll(translogs);
+       this.activeLog = activeLog;
+     }
+ 
+@@ -1159,7 +1172,9 @@ public void run() {
+       SolrRequestInfo.setRequestInfo(new SolrRequestInfo(req, rsp));    // setting request info will help logging
+ 
+       try {
+-        for (TransactionLog translog : translogs) {
++        for(;;) {
++          TransactionLog translog = translogs.pollFirst();
++          if (translog == null) break;
+           doReplay(translog);
+         }
+       } catch (SolrException e) {
+@@ -1179,6 +1194,13 @@ public void run() {
+         if (finishing) {
+           versionInfo.unblockUpdates();
+         }
++
++        // clean up in case we hit some unexpected exception and didn't get
++        // to more transaction logs
++        for (TransactionLog translog : translogs) {
++          log.error("ERROR: didn't get to recover from tlog " + translog);
++          translog.decref();
++        }
+       }
+ 
+       loglog.warn("Log replay finished. recoveryInfo=" + recoveryInfo);

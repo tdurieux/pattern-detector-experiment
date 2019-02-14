@@ -1,0 +1,171 @@
+diff --git a/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/java/org/apache/lucene/collation/ICUCollationKeyFilter.java b/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/java/org/apache/lucene/collation/ICUCollationKeyFilter.java
+index 3060a214..8a7e79d3 100644
+--- a/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/java/org/apache/lucene/collation/ICUCollationKeyFilter.java
++++ b/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/java/org/apache/lucene/collation/ICUCollationKeyFilter.java
+@@ -81,7 +81,12 @@
+    */
+   public ICUCollationKeyFilter(TokenStream input, Collator collator) {
+     super(input);
+-    this.collator = collator;
++    // clone the collator: see http://userguide.icu-project.org/collation/architecture
++    try {
++      this.collator = (Collator) collator.clone();
++    } catch (CloneNotSupportedException e) {
++      throw new RuntimeException(e);
++    }
+   }
+ 
+   @Override
+diff --git a/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/test/org/apache/lucene/collation/TestICUCollationKeyAnalyzer.java b/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/test/org/apache/lucene/collation/TestICUCollationKeyAnalyzer.java
+index 2c7b2cd1..072ddb8d 100644
+--- a/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/test/org/apache/lucene/collation/TestICUCollationKeyAnalyzer.java
++++ b/lucene/dev/branches/branch_3x/lucene/contrib/icu/src/test/org/apache/lucene/collation/TestICUCollationKeyAnalyzer.java
+@@ -76,4 +76,14 @@ public void testCollationKeySort() throws Exception {
+     (usAnalyzer, franceAnalyzer, swedenAnalyzer, denmarkAnalyzer, 
+      "BFJHD", "ECAGI", "BJDFH", "BJDHF");
+   }
++  
++  public void testThreadSafe() throws Exception {
++    int iters = 20 * RANDOM_MULTIPLIER;
++    for (int i = 0; i < iters; i++) {
++      Locale locale = randomLocale(random);
++      Collator collator = Collator.getInstance(locale);
++      collator.setStrength(Collator.IDENTICAL);
++      assertThreadSafe(new ICUCollationKeyAnalyzer(collator));
++    }
++  }
+ }
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/collation/CollationKeyFilter.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/collation/CollationKeyFilter.java
+index d5bcc81e..522939bd 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/collation/CollationKeyFilter.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/collation/CollationKeyFilter.java
+@@ -82,7 +82,9 @@
+    */
+   public CollationKeyFilter(TokenStream input, Collator collator) {
+     super(input);
+-    this.collator = collator;
++    // clone in case JRE doesnt properly sync,
++    // or to reduce contention in case they do
++    this.collator = (Collator) collator.clone();
+   }
+ 
+   @Override
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/CollationTestBase.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/CollationTestBase.java
+index 062adfa8..34355eb4 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/CollationTestBase.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/CollationTestBase.java
+@@ -21,6 +21,8 @@
+ import org.apache.lucene.analysis.Analyzer;
+ import org.apache.lucene.analysis.PerFieldAnalyzerWrapper;
+ import org.apache.lucene.analysis.WhitespaceAnalyzer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+ import org.apache.lucene.store.RAMDirectory;
+ import org.apache.lucene.index.IndexWriter;
+ import org.apache.lucene.index.IndexWriterConfig;
+@@ -39,8 +41,12 @@
+ import org.apache.lucene.document.Document;
+ import org.apache.lucene.util.IndexableBinaryStringTools;
+ import org.apache.lucene.util.LuceneTestCase;
++import org.apache.lucene.util._TestUtil;
+ 
+ import java.io.IOException;
++import java.io.StringReader;
++import java.util.HashMap;
++import java.util.Map;
+ 
+ public abstract class CollationTestBase extends LuceneTestCase {
+ 
+@@ -259,4 +265,73 @@ private void assertMatches(Searcher searcher, Query query, Sort sort,
+     }
+     assertEquals(expectedResult, buff.toString());
+   }
++  
++  private String randomString() {
++    // ideally we could do this!
++    // return _TestUtil.randomUnicodeString(random);
++    //
++    // http://bugs.icu-project.org/trac/ticket/8060
++    // http://bugs.icu-project.org/trac/ticket/7732
++    // ...
++    // 
++    // as a workaround, just test the BMP for now (and avoid 0xFFFF etc)
++    int length = _TestUtil.nextInt(random, 0, 10);
++    char chars[] = new char[length];
++    for (int i = 0; i < length; i++) {
++      if (random.nextBoolean()) {
++        chars[i] = (char) _TestUtil.nextInt(random, 0, 0xD7FF);
++      } else {
++        chars[i] = (char) _TestUtil.nextInt(random, 0xE000, 0xFFFD);
++      }
++    }
++    return new String(chars, 0, length);
++  }
++
++  public void assertThreadSafe(final Analyzer analyzer) throws Exception {
++    int numTestPoints = 1000;
++    int numThreads = _TestUtil.nextInt(random, 3, 5);
++    final HashMap<String,String> map = new HashMap<String,String>();
++    
++    // create a map<String,SortKey> up front.
++    // then with multiple threads, generate sort keys for all the keys in the map
++    // and ensure they are the same as the ones we produced in serial fashion.
++
++    for (int i = 0; i < numTestPoints; i++) {
++      String term = randomString();
++      TokenStream ts = analyzer.reusableTokenStream("fake", new StringReader(term));
++      CharTermAttribute encodedBytes = ts.addAttribute(CharTermAttribute.class);
++      ts.reset();
++      assertTrue(ts.incrementToken());
++      // ensure we make a copy of the actual bytes too
++      map.put(term, encodedBytes.toString());
++    }
++    
++    Thread threads[] = new Thread[numThreads];
++    for (int i = 0; i < numThreads; i++) {
++      threads[i] = new Thread() {
++        @Override
++        public void run() {
++          try {
++            for (Map.Entry<String,String> mapping : map.entrySet()) {
++              String term = mapping.getKey();
++              String expected = mapping.getValue();
++              TokenStream ts = analyzer.reusableTokenStream("fake", new StringReader(term));
++              CharTermAttribute encodedBytes = ts.addAttribute(CharTermAttribute.class);
++              ts.reset();
++              assertTrue(ts.incrementToken());
++              assertEquals(expected, encodedBytes.toString());
++            }
++          } catch (IOException e) {
++            throw new RuntimeException(e);
++          }
++        }
++      };
++    }
++    for (int i = 0; i < numThreads; i++) {
++      threads[i].start();
++    }
++    for (int i = 0; i < numThreads; i++) {
++      threads[i].join();
++    }
++  }
+ }
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/TestCollationKeyAnalyzer.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/TestCollationKeyAnalyzer.java
+index 9e7e72a8..e03c9542 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/TestCollationKeyAnalyzer.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/collation/TestCollationKeyAnalyzer.java
+@@ -79,4 +79,14 @@ public void testCollationKeySort() throws Exception {
+     (usAnalyzer, franceAnalyzer, swedenAnalyzer, denmarkAnalyzer, 
+      oStrokeFirst ? "BFJHD" : "BFJDH", "EACGI", "BJDFH", "BJDHF");
+   }
++  
++  public void testThreadSafe() throws Exception {
++    int iters = 20 * RANDOM_MULTIPLIER;
++    for (int i = 0; i < iters; i++) {
++      Locale locale = randomLocale(random);
++      Collator collator = Collator.getInstance(locale);
++      collator.setStrength(Collator.PRIMARY);
++      assertThreadSafe(new CollationKeyAnalyzer(collator));
++    }
++  }
+ }

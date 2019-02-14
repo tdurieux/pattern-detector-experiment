@@ -1,0 +1,624 @@
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/text/SparseVectorsFromSequenceFiles.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/text/SparseVectorsFromSequenceFiles.java
+index f2f341c0..5b61df23 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/text/SparseVectorsFromSequenceFiles.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/text/SparseVectorsFromSequenceFiles.java
+@@ -153,9 +153,16 @@ public static void main(String[] args) throws Exception {
+     
+     Parser parser = new Parser();
+     parser.setGroup(group);
+-    CommandLine cmdLine = parser.parse(args);
++    CommandLine cmdLine = null;
+     
+-    if (cmdLine.hasOption(helpOpt)) {
++    try {
++      // standard help opt won't work because
++      // outputDir is required and exception will 
++      // be thrown if it is not present.
++      cmdLine = parser.parse(args);
++    }
++    catch (OptionException oe) {
++        System.out.println(oe.getMessage());
+       CommandLineUtil.printHelp(group);
+       return;
+     }
+@@ -246,7 +253,7 @@ public static void main(String[] args) throws Exception {
+       }
+     }
+     HadoopUtil.overwriteOutput(outputDir);
+-    String tokenizedPath = outputDir + "/tokenized-documents";
++    String tokenizedPath = outputDir + DocumentProcessor.TOKENIZED_DOCUMENT_OUTPUT_FOLDER;
+     DocumentProcessor.tokenizeDocuments(inputDir, analyzerClass, tokenizedPath);
+     
+     DictionaryVectorizer.createTermFrequencyVectors(tokenizedPath, outputDir,
+@@ -254,7 +261,7 @@ public static void main(String[] args) throws Exception {
+     if (processIdf) {
+       TFIDFConverter.processTfIdf(
+         outputDir + DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER,
+-        outputDir + "/tfidf", chunkSize, minDf, maxDFPercent, norm);
++        outputDir + TFIDFConverter.TFIDF_OUTPUT_FOLDER, chunkSize, minDf, maxDFPercent, norm);
+     }
+   }
+ }
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocCombiner.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocCombiner.java
+index 2c13ffa2..a7b32a29 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocCombiner.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocCombiner.java
+@@ -28,10 +28,11 @@
+ import org.apache.hadoop.mapred.Reporter;
+ import org.apache.mahout.utils.nlp.collocations.llr.Gram.Type;
+ 
++/** Combiner for pass1 of the CollocationDriver */
+ public class CollocCombiner extends MapReduceBase implements
+-Reducer<Gram, Gram, Gram, Gram> {
++  Reducer<Gram, Gram, Gram, Gram> {
+ 
+-  /** collocation finder: pass 1 collec phase:
++  /** collocation finder: pass 1 colloc phase:
+    *  
+    *  given input from the mapper,
+    *  k:h_subgram:1 v:ngram:1
+@@ -49,34 +50,34 @@
+    *  and move the count into the value?
+    */
+   @Override
+-  public void reduce(Gram key, Iterator<Gram> value,
++  public void reduce(Gram subgramKey, Iterator<Gram> ngramValues,
+       OutputCollector<Gram, Gram> output, Reporter reporter) throws IOException {
+ 
+-    HashMap<Gram,Gram> set = new HashMap<Gram,Gram>();
++    HashMap<Gram,Gram> ngramSet = new HashMap<Gram,Gram>();
+     int subgramFrequency = 0;
+ 
+-    while (value.hasNext()) {
+-      Gram t = value.next();
+-      subgramFrequency += t.getFrequency();
++    while (ngramValues.hasNext()) {
++      Gram ngram = ngramValues.next();
++      subgramFrequency += ngram.getFrequency();
+ 
+-      Gram s = set.get(t);
+-      if (s == null) {
++      Gram ngramCanon = ngramSet.get(ngram);
++      if (ngramCanon == null) {
+         // t is potentially reused, so create a new object to populate the HashMap
+-        Gram e = new Gram(t);
+-        set.put(e,e);
++        Gram ngramEntry = new Gram(ngram);
++        ngramSet.put(ngramEntry,ngramEntry);
+       }
+       else {
+-        s.incrementFrequency(t.getFrequency());
++        ngramCanon.incrementFrequency(ngram.getFrequency());
+       }
+     }
+ 
+     // emit subgram:subgramFreq ngram:ngramFreq pairs
+-    key.setFrequency(subgramFrequency);
++    subgramKey.setFrequency(subgramFrequency);
+ 
+-    for (Gram t: set.keySet()) {
+-      if(key.getType() == Type.UNIGRAM)
+-        t.setType(key.getType());
+-      output.collect(key, t);
++    for (Gram ngram: ngramSet.keySet()) {
++      if(subgramKey.getType() == Type.UNIGRAM)
++        ngram.setType(subgramKey.getType());
++      output.collect(subgramKey, ngram);
+     }
+   }
+ 
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocDriver.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocDriver.java
+index 72ce7282..97d9be3c 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocDriver.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocDriver.java
+@@ -49,10 +49,13 @@
+ 
+ /** Driver for LLR collocation discovery mapreduce job */
+ public class CollocDriver {
++  public static final String DEFAULT_OUTPUT_DIRECTORY = "output";
++  public static final String SUBGRAM_OUTPUT_DIRECTORY = "subgrams";
++  public static final String NGRAM_OUTPUT_DIRECTORY   = "ngrams";
++  
+   public static final String EMIT_UNIGRAMS = "emit-unigrams";
+   public static final boolean DEFAULT_EMIT_UNIGRAMS = false;
+   
+-  public static final String DEFAULT_OUTPUT_DIRECTORY = "output";
+   public static final int DEFAULT_MAX_NGRAM_SIZE = 2;
+   public static final int DEFAULT_PASS1_NUM_REDUCE_TASKS = 1;
+   
+@@ -78,17 +81,16 @@ public static void main(String[] args) throws Exception {
+         .withDescription("The Path write output to").withShortName("o")
+         .create();
+     
+-    Option maxNGramSizeOpt = obuilder
+-        .withLongName("maxNGramSize")
+-        .withRequired(false)
+-        .withArgument(
++    Option maxNGramSizeOpt = obuilder.withLongName("maxNGramSize")
++        .withRequired(false).withArgument(
+           abuilder.withName("ngramSize").withMinimum(1).withMaximum(1).create())
+         .withDescription(
+           "(Optional) The maximum size of ngrams to create"
+               + " (2 = bigrams, 3 = trigrams, etc) Default Value:2")
+         .withShortName("ng").create();
+     
+-    Option minSupportOpt = obuilder.withLongName("minSupport").withArgument(
++    Option minSupportOpt = obuilder.withLongName("minSupport")
++        .withRequired(false).withArgument(
+       abuilder.withName("minSupport").withMinimum(1).withMaximum(1).create())
+         .withDescription(
+           "(Optional) Minimum Support. Default Value: "
+@@ -102,14 +104,14 @@ public static void main(String[] args) throws Exception {
+               + LLRReducer.DEFAULT_MIN_LLR).withShortName("ml").create();
+     
+     Option numReduceTasksOpt = obuilder.withLongName("numReducers")
+-        .withArgument(
++        .withRequired(false).withArgument(
+           abuilder.withName("numReducers").withMinimum(1).withMaximum(1)
+               .create()).withDescription(
+           "(Optional) Number of reduce tasks. Default Value: "
+               + DEFAULT_PASS1_NUM_REDUCE_TASKS).withShortName("nr").create();
+     
+-    Option preprocessOpt = obuilder.withLongName("preprocess").withRequired(
+-      false).withDescription(
++    Option preprocessOpt = obuilder.withLongName("preprocess")
++        .withRequired(false).withDescription(
+       "If set, input is SequenceFile<Text,Text> where the value is the document, "
+           + " which will be tokenized using the specified analyzer.")
+         .withShortName("p").create();
+@@ -188,7 +190,7 @@ public static void main(String[] args) throws Exception {
+         reduceTasks = Integer.parseInt(cmdLine.getValue(numReduceTasksOpt)
+             .toString());
+       }
+-      log.info("Pass1 reduce tasks: {}", reduceTasks);
++      log.info("Number of pass1 reduce tasks: {}", reduceTasks);
+       
+       boolean emitUnigrams = cmdLine.hasOption(unigramOpt);
+       
+@@ -204,7 +206,9 @@ public static void main(String[] args) throws Exception {
+           analyzerClass.newInstance();
+         }
+         
+-        String tokenizedPath = output + "/tokenized-documents";
++        String tokenizedPath = 
++          output + DocumentProcessor.TOKENIZED_DOCUMENT_OUTPUT_FOLDER;
++        
+         DocumentProcessor
+             .tokenizeDocuments(input, analyzerClass, tokenizedPath);
+         input = tokenizedPath;
+@@ -280,7 +284,7 @@ public static long generateCollocations(String input,
+     conf.setBoolean(CollocDriver.EMIT_UNIGRAMS, emitUnigrams);
+     
+     FileInputFormat.setInputPaths(conf, new Path(input));
+-    Path outPath = new Path(output + "/subgrams");
++    Path outPath = new Path(output, SUBGRAM_OUTPUT_DIRECTORY);
+     FileOutputFormat.setOutputPath(conf, outPath);
+     
+     conf.setInputFormat(SequenceFileInputFormat.class);
+@@ -316,8 +320,8 @@ public static void computeNGramsPruneByLLR(long nGramTotal,
+     conf.setOutputKeyClass(Text.class);
+     conf.setOutputValueClass(DoubleWritable.class);
+     
+-    FileInputFormat.setInputPaths(conf, new Path(output + "/subgrams"));
+-    Path outPath = new Path(output + "/ngrams");
++    FileInputFormat.setInputPaths(conf, new Path(output, SUBGRAM_OUTPUT_DIRECTORY));
++    Path outPath = new Path(output, NGRAM_OUTPUT_DIRECTORY);
+     FileOutputFormat.setOutputPath(conf, outPath);
+     
+     conf.setMapperClass(IdentityMapper.class);
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocReducer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocReducer.java
+index 0d525438..c552c3a5 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocReducer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/CollocReducer.java
+@@ -84,40 +84,40 @@ public void configure(JobConf job) {
+    * move the count into the value?
+    */
+   @Override
+-  public void reduce(Gram key,
+-                     Iterator<Gram> value,
++  public void reduce(Gram subgramKey,
++                     Iterator<Gram> ngramValues,
+                      OutputCollector<Gram,Gram> output,
+                      Reporter reporter) throws IOException {
+     
+-    HashMap<Gram,Gram> set = new HashMap<Gram,Gram>();
++    HashMap<Gram,Gram> ngramSet = new HashMap<Gram,Gram>();
+     int subgramFrequency = 0;
+     
+-    while (value.hasNext()) {
+-      Gram t = value.next();
+-      subgramFrequency += t.getFrequency();
++    while (ngramValues.hasNext()) {
++      Gram ngram = ngramValues.next();
++      subgramFrequency += ngram.getFrequency();
+       
+-      Gram s = set.get(t);
+-      if (s == null) {
++      Gram ngramCanon = ngramSet.get(ngram);
++      if (ngramCanon == null) {
+         // t is potentially reused, so create a new object to populate the
+         // HashMap
+-        Gram e = new Gram(t);
+-        set.put(e, e);
++        Gram ngramEntry = new Gram(ngram);
++        ngramSet.put(ngramEntry, ngramEntry);
+       } else {
+-        s.incrementFrequency(t.getFrequency());
++        ngramCanon.incrementFrequency(ngram.getFrequency());
+       }
+     }
+     
+     // emit ngram:ngramFreq, subgram:subgramFreq pairs.
+-    key.setFrequency(subgramFrequency);
++    subgramKey.setFrequency(subgramFrequency);
+     
+-    for (Gram t : set.keySet()) {
+-      if (t.getFrequency() < minSupport) {
++    for (Gram ngram : ngramSet.keySet()) {
++      if (ngram.getFrequency() < minSupport) {
+         reporter.incrCounter(Skipped.LESS_THAN_MIN_SUPPORT, 1);
+         continue;
+       }
+-      if(key.getType() == Type.UNIGRAM)
+-        t.setType(key.getType());
+-      output.collect(t, key);
++      if(subgramKey.getType() == Type.UNIGRAM)
++        ngram.setType(subgramKey.getType());
++      output.collect(ngram, subgramKey);
+     }
+   }
+ }
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollector.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollector.java
+index e69de29b..64dff847 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollector.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollector.java
+@@ -0,0 +1,179 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.mahout.utils.nlp.collocations.llr;
++
++import static org.apache.mahout.utils.nlp.collocations.llr.Gram.Type.HEAD;
++import static org.apache.mahout.utils.nlp.collocations.llr.Gram.Type.TAIL;
++import static org.apache.mahout.utils.nlp.collocations.llr.NGramCollector.Count.NGRAM_TOTAL;
++
++import java.io.IOException;
++import java.io.Reader;
++
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.hadoop.mapred.Reporter;
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.shingle.ShingleFilter;
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.analysis.tokenattributes.TermAttribute;
++import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
++import org.apache.lucene.util.Version;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/**
++ * Performs tokenization, ngram generation + collection for the first pass of
++ * the LLR collocation discovery job. Factors this code out of the mappers so
++ * that different input formats can be supported.
++ * 
++ * @see org.apache.mahout.utils.nlp.collocations.llr.colloc.CollocMapperTextFile
++ */
++public class NGramCollector {
++  
++  public static final String ANALYZER_CLASS = "analyzerClass";
++  public static final String MAX_SHINGLE_SIZE = "maxShingleSize";
++  
++  public static enum Count {
++    NGRAM_TOTAL;
++  }
++  
++  private static final Logger log = LoggerFactory
++      .getLogger(NGramCollector.class);
++  
++  /**
++   * An analyzer to perform tokenization. A ShingleFilter will be wrapped around
++   * its output to create ngrams
++   */
++  private Analyzer a;
++  
++  /** max size of shingles (ngrams) to create */
++  private int maxShingleSize;
++  
++  public NGramCollector() {}
++  
++  /**
++   * Configure the NGramCollector.
++   * 
++   * Reads NGramCollector.ANALYZER_CLASS and instantiates that class if it is
++   * provided. Otherwise a lucene StandardAnalyzer will be used that is set to
++   * be compatible to LUCENE_24.
++   * 
++   * Reads NGramCollector.MAX_SHINGLE_SIZE and uses this as the parameter to the
++   * ShingleFilter.
++   * 
++   * @param job
++   */
++  public void configure(JobConf job) {
++    this.a = null;
++    try {
++      ClassLoader ccl = Thread.currentThread().getContextClassLoader();
++      String analyzerClass = job.get(NGramCollector.ANALYZER_CLASS);
++      if (analyzerClass != null) {
++        Class<?> cl = ccl.loadClass(analyzerClass);
++        a = (Analyzer) cl.newInstance();
++      }
++    } catch (ClassNotFoundException e) {
++      throw new IllegalStateException(e);
++    } catch (InstantiationException e) {
++      throw new IllegalStateException(e);
++    } catch (IllegalAccessException e) {
++      throw new IllegalStateException(e);
++    }
++    
++    if (this.a == null) {
++      // No analyzer specified. Use the LUCENE_24 analzer here because
++      // it does not preserve stop word positions.
++      this.a = new StandardAnalyzer(Version.LUCENE_24);
++    }
++    
++    this.maxShingleSize = job.getInt(NGramCollector.MAX_SHINGLE_SIZE, 2);
++    
++    if (log.isInfoEnabled()) {
++      log.info("Analyzer is {}", this.a.toString());
++      log.info("Max Ngram size is {}", this.maxShingleSize);
++    }
++  }
++  
++  /**
++   * Receives a document and uses a lucene analyzer to tokenize them. The
++   * ShingleFilter delivers ngrams of the appropriate size which aren then
++   * decomposed into head and tail subgrams which are collected in the following
++   * manner
++   * 
++   * k:h_subgram v:ngram k:t_subgram v:ngram
++   * 
++   * The 'h_' or 't_' prefix is used to specify whether the subgram in question
++   * is the head or tail of the ngram. In this implementation the head of the
++   * ngram is a (n-1)gram, and the tail is a (1)gram.
++   * 
++   * For example, given 'click and clack' and an ngram length of 3: k:'h_click
++   * and' v:'clack and clack' k;'t_clack' v:'click and clack'
++   * 
++   * Also counts the total number of ngrams encountered and adds it to the
++   * counter CollocDriver.Count.NGRAM_TOTAL
++   * 
++   * @param r
++   *          The reader to read input from -- used to create a tokenstream from
++   *          the analyzer
++   * 
++   * @param collector
++   *          The collector to send output to
++   * 
++   * @param reporter
++   *          Used to deliver the final ngram-count.
++   * 
++   * @throws IOException
++   *           if there's a problem with the ShingleFilter reading data or the
++   *           collector collecting output.
++   */
++  public void collectNgrams(Reader r,
++                            OutputCollector<Gram,Gram> collector,
++                            Reporter reporter) throws IOException {
++    TokenStream st = a.tokenStream("text", r);
++    ShingleFilter sf = new ShingleFilter(st, maxShingleSize);
++    
++    sf.reset();
++    int count = 0; // ngram count
++    
++    do {
++      String term = ((TermAttribute) sf.getAttribute(TermAttribute.class))
++          .term();
++      String type = ((TypeAttribute) sf.getAttribute(TypeAttribute.class))
++          .type();
++      
++      if ("shingle".equals(type)) {
++        count++;
++        Gram ngram = new Gram(term);
++        
++        // obtain components, the leading (n-1)gram and the trailing unigram.
++        int i = term.lastIndexOf(' ');
++        if (i != -1) {
++          collector.collect(new Gram(term.substring(0, i), HEAD), ngram);
++          collector.collect(new Gram(term.substring(i + 1), TAIL), ngram);
++        }
++      }
++    } while (sf.incrementToken());
++    
++    reporter.incrCounter(NGRAM_TOTAL, count);
++    
++    sf.end();
++    sf.close();
++    r.close();
++  }
++}
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
+index 0e82c477..89a48200 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DictionaryVectorizer.java
+@@ -106,7 +106,7 @@ private DictionaryVectorizer() {
+    *          the minimum frequency of the feature in the entire corpus to be
+    *          considered for inclusion in the sparse vector
+    * @param maxNGramSize
+-   *          1 = unigram, 2 = unigram and bigram, 3 = unigram, bigrama and
++   *          1 = unigram, 2 = unigram and bigram, 3 = unigram, bigram and
+    *          trigram
+    * @param minLLRValue
+    *          minValue of log likelihood ratio to used to prune ngrams
+@@ -146,7 +146,7 @@ public static void createTermFrequencyVectors(String input,
+       CollocDriver.generateAllGrams(inputPath.toString(), dictionaryJobPath
+           .toString(), maxNGramSize, minSupport, minLLRValue, numReducers);
+       dictionaryChunks = createDictionaryChunks(minSupport, new Path(
+-          output + DICTIONARY_JOB_FOLDER + "/ngrams"), output,
++          output + DICTIONARY_JOB_FOLDER, CollocDriver.NGRAM_OUTPUT_DIRECTORY), output,
+         chunkSizeInMegabytes, new DoubleWritable());
+     }
+     
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DocumentProcessor.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DocumentProcessor.java
+index 7de715ae..5e53b546 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DocumentProcessor.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/text/DocumentProcessor.java
+@@ -46,6 +46,7 @@
+  */
+ public final class DocumentProcessor {
+   
++  public static final String TOKENIZED_DOCUMENT_OUTPUT_FOLDER = "/tokenized-documents";
+   public static final String ANALYZER_CLASS = "analyzer.class";
+   
+   public static final Charset CHARSET = Charset.forName("UTF-8");
+diff --git a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
+index 2acca3fc..9a02153e 100644
+--- a/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
++++ b/lucene/mahout/trunk/utils/src/main/java/org/apache/mahout/utils/vectors/tfidf/TFIDFConverter.java
+@@ -65,6 +65,8 @@
+   
+   public static final String MAX_DF_PERCENTAGE = "max.df.percentage";
+   
++  public static final String TFIDF_OUTPUT_FOLDER = "/tfidf";
++  
+   private static final String DOCUMENT_VECTOR_OUTPUT_FOLDER = "/vectors";
+   
+   private static final String FREQUENCY_FILE = "/frequency.file-";
+diff --git a/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollectorTest.java b/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollectorTest.java
+index e69de29b..1a84f48e 100644
+--- a/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollectorTest.java
++++ b/lucene/mahout/trunk/utils/src/test/java/org/apache/mahout/utils/nlp/collocations/llr/NGramCollectorTest.java
+@@ -0,0 +1,118 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.mahout.utils.nlp.collocations.llr;
++
++import static org.apache.mahout.utils.nlp.collocations.llr.Gram.Type.HEAD;
++import static org.apache.mahout.utils.nlp.collocations.llr.Gram.Type.TAIL;
++import static org.apache.mahout.utils.nlp.collocations.llr.NGramCollector.Count.NGRAM_TOTAL;
++
++import java.io.Reader;
++import java.io.StringReader;
++import java.util.Collections;
++
++import org.apache.hadoop.mapred.JobConf;
++import org.apache.hadoop.mapred.OutputCollector;
++import org.apache.hadoop.mapred.Reporter;
++import org.apache.lucene.analysis.Analyzer;
++import org.apache.lucene.analysis.TokenStream;
++import org.apache.lucene.analysis.standard.StandardAnalyzer;
++import org.apache.lucene.util.Version;
++import org.apache.mahout.utils.nlp.collocations.llr.Gram.Type;
++import org.easymock.EasyMock;
++import org.junit.Before;
++import org.junit.Test;
++
++/** Test for NGramCollectorTest
++ * FIXME: Add negative test cases
++ */
++@SuppressWarnings("deprecation")
++public class NGramCollectorTest {
++
++  OutputCollector<Gram,Gram> collector;
++  Reporter reporter;
++
++  @Before
++  @SuppressWarnings("unchecked")
++  public void setUp() {
++    collector = EasyMock.createMock(OutputCollector.class);
++    reporter  = EasyMock.createMock(Reporter.class);
++  }
++
++  @Test
++  public void testCollectNgrams() throws Exception {
++
++    String input = "the best of times the worst of times";
++
++    String[][] values = 
++      new String[][]{
++        {"h_the",   "the best"},
++        {"t_best",  "the best"},
++        {"h_best",  "best of"},
++        {"t_of",    "best of"},
++        {"h_of",    "of times"},
++        {"t_times", "of times"},
++        {"h_times", "times the"},
++        {"t_the",   "times the"},
++        {"h_the",   "the worst"},
++        {"t_worst", "the worst"},
++        {"h_worst", "worst of"},
++        {"t_of",    "worst of"},
++        {"h_of",    "of times"},
++        {"t_times", "of times"}
++    };
++    // set up expectations for mocks. ngram max size = 2
++
++    // setup expectations
++    for (String[] v: values) {
++      Type p = v[0].startsWith("h") ? HEAD : TAIL;
++      Gram subgram = new Gram(v[0].substring(2), p);
++      Gram ngram = new Gram(v[1]);
++      collector.collect(subgram, ngram);
++    }
++
++    reporter.incrCounter(NGRAM_TOTAL, 7);
++    EasyMock.replay(reporter, collector);
++    
++    Reader r = new StringReader(input);
++
++    JobConf conf = new JobConf();
++    conf.set(NGramCollector.MAX_SHINGLE_SIZE, "2");
++    conf.set(NGramCollector.ANALYZER_CLASS, TestAnalyzer.class.getName());
++
++    NGramCollector c = new NGramCollector();
++    c.configure(conf);
++    
++    c.collectNgrams(r, collector, reporter);
++
++    EasyMock.verify(reporter, collector);
++  }
++
++  /** A lucene 2.9 standard analyzer with no stopwords. */
++  public static class TestAnalyzer extends Analyzer {
++    final Analyzer a;
++    
++    public TestAnalyzer() {
++      a = new StandardAnalyzer(Version.LUCENE_29, Collections.EMPTY_SET);
++    }
++    
++    @Override
++    public TokenStream tokenStream(String arg0, Reader arg1) {
++      return a.tokenStream(arg0, arg1);
++    }
++  }
++}

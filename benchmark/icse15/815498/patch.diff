@@ -1,0 +1,666 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 66377389..e36b4dca 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -188,7 +188,7 @@ void onStart() throws IOException
+         ssTables_.onStart(sstables);
+ 
+         // submit initial check-for-compaction request
+-        MinorCompactionManager.instance().submit(ColumnFamilyStore.this);
++        CompactionManager.instance().submit(ColumnFamilyStore.this);
+ 
+         // schedule hinted handoff
+         if (table_.equals(Table.SYSTEM_TABLE) && columnFamily_.equals(HintedHandOffManager.HINTS_CF))
+@@ -248,7 +248,7 @@ public String cfStats(String newLineSeparator)
+     List<SSTableReader> forceAntiCompaction(List<Range> ranges, EndPoint target, long skip)
+     {
+         assert ranges != null;
+-        Future<List<SSTableReader>> futurePtr = MinorCompactionManager.instance().submit(ColumnFamilyStore.this, ranges, target);
++        Future<List<SSTableReader>> futurePtr = CompactionManager.instance().submit(ColumnFamilyStore.this, ranges, target);
+ 
+         List<SSTableReader> result;
+         try
+@@ -556,7 +556,7 @@ void onMemtableFlush(CommitLog.CommitLogContext cLogCtx) throws IOException
+     void addSSTable(SSTableReader sstable)
+     {
+         ssTables_.add(sstable);
+-        MinorCompactionManager.instance().submit(this);
++        CompactionManager.instance().submit(this);
+     }
+ 
+     private PriorityQueue<FileStruct> initializePriorityQueue(Collection<SSTableReader> sstables, List<Range> ranges) throws IOException
+@@ -714,7 +714,7 @@ SSTableReader getMaxSizeFile(Iterable<SSTableReader> sstables)
+ 
+     void forceCleanup()
+     {
+-        MinorCompactionManager.instance().submitCleanup(ColumnFamilyStore.this);
++        CompactionManager.instance().submitCleanup(ColumnFamilyStore.this);
+     }
+ 
+     /**
+@@ -1034,7 +1034,7 @@ private int doFileCompaction(Collection<SSTableReader> sstables) throws IOExcept
+         ssTable = writer.closeAndOpenReader();
+         ssTables_.add(ssTable);
+         ssTables_.markCompacted(sstables);
+-        MinorCompactionManager.instance().submit(ColumnFamilyStore.this);
++        CompactionManager.instance().submit(ColumnFamilyStore.this);
+ 
+         String format = "Compacted to %s.  %d/%d bytes for %d/%d keys read/written.  Time: %dms.";
+         long dTime = System.currentTimeMillis() - startTime;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index e69de29b..ef9e66ee 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -0,0 +1,232 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.db;
++
++import java.io.IOException;
++import java.lang.management.ManagementFactory;
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.Future;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.locks.Lock;
++import java.util.concurrent.locks.ReentrantLock;
++import javax.management.MBeanServer;
++import javax.management.ObjectName;
++
++import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
++import org.apache.cassandra.concurrent.ThreadFactoryImpl;
++import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.net.EndPoint;
++import org.apache.cassandra.io.SSTableReader;
++
++import org.apache.log4j.Logger;
++
++public class CompactionManager implements CompactionManagerMBean
++{
++    public static String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
++    private static CompactionManager instance_;
++    private static Lock lock_ = new ReentrantLock();
++    private static Logger logger_ = Logger.getLogger(CompactionManager.class);
++    private int minimumCompactionThreshold_ = 4; // compact this many sstables min at a time
++    private int maximumCompactionThreshold = 32; // compact this many sstables max at a time
++
++    public static CompactionManager instance()
++    {
++        if ( instance_ == null )
++        {
++            lock_.lock();
++            try
++            {
++                if ( instance_ == null )
++                {
++                    instance_ = new CompactionManager();
++                    MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
++                    mbs.registerMBean(instance_, new ObjectName(MBEAN_OBJECT_NAME));
++                }
++            }
++            catch (Exception e)
++            {
++                throw new RuntimeException(e);
++            }
++            finally
++            {
++                lock_.unlock();
++            }
++        }
++        return instance_;
++    }
++
++    static class FileCompactor2 implements Callable<List<SSTableReader>>
++    {
++        private ColumnFamilyStore columnFamilyStore_;
++        private List<Range> ranges_;
++        private EndPoint target_;
++
++        FileCompactor2(ColumnFamilyStore columnFamilyStore, List<Range> ranges, EndPoint target)
++        {
++            columnFamilyStore_ = columnFamilyStore;
++            ranges_ = ranges;
++            target_ = target;
++        }
++
++        public List<SSTableReader> call()
++        {
++        	List<SSTableReader> results;
++            if (logger_.isDebugEnabled())
++              logger_.debug("Started  compaction ..."+columnFamilyStore_.columnFamily_);
++            try
++            {
++                results = columnFamilyStore_.doAntiCompaction(ranges_, target_);
++            }
++            catch (IOException e)
++            {
++                throw new RuntimeException(e);
++            }
++            if (logger_.isDebugEnabled())
++              logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
++            return results;
++        }
++    }
++
++    static class OnDemandCompactor implements Runnable
++    {
++        private ColumnFamilyStore columnFamilyStore_;
++        private long skip_ = 0L;
++
++        OnDemandCompactor(ColumnFamilyStore columnFamilyStore, long skip)
++        {
++            columnFamilyStore_ = columnFamilyStore;
++            skip_ = skip;
++        }
++
++        public void run()
++        {
++            if (logger_.isDebugEnabled())
++              logger_.debug("Started  Major compaction for " + columnFamilyStore_.columnFamily_);
++            try
++            {
++                columnFamilyStore_.doMajorCompaction(skip_);
++            }
++            catch (IOException e)
++            {
++                throw new RuntimeException(e);
++            }
++            if (logger_.isDebugEnabled())
++              logger_.debug("Finished Major compaction for " + columnFamilyStore_.columnFamily_);
++        }
++    }
++
++    static class CleanupCompactor implements Runnable
++    {
++        private ColumnFamilyStore columnFamilyStore_;
++
++        CleanupCompactor(ColumnFamilyStore columnFamilyStore)
++        {
++        	columnFamilyStore_ = columnFamilyStore;
++        }
++
++        public void run()
++        {
++            if (logger_.isDebugEnabled())
++              logger_.debug("Started  compaction ..."+columnFamilyStore_.columnFamily_);
++            try
++            {
++                columnFamilyStore_.doCleanupCompaction();
++            }
++            catch (IOException e)
++            {
++                throw new RuntimeException(e);
++            }
++            if (logger_.isDebugEnabled())
++              logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
++        }
++    }
++    
++    
++    private ScheduledExecutorService compactor_ = new DebuggableScheduledThreadPoolExecutor(1, new ThreadFactoryImpl("MINOR-COMPACTION-POOL"));
++
++    /**
++     * Call this whenever a compaction might be needed on the given columnfamily.
++     * It's okay to over-call (within reason) since the compactions are single-threaded,
++     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
++     */
++    public Future<Integer> submit(final ColumnFamilyStore columnFamilyStore)
++    {
++        return submit(columnFamilyStore, minimumCompactionThreshold_, maximumCompactionThreshold);
++    }
++
++    Future<Integer> submit(final ColumnFamilyStore columnFamilyStore, final int minThreshold, final int maxThreshold)
++    {
++        Callable<Integer> callable = new Callable<Integer>()
++        {
++            public Integer call() throws IOException
++            {
++                return columnFamilyStore.doCompaction(minThreshold, maxThreshold);
++            }
++        };
++        return compactor_.submit(callable);
++    }
++
++    public void submitCleanup(ColumnFamilyStore columnFamilyStore)
++    {
++        compactor_.submit(new CleanupCompactor(columnFamilyStore));
++    }
++
++    public Future<List<SSTableReader>> submit(ColumnFamilyStore columnFamilyStore, List<Range> ranges, EndPoint target)
++    {
++        return compactor_.submit( new FileCompactor2(columnFamilyStore, ranges, target) );
++    }
++
++    public void  submitMajor(ColumnFamilyStore columnFamilyStore, long skip)
++    {
++        compactor_.submit( new OnDemandCompactor(columnFamilyStore, skip) );
++    }
++
++    /**
++     * Gets the minimum number of sstables in queue before compaction kicks off
++     */
++    public int getMinimumCompactionThreshold()
++    {
++        return minimumCompactionThreshold_;
++    }
++
++    /**
++     * Sets the minimum number of sstables in queue before compaction kicks off
++     */
++    public void setMinimumCompactionThreshold(int threshold)
++    {
++        minimumCompactionThreshold_ = threshold;
++    }
++
++    /**
++     * Gets the maximum number of sstables in queue before compaction kicks off
++     */
++    public int getMaximumCompactionThreshold()
++    {
++        return maximumCompactionThreshold;
++    }
++
++    /**
++     * Sets the maximum number of sstables in queue before compaction kicks off
++     */
++    public void setMaximumCompactionThreshold(int threshold)
++    {
++        maximumCompactionThreshold = threshold;
++    }
++}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManagerMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManagerMBean.java
+index e69de29b..e11b09fa 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManagerMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManagerMBean.java
+@@ -0,0 +1,42 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.db;
++
++public interface CompactionManagerMBean
++{    
++    /**
++     * Gets the minimum number of sstables in queue before compaction kicks off
++     */
++    public int getMinimumCompactionThreshold();
++
++    /**
++     * Sets the minimum number of sstables in queue before compaction kicks off
++     */
++    public void setMinimumCompactionThreshold(int threshold);
++
++    /**
++     * Gets the maximum number of sstables in queue before compaction kicks off
++     */
++    public int getMaximumCompactionThreshold();
++
++    /**
++     * Sets the maximum number of sstables in queue before compaction kicks off
++     */
++    public void setMaximumCompactionThreshold(int threshold);
++}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
+index c39bffa1..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MinorCompactionManager.java
+@@ -1,232 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.db;
+-
+-import java.io.IOException;
+-import java.lang.management.ManagementFactory;
+-import java.util.List;
+-import java.util.concurrent.Callable;
+-import java.util.concurrent.Future;
+-import java.util.concurrent.ScheduledExecutorService;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantLock;
+-import javax.management.MBeanServer;
+-import javax.management.ObjectName;
+-
+-import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.ThreadFactoryImpl;
+-import org.apache.cassandra.dht.Range;
+-import org.apache.cassandra.net.EndPoint;
+-import org.apache.cassandra.io.SSTableReader;
+-
+-import org.apache.log4j.Logger;
+-
+-public class MinorCompactionManager implements MinorCompactionManagerMBean
+-{
+-    public static String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=MinorCompactionManager";
+-    private static MinorCompactionManager instance_;
+-    private static Lock lock_ = new ReentrantLock();
+-    private static Logger logger_ = Logger.getLogger(MinorCompactionManager.class);
+-    private int minimumCompactionThreshold_ = 4; // compact this many sstables min at a time
+-    private int maximumCompactionThreshold = 32; // compact this many sstables max at a time
+-
+-    public static MinorCompactionManager instance()
+-    {
+-        if ( instance_ == null )
+-        {
+-            lock_.lock();
+-            try
+-            {
+-                if ( instance_ == null )
+-                {
+-                    instance_ = new MinorCompactionManager();
+-                    MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+-                    mbs.registerMBean(instance_, new ObjectName(MBEAN_OBJECT_NAME));
+-                }
+-            }
+-            catch (Exception e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-            finally
+-            {
+-                lock_.unlock();
+-            }
+-        }
+-        return instance_;
+-    }
+-
+-    static class FileCompactor2 implements Callable<List<SSTableReader>>
+-    {
+-        private ColumnFamilyStore columnFamilyStore_;
+-        private List<Range> ranges_;
+-        private EndPoint target_;
+-
+-        FileCompactor2(ColumnFamilyStore columnFamilyStore, List<Range> ranges, EndPoint target)
+-        {
+-            columnFamilyStore_ = columnFamilyStore;
+-            ranges_ = ranges;
+-            target_ = target;
+-        }
+-
+-        public List<SSTableReader> call()
+-        {
+-        	List<SSTableReader> results;
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Started  compaction ..."+columnFamilyStore_.columnFamily_);
+-            try
+-            {
+-                results = columnFamilyStore_.doAntiCompaction(ranges_, target_);
+-            }
+-            catch (IOException e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
+-            return results;
+-        }
+-    }
+-
+-    static class OnDemandCompactor implements Runnable
+-    {
+-        private ColumnFamilyStore columnFamilyStore_;
+-        private long skip_ = 0L;
+-
+-        OnDemandCompactor(ColumnFamilyStore columnFamilyStore, long skip)
+-        {
+-            columnFamilyStore_ = columnFamilyStore;
+-            skip_ = skip;
+-        }
+-
+-        public void run()
+-        {
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Started  Major compaction for " + columnFamilyStore_.columnFamily_);
+-            try
+-            {
+-                columnFamilyStore_.doMajorCompaction(skip_);
+-            }
+-            catch (IOException e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Finished Major compaction for " + columnFamilyStore_.columnFamily_);
+-        }
+-    }
+-
+-    static class CleanupCompactor implements Runnable
+-    {
+-        private ColumnFamilyStore columnFamilyStore_;
+-
+-        CleanupCompactor(ColumnFamilyStore columnFamilyStore)
+-        {
+-        	columnFamilyStore_ = columnFamilyStore;
+-        }
+-
+-        public void run()
+-        {
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Started  compaction ..."+columnFamilyStore_.columnFamily_);
+-            try
+-            {
+-                columnFamilyStore_.doCleanupCompaction();
+-            }
+-            catch (IOException e)
+-            {
+-                throw new RuntimeException(e);
+-            }
+-            if (logger_.isDebugEnabled())
+-              logger_.debug("Finished compaction ..."+columnFamilyStore_.columnFamily_);
+-        }
+-    }
+-    
+-    
+-    private ScheduledExecutorService compactor_ = new DebuggableScheduledThreadPoolExecutor(1, new ThreadFactoryImpl("MINOR-COMPACTION-POOL"));
+-
+-    /**
+-     * Call this whenever a compaction might be needed on the given columnfamily.
+-     * It's okay to over-call (within reason) since the compactions are single-threaded,
+-     * and if a call is unnecessary, it will just be no-oped in the bucketing phase.
+-     */
+-    public Future<Integer> submit(final ColumnFamilyStore columnFamilyStore)
+-    {
+-        return submit(columnFamilyStore, minimumCompactionThreshold_, maximumCompactionThreshold);
+-    }
+-
+-    Future<Integer> submit(final ColumnFamilyStore columnFamilyStore, final int minThreshold, final int maxThreshold)
+-    {
+-        Callable<Integer> callable = new Callable<Integer>()
+-        {
+-            public Integer call() throws IOException
+-            {
+-                return columnFamilyStore.doCompaction(minThreshold, maxThreshold);
+-            }
+-        };
+-        return compactor_.submit(callable);
+-    }
+-
+-    public void submitCleanup(ColumnFamilyStore columnFamilyStore)
+-    {
+-        compactor_.submit(new CleanupCompactor(columnFamilyStore));
+-    }
+-
+-    public Future<List<SSTableReader>> submit(ColumnFamilyStore columnFamilyStore, List<Range> ranges, EndPoint target)
+-    {
+-        return compactor_.submit( new FileCompactor2(columnFamilyStore, ranges, target) );
+-    }
+-
+-    public void  submitMajor(ColumnFamilyStore columnFamilyStore, long skip)
+-    {
+-        compactor_.submit( new OnDemandCompactor(columnFamilyStore, skip) );
+-    }
+-
+-    /**
+-     * Gets the minimum number of sstables in queue before compaction kicks off
+-     */
+-    public int getMinimumCompactionThreshold()
+-    {
+-        return minimumCompactionThreshold_;
+-    }
+-
+-    /**
+-     * Sets the minimum number of sstables in queue before compaction kicks off
+-     */
+-    public void setMinimumCompactionThreshold(int threshold)
+-    {
+-        minimumCompactionThreshold_ = threshold;
+-    }
+-
+-    /**
+-     * Gets the maximum number of sstables in queue before compaction kicks off
+-     */
+-    public int getMaximumCompactionThreshold()
+-    {
+-        return maximumCompactionThreshold;
+-    }
+-
+-    /**
+-     * Sets the maximum number of sstables in queue before compaction kicks off
+-     */
+-    public void setMaximumCompactionThreshold(int threshold)
+-    {
+-        maximumCompactionThreshold = threshold;
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 35a9165a..fb058250 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -486,7 +486,7 @@ public void forceCompaction()
+         {
+             ColumnFamilyStore cfStore = columnFamilyStores_.get( columnFamily );
+             if ( cfStore != null )
+-                MinorCompactionManager.instance().submitMajor(cfStore, 0);
++                CompactionManager.instance().submitMajor(cfStore, 0);
+         }
+     }
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index a5bb70ec..9bf3aa82 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -42,8 +42,8 @@
+ 
+ import org.apache.cassandra.concurrent.IExecutorMBean;
+ import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+-import org.apache.cassandra.db.MinorCompactionManager;
+-import org.apache.cassandra.db.MinorCompactionManagerMBean;
++import org.apache.cassandra.db.CompactionManager;
++import org.apache.cassandra.db.CompactionManagerMBean;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.net.EndPoint;
+ import org.apache.cassandra.service.StorageServiceMBean;
+@@ -74,7 +74,7 @@
+     private StorageServiceMBean ssProxy;
+     private MemoryMXBean memProxy;
+     private RuntimeMXBean runtimeProxy;
+-    private MinorCompactionManagerMBean mcmProxy;
++    private CompactionManagerMBean mcmProxy;
+ 
+     static
+     {
+@@ -159,8 +159,8 @@ private void connect() throws IOException
+         {
+             ObjectName name = new ObjectName(ssObjName);
+             ssProxy = JMX.newMBeanProxy(mbeanServerConn, name, StorageServiceMBean.class);
+-            name = new ObjectName(MinorCompactionManager.MBEAN_OBJECT_NAME);
+-            mcmProxy = JMX.newMBeanProxy(mbeanServerConn, name, MinorCompactionManagerMBean.class);
++            name = new ObjectName(CompactionManager.MBEAN_OBJECT_NAME);
++            mcmProxy = JMX.newMBeanProxy(mbeanServerConn, name, CompactionManagerMBean.class);
+         } catch (MalformedObjectNameException e)
+         {
+             throw new RuntimeException(
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CompactionsTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CompactionsTest.java
+index 1ab34e91..21924e49 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CompactionsTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CompactionsTest.java
+@@ -55,7 +55,7 @@ public void testCompactions() throws IOException, ExecutionException, Interrupte
+         }
+         while (true)
+         {
+-            Future<Integer> ft = MinorCompactionManager.instance().submit(store);
++            Future<Integer> ft = CompactionManager.instance().submit(store);
+             if (ft.get() == 0)
+                 break;
+         }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
+index 61df9b2f..3198f8bd 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
+@@ -46,7 +46,7 @@ private void testCompaction(String columnFamilyName, int insertsPerTable) throws
+             store.forceBlockingFlush();
+             assertEquals(inserted.size(), table.getColumnFamilyStore(columnFamilyName).getKeyRange("", "", 10000).keys.size());
+         }
+-        Future<Integer> ft = MinorCompactionManager.instance().submit(store, 2, 32);
++        Future<Integer> ft = CompactionManager.instance().submit(store, 2, 32);
+         ft.get();
+         assertEquals(1, store.getSSTables().size());
+         assertEquals(table.getColumnFamilyStore(columnFamilyName).getKeyRange("", "", 10000).keys.size(), inserted.size());
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+index e90e3e00..0d1887ea 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+@@ -57,7 +57,7 @@ public void testRemoveSuperColumn() throws IOException, ExecutionException, Inte
+         store.forceBlockingFlush();
+         validateRemoveTwoSources();
+ 
+-        Future<Integer> ft = MinorCompactionManager.instance().submit(store, 2, 32);
++        Future<Integer> ft = CompactionManager.instance().submit(store, 2, 32);
+         ft.get();
+         assertEquals(1, store.getSSTables().size());
+         validateRemoveCompacted();
+@@ -109,7 +109,7 @@ public void testRemoveSuperColumnWithNewData() throws IOException, ExecutionExce
+         store.forceBlockingFlush();
+         validateRemoveWithNewData();
+ 
+-        Future<Integer> ft = MinorCompactionManager.instance().submit(store, 2, 32);
++        Future<Integer> ft = CompactionManager.instance().submit(store, 2, 32);
+         ft.get();
+         assertEquals(1, store.getSSTables().size());
+         validateRemoveWithNewData();

@@ -1,0 +1,456 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/SQLExceptionFactory40.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/SQLExceptionFactory40.java
+index b5803fc2..fab45cec 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/SQLExceptionFactory40.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/SQLExceptionFactory40.java
+@@ -64,8 +64,7 @@ public SQLException getSQLException (String message, String sqlState,
+         SQLException ex = null;
+         if (sqlState == null) {
+             ex = new SQLException(message, sqlState, errCode); 
+-        } else if (sqlState.startsWith(SQLState.CONNECTIVITY_PREFIX) ||
+-            errCode >= ExceptionSeverity.SESSION_SEVERITY) {
++        } else if (sqlState.startsWith(SQLState.CONNECTIVITY_PREFIX)) {
+             //none of the sqlstate supported by derby belongs to
+             //TransientConnectionException. DERBY-3075
+             ex = new SQLNonTransientConnectionException(message, sqlState, errCode);
+@@ -77,8 +76,7 @@ public SQLException getSQLException (String message, String sqlState,
+         } else if (sqlState.startsWith(SQLState.AUTHORIZATION_SPEC_PREFIX)) {
+             ex = new SQLInvalidAuthorizationSpecException(message, sqlState,
+                     errCode);
+-        } else if (sqlState.startsWith(SQLState.TRANSACTION_PREFIX) ||
+-            errCode >= ExceptionSeverity.TRANSACTION_SEVERITY ) {
++        } else if (sqlState.startsWith(SQLState.TRANSACTION_PREFIX)) {
+             ex = new SQLTransactionRollbackException(message, sqlState,
+                     errCode);
+         } else if (sqlState.startsWith(SQLState.LSE_COMPILATION_PREFIX)) {
+@@ -95,7 +93,18 @@ public SQLException getSQLException (String message, String sqlState,
+                     errCode);
+         } else if (sqlState.equals(SQLState.LANG_STATEMENT_CANCELLED_OR_TIMED_OUT.substring(0, 5))) {
+             ex = new SQLTimeoutException(message, sqlState, errCode);
+-        } else {
++        }
++        // If the sub-class cannot be determined based on the SQLState, use
++        // the severity instead.
++        else if (errCode >= ExceptionSeverity.SESSION_SEVERITY) {
++            ex = new SQLNonTransientConnectionException(
++                    message, sqlState, errCode);
++        } else if (errCode >= ExceptionSeverity.TRANSACTION_SEVERITY) {
++            ex = new SQLTransactionRollbackException(
++                    message, sqlState, errCode);
++        }
++        // If none of the above fit, return a plain SQLException.
++        else {
+             ex = new SQLException(message, sqlState, errCode); 
+         }
+         return ex;
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/SqlException.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/SqlException.java
+index 773f3583..0ade8828 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/SqlException.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/SqlException.java
+@@ -259,7 +259,7 @@ public SqlException(LogWriter logWriter, Sqlca sqlca) {
+         this(sqlca, 0, true);
+         // only set the error code for the first exception in the chain (we
+         // don't know the error code for the rest)
+-        errorcode_ = sqlca.getSqlCode();
++        errorcode_ = sqlca.getErrorCode();
+         if ( logWriter != null )
+         {
+             logWriter.traceDiagnosable(this);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
+index d98f5a01..f1dfc0e4 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Sqlca.java
+@@ -22,8 +22,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ package org.apache.derby.client.am;
+ 
+ import java.sql.DataTruncation;
+-import org.apache.derby.shared.common.reference.SQLState;
+ import org.apache.derby.client.net.Typdef;
++import org.apache.derby.shared.common.error.ExceptionSeverity;
++import org.apache.derby.shared.common.reference.SQLState;
+ 
+ public abstract class Sqlca {
+     transient protected Connection connection_;
+@@ -99,6 +100,44 @@ synchronized public int getSqlCode() {
+         return sqlCode_;
+     }
+ 
++    /**
++     * <p>
++     * Get the error code based on the SQL code received from the server.
++     * </p>
++     *
++     * <p>
++     * The conversion from SQL code to error code happens like this:
++     * </p>
++     *
++     * <ul>
++     * <li>If the SQL code is 0, there is no error code because the Sqlca
++     * doesn't represent an error. Return 0.</li>
++     * <li>If the SQL code is positive, the Sqlca represents a warning, and
++     * the SQL code represents the actual error code. Return the SQL code.</li>
++     * <li>If the SQL code is negative, the Sqlca represents an error, and
++     * the error code is {@code -(sqlCode+1)}.</li>
++     * </ul>
++     *
++     * @see org.apache.derby.impl.drda.DRDAConnThread#getSqlCode(java.sql.SQLException)
++     */
++    public synchronized int getErrorCode() {
++        // Warning or other non-error, return SQL code.
++        if (sqlCode_ >= 0) return sqlCode_;
++
++        // Negative SQL code means it is an error. Transform into a positive
++        // error code.
++        int errorCode = -(sqlCode_ + 1);
++
++        // In auto-commit mode, the embedded driver promotes statement
++        // severity to transaction severity. Do the same here to match.
++        if (errorCode == ExceptionSeverity.STATEMENT_SEVERITY &&
++                connection_ != null && connection_.autoCommit_) {
++            errorCode = ExceptionSeverity.TRANSACTION_SEVERITY;
++        }
++
++        return errorCode;
++    }
++
+     synchronized public String getSqlErrmc() {
+         if (sqlErrmc_ != null) {
+             return sqlErrmc_;
+@@ -320,22 +359,22 @@ synchronized String getJDBCMessage(int messageNumber) {
+      * @return string with details about the error
+      */
+     private String getUnformattedMessage(int messageNumber) {
+-        int sqlCode;
++        int errorCode;
+         String sqlState;
+         String sqlErrmc;
+         if (messageNumber == 0) {
+             // if the first exception in the chain is requested, return all the
+             // information we have
+-            sqlCode = getSqlCode();
++            errorCode = getErrorCode();
+             sqlState = getSqlState();
+             sqlErrmc = getSqlErrmc();
+         } else {
+             // otherwise, return information about the specified error only
+-            sqlCode = 0;
++            errorCode = 0;
+             sqlState = sqlStates_[messageNumber];
+             sqlErrmc = sqlErrmcMessages_[messageNumber];
+         }
+-        return "DERBY SQL error: SQLCODE: " + sqlCode + ", SQLSTATE: " +
++        return "DERBY SQL error: ERRORCODE: " + errorCode + ", SQLSTATE: " +
+             sqlState + ", SQLERRMC: " + sqlErrmc;
+     }
+ 
+diff --git a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+index ac598717..48c88d82 100644
+--- a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
++++ b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+@@ -720,7 +720,7 @@ private void cleanUpAndCloseResultSet(DRDAStatement stmt,
+                     }
+                 }
+                 writeABNUOWRM();
+-                writeSQLCARD(sqle, CodePoint.SVRCOD_ERROR, 0, 0);
++                writeSQLCARD(sqle, 0, 0);
+             }
+         } else {
+             writeSQLCARDs(sqle, 0);
+@@ -812,7 +812,7 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLWarning w)
+ 					{
+-						writeSQLCARD(w, CodePoint.SVRCOD_WARNING, 0, 0);
++						writeSQLCARD(w, 0, 0);
+ 					}
+ 					catch (SQLException e)
+ 					{
+@@ -1298,7 +1298,7 @@ private void writeRDBfailure(int codePoint) throws DRDAProtocolException
+     			writer.endDss();
+     		case CodePoint.RDBNFNRM:
+     		case CodePoint.RDBATHRM:
+-    			writeSQLCARD(databaseAccessException,CodePoint.SVRCOD_ERROR,0,0);
++    			writeSQLCARD(databaseAccessException, 0, 0);
+     		case CodePoint.RDBACCRM:
+     			//Ignore anything that was chained to the ACCRDB.
+     			skipRemainder(false);
+@@ -5867,10 +5867,9 @@ private void writeSQLCARDs(SQLException e, int updateCount, boolean sendSQLERRRM
+ 									throws DRDAProtocolException
+ 	{
+ 
+-		int severity = CodePoint.SVRCOD_INFO;
+ 		if (e == null)
+ 		{
+-			writeSQLCARD(e,severity, updateCount, 0);
++			writeSQLCARD(e, updateCount, 0);
+ 			return;
+ 		}
+ 
+@@ -5878,7 +5877,7 @@ private void writeSQLCARDs(SQLException e, int updateCount, boolean sendSQLERRRM
+ 		// jcc/db2 limitation, see beetle 4629
+ 
+ 		// If it is a real SQL Error write a SQLERRRM first
+-		severity = getExceptionSeverity(e);
++		int severity = getExceptionSeverity(e);
+ 		if (severity > CodePoint.SVRCOD_ERROR)
+ 		{
+ 			// For a session ending error > CodePoint.SRVCOD_ERROR you cannot
+@@ -5892,20 +5891,58 @@ else if (sendSQLERRRM)
+ 		{
+ 			writeSQLERRRM(severity);
+ 		}
+-		writeSQLCARD(e,severity, updateCount, 0);
++		writeSQLCARD(e, updateCount, 0);
+ 	}
+ 
+-	private int getSqlCode(int severity)
++    /**
++     * <p>
++     * Get the SQLCODE to send for an exception or a warning.
++     * </p>
++     *
++     * <p>
++     * The client expects a negative SQLCODE for exceptions and a positive
++     * SQLCODE for warnings. SQLCODE 0 means there is no error or warning
++     * condition. SQLCODE is also used to encode the severity of the condition
++     * (as returned by {@code SQLException.getErrorCode()}).
++     * </p>
++     *
++     * <p>
++     * For warnings, the SQLCODE is 10000, which is identical to
++     * {@link ExceptionSeverity#WARNING_SEVERITY}.
++     * </p>
++     *
++     * <p>
++     * For exceptions, the SQLCODE is set to {@code -severity-1}, which allows
++     * all non-negative severity values to be encoded. (Derby only uses
++     * non-negative severity values in the first place.)
++     * </p>
++     *
++     * @param e the exception or warning to get the SQLCODE for
++     * @return the value to send as SQLCODE
++     */
++    private int getSqlCode(SQLException e)
+ 	{
+-		if (severity == CodePoint.SVRCOD_WARNING)		// warning
+-			return 100;		//CLI likes it
+-		else if (severity == CodePoint.SVRCOD_INFO)             
+-			return 0;
+-		else
+-			return -1;
++        if (e == null) return 0;
++
++        // All SQLWarnings should have warning severity. However,
++        // DataTruncation conditions for write operations (with SQL state
++        // 22001) are thrown as exceptions, even though DataTruncation
++        // technically is a sub-class of SQLWarning.
++        if (e instanceof SQLWarning &&
++                !SQLState.LANG_STRING_TRUNCATION.equals(e.getSQLState())) {
++            return ExceptionSeverity.WARNING_SEVERITY;
+ 	}
+ 
+-	private void writeSQLCARD(SQLException e,int severity, 
++        // The exception represents an error condition, so encode the severity
++        // as a negative value in the SQLCODE. Negative severity values are
++        // changed to 0 (NO_APPLICABLE_SEVERITY).
++        int severity =
++                Math.max(ExceptionSeverity.NO_APPLICABLE_SEVERITY,
++                         e.getErrorCode());
++        return -severity - 1;
++	}
++
++	private void writeSQLCARD(SQLException e,
+ 		int updateCount, long rowCount ) throws DRDAProtocolException
+ 	{
+ 		writer.createDssObject();
+@@ -6046,7 +6083,7 @@ private int getExceptionSeverity (SQLException e)
+     private void writeSQLCAGRP(SQLException e, int updateCount, long rowCount)
+         throws DRDAProtocolException
+ 	{
+-        int sqlcode = 0;
++        int sqlcode = getSqlCode(e);
+ 
+         if (e == null) {
+             // Forwarding to the optimized version when there is no
+@@ -6055,19 +6092,6 @@ private void writeSQLCAGRP(SQLException e, int updateCount, long rowCount)
+             return;
+         }
+ 
+-        // SQLWarnings should have warning severity, except if it's a
+-        // DataTruncation warning for write operations (with SQLState 22001),
+-        // which is supposed to be used as an exception even though it's a
+-        // sub-class of SQLWarning.
+-        if (e instanceof SQLWarning &&
+-                !SQLState.LANG_STRING_TRUNCATION.equals(e.getSQLState())) {
+-            sqlcode = ExceptionSeverity.WARNING_SEVERITY;
+-        } else {
+-            // Get the SQLCODE for exceptions. Note that this call will always
+-            // return -1, so the real error code will be lost.
+-            sqlcode = getSqlCode(getExceptionSeverity(e));
+-        }
+-
+ 		if (rowCount < 0 && updateCount < 0)
+ 		{
+ 			writer.writeByte(CodePoint.NULLDATA);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/BadConnectionTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/BadConnectionTest.java
+index 53619687..0128ef4b 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/BadConnectionTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/BadConnectionTest.java
+@@ -57,7 +57,7 @@ public void testNoUserOrPassword()
+             fail("Connection with no user or password succeeded");
+ 		} catch (SQLException e) {
+ 			assertSQLState("08004", e);
+-			assertEquals(40000, e.getErrorCode());
++            assertErrorCode(40000, e);
+ 		}
+ 	}
+ 	
+@@ -78,7 +78,7 @@ public void testDatabaseNotFound()
+ 		} catch (SQLException e)
+ 		{
+ 			assertSQLState("08004", e);
+-			assertEquals(40000, e.getErrorCode());
++            assertErrorCode(40000, e);
+ 		}
+ 	}
+ 	
+@@ -99,7 +99,7 @@ public void testBadConnectionAttribute()
+ 		} catch (SQLException e)
+ 		{
+ 			assertSQLState("XJ05B", e);
+-			assertEquals(-1, e.getErrorCode());
++            assertErrorCode(40000, e);
+ 		}
+ 	}
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
+index 0a9e5d3a..eb31912e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
+@@ -3425,7 +3425,7 @@ else if (usingDerbyNetClient())
+         // HOLDABLE Statement in global xact " 
+         assertEquals(ResultSet.CLOSE_CURSORS_AT_COMMIT, 
+             s.getResultSetHoldability());
+-        assertEquals(10000, conn.getWarnings().getErrorCode());
++        assertErrorCode(10000, conn.getWarnings());
+         shxa.close();
+ 
+         shxa = conn.prepareStatement("select id from hold_30",
+@@ -3434,7 +3434,7 @@ else if (usingDerbyNetClient())
+         // HOLDABLE PreparedStatement in global xact 
+         assertEquals(ResultSet.CLOSE_CURSORS_AT_COMMIT,
+             s.getResultSetHoldability());
+-        assertEquals(10000, conn.getWarnings().getErrorCode());
++        assertErrorCode(10000, conn.getWarnings());
+         shxa.close();
+ 
+         shxa = conn.prepareCall("CALL SYSCS_UTIL.SYSCS_CHECKPOINT_DATABASE()",
+@@ -3443,7 +3443,7 @@ else if (usingDerbyNetClient())
+         // HOLDABLE CallableStatement in global xact:
+         assertEquals(ResultSet.CLOSE_CURSORS_AT_COMMIT,
+             s.getResultSetHoldability());
+-        assertEquals(10000, conn.getWarnings().getErrorCode());
++        assertErrorCode(10000, conn.getWarnings());
+         shxa.close();
+ 
+         // check we can use a holdable statement set up in local mode.
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorCodeTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorCodeTest.java
+index 69d23d58..a05c7b98 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorCodeTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ErrorCodeTest.java
+@@ -48,7 +48,7 @@ public static Test suite()
+     {
+         TestSuite suite = new TestSuite("errorcode Test");
+         
+-        suite.addTest(TestConfiguration.embeddedSuite(ErrorCodeTest.class));
++        suite.addTest(TestConfiguration.defaultSuite(ErrorCodeTest.class));
+         
+         return new LocaleTestSetup(suite, Locale.ENGLISH);
+     }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ReplicationRun.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ReplicationRun.java
+index 400998f9..afa4b56e 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ReplicationRun.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ReplicationRun.java
+@@ -370,7 +370,7 @@ void connectPing(String fullDbPath,
+                 lastmsg = errCode + " " + sState + " " + lastmsg 
+                         + ". Expected: "+ expectedState;
+                 util.DEBUG("Got SQLException: " + lastmsg);
+-                if ( (errCode == -1)
++                if ( (errCode == 40000)
+                 && (sState.equalsIgnoreCase(expectedState) ) )
+                 {
+                     if (count++ >= 600) {
+@@ -1019,7 +1019,7 @@ private void startMaster_direct(String dbName,
+                     String expectedState = "XRE04";
+                     util.DEBUG("startMaster Got SQLException: " 
+                             + errCode + " " + sState + " " + msg + ". Expected " + expectedState);
+-                    if ( (errCode == -1)
++                    if ( (errCode == 40000)
+                     && (sState.equalsIgnoreCase(expectedState) ) )
+                     {
+                         if (count++ > 1200) {
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownMaster.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownMaster.java
+index e80e7041..4a522076 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownMaster.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownMaster.java
+@@ -144,8 +144,9 @@ else if ( url == null )
+                         String msg = se.getMessage();
+                         String state = se.getSQLState();
+                         String expectedState = (dbOnly)? "08006": "XJ015";
++                        int expectedCode = dbOnly ? 45000 : 50000;
+                         System.out.println("shutdown Got SQLException: " + errCode + " " + state + " " + msg);
+-                        if ( (errCode == -1)
++                        if ( (errCode == expectedCode)
+                         && (state.equalsIgnoreCase(expectedState) ) )
+                         {
+                             System.out.println("As expected.");
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownSlave.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownSlave.java
+index 5ba97f0b..f4105444 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownSlave.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/replicationTests/ShutdownSlave.java
+@@ -168,8 +168,9 @@ else if (url == null )
+                         String msg = se.getMessage();
+                         String state = se.getSQLState();
+                         String expectedState = (dbOnly)? "08004": "XJ015";
++                        int expectedCode = dbOnly ? 45000 : 50000;
+                         System.out.println("shutdown Got SQLException: " + errCode + " " + state + " " + msg);
+-                        if ( (errCode == -1)
++                        if ( (errCode == expectedCode)
+                         && (state.equalsIgnoreCase(expectedState) ) )
+                         {
+                             System.out.println("As expected.");
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseJDBCTestCase.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseJDBCTestCase.java
+index 2f0f2cdc..e6a90700 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseJDBCTestCase.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/junit/BaseJDBCTestCase.java
+@@ -896,6 +896,22 @@ public static void assertSQLState(String expected, SQLException exception) {
+         assertSQLState("Unexpected SQL state.", expected, exception);
+     }
+     
++    /**
++     * Assert that the error code is as expected.
++     *
++     * @param expected the expected error code
++     * @param exception the exception to check
++     * @throws AssertionFailedError if the error code is wrong
++     */
++    public static void assertErrorCode(int expected, SQLException exception) {
++        assertNotNull("Exception should not be null", exception);
++        int actual = exception.getErrorCode();
++        if (actual != expected) {
++            fail("Expected error code " + expected + ", got " + actual,
++                 exception);
++        }
++    }
++
+     /**
+      * Assert that the SQL statement does not compile and throws
+      * a SQLException with the expected state.
+@@ -1144,7 +1160,7 @@ public static void assertStatementError(String sqlState, int errorCode, Statemen
+                 "' but no error was thrown.");
+         } catch (SQLException se) {
+             assertSQLState(sqlState, se);
+-            assertEquals(errorCode,se.getErrorCode());
++            assertErrorCode(errorCode, se);
+         }
+         
+     }

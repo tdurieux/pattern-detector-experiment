@@ -1,0 +1,247 @@
+diff --git a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+index 7a2ca141..c4a6c286 100644
+--- a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
++++ b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+@@ -2340,8 +2340,11 @@ private void writeOPNQRYRM(boolean isDssObject, DRDAStatement stmt)
+ 			trace("sending QRYPRCTYP: " + prcType);
+ 		writer.writeScalar2Bytes(CodePoint.QRYPRCTYP, prcType);
+ 
+-		//pass the SQLCSRHLD codepoint only if statement has hold cursors over commit set
+-		if (stmt.withHoldCursor == JDBC30Translation.HOLD_CURSORS_OVER_COMMIT)
++		//pass the SQLCSRHLD codepoint only if statement producing the ResultSet has 
++		//hold cursors over commit set. In case of stored procedures which use server-side
++		//JDBC, the holdability of the ResultSet will be the holdability of the statement 
++		//in the stored procedure, not the holdability of the calling statement.
++		if (stmt.getCurrentDrdaResultSet().withHoldCursor == JDBC30Translation.HOLD_CURSORS_OVER_COMMIT)
+ 			writer.writeScalar1Byte(CodePoint.SQLCSRHLD, CodePoint.TRUE);
+ 		if (sqlamLevel >= MGRLVL_7)
+ 		{
+diff --git a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAStatement.java b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+index 03c18220..c8f084a2 100644
+--- a/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
++++ b/db/derby/code/branches/10.1/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+@@ -274,6 +274,38 @@ protected int getResultSetHoldability() throws SQLException
+ 		return holdValue;
+ 	}
+ 
++	/**
++	 *
++	 *  get resultSetHoldability with reflection. 
++	 *  We need to use reflection so we can use hold cursors with 1.3.1. 
++	 *  And also since our statement might be a BrokeredStatement.
++	 * 
++	 * @param rs ResultSet 
++	 * @return the resultSet holdability for the prepared statement
++	 *
++	 */
++	protected int getResultSetHoldability(ResultSet rs) throws SQLException
++	{
++		Statement rsstmt = null;
++		int holdValue = -1;
++
++		if (rs  != null)
++			rsstmt = rs.getStatement();
++		else
++			rsstmt = getPreparedStatement();
++				
++		Class[] getResultSetHoldabilityParam  = {};
++		try {
++			Method sh =
++				rsstmt.getClass().getMethod("getResultSetHoldability", getResultSetHoldabilityParam);
++			holdValue =  ((Integer) sh.invoke(rsstmt,null)).intValue();
++		}
++		catch (Exception e) {
++			handleReflectionException(e);
++		}
++		return holdValue;
++	}	
++
+ 	/*
+ 	 * Is lob object nullable
+ 	 * @param index - offset starting with 0
+@@ -540,7 +572,11 @@ protected boolean execute() throws SQLException
+ 			rs = ps.getResultSet();
+ 			if (rs !=null)
+ 			{
+-				addResultSet(rs);
++				//For callable statement, get holdability of statement generating the result set
++				if(isCallable)
++					addResultSet(rs,getResultSetHoldability(rs));
++				else
++					addResultSet(rs,withHoldCursor);
+ 				hasResultSet = true;
+ 			}
+ 			// For normal selects we are done, but procedures might
+@@ -707,6 +743,16 @@ protected void setResultSet(ResultSet value) throws SQLException
+ 		setRsDefaultOptions(currentDrdaRs);
+ 	}
+ 
++	/**
++	 * Gets the current DRDA ResultSet
++	 * 
++	 * @return DRDAResultSet
++	 */
++	protected DRDAResultSet getCurrentDrdaResultSet()
++	{
++		return currentDrdaRs ;
++	}
++
+ 	/**
+  	 * Set currentDrdaResultSet 
+ 	 *
+@@ -785,11 +831,12 @@ private String extractPkgcnstknStr(String pkgnamcsn)
+ 	 * Set as the current result set if  there is not an 
+ 	 * existing current resultset.
+ 	 * @param value - ResultSet to add
++	 * @param holdValue - Holdability of the ResultSet 
+ 	 * @return    Consistency token  for this resultSet
+ 	 *            For a single resultSet that is the same as the statement's 
+ 	 *            For multiple resultSets just the consistency token is changed 
+ 	 */
+-	protected String  addResultSet(ResultSet value) throws SQLException
++	protected String  addResultSet(ResultSet value, int holdValue) throws SQLException
+ 	{
+ 
+ 		DRDAResultSet newDrdaRs = null;
+@@ -822,6 +869,7 @@ protected String  addResultSet(ResultSet value) throws SQLException
+ 
+ 		newDrdaRs.setResultSet(value);
+ 		newDrdaRs.setPkgcnstknStr(newRsPkgcnstknStr);
++		newDrdaRs.withHoldCursor = holdValue;
+ 		setRsDefaultOptions(newDrdaRs);
+ 		newDrdaRs.suspend();
+ 		numResultSets++;
+diff --git a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/holdCursorJava.java b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/holdCursorJava.java
+index 58ff9d94..e94e3e88 100644
+--- a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/holdCursorJava.java
++++ b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/holdCursorJava.java
+@@ -22,6 +22,7 @@
+ 
+ import java.sql.CallableStatement;
+ import java.sql.Connection;
++import java.sql.DriverManager;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.ResultSetMetaData;
+@@ -50,6 +51,8 @@ public static void main (String args[])
+ 
+     //set autocommit to off after creating table and inserting data
+     conn.setAutoCommit(false);
++    testHoldability(conn,ResultSet.HOLD_CURSORS_OVER_COMMIT);
++    testHoldability(conn,ResultSet.CLOSE_CURSORS_AT_COMMIT);
+ 		testHoldCursorOnMultiTableQuery(conn);
+ 		testIsolationLevelChange(conn);
+ 
+@@ -73,6 +76,12 @@ private static void createAndPopulateTable(Connection conn) throws SQLException
+     stmt.executeUpdate("INSERT INTO T2 VALUES(1,1)");
+     stmt.executeUpdate("INSERT INTO T2 VALUES(1,2)");
+     stmt.executeUpdate("INSERT INTO T2 VALUES(1,3)");
++    stmt.execute("create table testtable1 (id integer, vc varchar(100))");
++    stmt.execute("insert into testtable1 values (11, 'testtable1-one'), (12, 'testtable1-two')");
++    stmt.execute("create table testtable2 (id integer, vc varchar(100))");
++    stmt.execute("insert into testtable2 values (21, 'testtable2-one'), (22, 'testtable2-two')");
++    stmt.execute("create procedure MYPROC() language java parameter style java external name " +
++    				"'org.apache.derbyTesting.functionTests.tests.lang.holdCursorJava.testProc' result sets 2");
+     System.out.println("done creating table and inserting data.");
+ 
+     stmt.close();
+@@ -189,4 +198,99 @@ private static void testIsolationLevelChange(Connection conn) throws Exception
+ 	conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
+   }
+ 
++	//set connection holdability and test holdability of statements inside and outside procedures
++	//test that holdability of statements always overrides holdability of connection
++	private static void testHoldability(Connection conn,int holdability) throws SQLException{
++		
++		conn.setHoldability(holdability);
++		
++		switch(holdability){
++			case ResultSet.HOLD_CURSORS_OVER_COMMIT:
++				System.out.println("\ntestHoldability with HOLD_CURSORS_OVER_COMMIT\n");
++				break;
++			case ResultSet.CLOSE_CURSORS_AT_COMMIT:
++				System.out.println("\ntestHoldability with CLOSE_CURSORS_AT_COMMIT\n");
++				break;
++		}
++	
++		testStatements(conn);
++	  	testStatementsInProcedure(conn);
++	}
++	
++	//test holdability of statements outside procedures
++	private static void testStatements(Connection conn) throws SQLException{
++	    System.out.println("\ntestStatements()\n");
++		
++		//HOLD_CURSORS_OVER_COMMIT
++		Statement st1 = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE ,
++					ResultSet.CONCUR_READ_ONLY, ResultSet.HOLD_CURSORS_OVER_COMMIT);
++		ResultSet rs1 = st1.executeQuery("select * from testtable1");
++		checkResultSet(rs1, "before");
++		conn.commit();
++		checkResultSet(rs1, "after");
++		st1.close();
++		
++		//CLOSE_CURSORS_AT_COMMIT
++		Statement st2 = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE ,
++					ResultSet.CONCUR_READ_ONLY, ResultSet.CLOSE_CURSORS_AT_COMMIT);
++		ResultSet rs2 = st2.executeQuery("select * from testtable2");
++		checkResultSet(rs2, "before");
++		conn.commit();
++		checkResultSet(rs2, "after");
++		st2.close();
++	 }
++	
++	//test holdability of statements in procedures
++	private static void testStatementsInProcedure(Connection conn) throws SQLException{
++		System.out.println("\ntestStatementsInProcedure()\n");
++		
++		CallableStatement cs1 = conn.prepareCall("call MYPROC()");
++		cs1.execute();
++		do{
++			checkResultSet(cs1.getResultSet(), "before");
++		}while(cs1.getMoreResults());
++				
++		CallableStatement cs2 = conn.prepareCall("call MYPROC()");
++		cs2.execute();
++		conn.commit();
++		do{
++			checkResultSet(cs2.getResultSet(),"after");
++		}while(cs2.getMoreResults());
++		
++		cs1.close();
++		cs2.close();
++	}
++	
++	//check if resultset is accessible 
++	private static void checkResultSet(ResultSet rs, String beforeOrAfter) throws SQLException{
++		System.out.println("checkResultSet "+ beforeOrAfter  + " commit");
++	    try{
++	    	if(rs != null){
++	    		rs.next();
++	    		System.out.println(rs.getString(1) + ", " + rs.getString(2));
++	    	}
++	    	else{
++	    		System.out.println("EXPECTED:ResultSet is null");
++	    	}
++	  	} catch(SQLException se){
++	  		System.out.println("EXPECTED EXCEPTION:"+se.getMessage());
++	  	}
++	}
++	  
++	//Java method for stored procedure
++	public static void testProc(ResultSet[] rs1, ResultSet[] rs2) throws Exception
++	{
++		Connection conn = DriverManager.getConnection("jdbc:default:connection");
++		
++		//HOLD_CURSORS_OVER_COMMIT
++		Statement st1 = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE ,
++					ResultSet.CONCUR_READ_ONLY, ResultSet.HOLD_CURSORS_OVER_COMMIT);
++		rs1[0] = st1.executeQuery("select * from testtable1");
++
++		//CLOSE_CURSORS_AT_COMMIT
++		Statement st2 = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE ,
++					ResultSet.CONCUR_READ_ONLY, ResultSet.CLOSE_CURSORS_AT_COMMIT);
++		rs2[0] = st2.executeQuery("select * from testtable2");
++
++	}
+ }

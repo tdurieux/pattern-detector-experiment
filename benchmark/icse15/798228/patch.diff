@@ -1,0 +1,369 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index f7349575..7f02142a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -56,7 +56,6 @@
+     private static int replicationFactor_ = 3;
+     private static long rpcTimeoutInMillis_ = 2000;
+     private static Set<String> seeds_ = new HashSet<String>();
+-    private static String snapshotDirectory_;
+     /* Keeps the list of data file directories */
+     private static String[] dataFileDirectories_;
+     /* Current index into the above list of directories */
+@@ -233,11 +232,6 @@
+                 columnIndexSizeInKB_ = Integer.parseInt(columnIndexSizeInKB);
+             }
+ 
+-            /* snapshot directory */
+-            snapshotDirectory_ = xmlUtils.getNodeValue("/Storage/SnapshotDirectory");
+-            if ( snapshotDirectory_ != null )
+-                FileUtils.createDirectory(snapshotDirectory_);
+-
+             /* data file directory */
+             dataFileDirectories_ = xmlUtils.getNodeValues("/Storage/DataFileDirectories/DataFileDirectory");
+             if (dataFileDirectories_.length == 0)
+@@ -682,21 +676,18 @@ public static int getThreadsPerPool()
+         return threadsPerPool_;
+     }
+ 
+-    public static String getSnapshotDirectory()
+-    {
+-        return snapshotDirectory_;
+-    }
+-
+-    public static void setSnapshotDirectory(String snapshotDirectory)
+-    {
+-    	snapshotDirectory_ = snapshotDirectory;
+-    }
+-
+     public static String[] getAllDataFileLocations()
+     {
+         return dataFileDirectories_;
+     }
+ 
++    /**
++     * Get a list of data directories for a given table
++     * 
++     * @param table name of the table.
++     * 
++     * @return an array of path to the data directories. 
++     */
+     public static String[] getAllDataFileLocationsForTable(String table)
+     {
+         String[] tableLocations = new String[dataFileDirectories_.length];
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index aa51960a..4e8a07a5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1522,6 +1522,37 @@ public AbstractType getComparator()
+         return DatabaseDescriptor.getComparator(table_, columnFamily_);
+     }
+ 
++    /**
++     * Take a snap shot of this columnfamily store.
++     * 
++     * @param snapshotName the name of the associated with the snapshot 
++     */
++    public void snapshot(String snapshotName) throws IOException
++    {
++        sstableLock_.readLock().lock();
++        try
++        {
++            for (String filename : new ArrayList<String>(ssTables_.keySet()))
++            {
++                File sourceFile = new File(filename);
++
++                File dataDirectory = sourceFile.getParentFile().getParentFile();
++                String snapshotDirectoryPath = Table.getSnapshotPath(dataDirectory.getAbsolutePath(), table_, snapshotName);
++                FileUtils.createDirectory(snapshotDirectoryPath);
++
++                File targetLink = new File(snapshotDirectoryPath, sourceFile.getName());
++                FileUtils.createHardLink(new File(filename), targetLink);
++                if (logger_.isDebugEnabled())
++                    logger_.debug("Snapshot for " + table_ + " table data file " + sourceFile.getAbsolutePath() +    
++                        " created as " + targetLink.getAbsolutePath());
++            }
++        }
++        finally
++        {
++            sstableLock_.readLock().unlock();
++        }
++    }
++
+     /**
+      * for testing.  no effort is made to clear historical memtables.
+      */
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 93d58c6f..561b82e3 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -56,6 +56,7 @@
+     public static final String SYSTEM_TABLE = "system";
+ 
+     private static Logger logger_ = Logger.getLogger(Table.class);
++    private static final String SNAPSHOT_SUBDIR_NAME = "snapshots";
+ 
+     /*
+      * This class represents the metadata of this Table. The metadata
+@@ -403,14 +404,45 @@ public void forceCleanup()
+         }   
+     }
+     
+-    /*
+-     * Clear the existing snapshots in the system
++    
++    /**
++     * Take a snapshot of the entire set of column families with a given timestamp.
++     * 
++     * @param clientSuppliedName the tag associated with the name of the snapshot.  This
++     *                           value can be null.
+      */
+-    public void clearSnapshot()
++    public void snapshot(String clientSuppliedName) throws IOException
+     {
+-    	String snapshotDir = DatabaseDescriptor.getSnapshotDirectory();
+-    	File snapshot = new File(snapshotDir);
+-    	FileUtils.deleteDir(snapshot);
++        String snapshotName = Long.toString(System.currentTimeMillis());
++        if (clientSuppliedName != null && !clientSuppliedName.equals(""))
++        {
++            snapshotName = snapshotName + "-" + clientSuppliedName;
++        }
++
++        for (ColumnFamilyStore cfStore : columnFamilyStores_.values())
++        {
++            cfStore.snapshot(snapshotName);
++        }
++    }
++
++
++    /**
++     * Clear all the snapshots for a given table.
++     */
++    public void clearSnapshot() throws IOException
++    {
++        for (String dataDirPath : DatabaseDescriptor.getAllDataFileLocations())
++        {
++            String snapshotPath = dataDirPath + File.separator + table_ + File.separator + SNAPSHOT_SUBDIR_NAME;
++            File snapshotDir = new File(snapshotPath);
++            if (snapshotDir.exists())
++    {
++                if (logger_.isDebugEnabled())
++                    logger_.debug("Removing snapshot directory " + snapshotPath);
++                if (!FileUtils.deleteDir(snapshotDir))
++                    throw new IOException("Could not clear snapshot directory " + snapshotPath);
++            }
++        }
+     }
+     
+     /*
+@@ -729,4 +761,8 @@ protected String getReduced()
+         }
+     }
+ 
++    public static String getSnapshotPath(String dataDirPath, String tableName, String snapshotName)
++    {
++        return dataDirPath + File.separator + tableName + File.separator + SNAPSHOT_SUBDIR_NAME + File.separator + snapshotName;
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 043f5fb7..23193961 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -734,6 +734,50 @@ public void forceHandoff(List<String> dataDirectories, String host) throws IOExc
+         }
+     }
+ 
++    /**
++     * Takes the snapshot for a given table.
++     * 
++     * @param table the name of the table.
++     * @param tag   the tag given to the snapshot (null is permissible)
++     */
++    public void takeSnapshot(String tableName, String tag) throws IOException
++    {
++    	if (DatabaseDescriptor.getTable(tableName) == null)
++        {
++            throw new IOException("Table " + tableName + "does not exist");
++    	}
++        Table tableInstance = Table.open(tableName);
++        tableInstance.snapshot(tag);
++    }
++    
++    /**
++     * Takes a snapshot for every table.
++     * 
++     * @param tag the tag given to the snapshot (null is permissible)
++     */
++    public void takeAllSnapshot(String tag) throws IOException
++    {
++    	for (String tableName: DatabaseDescriptor.getTables())
++        {
++            Table tableInstance = Table.open(tableName);
++            tableInstance.snapshot(tag);
++    	}
++    }
++
++    /**
++     * Remove all the existing snapshots.
++     */
++    public void clearSnapshot() throws IOException
++    {
++    	for (String tableName: DatabaseDescriptor.getTables())
++        {
++            Table tableInstance = Table.open(tableName);
++            tableInstance.clearSnapshot();
++    	}
++        if (logger_.isDebugEnabled())
++            logger_.debug("Cleared out all snapshot directories");
++    }
++
+     /* End of MBean interface methods */
+     
+     /**
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 67e60511..2fa16565 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -66,4 +66,24 @@
+      * @param target endpoint receiving data.
+     */
+     public void forceHandoff(List<String> directories, String target) throws IOException;
++
++    /**
++     * Takes the snapshot for a given table.
++     * 
++     * @param tableName the name of the table.
++     * @param tag       the tag given to the snapshot (null is permissible)
++     */
++    public void takeSnapshot(String tableName, String tag) throws IOException;
++
++    /**
++     * Takes a snapshot for every table.
++     * 
++     * @param tag the tag given to the snapshot (null is permissible)
++     */
++    public void takeAllSnapshot(String tag) throws IOException;
++
++    /**
++     * Remove all the existing snapshots.
++     */
++    public void clearSnapshot() throws IOException;
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index e699d1ba..bd715090 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -425,6 +425,24 @@ public void printInfo(PrintStream outs)
+         outs.println(String.format("%-17s: %.2f / %.2f", "Heap Memory (MB)", memUsed, memMax));
+     }
+     
++    /**
++     * Take a snapshot of all the tables.
++     * 
++     * @param snapshotName the name of the snapshot.
++     */
++    public void takeSnapshot(String snapshotName) throws IOException
++    {
++        ssProxy.takeAllSnapshot(snapshotName);
++    }
++
++    /**
++     * Remove all the existing snapshots.
++     */
++    public void clearSnapshot() throws IOException
++    {
++        ssProxy.clearSnapshot();
++    }
++
+     /**
+      * Retrieve any non-option arguments passed on the command line.
+      * 
+@@ -454,7 +472,7 @@ private static void printUsage()
+     {
+         HelpFormatter hf = new HelpFormatter();
+         String header = String.format(
+-                "%nAvailable commands: ring, cluster, info, cleanup, compact, cfstats");
++                "%nAvailable commands: ring, cluster, info, cleanup, compact, cfstats, snapshot [name], clearsnapshot");
+         String usage = String.format("java %s -host <arg> <command>%n", NodeProbe.class.getName());
+         hf.printHelp(usage, "", options, header);
+     }
+@@ -490,7 +508,8 @@ public static void main(String[] args) throws IOException
+         }
+         
+         // Execute the requested command.
+-        String cmdName = probe.getArgs()[0];
++        String[] arguments = probe.getArgs();
++        String cmdName = arguments[0];
+         if (cmdName.equals("ring"))
+         {
+             probe.printRing(System.out);
+@@ -515,6 +534,19 @@ else if (cmdName.equals("cfstats"))
+         {
+             probe.printColumnFamilyStats(System.out);
+         }
++        else if (cmdName.equals("snapshot"))
++        {
++            String snapshotName = "";
++            if (arguments.length > 1)
++            {
++                snapshotName = arguments[1];
++            }
++            probe.takeSnapshot(snapshotName);
++        }
++        else if (cmdName.equals("clearsnapshot"))
++        {
++            probe.clearSnapshot();
++        }
+         else
+         {
+             System.err.println("Unrecognized command: " + cmdName + ".");
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/FileUtils.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/FileUtils.java
+index d02ceb1f..a29f2a85 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/FileUtils.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/utils/FileUtils.java
+@@ -263,4 +263,44 @@ public static boolean deleteDir(File dir) {
+         // The directory is now empty so now it can be smoked
+         return dir.delete();
+     }
++
++    /**
++     * Create a hard link for a given file.
++     * 
++     * @param sourceFile      The name of the source file.
++     * @param destinationFile The name of the destination file.
++     * 
++     * @throws IOException if an error has occurred while creating the link.
++     */
++    public static void createHardLink(File sourceFile, File destinationFile) throws IOException
++    {
++        String osname = System.getProperty("os.name");
++        ProcessBuilder pb;
++        if (osname.startsWith("Windows"))
++        {
++            float osversion = Float.parseFloat(System.getProperty("os.version"));
++            if (osversion >= 6.0f)
++            {
++                pb = new ProcessBuilder("cmd", "/c", "mklink", "/H", destinationFile.getAbsolutePath(), sourceFile.getAbsolutePath());
++            }
++            else
++            {
++                pb = new ProcessBuilder("fsutil", "hardlink", "create", destinationFile.getAbsolutePath(), sourceFile.getAbsolutePath());
++            }
++        }
++        else
++        {
++            pb = new ProcessBuilder("ln", sourceFile.getAbsolutePath(), destinationFile.getAbsolutePath());
++            pb.redirectErrorStream(true);
++        }
++        Process p = pb.start();
++        try
++        {
++            p.waitFor();
++        }
++        catch (InterruptedException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
+ }

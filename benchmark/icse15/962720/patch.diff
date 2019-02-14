@@ -1,0 +1,696 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java b/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
+index 2a5478e6..315c9a49 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
+@@ -71,6 +71,7 @@
+     public Integer commitlog_sync_period_in_ms;
+     
+     public String endpoint_snitch;
++    public Boolean dynamic_snitch = false;
+     
+     public String request_scheduler;
+     public RequestSchedulerId request_scheduler_id;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 0947af0d..ee04c9d8 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -27,6 +27,7 @@
+ import java.net.UnknownHostException;
+ import java.util.*;
+ 
++import org.apache.cassandra.locator.DynamicEndpointSnitch;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -415,7 +416,7 @@ private static IEndpointSnitch createEndpointSnitch(String endpointSnitchClassNa
+                 throw (ConfigurationException)e.getCause();
+             throw new ConfigurationException("Error instantiating " + endpointSnitchClassName + " " + e.getMessage());
+         }
+-        return snitch;
++        return conf.dynamic_snitch ? new DynamicEndpointSnitch(snitch) : snitch;
+     }
+     
+     public static void loadSchemas() throws IOException
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractEndpointSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractEndpointSnitch.java
+index 4892281e..2ef4980e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractEndpointSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractEndpointSnitch.java
+@@ -21,6 +21,7 @@
+ 
+ import java.net.InetAddress;
+ import java.util.Collection;
++import java.util.Comparator;
+ import java.util.List;
+ import java.util.concurrent.CopyOnWriteArrayList;
+ 
+@@ -42,4 +43,9 @@ protected void invalidateCachedSnitchValues()
+ 
+     public abstract List<InetAddress> getSortedListByProximity(InetAddress address, Collection<InetAddress> unsortedAddress);
+     public abstract List<InetAddress> sortByProximity(InetAddress address, List<InetAddress> addresses);
++
++    public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
++    {
++        return a1.getHostAddress().compareTo(a2.getHostAddress());
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractRackAwareSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractRackAwareSnitch.java
+index acb1d166..5cdf3b70 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractRackAwareSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/AbstractRackAwareSnitch.java
+@@ -72,6 +72,14 @@
+         {
+             public int compare(InetAddress a1, InetAddress a2)
+             {
++                   return compareEndpoints(address, a1, a2);
++            };
++        });
++        return addresses;
++    }
++
++    public int compareEndpoints(InetAddress address, InetAddress a1, InetAddress a2)
++    {
+                 if (address.equals(a1) && !address.equals(a2))
+                     return -1;
+                 if (address.equals(a2) && !address.equals(a1))
+@@ -95,7 +103,4 @@ public int compare(InetAddress a1, InetAddress a2)
+ 
+                 return 0;
+             }
+-        });
+-        return addresses;
+-    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
+index e69de29b..cb2f03bc 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
+@@ -0,0 +1,238 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.locator;
++
++import java.net.InetAddress;
++import java.util.*;
++import java.util.concurrent.LinkedBlockingDeque;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import java.lang.management.ManagementFactory;
++import javax.management.MBeanServer;
++import javax.management.ObjectName;
++
++import org.apache.cassandra.net.IVerbHandler;
++import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.net.ResponseVerbHandler;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.AbstractStatsDeque;
++import org.apache.cassandra.locator.IEndpointSnitch;
++import org.apache.cassandra.locator.ILatencyPublisher;
++import org.apache.cassandra.locator.ILatencySubscriber;
++import org.apache.cassandra.locator.AbstractEndpointSnitch;
++import org.apache.cassandra.locator.DynamicEndpointSnitchMBean;
++import org.apache.cassandra.utils.FBUtilities;
++
++/**
++ * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
++ */
++public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILatencySubscriber, DynamicEndpointSnitchMBean
++{
++    private static int UPDATES_PER_INTERVAL = 100;
++    private static int UPDATE_INTERVAL_IN_MS = 1000;
++    private static int RESET_INTERVAL_IN_MS = 60000;
++    private static int WINDOW_SIZE = 100;
++    private boolean registered = false;
++
++    private ConcurrentHashMap<InetAddress, Double> scores = new ConcurrentHashMap();
++    private ConcurrentHashMap<InetAddress, AdaptiveLatencyTracker> windows = new ConcurrentHashMap();
++    private AtomicInteger intervalupdates = new AtomicInteger(0);
++    public IEndpointSnitch subsnitch;
++
++    public DynamicEndpointSnitch(IEndpointSnitch snitch)
++    {
++        subsnitch = snitch;
++        TimerTask update = new TimerTask()
++        {
++            public void run()
++            {
++                updateScores();
++            }
++        };
++        TimerTask reset = new TimerTask()
++        {
++            public void run()
++            {
++                // we do this so that a host considered bad has a chance to recover, otherwise would we never try
++                // to read from it, which would cause its score to never change
++                reset();
++            }
++        };
++        Timer timer = new Timer("DynamicEndpointSnitch");
++        timer.schedule(update, UPDATE_INTERVAL_IN_MS, UPDATE_INTERVAL_IN_MS);
++        timer.schedule(reset, RESET_INTERVAL_IN_MS, RESET_INTERVAL_IN_MS);
++
++        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
++        try
++        {
++            mbs.registerMBean(this, new ObjectName("org.apache.cassandra.locator:type=DynamicEndpointSnitch"));
++        }
++        catch (Exception e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    public String getRack(InetAddress endpoint)
++    {
++        return subsnitch.getRack(endpoint);
++    }
++
++    public String getDatacenter(InetAddress endpoint)
++    {
++        return subsnitch.getDatacenter(endpoint);
++    }
++
++    public List<InetAddress> getSortedListByProximity(final InetAddress address, Collection<InetAddress> addresses)
++    {
++        List<InetAddress> list = new ArrayList<InetAddress>(addresses);
++        sortByProximity(address, list);
++        return list;
++    }
++
++    public List<InetAddress> sortByProximity(final InetAddress address, List<InetAddress> addresses)
++    {
++        assert address == FBUtilities.getLocalAddress(); // we only know about ourself
++        Collections.sort(addresses, new Comparator<InetAddress>()
++        {
++            public int compare(InetAddress a1, InetAddress a2)
++            {
++                return compareEndpoints(address, a1, a2);
++            }
++        });
++        return addresses;
++    }
++
++    public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
++    {
++        Double scored1 = scores.get(a1);
++        Double scored2 = scores.get(a2);
++
++        if (scored1 == null || scored2 == null)
++            return subsnitch.compareEndpoints(target, a1, a2);
++        if (scored1.equals(scored2))
++            return 0;
++        if (scored1 < scored2)
++            return 1;
++        else
++            return -1;
++    }
++
++    public void receiveTiming(InetAddress host, Double latency) // this is cheap
++    {
++        if (intervalupdates.intValue() >= UPDATES_PER_INTERVAL)
++            return;
++        AdaptiveLatencyTracker tracker = windows.get(host);
++        if (tracker == null)
++        {
++            AdaptiveLatencyTracker alt = new AdaptiveLatencyTracker(WINDOW_SIZE);
++            tracker = windows.putIfAbsent(host, alt);
++            if (tracker == null)
++                tracker = alt;
++        }
++        tracker.add(latency);
++        intervalupdates.getAndIncrement();
++    }
++
++    private void updateScores() // this is expensive
++    {
++        if (!registered)
++        {
++       	    ILatencyPublisher handler = (ILatencyPublisher)MessagingService.instance.getVerbHandler(StorageService.Verb.READ_RESPONSE);
++            if (handler != null)
++            {
++                handler.register(this);
++                registered = true;
++            }
++
++        }
++        for (Map.Entry<InetAddress, AdaptiveLatencyTracker> entry: windows.entrySet())
++        {
++            scores.put(entry.getKey(), entry.getValue().score());
++        }
++        intervalupdates.set(0);
++    }
++
++    private void reset()
++    {
++        for (AdaptiveLatencyTracker tracker : windows.values())
++        {
++            tracker.clear();
++        }
++    }
++
++    public Map<InetAddress, Double> getScores()
++    {
++        return scores;
++    }
++}
++
++/** a threadsafe version of BoundedStatsDeque+ArrivalWindow with modification for arbitrary times **/
++class AdaptiveLatencyTracker extends AbstractStatsDeque
++{
++    private LinkedBlockingDeque latencies;
++    private final int size;                                   
++    private static double SENTINEL_COMPARE = 0.0001; // arbitrary; as long as it is the same across hosts it doesn't matter
++
++    AdaptiveLatencyTracker(int size)
++    {
++        this.size = size;
++        latencies = new LinkedBlockingDeque(size);
++    }
++
++    public void add(double i)
++    {
++        latencies.offer(i);
++    }
++
++    public void clear()
++    {
++        latencies.clear();
++    }
++
++    public Iterator<Double> iterator()
++    {
++        return latencies.iterator();
++    }
++
++    public int size()
++    {
++        return latencies.size();
++    }
++
++    double p(double t)
++    {
++        double mean = mean();
++        double exponent = (-1) * (t) / mean;
++        return 1 - ( 1 - Math.pow( Math.E, exponent) );
++    }
++
++    double score()
++    {
++        double log = 0d;
++        if ( latencies.size() > 0 )
++        {
++            double probability = p(SENTINEL_COMPARE);
++            log = (-1) * Math.log10( probability );
++        }
++        return log;
++    }
++
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitchMBean.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitchMBean.java
+index e69de29b..26c57997 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitchMBean.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitchMBean.java
+@@ -0,0 +1,27 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++
++package org.apache.cassandra.locator;
++
++import java.net.InetAddress;
++import java.util.Map;
++
++public interface DynamicEndpointSnitchMBean {
++    public Map<InetAddress, Double> getScores();
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/IEndpointSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/IEndpointSnitch.java
+index ca451c00..091c4c20 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/IEndpointSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/IEndpointSnitch.java
+@@ -30,6 +30,16 @@
+ 
+ public interface IEndpointSnitch
+ {
++    /**
++     * returns a String repesenting the rack this endpoint belongs to
++     */
++    public String getRack(InetAddress endpoint);
++
++    /**
++     * returns a String representing the datacenter this endpoint belongs to
++     */
++    public String getDatacenter(InetAddress endpoint);
++
+     /**
+      * returns a new <tt>List</tt> sorted by proximity to the given endpoint
+      */
+@@ -45,4 +55,9 @@
+      * @param subscriber the subscriber to notify
+      */
+     public void register(AbstractReplicationStrategy subscriber);
++
++    /**
++     * compares two endpoints in relation to the target endpoint, returning as Comparator.compare would
++     */
++    public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2);
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencyPublisher.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencyPublisher.java
+index e69de29b..0d97e84f 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencyPublisher.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencyPublisher.java
+@@ -0,0 +1,26 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.locator;
++
++import org.apache.cassandra.locator.ILatencySubscriber;
++
++public interface ILatencyPublisher
++{
++    public void register(ILatencySubscriber subcriber);
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencySubscriber.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencySubscriber.java
+index e69de29b..6cfcf334 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencySubscriber.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/ILatencySubscriber.java
+@@ -0,0 +1,26 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.locator;
++
++import java.net.InetAddress;
++
++public interface ILatencySubscriber
++{
++    public void receiveTiming(InetAddress address, Double latency);
++}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/SimpleSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/SimpleSnitch.java
+index c2fd8b56..dd8fb680 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/SimpleSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/SimpleSnitch.java
+@@ -23,12 +23,24 @@
+ import java.util.Collection;
+ import java.util.List;
+ 
++import org.apache.commons.lang.NotImplementedException;
++
+ /**
+  * A simple endpoint snitch implementation does not sort addresses by
+  * proximity.
+  */
+ public class SimpleSnitch extends AbstractEndpointSnitch
+ {
++    public String getRack(InetAddress endpoint)
++    {
++        throw new NotImplementedException();
++    }
++
++    public String getDatacenter(InetAddress endpoint)
++    {
++        throw new NotImplementedException();
++    }
++    
+     public List<InetAddress> getSortedListByProximity(final InetAddress address, Collection<InetAddress> addresses)
+     {
+         return new ArrayList<InetAddress>(addresses);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index 474d7c2b..efd25458 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -400,6 +400,16 @@ public static IAsyncResult getAsyncResult(String key)
+         return taskCompletionMap_.remove(key);
+     }
+ 
++    public static long getRegisteredCallbackAge(String key)
++    {
++        return callbackMap_.getAge(key);
++    }
++
++    public static long getAsyncResultAge(String key)
++    {
++        return taskCompletionMap_.getAge(key);
++    }
++
+     public static ExecutorService getDeserializationExecutor()
+     {
+         return messageDeserializerExecutor_;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/ResponseVerbHandler.java b/cassandra/trunk/src/java/org/apache/cassandra/net/ResponseVerbHandler.java
+index 020d1876..ae806c20 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/ResponseVerbHandler.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/ResponseVerbHandler.java
+@@ -18,21 +18,30 @@
+ 
+ package org.apache.cassandra.net;
+ 
++
++import java.util.*;
++import java.net.InetAddress;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.apache.cassandra.locator.ILatencyPublisher;
++import org.apache.cassandra.locator.ILatencySubscriber;
+ 
+-public class ResponseVerbHandler implements IVerbHandler
++public class ResponseVerbHandler implements IVerbHandler, ILatencyPublisher
+ {
+     private static final Logger logger_ = LoggerFactory.getLogger( ResponseVerbHandler.class );
++    private List<ILatencySubscriber>  subscribers = new ArrayList<ILatencySubscriber>();
++
+     
+     public void doVerb(Message message)
+     {     
+         String messageId = message.getMessageId();        
+         IAsyncCallback cb = MessagingService.getRegisteredCallback(messageId);
++        double age = 0;
+         if (cb != null)
+         {
+             if (logger_.isDebugEnabled())
+                 logger_.debug("Processing response on a callback from " + message.getMessageId() + "@" + message.getFrom());
++            age = System.currentTimeMillis() - MessagingService.getRegisteredCallbackAge(messageId);
+             cb.response(message);
+         }
+         else
+@@ -42,8 +51,23 @@ public void doVerb(Message message)
+             {
+                 if (logger_.isDebugEnabled())
+                     logger_.debug("Processing response on an async result from " + message.getMessageId() + "@" + message.getFrom());
++                age = System.currentTimeMillis() - MessagingService.getAsyncResultAge(messageId);
+                 ar.result(message);
+             }
+         }
++        notifySubscribers(message.getFrom(), age);
++    }
++
++    private void notifySubscribers(InetAddress host, double latency)
++    {
++        for (ILatencySubscriber subscriber : subscribers)
++        {
++            subscriber.receiveTiming(host, latency);
++        }
++    }
++
++    public void register(ILatencySubscriber subscriber)
++    {
++        subscribers.add(subscriber);
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/ExpiringMap.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/ExpiringMap.java
+index dfaadf7a..aa2c7ec4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/ExpiringMap.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/ExpiringMap.java
+@@ -129,6 +129,17 @@ public V remove(K key)
+         return result;
+     }
+ 
++    public long getAge(K key)
++    {
++        long age = 0;
++        CacheableObject<V> co = cache.get(key);
++        if (co != null)
++        {
++            age = co.age;
++        }
++        return age;
++    }
++
+     public int size()
+     {
+         return cache.size();
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/locator/DynamicEndpointSnitchTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/locator/DynamicEndpointSnitchTest.java
+index e69de29b..62904b46 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/locator/DynamicEndpointSnitchTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/locator/DynamicEndpointSnitchTest.java
+@@ -0,0 +1,109 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++
++package org.apache.cassandra.locator;
++
++import java.net.InetAddress;
++import java.net.UnknownHostException;
++import java.util.ArrayList;
++
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++import org.apache.cassandra.locator.DynamicEndpointSnitch;
++import org.apache.cassandra.locator.SimpleSnitch;
++import org.apache.cassandra.utils.FBUtilities;
++
++public class DynamicEndpointSnitchTest
++{
++    @Test
++    public void testSnitch() throws UnknownHostException, InterruptedException
++    {
++        DynamicEndpointSnitch dsnitch = new DynamicEndpointSnitch(new SimpleSnitch());
++        InetAddress self = FBUtilities.getLocalAddress();
++        ArrayList<InetAddress> order = new ArrayList<InetAddress>();
++        InetAddress host1 = InetAddress.getByName("127.0.0.1");
++        InetAddress host2 = InetAddress.getByName("127.0.0.2");
++        InetAddress host3 = InetAddress.getByName("127.0.0.3");
++
++        // first, make all hosts equal
++        for (int i = 0; i < 5; i++)
++        {
++            dsnitch.receiveTiming(host1, 1.0);
++            dsnitch.receiveTiming(host2, 1.0);
++            dsnitch.receiveTiming(host3, 1.0);
++        }
++
++        Thread.sleep(1500);
++
++        order.add(host1);
++        order.add(host2);
++        order.add(host3);
++
++        assert dsnitch.getSortedListByProximity(self, order).equals(order);
++
++        // make host1 a little worse
++        dsnitch.receiveTiming(host1, 2.0);
++        Thread.sleep(1500);
++        order.clear();
++
++        order.add(host2);
++        order.add(host3);
++        order.add(host1);
++
++        assert dsnitch.getSortedListByProximity(self, order).equals(order);
++
++        // make host2 a little worse
++        dsnitch.receiveTiming(host2, 2.0);
++        Thread.sleep(1500);
++        order.clear();
++
++        order.add(host3);
++        order.add(host2);
++        order.add(host1);
++
++        assert dsnitch.getSortedListByProximity(self, order).equals(order);
++
++        // make host3 the worst
++        for (int i = 0; i < 2; i++)
++        {
++            dsnitch.receiveTiming(host3, 2.0);
++        }
++        Thread.sleep(1500);
++        order.clear();
++
++        order.add(host2);
++        order.add(host1);
++        order.add(host3);
++
++        // make host3 equal to the others
++        for (int i = 0; i < 2; i++)
++        {
++            dsnitch.receiveTiming(host3, 1.0);
++        }
++        Thread.sleep(1500);
++        order.clear();
++
++        order.add(host1);
++        order.add(host2);
++        order.add(host3);
++
++        assert dsnitch.getSortedListByProximity(self, order).equals(order);
++    }
++}

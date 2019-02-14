@@ -1,0 +1,288 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/GroupByNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/GroupByNode.java
+index 59fbfe9d..ffca334d 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/GroupByNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/GroupByNode.java
+@@ -23,6 +23,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.util.Iterator;
+ import java.util.Vector;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.Collections;
+ 
+ import org.apache.derby.catalog.IndexDescriptor;
+ import org.apache.derby.iapi.error.StandardException;
+@@ -343,6 +346,10 @@ private void addUnAggColumns() throws StandardException
+ 		ResultColumnList bottomRCL  = childResult.getResultColumns();
+ 		ResultColumnList groupByRCL = resultColumns;
+ 
++		ArrayList referencesToSubstitute = new ArrayList();
++		ArrayList havingRefsToSubstitute = null;
++		if (havingClause != null)
++			havingRefsToSubstitute = new ArrayList();
+ 		int sz = groupingList.size();
+ 		for (int i = 0; i < sz; i++) 
+ 		{
+@@ -385,12 +392,27 @@ private void addUnAggColumns() throws StandardException
+ 			// in the projection list with a virtual column node
+ 			// that effectively points to a result column 
+ 			// in the result set doing the group by
+-			SubstituteExpressionVisitor se = 
+-				new SubstituteExpressionVisitor(
+-						gbc.getColumnExpression(),
+-						vc,
++			//
++			// Note that we don't perform the replacements
++			// immediately, but instead we accumulate them
++			// until the end of the loop. This allows us to
++			// sort the expressions and process them in
++			// descending order of complexity, necessary
++			// because a compound expression may contain a
++			// reference to a simple grouped column, but in
++			// such a case we want to process the expression
++			// as an expression, not as individual column
++			// references. E.g., if the statement was:
++			//   SELECT ... GROUP BY C1, C1 * (C2 / 100), C3
++			// then we don't want the replacement of the
++			// simple column reference C1 to affect the
++			// compound expression C1 * (C2 / 100). DERBY-3094.
++			//
++			ValueNode vn = gbc.getColumnExpression();
++			SubstituteExpressionVisitor vis =
++				new SubstituteExpressionVisitor(vn, vc,
+ 						AggregateNode.class);
+-			parent.getResultColumns().accept(se);
++			referencesToSubstitute.add(vis);
+ 			
+ 			// Since we always need a PR node on top of the GB 
+ 			// node to perform projection we can use it to perform 
+@@ -414,15 +436,26 @@ private void addUnAggColumns() throws StandardException
+ 			// GBN (RCL) -> (C1, SUM(C2), <input>, <aggregator>, MAX(C3), <input>, <aggregator>
+ 			//              |
+ 			//       FBT (C1, C2)
+-			if (havingClause != null) {
++			if (havingClause != null)
++			{
+ 				SubstituteExpressionVisitor havingSE =
+-					new SubstituteExpressionVisitor(
+-							gbc.getColumnExpression(),
+-							vc, null);
+-				havingClause.accept(havingSE);
++					new SubstituteExpressionVisitor(vn,vc,null);
++				havingRefsToSubstitute.add(havingSE);
+ 			}
+ 			gbc.setColumnPosition(bottomRCL.size());
+ 		}
++		Comparator sorter = new ExpressionSorter();
++		Collections.sort(referencesToSubstitute,sorter);
++		for (int r = 0; r < referencesToSubstitute.size(); r++)
++			parent.getResultColumns().accept(
++				(SubstituteExpressionVisitor)referencesToSubstitute.get(r));
++		if (havingRefsToSubstitute != null)
++		{
++			Collections.sort(havingRefsToSubstitute,sorter);
++			for (int r = 0; r < havingRefsToSubstitute.size(); r++)
++				havingClause.accept(
++					(SubstituteExpressionVisitor)havingRefsToSubstitute.get(r));
++}
+ 	}
+ 
+ 	/**
+@@ -1225,4 +1258,46 @@ else if (an.getOperand() instanceof ConstantNode)
+ 			}
+ 		}
+ 	}
++
++	/**
++	 * Comparator class for GROUP BY expression substitution.
++	 *
++	 * This class enables the sorting of a collection of
++	 * SubstituteExpressionVisitor instances. We sort the visitors
++	 * during the tree manipulation processing in order to process
++	 * expressions of higher complexity prior to expressions of
++	 * lower complexity. Processing the expressions in this order ensures
++	 * that we choose the best match for an expression, and thus avoids
++	 * problems where we substitute a sub-expression instead of the
++	 * full expression. For example, if the statement is:
++	 *   ... GROUP BY a+b, a, a*(a+b), a+b+c
++	 * we'll process those expressions in the order: a*(a+b),
++	 * a+b+c, a+b, then a.
++	 */
++	private static final class ExpressionSorter implements Comparator
++	{
++		public int compare(Object o1, Object o2)
++		{
++			try {
++				ValueNode v1 = ((SubstituteExpressionVisitor)o1).getSource();
++				ValueNode v2 = ((SubstituteExpressionVisitor)o2).getSource();
++				int refCount1, refCount2;
++				CollectNodesVisitor vis = new CollectNodesVisitor(
++				ColumnReference.class);
++				v1.accept(vis);
++				refCount1 = vis.getList().size();
++				vis = new CollectNodesVisitor(ColumnReference.class);
++				v2.accept(vis);
++				refCount2 = vis.getList().size();
++				// The ValueNode with the larger number of refs
++				// should compare lower. That way we are sorting
++				// the expressions in descending order of complexity.
++				return refCount2 - refCount1;
++			}
++			catch (StandardException e)
++			{
++				throw new RuntimeException(e);
++			}
++		}
++	}
+ }
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubstituteExpressionVisitor.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubstituteExpressionVisitor.java
+index 1f55b45f..055f5b33 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubstituteExpressionVisitor.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/SubstituteExpressionVisitor.java
+@@ -43,6 +43,14 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 		skipOverClass = skipThisClass;
+ 	}
+ 
++	/**
++	 * used by GroupByNode to process expressions by complexity level.
++	 */
++	public ValueNode getSource()
++	{
++		return source;
++	}
++
+ 	public Visitable visit(Visitable node) throws StandardException 
+ 	{
+ 		if (!(node instanceof ValueNode))
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GroupByExpressionTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GroupByExpressionTest.java
+index 821c766d..379713a1 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GroupByExpressionTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GroupByExpressionTest.java
+@@ -122,6 +122,127 @@ public void testSimpleExpressions() throws Exception
+                         {9,13,2}});
+     }
+     
++    /**
++     * queries which combine compound expressions and simple column refs.
++     */
++    public void testDerby3094Expressions() throws Exception
++    {
++        verifyQueryResults(
++                "Q1",
++                "select c1+c2, sum(c3) from test group by c1+c2, c1",
++                new int[][] {
++                        {11, 100}, 
++                        {12, 100},  // c1=1, c2=11
++                        {12, 100},  // c1=2, c2=10
++                        {13, 202}});
++        verifyQueryResults(
++                "Q2",
++                "select c1+c2, sum(c3) from test group by c1, c1+c2",
++                new int[][] {
++                        {11, 100}, 
++                        {12, 100},  // c1=1, c2=11
++                        {12, 100},  // c1=2, c2=10
++                        {13, 202}});
++        verifyQueryResults(
++                "Q3",
++                "select c1, c1+c2 from test group by c1, c1+c2",
++                new int[][] {
++                        {1, 11}, 
++                        {1, 12},
++                        {2, 12},
++                        {2, 13}});
++        verifyQueryResults(
++                "Q4",
++                "select c1+c2, sum(c3) from test group by c1+c2",
++                new int[][] {
++                        {11, 100}, 
++                        {12, 200},
++                        {13, 202}});
++        verifyQueryResults(
++                "Q5",
++                "select c1,c2,c1+c2,sum(c3) from test group by c1,c2,c1+c2",
++                new int[][] {
++                        {1, 10, 11, 100},
++                        {1, 11, 12, 100},
++                        {2, 10, 12, 100},
++                        {2, 11, 13, 202}});
++        verifyQueryResults(
++                "Q6",
++                "select c1,c2,sum(c3) from test group by c2, c1",
++                new int[][] {
++                        {1, 10, 100},
++                        {2, 10, 100},
++                        {1, 11, 100},
++                        {2, 11, 202}});
++        verifyQueryResults(
++                "Q7",
++                "select c1 as c2, sum(c3) from test group by c1,c2",
++                new int[][] {
++                        {1, 100},
++                        {1, 100},
++                        {2, 100},
++                        {2, 202}});
++        verifyQueryResults(
++                "Q8",
++                "select c1 as c2, sum(c3) from test group by c1",
++                new int[][] {
++                        {1, 200},
++                        {2, 302}});
++        verifyQueryResults(
++                "Q9",
++            "select c1+c2, sum(c3) from test group by c1+c2 having c1+c2 > 11",
++                new int[][] {
++                        {12, 200},
++                        {13, 202}});
++        verifyQueryResults(
++                "Q10",
++            "select c1+c2, sum(c3) from test " +
++                     "group by c1, c1+c2 having c1+c2 > 11",
++                new int[][] {
++                        {12, 100},
++                        {12, 100},
++                        {13, 202}});
++        verifyQueryResults(
++                "Q11",
++                "select c1*((c1+c2)/2), count(*) from test " +
++                " group by (c1+c2),  c1*((c1+c2)/2)",
++                new int[][] {
++                        {5, 1},
++                        {6, 1},
++                        {12, 1},
++                        {12, 2}});
++        verifyQueryResults(
++                "Q12",
++                "select c1, c1+c2, (c1+c2)+c3, count(*) from test " +
++                " group by c1, c1+c2, (c1+c2)+c3",
++                new int[][] {
++                        {1, 11, 111, 1},
++                        {1, 12, 112, 1},
++                        {2, 12, 112, 1},
++                        {2, 13, 114, 2}});
++        verifyQueryResults(
++                "Q13",
++                "select (c1+c2)+c3, count(*) from test " +
++                " group by c3, c1+c2",
++                new int[][] {
++                        {111, 1},
++                        {112, 2},
++                        {114, 2}});
++        assertCompileError(
++                "42Y30", "select c1+c2, sum(c3) from test group by c1");
++        assertCompileError(
++                "42Y30", "select c1,c2, sum(c3) from test group by c1+c2,c1");
++        assertCompileError(
++                "42Y30", "select c1+c2, sum(c3) from test group by 1");
++        assertCompileError(
++            "42X04", "select c1+c2 as expr, sum(c3) from test group by expr");
++        assertCompileError(
++            "42X04", "select c1 as c1a, c2, sum(c3) from test group by c1a,c2");
++        assertCompileError(
++                "42Y30", "select c1 as c2, sum(c3) from test group by c2");
++        assertCompileError(
++                "42Y30", "select c1+(c2+c3), sum(c3) from test group by c3, (c1+c2)");
++    }
+     
+     public void testSubSelect() throws Exception
+     {

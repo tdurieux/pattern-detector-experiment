@@ -1,0 +1,148 @@
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/Descriptor.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/Descriptor.java
+index 143a92c8..a72882b4 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/Descriptor.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/Descriptor.java
+@@ -63,7 +63,8 @@
+     public final boolean hasEncodedKeys;
+     public final boolean isLatestVersion;
+     public final boolean usesOldBloomFilter;
+-    public final boolean usesHistogramAndReplayPositionStatsFile;
++    public final boolean metadataIncludesReplayPosition;
++    public final boolean tracksMaxTimestamp;
+ 
+     public enum TempState
+     {
+@@ -103,15 +104,11 @@ public Descriptor(String version, File directory, String ksname, String cfname,
+         hasIntRowSize = version.compareTo("d") < 0;
+         hasEncodedKeys = version.compareTo("e") < 0;
+         usesOldBloomFilter = version.compareTo("f") < 0;
+-        usesHistogramAndReplayPositionStatsFile = version.compareTo("h") < 0;
++        metadataIncludesReplayPosition = version.compareTo("g") >= 0;
++        tracksMaxTimestamp = version.compareTo("h") >= 0;
+         isLatestVersion = version.compareTo(CURRENT_VERSION) == 0;
+     }
+ 
+-    public boolean hasReplayPosition()
+-    {
+-        return version.compareTo("g") >= 0;
+-    }
+-
+     public String filenameFor(Component component)
+     {
+         return filenameFor(component.name());
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
+index 7fa26577..6fe448b6 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
+@@ -20,7 +20,6 @@
+ package org.apache.cassandra.io.sstable;
+ 
+ import java.io.BufferedInputStream;
+-import java.io.DataInput;
+ import java.io.DataInputStream;
+ import java.io.DataOutput;
+ import java.io.File;
+@@ -31,7 +30,6 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.db.commitlog.ReplayPosition;
+-import org.apache.cassandra.io.ISerializer;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.utils.EstimatedHistogram;
+ 
+@@ -57,13 +55,7 @@
+ 
+     private SSTableMetadata()
+     {
+-        this(defaultRowSizeHistogram(), defaultColumnCountHistogram(), ReplayPosition.NONE);
+-    }
+-
+-    // when there is no max timestamp recorded, default to max long
+-    private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition)
+-    {
+-        this(rowSizes, columnCounts, replayPosition, Long.MAX_VALUE);
++        this(defaultRowSizeHistogram(), defaultColumnCountHistogram(), ReplayPosition.NONE, Long.MIN_VALUE);
+     }
+ 
+     private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition, long maxTimestamp)
+@@ -170,7 +162,7 @@ public Collector replayPosition(ReplayPosition replayPosition)
+         }
+     }
+ 
+-    public static class SSTableMetadataSerializer implements ISerializer<SSTableMetadata>
++    public static class SSTableMetadataSerializer
+     {
+         private static final Logger logger = LoggerFactory.getLogger(SSTableMetadataSerializer.class);
+ 
+@@ -184,6 +176,7 @@ public void serialize(SSTableMetadata sstableStats, DataOutput dos) throws IOExc
+ 
+         public SSTableMetadata deserialize(Descriptor descriptor) throws IOException
+         {
++            logger.debug("Load metadata for {}", descriptor);
+             File statsFile = new File(descriptor.filenameFor(SSTable.COMPONENT_STATS));
+             if (!statsFile.exists())
+             {
+@@ -191,22 +184,10 @@ public SSTableMetadata deserialize(Descriptor descriptor) throws IOException
+                 return new SSTableMetadata();
+             }
+ 
+-            DataInputStream dis = null;
++            DataInputStream dis = new DataInputStream(new BufferedInputStream(new FileInputStream(statsFile)));
+             try
+             {
+-                logger.debug("Load metadata for {}", descriptor);
+-                dis = new DataInputStream(new BufferedInputStream(new FileInputStream(statsFile)));
+-
+-                if (!descriptor.usesHistogramAndReplayPositionStatsFile)
+-                  return deserialize(dis);
+-
+-                EstimatedHistogram rowSizes = EstimatedHistogram.serializer.deserialize(dis);
+-                EstimatedHistogram columnCounts = EstimatedHistogram.serializer.deserialize(dis);
+-                ReplayPosition replayPosition = descriptor.hasReplayPosition()
+-                                              ? ReplayPosition.serializer.deserialize(dis)
+-                                              : ReplayPosition.NONE;
+-
+-                return new SSTableMetadata(rowSizes, columnCounts, replayPosition);
++                return deserialize(dis, descriptor.metadataIncludesReplayPosition, descriptor.tracksMaxTimestamp);
+             }
+             finally
+             {
+@@ -214,18 +195,16 @@ public SSTableMetadata deserialize(Descriptor descriptor) throws IOException
+             }
+         }
+ 
+-        public SSTableMetadata deserialize(DataInput dis) throws IOException
++        public SSTableMetadata deserialize(DataInputStream dis, boolean includesReplayPosition, boolean tracksMaxTimestamp) throws IOException
+         {
+             EstimatedHistogram rowSizes = EstimatedHistogram.serializer.deserialize(dis);
+             EstimatedHistogram columnCounts = EstimatedHistogram.serializer.deserialize(dis);
+-            ReplayPosition replayPosition = ReplayPosition.serializer.deserialize(dis);
+-            long maxTimestamp = dis.readLong();
+-            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, maxTimestamp);
+-        }
++            ReplayPosition replayPosition = includesReplayPosition
++                                          ? ReplayPosition.serializer.deserialize(dis)
++                                          : ReplayPosition.NONE;
++            long maxTimestamp = tracksMaxTimestamp ? dis.readLong() : Long.MIN_VALUE;
+ 
+-        public long serializedSize(SSTableMetadata object)
+-        {
+-            throw new UnsupportedOperationException();
++            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, maxTimestamp);
+         }
+     }
+ }
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/io/sstable/SSTableMetadataSerializerTest.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/io/sstable/SSTableMetadataSerializerTest.java
+index 6541041a..c0ae8774 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/io/sstable/SSTableMetadataSerializerTest.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/io/sstable/SSTableMetadataSerializerTest.java
+@@ -58,8 +58,7 @@ public void testSerialization() throws IOException
+ 
+         ByteArrayInputStream byteInput = new ByteArrayInputStream(byteOutput.toByteArray());
+         DataInputStream dis = new DataInputStream(byteInput);
+-
+-        SSTableMetadata stats = SSTableMetadata.serializer.deserialize(dis);
++        SSTableMetadata stats = SSTableMetadata.serializer.deserialize(dis, true, true);
+ 
+         assert stats.getEstimatedRowSize().equals(originalMetadata.getEstimatedRowSize());
+         assert stats.getEstimatedRowSize().equals(rowSizes);

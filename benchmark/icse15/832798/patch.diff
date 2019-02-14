@@ -1,0 +1,190 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index cca3c410..4ac30da7 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -499,45 +499,55 @@ public static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
+             return null;
+         }
+ 
++        if (cf.isSuper())
++            removeDeletedSuper(cf, gcBefore);
++        else
++            removeDeletedStandard(cf, gcBefore);
++
+         // in case of a timestamp tie, tombstones get priority over non-tombstones.
+         // (we want this to be deterministic to avoid confusion.)
++        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
++        {
++            return null;
++        }
++        return cf;
++    }
++
++    private static void removeDeletedStandard(ColumnFamily cf, int gcBefore)
++    {
+         for (byte[] cname : cf.getColumnNames())
+         {
+             IColumn c = cf.getColumnsMap().get(cname);
+-            if (c instanceof SuperColumn)
++            if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
++                || c.timestamp() <= cf.getMarkedForDeleteAt())
+             {
+-                long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
+-                // don't operate directly on the supercolumn, it could be the one in the memtable.
+-                // instead, create a new SC and add in the subcolumns that qualify.
+                 cf.remove(cname);
+-                SuperColumn sc = ((SuperColumn)c).cloneMeShallow();
+-                for (IColumn subColumn : c.getSubColumns())
+-                {
+-                    if (subColumn.timestamp() > minTimestamp)
+-                    {
+-                        if (!subColumn.isMarkedForDelete() || subColumn.getLocalDeletionTime() > gcBefore)
+-                        {
+-                            sc.addColumn(subColumn);
+                         }
+                     }
+                 }
+-                if (sc.getSubColumns().size() > 0 || sc.getLocalDeletionTime() > gcBefore)
++
++    private static void removeDeletedSuper(ColumnFamily cf, int gcBefore)
+                 {
+-                    cf.addColumn(sc);
+-                }
+-            }
+-            else if ((c.isMarkedForDelete() && c.getLocalDeletionTime() <= gcBefore)
+-                     || c.timestamp() <= cf.getMarkedForDeleteAt())
++        // TODO assume deletion means "most are deleted?" and add to clone, instead of remove from original?
++        // this could be improved by having compaction, or possibly even removeDeleted, r/m the tombstone
++        // once gcBefore has passed, so if new stuff is added in it doesn't used the wrong algorithm forever
++        for (byte[] cname : cf.getColumnNames())
+             {
+-                cf.remove(cname);
++            IColumn c = cf.getColumnsMap().get(cname);
++            long minTimestamp = Math.max(c.getMarkedForDeleteAt(), cf.getMarkedForDeleteAt());
++            for (IColumn subColumn : c.getSubColumns())
++            {
++                if (subColumn.timestamp() <= minTimestamp
++                    || (subColumn.isMarkedForDelete() && subColumn.getLocalDeletionTime() <= gcBefore))
++                {
++                    ((SuperColumn)c).remove(subColumn.name());
+             }
+         }
+-
+-        if (cf.getColumnCount() == 0 && cf.getLocalDeletionTime() <= gcBefore)
++            if (c.getSubColumns().isEmpty() && c.getLocalDeletionTime() <= gcBefore)
+         {
+-            return null;
++                cf.remove(c.name());
++            }
+         }
+-        return cf;
+     }
+ 
+     /*
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 0f5777cd..ebe38d00 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -262,7 +262,8 @@ public ColumnIterator getSliceIterator(SliceQueryFilter filter, AbstractType typ
+         if (filter.reversed)
+             ArrayUtils.reverse(columns);
+         IColumn startIColumn;
+-        if (DatabaseDescriptor.getColumnFamilyType(table_, filter.getColumnFamilyName()).equals("Standard"))
++        final boolean isStandard = DatabaseDescriptor.getColumnFamilyType(table_, filter.getColumnFamilyName()).equals("Standard");
++        if (isStandard)
+             startIColumn = new Column(filter.start);
+         else
+             startIColumn = new SuperColumn(filter.start, null); // ok to not have subcolumnComparator since we won't be adding columns to this object
+@@ -298,7 +299,8 @@ public boolean hasNext()
+ 
+             public IColumn next()
+             {
+-                return columns[curIndex_++];
++                // clone supercolumns so caller can freely removeDeleted or otherwise mutate it
++                return isStandard ? columns[curIndex_++] : ((SuperColumn)columns[curIndex_++]).cloneMe();
+             }
+         };
+     }
+@@ -307,6 +309,7 @@ public ColumnIterator getNamesIterator(final NamesQueryFilter filter)
+     {
+         final ColumnFamily cf = columnFamilies_.get(partitioner_.decorateKey(filter.key));
+         final ColumnFamily columnFamily = cf == null ? ColumnFamily.create(table_, filter.getColumnFamilyName()) : cf.cloneMeShallow();
++        final boolean isStandard = DatabaseDescriptor.getColumnFamilyType(table_, filter.getColumnFamilyName()).equals("Standard");
+ 
+         return new SimpleAbstractColumnIterator()
+         {
+@@ -329,7 +332,8 @@ protected IColumn computeNext()
+                     current = iter.next();
+                     IColumn column = cf.getColumn(current);
+                     if (column != null)
+-                        return column;
++                        // clone supercolumns so caller can freely removeDeleted or otherwise mutate it
++                        return isStandard ? column : ((SuperColumn)column).cloneMe();
+                 }
+                 return endOfData();
+             }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
+index 52a87d8a..60f61086 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
+@@ -48,11 +48,16 @@ public static SuperColumnSerializer serializer(AbstractType comparator)
+     private AtomicInteger size_ = new AtomicInteger(0);
+ 
+     SuperColumn(byte[] name, AbstractType comparator)
++    {
++        this(name, new ConcurrentSkipListMap<byte[], IColumn>(comparator));
++    }
++
++    private SuperColumn(byte[] name, ConcurrentSkipListMap<byte[], IColumn> columns)
+     {
+         assert name != null;
+         assert name.length <= IColumn.MAX_NAME_LENGTH;
+     	name_ = name;
+-        columns_ = new ConcurrentSkipListMap<byte[], IColumn>(comparator);
++        columns_ = columns;
+     }
+ 
+     public AbstractType getComparator()
+@@ -67,6 +72,14 @@ public SuperColumn cloneMeShallow()
+         return sc;
+     }
+ 
++
++    public IColumn cloneMe()
++    {
++        SuperColumn sc = new SuperColumn(name_, new ConcurrentSkipListMap<byte[], IColumn>(columns_));
++        sc.markForDeleteAt(localDeletionTime, markedForDeleteAt);
++        return sc;
++    }
++
+ 	public boolean isMarkedForDelete()
+ 	{
+ 		return markedForDeleteAt > Long.MIN_VALUE;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+index a9530795..5cac3165 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+@@ -66,6 +66,8 @@ public ColumnIterator getSSTableColumnIterator(SSTableReader sstable) throws IOE
+ 
+     public SuperColumn filterSuperColumn(SuperColumn superColumn, int gcBefore)
+     {
++        // we clone shallow, then add, under the theory that generally we're interested in a relatively small number of subcolumns.
++        // this may be a poor assumption.
+         SuperColumn scFiltered = superColumn.cloneMeShallow();
+         Iterator<IColumn> subcolumns;
+         if (reversed)
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+index c7e44f5b..e462a828 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+@@ -100,8 +100,8 @@ private void validateRemoveTwoSources() throws IOException
+     {
+         ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Super1");
+         ColumnFamily resolved = store.getColumnFamily(new NamesQueryFilter("key1", new QueryPath("Super1"), "SC1".getBytes()));
+-        assert resolved.getSortedColumns().iterator().next().getMarkedForDeleteAt() == 1;
+-        assert resolved.getSortedColumns().iterator().next().getSubColumns().size() == 0;
++        assert resolved.getSortedColumns().iterator().next().getMarkedForDeleteAt() == 1 : resolved;
++        assert resolved.getSortedColumns().iterator().next().getSubColumns().size() == 0 : resolved;
+         assertNull(ColumnFamilyStore.removeDeleted(resolved, Integer.MAX_VALUE));
+         assertNull(store.getColumnFamily(new NamesQueryFilter("key1", new QueryPath("Super1"), "SC1".getBytes()), Integer.MAX_VALUE));
+         assertNull(store.getColumnFamily(new IdentityQueryFilter("key1", new QueryPath("Super1")), Integer.MAX_VALUE));

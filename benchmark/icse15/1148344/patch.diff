@@ -1,0 +1,266 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index c1ec697e..7c9bbe52 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -74,16 +74,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private static final int STUBBIFY_ACTION = 5;
+ 	private static final int BACKUP_CONTAINER_ACTION = 6;
+     private static final int GET_RANDOM_ACCESS_FILE_ACTION = 7;
++    private static final int REOPEN_CONTAINER_ACTION = 8;
+     private ContainerKey actionIdentity;
+-
+-    /**
+-     * Identity of this container. Make it visible to RAFContainer4, which may
+-     * need to reopen the container after interrupts due to a NIO channel being
+-     * closed by the interrupt.
+-     */
+-    protected ContainerKey currentIdentity;
+-    private boolean reopen;
+-
+     private boolean actionStub;
+     private boolean actionErrorOK;
+     private boolean actionTryAlternatePath;
+@@ -811,7 +803,6 @@ synchronized void createContainer(ContainerKey newIdentity)
+         try
+         {
+             AccessController.doPrivileged( this);
+-            currentIdentity = newIdentity;
+         }
+         catch( PrivilegedActionException pae){ throw (StandardException) pae.getException();}
+         finally{ actionIdentity = null; }
+@@ -849,43 +840,14 @@ private boolean privRemoveFile(StorageFile file)
+ 		return true;
+     } // end of privRemoveFile
+ 
+-    protected ContainerKey idAPriori = null;
+ 
+     synchronized boolean openContainer(ContainerKey newIdentity)
+             throws StandardException {
+-        return openContainerMinion(newIdentity, false);
+-    }
+-
+-    synchronized boolean reopenContainer(ContainerKey newIdentity)
+-            throws StandardException {
+-        return openContainerMinion(newIdentity, true);
+-    }
+-
+-    private boolean openContainerMinion(
+-        ContainerKey newIdentity,
+-        boolean doReopen) throws StandardException
+-    {
+         actionCode = OPEN_CONTAINER_ACTION;
+-        reopen = doReopen;
+         actionIdentity = newIdentity;
+-        boolean success = false;
+-        idAPriori = currentIdentity;
+-
+         try
+         {
+-            currentIdentity = newIdentity;
+-            // NIO: We need to set currentIdentity before we try to open, in
+-            // case we need its value to perform a recovery in the case of an
+-            // interrupt during readEmbryonicPage as part of
+-            // OPEN_CONTAINER_ACTION.  Note that this gives a recursive call to
+-            // openContainer.
+-            //
+-            // If we don't succeed in opening, we reset currentIdentity to its
+-            // a priori value.
+-
+-            success = AccessController.doPrivileged(this) != null;
+-            idAPriori = currentIdentity;
+-            return success;
++            return AccessController.doPrivileged( this) != null;
+         }
+         catch( PrivilegedActionException pae) { 
+             closeContainer();
+@@ -897,10 +859,32 @@ private boolean openContainerMinion(
+         }
+         finally
+         {
+-            if (!success) {
+-                currentIdentity = idAPriori;
++            actionIdentity = null;
++        }
+             }
+ 
++    /**
++     * Only used by RAFContainer4 (NIO) to reopen RAF when its channel gets
++     * closed due to interrupts.
++     *
++     * @param currentIdentity
++     * @throws StandardException standard exception policy
++     */
++    protected synchronized void reopenContainer(ContainerKey currentIdentity)
++            throws StandardException {
++
++        actionCode = REOPEN_CONTAINER_ACTION;
++        actionIdentity = currentIdentity;
++
++        try {
++            AccessController.doPrivileged(this);
++        } catch (PrivilegedActionException pae) {
++            closeContainer();
++            throw (StandardException) pae.getException();
++        } catch (RuntimeException e) {
++            closeContainer();
++            throw e;
++        } finally {
+             actionIdentity = null; 
+         }
+     }
+@@ -1475,14 +1459,8 @@ public Object run() throws StandardException
+ 
+                  fileData = file.getRandomAccessFile(canUpdate ? "rw" : "r");
+ 
+-                 if (!reopen) {
+-                     // under reopen: can give race condition or if we
+-                     // synchronize access, deadlock, so skip, we know
+-                     // what's there anyway.
+                      readHeader(getEmbryonicPage(fileData,
+                                                  FIRST_ALLOC_PAGE_OFFSET));
+-                 }
+-
+ 
+                  if (SanityManager.DEBUG)
+                  {
+@@ -1558,6 +1536,31 @@ public Object run() throws StandardException
+ 
+              return this;
+          } // end of case OPEN_CONTAINER_ACTION
++         case REOPEN_CONTAINER_ACTION:
++         {
++             StorageFile file =
++                 privGetFileName( actionIdentity, false, true, true);
++
++             synchronized (this) {
++                 try {
++                     fileData =
++                         file.getRandomAccessFile(canUpdate ? "rw" : "r");
++                 } catch (FileNotFoundException ioe) {
++                     throw dataFactory.
++                         markCorrupt(
++                             StandardException.newException(
++                                 SQLState.FILE_CONTAINER_EXCEPTION,
++                                 ioe,
++                                 (getIdentity() != null ?
++                                  getIdentity().toString() :
++                                  "unknown"),
++                                 "read",
++                                 fileName));
++                 }
++             }
++
++             return this;
++         }
+ 
+          case STUBBIFY_ACTION:
+          {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+index 43a54a4b..d352d015 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+@@ -83,8 +83,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+     // channelCleanupMonitor protects next three state variables:
+ 
+-    private Thread threadDoingRestore = null;
+-
+     // volatile on threadsInPageIO, is just to ensure that we get a correct
+     // value for debugging: we can't always use channelCleanupMonitor
+     // then. Otherwise protected by channelCleanupMonitor. Debugging value not
+@@ -166,6 +164,8 @@ private FileChannel getChannel() {
+         return ourChannel;
+     }
+ 
++    private ContainerKey currentIdentity;
++
+     /*
+      * Wrapping methods that retrieve the FileChannel from RAFContainer's
+      * fileData after calling the real methods in RAFContainer.
+@@ -183,6 +183,7 @@ synchronized boolean openContainer(ContainerKey newIdentity)
+             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+         }
+ 
++        currentIdentity = newIdentity;
+         return super.openContainer(newIdentity);
+     }
+ 
+@@ -199,9 +200,24 @@ synchronized void createContainer(ContainerKey newIdentity)
+             SanityManager.ASSERT(fileData == null, "fileData isn't null");
+             SanityManager.ASSERT(ourChannel == null, "ourChannel isn't null");
+         }
++
++        currentIdentity = newIdentity;
+         super.createContainer(newIdentity);
+     }
+ 
++    /**
++     * When the existing channel ({@code ourChannel}) has been closed due to
++     * interrupt, we need to reopen the underlying RAF to get a fresh channel
++     * so we can resume IO.
++     */
++    private void reopen() throws StandardException {
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(!ourChannel.isOpen());
++        }
++        ourChannel = null;
++        reopenContainer(currentIdentity);
++    }
++
+     /**
+      * override of RAFContainer#closeContainer
+      */
+@@ -311,14 +327,6 @@ private void readPage(long pageNumber, byte[] pageData, long offset)
+                 int retries = MAX_INTERRUPT_RETRIES;
+ 
+                 while (restoreChannelInProgress) {
+-                    if (Thread.currentThread() == threadDoingRestore) {
+-                        // Reopening the container will do readEmbryonicPage
+-                        // (i.e. ReadPage is called recursively from
+-                        // recoverContainerAfterInterrupt), so now let's make
+-                        // sure we don't get stuck waiting for ourselves ;-)
+-                        break;
+-                    }
+-
+                     if (retries-- == 0) {
+                         throw StandardException.newException(
+                             SQLState.FILE_IO_INTERRUPTED);
+@@ -842,7 +850,6 @@ private boolean recoverContainerAfterInterrupt(
+             // in writePage above. Any concurrent threads already inside will
+             // also wait till we're done, see below
+             restoreChannelInProgress = true;
+-            threadDoingRestore = Thread.currentThread();
+         }
+ 
+         // Wait till other concurrent threads hit the wall
+@@ -860,7 +867,6 @@ private boolean recoverContainerAfterInterrupt(
+ 
+                 if (retries-- == 0) {
+                     // Clean up state and throw
+-                    threadDoingRestore = null;
+                     restoreChannelInProgress = false;
+                     channelCleanupMonitor.notifyAll();
+ 
+@@ -895,13 +901,7 @@ private boolean recoverContainerAfterInterrupt(
+                 while (true) {
+                     synchronized(this) {
+                         try {
+-                            closeContainer();
+-                            reopenContainer(currentIdentity);
+-                        } catch (InterruptDetectedException e) {
+-                            // Interrupted again?
+-                            debugTrace("interrupted during recovery's " +
+-                                       "readEmbryonicPage");
+-                            continue;
++                            reopen();
+                         } catch (Exception newE) {
+                             // Something else failed - shutdown happening?
+                             synchronized(giveUpIOm) {
+@@ -934,7 +934,6 @@ private boolean recoverContainerAfterInterrupt(
+                 // Recovery work done (or failed), now set other threads free
+                 // to retry or give up as the case may be, cf. giveUpIO.
+                 restoreChannelInProgress = false;
+-                threadDoingRestore = null;
+                 channelCleanupMonitor.notifyAll();
+             }
+         } // end channelCleanupMonitor region

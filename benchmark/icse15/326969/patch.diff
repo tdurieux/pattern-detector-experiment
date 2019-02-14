@@ -1,0 +1,239 @@
+diff --git a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+index 6b767a9a..a8ddc056 100644
+--- a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
++++ b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericPreparedStatement.java
+@@ -880,7 +880,15 @@ public String getClassType()
+ 	}
+ 
+ 	/**
+-	 * Return true if the query node for this statement references SESSION schema tables.
++	 * Return true if the query node for this statement references SESSION schema
++	 * tables/views.
++	 * This method gets called at the very beginning of the compile phase of any statement.
++	 * If the statement which needs to be compiled is already found in cache, then there is
++	 * no need to compile it again except the case when the statement is referencing SESSION
++	 * schema objects. There is a small window where such a statement might get cached 
++	 * temporarily (a statement referencing SESSION schema object will be removed from the
++	 * cache after the bind phase is over because that is when we know for sure that the 
++	 * statement is referencing SESSION schema objects.)
+ 	 *
+ 	 * @return	true if references SESSION schema tables, else false
+ 	 */
+@@ -889,6 +897,30 @@ public boolean referencesSessionSchema()
+ 		return referencesSessionSchema;
+ 	}
+ 
++	/**
++	 * Return true if the QueryTreeNode references SESSION schema tables/views.
++	 * The return value is also saved in the local field because it will be 
++	 * used by referencesSessionSchema() method. 
++	 * This method gets called when the statement is not found in cache and 
++	 * hence it is getting compiled.
++	 * At the beginning of compilation for any statement, first we check if
++	 * the statement's plan already exist in the cache. If not, then we add
++	 * the statement to the cache and continue with the parsing and binding.
++	 * At the end of the binding, this method gets called to see if the 
++	 * QueryTreeNode references a SESSION schema object. If it does, then
++	 * we want to remove it from the cache, since any statements referencing
++	 * SESSION schema objects should never get cached.  
++	 *
++	 * @return	true if references SESSION schema tables/views, else false
++	 */
++	public boolean referencesSessionSchema(QueryTreeNode qt)
++	throws StandardException {
++		//If the query references a SESSION schema table (temporary or permanent), then
++		// mark so in this statement
++		referencesSessionSchema = qt.referencesSessionSchema();
++		return(referencesSessionSchema);
++	}
++
+ 	//
+ 	// class interface
+ 	//
+@@ -902,23 +934,15 @@ public boolean referencesSessionSchema()
+ 		@param dtd	The DataTypeDescriptors for the parameters, if any
+ 		@param ac the generated class for this statement
+ 
+-		@return	true if there is a reference to SESSION schema tables, else false
+-
+ 		@exception StandardException thrown on failure.
+ 	 */
+-	boolean completeCompile(QueryTreeNode qt)
++	void completeCompile(QueryTreeNode qt)
+ 						throws StandardException {
+ 		//if (finished)
+ 		//	throw StandardException.newException(SQLState.LANG_STATEMENT_CLOSED, "completeCompile()");
+ 
+ 		paramTypeDescriptors = qt.getParameterTypes();
+ 
+-		//If the query references a SESSION schema table (temporary or permanent), then mark so in this statement
+-		//This information will be used by EXECUTE STATEMENT if it is executing a statement that was created with NOCOMPILE. Because
+-		//of NOCOMPILE, we could not catch SESSION schema table reference by the statement at CREATE STATEMENT time. Need to catch
+-		//such statements at EXECUTE STATEMENT time when the query is getting compiled.
+-		referencesSessionSchema = qt.referencesSessionSchema();
+-
+ 		// erase cursor info in case statement text changed
+ 		if (targetTable!=null) {
+ 			targetTable = null;
+@@ -952,8 +976,7 @@ boolean completeCompile(QueryTreeNode qt)
+ 		}
+ 		isValid = true;
+ 
+-		//if this statement is referencing session schema tables, then we do not want cache it. 
+-		return referencesSessionSchema;
++		return;
+ 	}
+ 
+ 	public GeneratedClass getActivationClass()
+diff --git a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericStatement.java b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+index 66307d1e..32037a8c 100644
+--- a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericStatement.java
++++ b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+@@ -344,6 +344,42 @@ private PreparedStatement prepMinion(LanguageConnectionContext lcc, boolean cach
+ 						}
+ 					}
+ 
++					//Derby424 - In order to avoid caching select statements referencing
++					// any SESSION schema objects (including statements referencing views
++					// in SESSION schema), we need to do the SESSION schema object check
++					// here.  
++					//a specific eg for statement referencing a view in SESSION schema 
++					//CREATE TABLE t28A (c28 int)
++					//INSERT INTO t28A VALUES (280),(281)
++					//CREATE VIEW SESSION.t28v1 as select * from t28A
++					//SELECT * from SESSION.t28v1 should show contents of view and we
++					// should not cache this statement because a user can later define
++					// a global temporary table with the same name as the view name.
++					//Following demonstrates that
++					//DECLARE GLOBAL TEMPORARY TABLE SESSION.t28v1(c21 int, c22 int) not
++					//     logged
++					//INSERT INTO SESSION.t28v1 VALUES (280,1),(281,2)
++					//SELECT * from SESSION.t28v1 should show contents of global temporary
++					//table and not the view.  Since this select statement was not cached
++					// earlier, it will be compiled again and will go to global temporary
++					// table to fetch data. This plan will not be cached either because
++					// select statement is using SESSION schema object.
++					//
++					//Following if statement makes sure that if the statement is
++					// referencing SESSION schema objects, then we do not want to cache it.
++					// We will remove the entry that was made into the cache for 
++					//this statement at the beginning of the compile phase.
++					//The reason we do this check here rather than later in the compile
++					// phase is because for a view, later on, we loose the information that
++					// it was referencing SESSION schema because the reference
++					//view gets replaced with the actual view definition. Right after
++					// binding, we still have the information on the view and that is why
++					// we do the check here.
++					if (preparedStmt.referencesSessionSchema(qt)) {
++						if (foundInCache)
++							((GenericLanguageConnectionContext)lcc).removeStatement(this);
++					}
++					
+ 					qt = qt.optimize();
+ 
+ 					optimizeTime = getCurrentTimeMillis(lcc);
+@@ -468,14 +504,7 @@ private PreparedStatement prepMinion(LanguageConnectionContext lcc, boolean cach
+ 												qt.executeSchemaName()
+ 												);
+ 					preparedStmt.setSPSName(qt.getSPSName());
+-
+-					//if this statement is referencing session schema tables, then we do not want cache it. Following will remove the
+-					//entry that was made into the cache for this statement at the beginning of the compile phase
+-					if (preparedStmt.completeCompile(qt)) {
+-						if (foundInCache)
+-							((GenericLanguageConnectionContext)lcc).removeStatement(this);
+-					}
+-
++					preparedStmt.completeCompile(qt);
+ 					preparedStmt.setCompileTimeWarnings(cc.getWarnings());
+ 				}
+ 				catch (StandardException e) 	// hold it, throw it
+diff --git a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/compile/FromList.java b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/compile/FromList.java
+index a35e3162..84217c1d 100644
+--- a/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/compile/FromList.java
++++ b/db/derby/code/branches/10.1/java/engine/org/apache/derby/impl/sql/compile/FromList.java
+@@ -61,6 +61,12 @@
+ 	// true by default.
+ 	boolean 	useStatistics = true;
+ 
++	// FromList could have a view in it's list. If the view is defined in SESSION
++	// schema, then we do not want to cache the statement's plan. This boolean
++	// will help keep track of such a condition.
++	private boolean  referencesSessionSchema;
++
++
+ 	/** Initializer for a FromList */
+ 
+ 	public void init(Object optimizeJoinOrder)
+@@ -208,6 +214,14 @@ public boolean referencesSessionSchema()
+ 		FromTable		fromTable;
+ 		boolean			found = false;
+ 
++		// Following if will return true if this FromList object had any VIEWs
++		// from SESSION schema as elements.  This information is gathered during
++		// the bindTables method. At the end of the bindTables, we loose
++		// the information on VIEWs since they get replaced with their view
++		// definition. Hence, we need to intercept in the middle on the bindTables
++		// method and save that information in referencesSeesionSchema field.
++		if (referencesSessionSchema) return true;
++
+ 		/* Check for table or VTI name in FROM list */
+ 		int size = size();
+ 		for (int index = 0; index < size; index++)
+@@ -290,12 +304,22 @@ public void bindTables(DataDictionary dataDictionary,
+ 		for (int index = 0; index < size; index++)
+ 		{
+ 			fromTable = (FromTable) elementAt(index);
+-			setElementAt(fromTable.bindNonVTITables(dataDictionary, fromListParam), index);
++			ResultSetNode newNode = fromTable.bindNonVTITables(dataDictionary, fromListParam);
++			// If the fromTable is a view in the SESSION schema, then we need to save that information
++			// in referencesSessionSchema element. The reason for this is that the view will get
++			// replaced by it's view definition and we will loose the information that the statement
++			// was referencing a SESSION schema object. 
++			if (fromTable.referencesSessionSchema())
++				referencesSessionSchema = true;
++			setElementAt(newNode, index);
+ 		}
+ 		for (int index = 0; index < size; index++)
+ 		{
+ 			fromTable = (FromTable) elementAt(index);
+-			setElementAt(fromTable.bindVTITables(fromListParam), index);
++			ResultSetNode newNode = fromTable.bindVTITables(fromListParam);
++			if (fromTable.referencesSessionSchema())
++				referencesSessionSchema = true;
++			setElementAt(newNode, index);
+ 		}
+ 	}
+ 
+diff --git a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/declareGlobalTempTableJava.java b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/declareGlobalTempTableJava.java
+index e0913d3c..4320f4b8 100644
+--- a/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/declareGlobalTempTableJava.java
++++ b/db/derby/code/branches/10.1/java/testing/org/apache/derbyTesting/functionTests/tests/lang/declareGlobalTempTableJava.java
+@@ -984,6 +984,27 @@ static boolean testOtherOperations(Connection con1, Statement s, Connection con2
+ 			System.out.println("TEST27A PASSED");
+ 		}
+ 
++		//Derby424 - Queryplan for a query using SESSION schema view is incorrectly put in statement cache. This 
++		//could cause incorrect plan getting executed later if a temp. table is created with that name.
++		System.out.println("TEST28A : CREATE VIEW in SESSION schema referencing a table outside of SESSION schema");
++		s.executeUpdate("CREATE TABLE t28A (c28 int)");
++		s.executeUpdate("INSERT INTO t28A VALUES (280),(281)");
++		s.executeUpdate("CREATE VIEW SESSION.t28v1 as select * from t28A");
++		System.out.println("SELECT * from SESSION.t28v1 should show contents of view");
++		dumpRS(s.executeQuery("SELECT * from SESSION.t28v1"));
++		System.out.println("Now declare a global temporary table with same name as the view in SESSION schema");
++		s.executeUpdate("DECLARE GLOBAL TEMPORARY TABLE SESSION.t28v1(c21 int, c22 int) not logged");
++		s.executeUpdate("INSERT INTO SESSION.t28v1 VALUES (280,1),(281,2)");
++		System.out.println("SELECT * from SESSION.t28v1 should show contents of global temporary table");
++		dumpRS(s.executeQuery("SELECT * from SESSION.t28v1"));
++		s.executeUpdate("DROP TABLE SESSION.t28v1");
++		System.out.println("We have dropped global temporary table hence SESSION.t28v1 should point to view at this point");
++		dumpRS(s.executeQuery("SELECT * from SESSION.t28v1"));
++		s.executeUpdate("DROP VIEW SESSION.t28v1");
++		con1.rollback();
++		con1.commit();
++		System.out.println("TEST28A PASSED");
++
+ 		try
+ 		{
+ 			System.out.println("TEST29A : DELETE FROM global temporary table allowed.");

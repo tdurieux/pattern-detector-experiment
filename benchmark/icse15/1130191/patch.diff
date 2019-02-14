@@ -1,0 +1,140 @@
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 69ca2425..5c38c7de 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1887,8 +1887,12 @@ void clearUnsafe()
+      */
+     public Future<?> truncate() throws IOException
+     {
+-        // snapshot will also flush, but we want to truncate the most possible, and anything in a flush written
+-        // after truncateAt won't be truncated.
++        // We have two goals here:
++        // - truncate should delete everything written before truncate was invoked
++        // - but not delete anything that isn't part of the snapshot we create.
++        // We accomplish this by first flushing manually, then snapshotting, and
++        // recording the timestamp IN BETWEEN those actions. Any sstables created
++        // with this timestamp or greater time, will not be marked for delete.
+         try
+         {
+             forceBlockingFlush();
+@@ -1897,33 +1901,20 @@ void clearUnsafe()
+         {
+             throw new RuntimeException(e);
+         }
+-
+-        final long truncatedAt = System.currentTimeMillis();
+-        snapshot(Table.getTimestampedSnapshotName("before-truncate"));
+-
+-        Runnable runnable = new WrappedRunnable()
+-        {
+-            public void runMayThrow() throws InterruptedException, IOException
+-            {
+-                // putting markCompacted on the commitlogUpdater thread ensures it will run
+-                // after any compactions that were in progress when truncate was called, are finished
+-                for (ColumnFamilyStore cfs : concatWithIndexes())
+-                {
+-                    List<SSTableReader> truncatedSSTables = new ArrayList<SSTableReader>();
+-                    for (SSTableReader sstable : cfs.getSSTables())
++        // sleep a little to make sure that our truncatedAt comes after any sstable
++        // that was part of the flushed we forced; otherwise on a tie, it won't get deleted.
++        try
+                     {
+-                        if (!sstable.newSince(truncatedAt))
+-                            truncatedSSTables.add(sstable);
+-                    }
+-                    cfs.markCompacted(truncatedSSTables);
++            Thread.sleep(100);
+                 }
+-
+-                // Invalidate row cache
+-                invalidateRowCache();
++        catch (InterruptedException e)
++        {
++            throw new AssertionError(e);
+             }
+-        };
++        long truncatedAt = System.currentTimeMillis();
++        snapshot(Table.getTimestampedSnapshotName("before-truncate"));
+ 
+-        return postFlushExecutor.submit(runnable);
++        return CompactionManager.instance.submitTruncate(this, truncatedAt);
+     }
+ 
+     // if this errors out, we are in a world of hurt.
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/CompactionManager.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/CompactionManager.java
+index 56fa1c36..c3420a05 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -977,6 +977,30 @@ public void runMayThrow() throws IOException
+         return executor.submit(runnable);
+     }
+ 
++    public Future<?> submitTruncate(final ColumnFamilyStore main, final long truncatedAt)
++    {
++        Runnable runnable = new WrappedRunnable()
++        {
++            public void runMayThrow() throws InterruptedException, IOException
++            {
++                for (ColumnFamilyStore cfs : main.concatWithIndexes())
++                {
++                    List<SSTableReader> truncatedSSTables = new ArrayList<SSTableReader>();
++                    for (SSTableReader sstable : cfs.getSSTables())
++                    {
++                        if (!sstable.newSince(truncatedAt))
++                            truncatedSSTables.add(sstable);
++                    }
++                    cfs.markCompacted(truncatedSSTables);
++                }
++
++                main.invalidateRowCache();
++            }
++        };
++
++        return executor.submit(runnable);
++    }
++
+     private static int getDefaultGcBefore(ColumnFamilyStore cfs)
+     {
+         return (int) (System.currentTimeMillis() / 1000) - cfs.metadata.getGcGraceSeconds();
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+index f6bb0096..a9a7546b 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+@@ -677,23 +677,6 @@ public Table apply(String tableName)
+         return Iterables.transform(DatabaseDescriptor.getTables(), transformer);
+     }
+ 
+-    /**
+-     * Performs a synchronous truncate operation, effectively deleting all data
+-     * from the column family cfname
+-     * @param cfname
+-     * @throws IOException
+-     * @throws ExecutionException
+-     * @throws InterruptedException
+-     */
+-    public void truncate(String cfname) throws InterruptedException, ExecutionException, IOException
+-    {
+-        logger.debug("Truncating...");
+-        ColumnFamilyStore cfs = getColumnFamilyStore(cfname);
+-        // truncate, blocking
+-        cfs.truncate().get();
+-        logger.debug("Truncation done.");
+-    }
+-
+     @Override
+     public String toString() {
+         return getClass().getSimpleName() + "(name='" + name + "')";
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/TruncateVerbHandler.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/TruncateVerbHandler.java
+index cebf0bd5..bc6cd46f 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/TruncateVerbHandler.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/TruncateVerbHandler.java
+@@ -52,7 +52,8 @@ public void doVerb(Message message, String id)
+ 
+             try
+             {
+-                Table.open(t.keyspace).truncate(t.columnFamily);
++                ColumnFamilyStore cfs = Table.open(t.keyspace).getColumnFamilyStore(t.columnFamily);
++                cfs.truncate().get();
+             }
+             catch (IOException e)
+             {

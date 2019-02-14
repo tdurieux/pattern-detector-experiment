@@ -1,0 +1,647 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnIndexer.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnIndexer.java
+index a22e1394..2f1a4957 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnIndexer.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnIndexer.java
+@@ -23,6 +23,7 @@
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.List;
++import java.util.Iterator;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.io.DataOutputBuffer;
+@@ -102,41 +103,51 @@ private static BloomFilter createColumnBloomFilter(Collection<IColumn> columns)
+      */
+     private static void doIndexing(AbstractType comparator, Collection<IColumn> columns, DataOutputStream dos) throws IOException
+     {
+-        /* we are going to write column indexes */
+-        int position = 0;
+-        int indexSizeInBytes = 0;
+-        int sizeSummarized = 0;
++        assert !columns.isEmpty();
+         
+         /*
+-         * Maintains a list of KeyPositionInfo objects for the columns in this
++         * Maintains a list of ColumnIndexInfo objects for the columns in this
+          * column family. The key is the column name and the position is the
+          * relative offset of that column name from the start of the list.
+          * We do this so that we don't read all the columns into memory.
+         */
++        List<IndexHelper.IndexInfo> indexList = new ArrayList<IndexHelper.IndexInfo>();
+         
+-        List<IndexHelper.ColumnIndexInfo> columnIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();        
+-        
++        int endPosition = 0, startPosition = -1;
++        int indexSizeInBytes = 0;
++        IColumn column = null, firstColumn = null;
+         /* column offsets at the right thresholds into the index map. */
+-        for (IColumn column : columns)
++        for (Iterator<IColumn> it = columns.iterator(); it.hasNext();)
+         {
+-            /* if we hit the column index size that we have to index after, go ahead and index it */
+-            if (position - sizeSummarized >= DatabaseDescriptor.getColumnIndexSize())
++            column = it.next();
++            if (firstColumn == null)
++            {
++                firstColumn = column;
++                startPosition = endPosition;
++            }
++            endPosition += column.serializedSize();
++            /* if we hit the column index size that we have to index after, go ahead and index it. */
++            if (endPosition - startPosition >= DatabaseDescriptor.getColumnIndexSize())
+             {
+-                IndexHelper.ColumnIndexInfo cIndexInfo = new IndexHelper.ColumnIndexInfo(column.name(), 0, comparator);
+-                cIndexInfo.position(position);
+-                columnIndexList.add(cIndexInfo);
+-                /*
+-                 * we will be writing this object as a UTF8 string and two ints,
+-                 * so calculate the size accordingly. Note that we store the string
+-                 * as UTF-8 encoded, so when we calculate the length, it should be
+-                 * converted to UTF-8.
+-                 */
+-                indexSizeInBytes += cIndexInfo.size();
+-                sizeSummarized = position;
++                IndexHelper.IndexInfo cIndexInfo = new IndexHelper.IndexInfo(firstColumn.name(), column.name(), startPosition, endPosition - startPosition, null);
++                indexList.add(cIndexInfo);
++                indexSizeInBytes += cIndexInfo.serializedSize();
++                firstColumn = null;
+             }
+-            position += column.serializedSize();
+         }
+-        /* write the column index list */
+-        IndexHelper.serialize(indexSizeInBytes, columnIndexList, dos);
++        // the last column may have fallen on an index boundary already.  if not, index it explicitly.
++        if (indexList.isEmpty() || comparator.compare(indexList.get(indexList.size() - 1).lastName, column.name()) != 0)
++        {
++            IndexHelper.IndexInfo cIndexInfo = new IndexHelper.IndexInfo(firstColumn.name(), column.name(), startPosition, endPosition - startPosition, null);
++            indexList.add(cIndexInfo);
++            indexSizeInBytes += cIndexInfo.serializedSize();
++        }
++
++        assert indexSizeInBytes > 0;
++        dos.writeInt(indexSizeInBytes);
++        for (IndexHelper.IndexInfo cIndexInfo : indexList)
++        {
++            cIndexInfo.serialize(dos);
++        }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
+index f814465b..c1868078 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
+@@ -1,10 +1,7 @@
+ package org.apache.cassandra.db.filter;
+ 
+ import java.io.IOException;
+-import java.util.SortedSet;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.ArrayList;
++import java.util.*;
+ 
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.IColumn;
+@@ -35,35 +32,31 @@ public SSTableNamesIterator(String filename, String key, String cfName, SortedSe
+             /* note the position where the key starts */
+             String keyInDisk = file.readUTF();
+             assert keyInDisk.equals(decoratedKey) : keyInDisk;
+-            int dataSize = file.readInt();
++            file.readInt(); // data size
+ 
+             /* Read the bloom filter summarizing the columns */
+-            long preBfPos = file.getFilePointer();
+             IndexHelper.defreezeBloomFilter(file);
+-            long postBfPos = file.getFilePointer();
+-            dataSize -= (postBfPos - preBfPos);
+ 
+-            List<IndexHelper.ColumnIndexInfo> columnIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
+-            dataSize -= IndexHelper.readColumnIndexes(file, ssTable.getTableName(), cfName, columnIndexList);
++            List<IndexHelper.IndexInfo> indexList = IndexHelper.deserializeIndex(ssTable.getTableName(), cfName, file);
+ 
+             cf = ColumnFamily.serializer().deserializeEmpty(file);
+-            int totalColumns = file.readInt();
+-            dataSize -= cf.serializedSize();
++            file.readInt(); // column count
+ 
+             /* get the various column ranges we have to read */
+-            List<IndexHelper.ColumnRange> columnRanges = IndexHelper.getMultiColumnRangesFromNameIndex(columns, columnIndexList, dataSize, totalColumns);
+-
+-            int prevPosition = 0;
+-            /* now read all the columns from the ranges */
+-            for (IndexHelper.ColumnRange columnRange : columnRanges)
++            SortedSet<IndexHelper.IndexInfo> ranges = new TreeSet<IndexHelper.IndexInfo>();
++            for (byte[] name : columns)
+             {
++                ranges.add(indexList.get(IndexHelper.indexFor(name, indexList)));
++            }
++
+                 /* seek to the correct offset to the data */
+                 long columnBegin = file.getFilePointer();
+-                Coordinate coordinate = columnRange.coordinate();
+-                file.skipBytes((int)(coordinate.start_ - prevPosition));
+-                // read the columns in this range
++            /* now read all the columns from the ranges */
++            for (IndexHelper.IndexInfo indexInfo : ranges)
++            {
++                file.seek(columnBegin + indexInfo.offset);
+                 // TODO only completely deserialize columns we are interested in
+-                while (file.getFilePointer() - columnBegin < coordinate.end_ - coordinate.start_)
++                while (file.getFilePointer() < columnBegin + indexInfo.offset + indexInfo.width)
+                 {
+                     final IColumn column = cf.getColumnSerializer().deserialize(file);
+                     if (columns.contains(column.name()))
+@@ -71,8 +64,6 @@ public SSTableNamesIterator(String filename, String key, String cfName, SortedSe
+                         cf.addColumn(column);
+                     }
+                 }
+-
+-                prevPosition = (int) coordinate.end_;
+             }
+         }
+         finally
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+index 2fac27ea..9f604be8 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+@@ -141,10 +141,9 @@ public void close() throws IOException
+         private boolean isAscending_;
+         private ColumnFamily emptyColumnFamily;
+ 
+-        private List<IndexHelper.ColumnIndexInfo> columnIndexList_;
++        private List<IndexHelper.IndexInfo> indexList_;
+         private long columnStartPosition_;
+         private int curRangeIndex_;
+-        private int allColumnsSize_;
+         private BufferedRandomAccessFile file_;
+         private Queue<IColumn> blockColumns = new ArrayDeque<IColumn>();
+ 
+@@ -158,69 +157,37 @@ public ColumnGroupReader(String filename, String key, String cfName, AbstractTyp
+             init(startColumn, position);
+         }
+ 
+-        /**
+-         *   Build a list of index entries ready for search.
+-         */
+-        private List<IndexHelper.ColumnIndexInfo> getFullColumnIndexList(List<IndexHelper.ColumnIndexInfo> columnIndexList)
+-        {
+-            if (columnIndexList.size() == 0)
+-            {
+-                /* if there is no column index, add an index entry that covers the full space. */
+-                return Arrays.asList(new IndexHelper.ColumnIndexInfo(ArrayUtils.EMPTY_BYTE_ARRAY, 0, comparator_));
+-            }
+-
+-            List<IndexHelper.ColumnIndexInfo> fullColIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
+-
+-            fullColIndexList.add(new IndexHelper.ColumnIndexInfo(ArrayUtils.EMPTY_BYTE_ARRAY, 0, comparator_));
+-            for (int i = 0; i < columnIndexList.size() - 1; i++)
+-            {
+-                IndexHelper.ColumnIndexInfo colPosInfo = columnIndexList.get(i);
+-                fullColIndexList.add(new IndexHelper.ColumnIndexInfo(colPosInfo.name(), colPosInfo.position(), comparator_));
+-            }
+-            byte[] columnName = columnIndexList.get(columnIndexList.size() - 1).name();
+-            fullColIndexList.add(new IndexHelper.ColumnIndexInfo(columnName, columnIndexList.get(columnIndexList.size() - 1).position(), comparator_));
+-            return fullColIndexList;
+-        }
+-
+         private void init(byte[] startColumn, long position) throws IOException
+         {
+             file_.seek(position);
+             String keyInDisk = file_.readUTF();
+             assert keyInDisk.equals(key_);
+ 
+-            /* read off the size of this row */
+-            int dataSize = file_.readInt();
+-            /* skip the bloomfilter */
+-            int totalBytesRead = IndexHelper.skipBloomFilter(file_);
+-            /* read off the index flag, it has to be true */
+-            boolean hasColumnIndexes = file_.readBoolean();
+-            totalBytesRead += 1;
++            file_.readInt(); // row size
++            IndexHelper.skipBloomFilter(file_);
+ 
+             /* read the index */
+-            List<IndexHelper.ColumnIndexInfo> colIndexList = new ArrayList<IndexHelper.ColumnIndexInfo>();
+-            if (hasColumnIndexes)
+-                totalBytesRead += IndexHelper.deserializeIndex(SSTableReader.parseTableName(file_.getPath()), cfName_, file_, colIndexList);
++            indexList_ = IndexHelper.deserializeIndex(SSTableReader.parseTableName(file_.getPath()), cfName_, file_);
+ 
+             /* need to do two things here.
+              * 1. move the file pointer to the beginning of the list of stored columns
+              * 2. calculate the size of all columns */
+             emptyColumnFamily = ColumnFamily.serializer().deserializeEmpty(file_);
+-            int totalNumCols = file_.readInt();
+-            totalBytesRead += emptyColumnFamily.serializedSize();
+-            allColumnsSize_ = dataSize - totalBytesRead;
++            file_.readInt(); // column count
+ 
+             columnStartPosition_ = file_.getFilePointer();
+-            columnIndexList_ = getFullColumnIndexList(colIndexList);
+ 
+             if (startColumn.length == 0 && !isAscending_)
+             {
+                 /* in this case, we assume that we want to scan from the largest column in descending order. */
+-                curRangeIndex_ = columnIndexList_.size() - 1;
++                curRangeIndex_ = indexList_.size() - 1;
+             }
+             else
+             {
+-                int index = Collections.binarySearch(columnIndexList_, new IndexHelper.ColumnIndexInfo(startColumn, 0, comparator_));
+-                curRangeIndex_ = index < 0 ? (++index) * (-1) - 1 : index;
++                int index = Collections.binarySearch(indexList_, new IndexHelper.IndexInfo(startColumn, startColumn, 0, 0, comparator_));
++                curRangeIndex_ = index < 0 ? -1 * (index + 1): index;
++                if (curRangeIndex_ < 0)
++                    curRangeIndex_ = 0;
+             }
+         }
+ 
+@@ -236,17 +203,13 @@ public IColumn pollColumn()
+ 
+         private boolean getBlockFromCurIndex() throws IOException
+         {
+-            if (curRangeIndex_ < 0 || curRangeIndex_ >= columnIndexList_.size())
++            if (curRangeIndex_ < 0 || curRangeIndex_ >= indexList_.size())
+                 return false;
+-            IndexHelper.ColumnIndexInfo curColPostion = columnIndexList_.get(curRangeIndex_);
+-            long start = curColPostion.position();
+-            long end = curRangeIndex_ < columnIndexList_.size() - 1
+-                       ? columnIndexList_.get(curRangeIndex_+1).position()
+-                       : allColumnsSize_;
++            IndexHelper.IndexInfo curColPostion = indexList_.get(curRangeIndex_);
+ 
+             /* seek to the correct offset to the data, and calculate the data size */
+-            file_.seek(columnStartPosition_ + start);
+-            while (file_.getFilePointer() < columnStartPosition_ + end)
++            file_.seek(columnStartPosition_ + curColPostion.offset);
++            while (file_.getFilePointer() < columnStartPosition_ + curColPostion.offset + curColPostion.width)
+             {
+                 blockColumns.add(emptyColumnFamily.getColumnSerializer().deserialize(file_));
+             }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Coordinate.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Coordinate.java
+index b40e1a2b..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Coordinate.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/Coordinate.java
+@@ -1,42 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.cassandra.io;
+-
+-/**
+- * Section of a file that needs to be scanned
+- * is represented by this class.
+-*/
+-public class Coordinate
+-{
+-    public final long start_;
+-    public final long end_;
+-    
+-    Coordinate(long start, long end)
+-    {
+-        start_ = start;
+-        end_ = end;
+-    }
+-
+-    public String toString()
+-    {
+-        return "Coordinate(" +
+-               "start_=" + start_ +
+-               ", end_=" + end_ +
+-               ')';
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/IndexHelper.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/IndexHelper.java
+index 85cb2e32..8d7c6168 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/IndexHelper.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/IndexHelper.java
+@@ -34,32 +34,6 @@
+ 
+ public class IndexHelper
+ {
+-	/**
+-	 * Serializes a column index to a data output stream
+-	 * @param indexSizeInBytes Size of index to be written
+-	 * @param columnIndexList List of column index entries as objects
+-	 * @param dos the output stream into which the column index is to be written
+-	 * @throws IOException
+-	 */
+-	public static void serialize(int indexSizeInBytes, List<ColumnIndexInfo> columnIndexList, DataOutputStream dos) throws IOException
+-	{
+-		/* if we have no data to index, the write that there is no index present */
+-		if(indexSizeInBytes == 0 || columnIndexList == null || columnIndexList.size() == 0)
+-		{
+-			dos.writeBoolean(false);
+-		}
+-		else
+-		{
+-	        /* write if we are storing a column index */
+-	    	dos.writeBoolean(true);
+-	    	/* write the size of the index */
+-	    	dos.writeInt(indexSizeInBytes);
+-	        for( ColumnIndexInfo cIndexInfo : columnIndexList )
+-	        {
+-	        	cIndexInfo.serialize(dos);
+-	        }
+-		}
+-	}
+     
+     /**
+      * Skip the bloom filter and the index and return the bytes read.
+@@ -70,22 +44,7 @@ public static void serialize(int indexSizeInBytes, List<ColumnIndexInfo> columnI
+      */
+     public static int skipBloomFilterAndIndex(DataInput in) throws IOException
+     {
+-        int totalBytesRead = 0;
+-        /* size of the bloom filter */
+-        int size = in.readInt();
+-        totalBytesRead += 4;
+-        /* skip the serialized bloom filter */
+-        in.skipBytes(size);
+-        totalBytesRead += size;
+-        /* skip the index on disk */
+-        /* read if the file has column indexes */
+-        boolean hasColumnIndexes = in.readBoolean();
+-        totalBytesRead += 1;
+-        if ( hasColumnIndexes )
+-        {
+-            totalBytesRead += skipIndex(in);
+-        }
+-        return totalBytesRead;
++        return skipBloomFilter(in) + skipIndex(in);
+     }
+     
+     /**
+@@ -113,7 +72,7 @@ public static int skipBloomFilter(DataInput in) throws IOException
+ 	 * @return number of bytes read from the data input
+ 	 * @throws IOException
+ 	 */
+-	public static int skipIndex(DataInput file) throws IOException
++	private static int skipIndex(DataInput file) throws IOException
+ 	{
+         /* read only the column index list */
+         int columnIndexSize = file.readInt();
+@@ -128,113 +87,22 @@ public static int skipIndex(DataInput file) throws IOException
+     
+     /**
+      * Deserialize the index into a structure and return the number of bytes read.
+-     * @param tableName
+-     * @param in Input from which the serialized form of the index is read
+-     * @param columnIndexList the structure which is filled in with the deserialized index   @return number of bytes read from the input
+      * @throws IOException
+      */
+-	public static int deserializeIndex(String tableName, String cfName, DataInput in, List<ColumnIndexInfo> columnIndexList) throws IOException
++	public static ArrayList<IndexInfo> deserializeIndex(String tableName, String cfName, RandomAccessFile in) throws IOException
+ 	{
+-		/* read only the column index list */
+-		int columnIndexSize = in.readInt();
+-		int totalBytesRead = 4;
+-
+-		/* read the indexes into a separate buffer */
+-		DataOutputBuffer indexOut = new DataOutputBuffer();
+-        /* write the data into buffer */
+-		indexOut.write(in, columnIndexSize);
+-		totalBytesRead += columnIndexSize;
+-
+-		/* now deserialize the index list */
+-        DataInputBuffer indexIn = new DataInputBuffer();
+-        indexIn.reset(indexOut.getData(), indexOut.getLength());
++        ArrayList<IndexInfo> indexList = new ArrayList<IndexInfo>();
+         
++		int columnIndexSize = in.readInt();
++        long start = in.getFilePointer();
+         AbstractType comparator = DatabaseDescriptor.getComparator(tableName, cfName);
+-
+-        while (indexIn.available() > 0)
+-        {
+-            // TODO this is all kinds of messed up
+-            ColumnIndexInfo cIndexInfo = new ColumnIndexInfo(comparator);
+-            cIndexInfo = cIndexInfo.deserialize(indexIn);
+-            columnIndexList.add(cIndexInfo);
+-        }
+-
+-        return totalBytesRead;
+-	}
+-
+-    /**
+-     * Returns the range in which a given column falls in the index
+-     * @param columnIndexList the in-memory representation of the column index
+-     * @param dataSize the total size of the data
+-     * @param totalNumCols total number of columns
+-     * @return an object describing a subrange in which the column is serialized
+-     */
+-	static ColumnRange getColumnRangeFromNameIndex(IndexHelper.ColumnIndexInfo cIndexInfo, List<IndexHelper.ColumnIndexInfo> columnIndexList, int dataSize, int totalNumCols)
+-	{
+-        // TODO this looks like it can be simplified
+-        int rawIndex = Collections.binarySearch(columnIndexList, cIndexInfo);
+-        int index = rawIndex < 0
+-                  ? -1 * (rawIndex + 1)
+-                  : rawIndex + 1;
+-        if (index > 0)
+-            index -= 1;
+-        assert index < columnIndexList.size();
+-
+-        long blockStart = columnIndexList.get(index).position();
+-
+-        return new ColumnRange(blockStart, blockStart);
+-	}
+-
+-    /**
+-	 * Returns the sub-ranges that contain the list of columns in columnNames.
+-	 * @param columnNames The list of columns whose subranges need to be found
+-	 * @param columnIndexList the deserialized column indexes
+-	 * @param dataSize the total size of data
+-	 * @param totalNumCols the total number of columns
+-	 * @return a list of subranges which contain all the columns in columnNames
+-	 */
+-	public static List<ColumnRange> getMultiColumnRangesFromNameIndex(SortedSet<byte[]> columnNames, List<IndexHelper.ColumnIndexInfo> columnIndexList, int dataSize, int totalNumCols)
+-	{
+-		List<ColumnRange> columnRanges = new ArrayList<ColumnRange>();
+-
+-        if (columnIndexList.size() == 0)
+-        {
+-            columnRanges.add(new ColumnRange(0, dataSize));
+-        }
+-        else
++        while (in.getFilePointer() < start + columnIndexSize)
+         {
+-            Map<Long, Boolean> offset = new HashMap<Long, Boolean>();
+-            for (byte[] name : columnNames)
+-            {
+-                IndexHelper.ColumnIndexInfo cIndexInfo = new IndexHelper.ColumnIndexInfo(name, 0, (AbstractType)columnNames.comparator());
+-                ColumnRange columnRange = getColumnRangeFromNameIndex(cIndexInfo, columnIndexList, dataSize, totalNumCols);
+-                if (offset.get(columnRange.coordinate().start_) == null)
+-                {
+-                    columnRanges.add(columnRange);
+-                    offset.put(columnRange.coordinate().start_, true);
+-                }
+-            }
++            indexList.add(IndexInfo.deserialize(in, comparator));
+         }
++        assert in.getFilePointer() == start + columnIndexSize;
+ 
+-        return columnRanges;
+-	}
+-
+-    /**
+-     * Reads the column name indexes if present. If the
+-     * indexes are based on time then skip over them.
+-     */
+-    public static int readColumnIndexes(RandomAccessFile file, String tableName, String cfName, List<ColumnIndexInfo> columnIndexList) throws IOException
+-    {
+-        /* check if we have an index */
+-        boolean hasColumnIndexes = file.readBoolean();
+-        int totalBytesRead = 1;
+-        /* if we do then deserialize the index */
+-        if (hasColumnIndexes)
+-        {
+-            /* read the index */
+-            totalBytesRead += deserializeIndex(tableName, cfName, file, columnIndexList);
+-        }
+-        return totalBytesRead;
++        return indexList;
+     }
+ 
+     /**
+@@ -253,89 +121,52 @@ public static BloomFilter defreezeBloomFilter(RandomAccessFile file) throws IOEx
+         return BloomFilter.serializer().deserialize(bufIn);
+     }
+ 
+-
+-    /**
+-     * A column range containing the start and end
+-     * offset of the appropriate column index chunk
+-     * and the number of columns in that chunk.
+-     * @author alakshman
+-     *
+-     */
+-    public static class ColumnRange
+-    {
+-        private Coordinate coordinate_;
+-
+-        ColumnRange(long start, long end)
+-        {
+-            coordinate_ = new Coordinate(start, end);
+-        }
+-        
+-        public Coordinate coordinate()
++    public static int indexFor(byte[] name, List<IndexInfo> indexList)
+         {
+-            return coordinate_;
+-        }
++        IndexInfo target = new IndexInfo(name, name, 0, 0, indexList.get(0).comparator);
++        int index = Collections.binarySearch(indexList, target);
++        return index < 0 ? -1 * (index + 1) : index;
+     }
+ 
+-    /**
+-     * A helper class to generate indexes while
+-     * the columns are sorted by name on disk.
+-     */
+-    public static class ColumnIndexInfo implements Comparable<ColumnIndexInfo>
++    public static class IndexInfo implements Comparable<IndexInfo>
+     {
+-        private long position_;
+-        private byte[] name_;
+-        private AbstractType comparator_;
++        public final long width;
++        public final byte[] lastName;
++        private AbstractType comparator;
++        public final byte[] firstName;
++        public final long offset;
+ 
+-        public ColumnIndexInfo(AbstractType comparator_)
++        public IndexInfo(byte[] firstName, byte[] lastName, long offset, long width, AbstractType comparator)
+         {
+-            this.comparator_ = comparator_;
+-        }
+-
+-        public ColumnIndexInfo(byte[] name, long position, AbstractType comparator)
+-        {
+-            this(comparator);
+-            assert name.length == 0 || !"".equals(comparator.getString(name));
+-            name_ = name;
+-            position_ = position;
++            this.firstName = firstName;
++            this.lastName = lastName;
++            this.offset = offset;
++            this.width = width;
++            this.comparator = comparator;
+         }
+                 
+-        public long position()
+-        {
+-            return position_;
+-        }
+-        
+-        public void position(long position)
+-        {
+-            position_ = position;
+-        }
+-
+-        public int compareTo(ColumnIndexInfo rhs)
++        public int compareTo(IndexInfo rhs)
+         {
+-            return comparator_.compare(name_, rhs.name_);
++            return comparator.compare(lastName, rhs.lastName);
+         }
+ 
+         public void serialize(DataOutputStream dos) throws IOException
+         {
+-            dos.writeLong(position());
+-            ColumnSerializer.writeName(name_, dos);
++            ColumnSerializer.writeName(firstName, dos);
++            ColumnSerializer.writeName(lastName, dos);
++            dos.writeLong(offset);
++            dos.writeLong(width);
+         }
+ 
+-        public ColumnIndexInfo deserialize(DataInputStream dis) throws IOException
++        public int serializedSize()
+         {
+-            long position = dis.readLong();
+-            byte[] name = ColumnSerializer.readName(dis);
+-            return new ColumnIndexInfo(name, position, comparator_);
++            return 2 + firstName.length + 2 + lastName.length + 8 + 8;
+         }
+ 
+-        public int size()
++        public static IndexInfo deserialize(RandomAccessFile dis, AbstractType comparator) throws IOException
+         {
+-            // serialized size -- CS.writeName includes a 2-byte length prefix
+-            return 8 + 2 + name_.length;
+-        }
+-
+-        public byte[] name()
+-        {
+-            return name_;
++            return new IndexInfo(ColumnSerializer.readName(dis), ColumnSerializer.readName(dis), dis.readLong(), dis.readLong(), comparator);
+         }
+     }
++
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+index 1a2afe3d..e042e829 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+@@ -225,7 +225,6 @@ public void run() throws Exception
+         {
+             public void run() throws Exception
+             {
+-                Row result;
+                 ColumnFamily cf;
+ 
+                 cf = cfStore.getColumnFamily(ROW, new QueryPath("Standard1"), "col5".getBytes(), ArrayUtils.EMPTY_BYTE_ARRAY, true, 2);

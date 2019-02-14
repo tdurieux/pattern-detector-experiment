@@ -1,0 +1,2115 @@
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/JoinStrategy.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/JoinStrategy.java
+index e81dde07..94bdda03 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/JoinStrategy.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/JoinStrategy.java
+@@ -158,10 +158,15 @@ void estimateCost(Optimizable innerTable,
+ 		throws StandardException;
+ 
+ 	/**
+-	 * Get the estimated memory usage for this join strategy, given
+-	 * the number of rows and the memory usage per row.
+-	 */
+-	double memoryUsage(double memoryPerRow, double rowCount);
++     * @param userSpecifiedCapacity
++     * @param maxMemoryPerTable maximum number of bytes per table
++     * @param perRowUsage number of bytes per row
++     *
++     * @return The maximum number of rows that can be handled by this join strategy
++     */
++    public int maxCapacity( int userSpecifiedCapacity,
++                            int maxMemoryPerTable,
++                            double perRowUsage);
+ 
+ 	/** Get the name of this join strategy */
+ 	String getName();
+@@ -227,7 +232,8 @@ int getScanArgs(TransactionController tc,
+ 							int indexColItem,
+ 							int lockMode,
+ 							boolean tableLocked,
+-							int isolationLevel
++                            int isolationLevel,
++                            int maxMemoryPerTable
+ 							)
+ 					throws StandardException;
+ 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
+index ab75ef70..5551c019 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizable.java
+@@ -308,9 +308,6 @@ CostEstimate estimateCost(OptimizablePredicateList predList,
+ 	/** Return the load factor of the hash table, for hash join strategy */
+ 	public float loadFactor();
+ 
+-	/** Return the maximum capacity of the hash table, for hash join strategy */
+-	public int maxCapacity();
+-
+ 	/** Return the hash key column numbers, for hash join strategy */
+ 	public int[] hashKeyColumns();
+ 
+@@ -334,15 +331,24 @@ public boolean feasibleJoinStrategy(OptimizablePredicateList predList,
+ 			throws StandardException;
+ 
+ 	/**
+-	 * What is the memory usage in bytes of the proposed access path for this
+-	 * optimizable?
++     * @param rowCount
++     * @param maxMemoryPerTable
++     * @return true if the memory usage of the proposed access path is OK, false if not.
+ 	 *
+-	 * @param rowCount	The estimated number of rows returned by a single
+-	 *					scan of this optimizable
++     * @exception StandardException standard error policy
++     */
++    public boolean memoryUsageOK( double rowCount, int maxMemoryPerTable)
++			throws StandardException;
++
++	/**
++     * Return the maximum capacity of the hash table, for hash join strategy
+ 	 *
+-	 * @exception StandardException		Thrown on error
++     * @param maxMemoryPerTable The maximum number of bytes to be used. Ignored if the user has set a maximum
++     *                          number of rows for the Optimizable.
++     *
++     * @exception StandardException Standard error policy
+ 	 */
+-	public double memoryUsage(double rowCount) throws StandardException;
++	public int maxCapacity( JoinStrategy joinStrategy, int maxMemoryPerTable) throws StandardException;
+ 
+ 	/**
+ 	 * Can this Optimizable appear at the current location in the join order.
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizer.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizer.java
+index 78c95192..9580a88d 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizer.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/Optimizer.java
+@@ -322,4 +322,9 @@ public void trace(int traceFlag, int intParam1, int intParam2,
+ 	 * @see #USE_STATISTICS
+ 	 */
+ 	public boolean useStatistics();
++
++    /**
++     * @return the maximum number of bytes to be used per table.
++     */
++    public int getMaxMemoryPerTable();
+ }
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/BackingStoreHashtable.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/BackingStoreHashtable.java
+index a62dadc3..70d435f1 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/BackingStoreHashtable.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/BackingStoreHashtable.java
+@@ -29,10 +29,13 @@
+ import org.apache.derby.iapi.types.CloneableObject;
+ import org.apache.derby.iapi.types.DataValueDescriptor;
+ 
++import org.apache.derby.iapi.services.cache.ClassSize;
++
+ import java.util.Enumeration;
+ import java.util.Hashtable;
+ import java.util.Properties; 
+ import java.util.Vector;
++import java.util.NoSuchElementException;
+ 
+ /**
+ A BackingStoreHashtable is a utility class which will store a set of rows into
+@@ -102,12 +105,35 @@ The hash table will be built logically as follows (actual implementation
+      * Fields of the class
+      **************************************************************************
+      */
++    private TransactionController tc;
+     private Hashtable   hash_table;
+     private int[]       key_column_numbers;
+     private boolean     remove_duplicates;
+ 	private boolean		skipNullKeyColumns;
+     private Properties  auxillary_runtimestats;
+ 	private RowSource	row_source;
++    /* If max_inmemory_rowcnt > 0 then use that to decide when to spill to disk.
++     * Otherwise compute max_inmemory_size based on the JVM memory size when the BackingStoreHashtable
++     * is constructed and use that to decide when to spill to disk.
++     */
++    private long max_inmemory_rowcnt;
++    private long inmemory_rowcnt;
++    private long max_inmemory_size;
++    private boolean keepAfterCommit;
++
++    private static int vectorSize; // The estimated number of bytes used by Vector(0)
++    static {
++        try
++        {
++            vectorSize = ClassSize.estimateBase( java.util.Vector.class);
++        }
++        catch( SecurityException se)
++        {
++            vectorSize = 4*ClassSize.refSize;
++        }
++    };
++    
++    private DiskHashtable diskHashtable;
+ 
+     /**************************************************************************
+      * Constructors for This class:
+@@ -163,6 +189,9 @@ private BackingStoreHashtable(){}
+ 	 *
+ 	 * @param skipNullKeyColumns	Skip rows with a null key column, if true.
+      *
++     * @param keepAfterCommit If true the hash table is kept after a commit,
++     *                        if false the hash table is dropped on the next commit.
++     *
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+@@ -175,13 +204,21 @@ public BackingStoreHashtable(
+     long                    max_inmemory_rowcnt,
+     int                     initialCapacity,
+     float                   loadFactor,
+-	boolean					skipNullKeyColumns)
++	boolean					skipNullKeyColumns,
++    boolean                 keepAfterCommit)
+         throws StandardException
+     {
+         this.key_column_numbers    = key_column_numbers;
+         this.remove_duplicates    = remove_duplicates;
+ 		this.row_source			   = row_source;
+ 		this.skipNullKeyColumns	   = skipNullKeyColumns;
++        this.max_inmemory_rowcnt = max_inmemory_rowcnt;
++        if( max_inmemory_rowcnt > 0)
++            max_inmemory_size = Long.MAX_VALUE;
++        else
++            max_inmemory_size = Runtime.getRuntime().totalMemory()/100;
++        this.tc = tc;
++        this.keepAfterCommit = keepAfterCommit;
+ 
+         Object[] row;
+ 
+@@ -280,7 +317,7 @@ public BackingStoreHashtable(
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+-    private Object[] cloneRow(Object[] old_row)
++    static Object[] cloneRow(Object[] old_row)
+         throws StandardException
+     {
+         Object[] new_row = new DataValueDescriptor[old_row.length];
+@@ -299,8 +336,6 @@ public BackingStoreHashtable(
+      *
+      * @param row               Row to add to the hash table.
+      * @param hash_table        The java HashTable to load into.
+-     *
+-	 * @return true if successful, false if heap add fails.
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+@@ -310,9 +345,14 @@ private void add_row_to_hash_table(
+     Object[]    row)
+ 		throws StandardException
+     {
++        if( spillToDisk( hash_table, key, row))
++            return;
++        
+         Object  duplicate_value = null;
+ 
+-        if ((duplicate_value = hash_table.put(key, row)) != null)
++        if ((duplicate_value = hash_table.put(key, row)) == null)
++            doSpaceAccounting( row, false);
++        else
+         {
+             if (!remove_duplicates)
+             {
+@@ -321,6 +361,7 @@ private void add_row_to_hash_table(
+                 // inserted a duplicate
+                 if ((duplicate_value instanceof Vector))
+                 {
++                    doSpaceAccounting( row, false);
+                     row_vec = (Vector) duplicate_value;
+                 }
+                 else
+@@ -330,6 +371,7 @@ private void add_row_to_hash_table(
+ 
+                     // insert original row into vector
+                     row_vec.addElement(duplicate_value);
++                    doSpaceAccounting( row, true);
+                 }
+ 
+                 // insert new row into vector
+@@ -345,6 +387,89 @@ private void add_row_to_hash_table(
+         row = null;
+     }
+ 
++    private void doSpaceAccounting( Object[] row,
++                                    boolean firstDuplicate)
++    {
++        inmemory_rowcnt++;
++        if( max_inmemory_rowcnt <= 0)
++        {
++            for( int i = 0; i < row.length; i++)
++            {
++                if( row[i] instanceof DataValueDescriptor)
++                    max_inmemory_size -= ((DataValueDescriptor) row[i]).estimateMemoryUsage();
++                max_inmemory_size -= ClassSize.refSize;
++            }
++            max_inmemory_size -= ClassSize.refSize;
++            if( firstDuplicate)
++                max_inmemory_size -= vectorSize;
++        }
++    } // end of doSpaceAccounting
++
++    /**
++     * Determine whether a new row should be spilled to disk and, if so, do it.
++     *
++     * @param hash_table The in-memory hash table
++     * @param key The row's key
++     * @param row
++     *
++     * @return true if the row was spilled to disk, false if not
++     *
++     * @exception  StandardException  Standard exception policy.
++     */
++    private boolean spillToDisk( Hashtable   hash_table,
++                                 Object      key,
++                                 Object[]    row)
++		throws StandardException
++    {
++        // Once we have started spilling all new rows will go to disk, even if we have freed up some
++        // memory by moving duplicates to disk. This simplifies handling of duplicates and accounting.
++        if( diskHashtable == null)
++        {
++            if( max_inmemory_rowcnt > 0)
++            {
++                if( inmemory_rowcnt < max_inmemory_rowcnt)
++                    return false; // Do not spill
++            }
++            else if( max_inmemory_size > 0)
++                return false;
++            // Want to start spilling
++            if( ! (row instanceof DataValueDescriptor[]))
++            {
++                if( SanityManager.DEBUG)
++                    SanityManager.THROWASSERT( "BackingStoreHashtable row is not DataValueDescriptor[]");
++                // Do not know how to put it on disk
++                return false;
++            }
++            diskHashtable = new DiskHashtable( tc,
++                                               (DataValueDescriptor[]) row,
++                                               key_column_numbers,
++                                               remove_duplicates,
++                                               keepAfterCommit);
++        }
++        
++        Object duplicateValue = hash_table.get( key);
++        if( duplicateValue != null)
++        {
++            if( remove_duplicates)
++                return true; // a degenerate case of spilling
++            // If we are keeping duplicates then move all the duplicates from memory to disk
++            // This simplifies finding duplicates: they are either all in memory or all on disk.
++            if( duplicateValue instanceof Vector)
++            {
++                Vector duplicateVec = (Vector) duplicateValue;
++                for( int i = duplicateVec.size() - 1; i >= 0; i--)
++                {
++                    Object[] dupRow = (Object[]) duplicateVec.elementAt(i);
++                    diskHashtable.put( key, dupRow);
++                }
++            }
++            else
++                diskHashtable.put( key, (Object []) duplicateValue);
++            hash_table.remove( key);
++        }
++        diskHashtable.put( key, row);
++        return true;
++    } // end of spillToDisk
+     /**************************************************************************
+      * Public Methods of This class:
+      **************************************************************************
+@@ -364,6 +489,11 @@ public void close()
+ 		throws StandardException
+     {
+         hash_table = null;
++        if( diskHashtable != null)
++        {
++            diskHashtable.close();
++            diskHashtable = null;
++        }
+         return;
+     }
+ 
+@@ -380,7 +510,9 @@ public void close()
+     public Enumeration elements()
+         throws StandardException
+     {
++        if( diskHashtable == null)
+         return(hash_table.elements());
++        return new BackingStoreHashtableEnumeration();
+     }
+ 
+     /**
+@@ -420,7 +552,10 @@ public Enumeration elements()
+     public Object get(Object key)
+ 		throws StandardException
+     {
+-        return(hash_table.get(key));
++        Object obj = hash_table.get(key);
++        if( diskHashtable == null || obj != null)
++            return obj;
++        return diskHashtable.get( key);
+     }
+ 
+     /**
+@@ -451,7 +586,10 @@ public Object remove(
+     Object      key)
+ 		throws StandardException
+     {
+-        return(hash_table.remove(key));
++        Object obj = hash_table.remove(key);
++        if( obj != null || diskHashtable == null)
++            return obj;
++        return diskHashtable.remove(key);
+     }
+ 
+     /**
+@@ -553,7 +691,54 @@ public boolean put(
+     public int size()
+ 		throws StandardException
+     {
++        if( diskHashtable == null)
+         return(hash_table.size());
++        return hash_table.size() + diskHashtable.size();
+     }
+ 
++    private class BackingStoreHashtableEnumeration implements Enumeration
++    {
++        private Enumeration memoryEnumeration;
++        private Enumeration diskEnumeration;
++
++        BackingStoreHashtableEnumeration()
++        {
++            memoryEnumeration = hash_table.elements();
++            if( diskHashtable != null)
++            {
++                try
++                {
++                    diskEnumeration = diskHashtable.elements();
++                }
++                catch( StandardException se)
++                {
++                    diskEnumeration = null;
++                }
++            }
++        }
++        
++        public boolean hasMoreElements()
++        {
++            if( memoryEnumeration != null)
++            {
++                if( memoryEnumeration.hasMoreElements())
++                    return true;
++                memoryEnumeration = null;
++            }
++            if( diskEnumeration == null)
++                return false;
++            return diskEnumeration.hasMoreElements();
++        }
++
++        public Object nextElement() throws NoSuchElementException
++        {
++            if( memoryEnumeration != null)
++            {
++                if( memoryEnumeration.hasMoreElements())
++                    return memoryEnumeration.nextElement();
++                memoryEnumeration = null;
++            }
++            return diskEnumeration.nextElement();
++        }
++    } // end of class BackingStoreHashtableEnumeration
+ }
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/DiskHashtable.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/DiskHashtable.java
+index e69de29b..1442d05b 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/DiskHashtable.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/DiskHashtable.java
+@@ -0,0 +1,377 @@
++/*
++
++   Derby - Class org.apache.derby.iapi.store.access.DiskHashtable
++
++   Copyright 2005 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derby.iapi.store.access;
++
++import java.util.Enumeration;
++import java.util.NoSuchElementException;
++import java.util.Properties;
++import java.util.Vector;
++import org.apache.derby.iapi.error.StandardException;
++import org.apache.derby.iapi.services.io.FormatableBitSet;
++import org.apache.derby.iapi.types.DataValueDescriptor;
++import org.apache.derby.iapi.types.SQLInteger;
++import org.apache.derby.impl.store.access.heap.HeapRowLocation;
++import org.apache.derby.iapi.types.RowLocation;
++import org.apache.derby.iapi.services.context.ContextService;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++
++/**
++ * This class is used by BackingStoreHashtable when the BackingStoreHashtable must spill to disk.
++ * It implements the methods of a hash table: put, get, remove, elements, however it is not implemented
++ * as a hash table. In order to minimize the amount of unique code it is implemented using a Btree and a heap
++ * conglomerate. The Btree indexes the hash code of the row key. The actual key may be too long for
++ * our Btree implementation.
++ *
++ * Created: Fri Jan 28 13:58:03 2005
++ *
++ * @author <a href="mailto:klebanof@us.ibm.com">Jack Klebanoff</a>
++ * @version 1.0
++ */
++
++public class DiskHashtable 
++{
++    private final long rowConglomerateId;
++    private ConglomerateController rowConglomerate;
++    private final long btreeConglomerateId;
++    private ConglomerateController btreeConglomerate;
++    private final DataValueDescriptor[] btreeRow;
++    private final int[] key_column_numbers;
++    private final boolean remove_duplicates;
++    private final TransactionController tc;
++    private final DataValueDescriptor[] row;
++    private final DataValueDescriptor[] scanKey = { new SQLInteger()};
++    private int size;
++    private boolean keepStatistics;
++
++    /**
++     * Creates a new <code>DiskHashtable</code> instance.
++     *
++     * @param tc
++     * @param template An array of DataValueDescriptors that serves as a template for the rows.
++     * @param key_column_numbers The indexes of the key columns (0 based)
++     * @param remove_duplicates If true then rows with duplicate keys are removed
++     * @param keepAfterCommit If true then the hash table is kept after a commit
++     */
++    public DiskHashtable( TransactionController tc,
++                          DataValueDescriptor[] template,
++                          int[] key_column_numbers,
++                          boolean remove_duplicates,
++                          boolean keepAfterCommit)
++        throws StandardException
++    {
++        this.tc = tc;
++        this.key_column_numbers = key_column_numbers;
++        this.remove_duplicates = remove_duplicates;
++        LanguageConnectionContext lcc = (LanguageConnectionContext)
++				ContextService.getContextOrNull(LanguageConnectionContext.CONTEXT_ID);
++        keepStatistics = (lcc != null) && lcc.getRunTimeStatisticsMode();
++        row = new DataValueDescriptor[ template.length];
++        for( int i = 0; i < row.length; i++)
++            row[i] = template[i].getNewNull();
++        int tempFlags = keepAfterCommit ? (TransactionController.IS_TEMPORARY | TransactionController.IS_KEPT)
++          : TransactionController.IS_TEMPORARY;
++        
++        rowConglomerateId = tc.createConglomerate( "heap",
++                                                   template,
++                                                   (ColumnOrdering[]) null,
++                                                   (Properties) null,
++                                                   tempFlags);
++        rowConglomerate = tc.openConglomerate( rowConglomerateId,
++                                               keepAfterCommit,
++                                               TransactionController.OPENMODE_FORUPDATE,
++                                               TransactionController.MODE_TABLE,
++                                               TransactionController.ISOLATION_NOLOCK /* Single thread only */ );
++
++        btreeRow = new DataValueDescriptor[] { new SQLInteger(), rowConglomerate.newRowLocationTemplate()};
++        Properties btreeProps = new Properties();
++        btreeProps.put( "baseConglomerateId", String.valueOf( rowConglomerateId));
++        btreeProps.put( "rowLocationColumn", "1");
++        btreeProps.put( "allowDuplicates", "false"); // Because the row location is part of the key
++        btreeProps.put( "nKeyFields", "2"); // Include the row location column
++        btreeProps.put( "nUniqueColumns", "2"); // Include the row location column
++        btreeProps.put( "maintainParentLinks", "false");
++        btreeConglomerateId = tc.createConglomerate( "BTREE",
++                                                     btreeRow,
++                                                     (ColumnOrdering[]) null,
++                                                     btreeProps,
++                                                     tempFlags);
++
++        btreeConglomerate = tc.openConglomerate( btreeConglomerateId,
++                                                 keepAfterCommit,
++                                                 TransactionController.OPENMODE_FORUPDATE,
++                                                 TransactionController.MODE_TABLE,
++                                                 TransactionController.ISOLATION_NOLOCK /* Single thread only */ );
++    } // end of constructor
++
++    public void close() throws StandardException
++    {
++        btreeConglomerate.close();
++        rowConglomerate.close();
++        tc.dropConglomerate( btreeConglomerateId);
++        tc.dropConglomerate( rowConglomerateId);
++    } // end of close
++    
++    /**
++     * Put a new row in the overflow structure.
++     *
++     * @param row The row to be inserted.
++     * @param hashCode The row's hash code.
++     *
++     * @return true if the row was added,
++     *         false if it was not added (because it was a duplicate and we are eliminating duplicates).
++     *
++     * @exception StandardException standard error policy
++     */
++    public boolean put( Object key, Object[] row)
++        throws StandardException
++    {
++        boolean isDuplicate = false;
++        if( remove_duplicates || keepStatistics)
++        {
++            // Go to the work of finding out whether it is a duplicate
++            isDuplicate = (getRemove( key, false, true) != null);
++            if( remove_duplicates && isDuplicate)
++                return false;
++        }
++        rowConglomerate.insertAndFetchLocation( (DataValueDescriptor[]) row, (RowLocation) btreeRow[1]);
++        btreeRow[0].setValue( key.hashCode());
++        btreeConglomerate.insert( btreeRow);
++        if( keepStatistics && !isDuplicate)
++            size++;
++        return true;
++    } // end of put
++
++    /**
++     * Get a row from the overflow structure.
++     *
++     * @param key If the rows only have one key column then the key value. If there is more than one
++     *            key column then a KeyHasher
++     *
++     * @return null if there is no corresponding row,
++     *         the row (DataValueDescriptor[]) if there is exactly one row with the key
++     *         a Vector of all the rows with the key if there is more than one.
++     *
++     * @exception StandardException
++     */
++    public Object get( Object key)
++        throws StandardException
++    {
++        return getRemove( key, false, false);
++    }
++
++    private Object getRemove( Object key, boolean remove, boolean existenceOnly)
++        throws StandardException
++    {
++        int hashCode = key.hashCode();
++        int rowCount = 0;
++        Object retValue = null;
++
++        scanKey[0].setValue( hashCode);
++        ScanController scan = tc.openScan( btreeConglomerateId,
++                                           false, // do not hold
++                                           remove ? TransactionController.OPENMODE_FORUPDATE : 0,
++                                           TransactionController.MODE_TABLE,
++                                           TransactionController.ISOLATION_READ_UNCOMMITTED,
++                                           null, // Scan all the columns
++                                           scanKey,
++                                           ScanController.GE,
++                                           (Qualifier[][]) null,
++                                           scanKey,
++                                           ScanController.GT);
++        try
++        {
++            while( scan.fetchNext( btreeRow))
++            {
++                if( rowConglomerate.fetch( (RowLocation) btreeRow[1], row, (FormatableBitSet) null /* all columns */)
++                    && rowMatches( row, key))
++                {
++                    if( existenceOnly)
++                        return this;
++
++                    rowCount++;
++                    if( rowCount == 1)
++                        retValue = BackingStoreHashtable.cloneRow( row);
++                    else 
++                    {
++                        Vector v;
++                        if( rowCount == 2)
++                        {
++                            v = new Vector( 2);
++                            v.add( retValue);
++                            retValue = v;
++                        }
++                        else
++                            v = (Vector) retValue;
++                        v.add( BackingStoreHashtable.cloneRow( row));
++                    }
++                    if( remove)
++                    {
++                        rowConglomerate.delete( (RowLocation) btreeRow[1]);
++                        scan.delete();
++                        size--;
++                    }
++                    if( remove_duplicates)
++                        // This must be the only row with the key
++                        return retValue;
++                }
++            }
++        }
++        finally
++        {
++            scan.close();
++        }
++        return retValue;
++    } // end of getRemove
++
++
++    private boolean rowMatches( DataValueDescriptor[] row,
++                                Object key)
++    {
++        if( key_column_numbers.length == 1)
++            return row[ key_column_numbers[0]].equals( key);
++
++        KeyHasher kh = (KeyHasher) key;
++        for( int i = 0; i < key_column_numbers.length; i++)
++        {
++            if( ! row[ key_column_numbers[i]].equals( kh.getObject(i)))
++                return false;
++        }
++        return true;
++    } // end of rowMatches
++
++    /**
++     * remove all rows with a given key from the hash table.
++     *
++     * @param key          The key of the rows to remove.
++     *
++     * @return The removed row(s).
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public Object remove( Object key)
++		throws StandardException
++    {
++        return getRemove( key, true, false);
++    } // end of remove
++
++    /**
++     * @return The number of rows in the hash table
++     */
++    public int size()
++    {
++        return size;
++    }
++    
++    /**
++     * Return an Enumeration that can be used to scan entire table.
++     * <p>
++     * RESOLVE - is it worth it to support this routine?
++     *
++	 * @return The Enumeration.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    public Enumeration elements()
++        throws StandardException
++    {
++        return new ElementEnum();
++    }
++
++    private class ElementEnum implements Enumeration
++    {
++        private ScanController scan;
++        private boolean hasMore;
++
++        ElementEnum()
++        {
++            try
++            {
++                scan = tc.openScan( rowConglomerateId,
++                                    false, // do not hold
++                                    0, // read only
++                                    TransactionController.MODE_TABLE,
++                                    TransactionController.ISOLATION_NOLOCK,
++                                    (FormatableBitSet) null, // all columns
++                                    (DataValueDescriptor[]) null, // no start key
++                                    0, // no start key operator
++                                    (Qualifier[][]) null,
++                                    (DataValueDescriptor[]) null, // no stop key
++                                    0 /* no stop key operator */);
++                hasMore = scan.next();
++                if( ! hasMore)
++                {
++                    scan.close();
++                    scan = null;
++                }
++            }
++            catch( StandardException se)
++            {
++                hasMore = false;
++                if( scan != null)
++                {
++                    try
++                    {
++                        scan.close();
++                    }
++                    catch( StandardException se1){};
++                    scan = null;
++                }
++            }
++        } // end of constructor
++
++        public boolean hasMoreElements()
++        {
++            return hasMore;
++        }
++
++        public Object nextElement()
++        {
++            if( ! hasMore)
++                throw new NoSuchElementException();
++            try
++            {
++                scan.fetch( row);
++                Object retValue =  BackingStoreHashtable.cloneRow( row);
++                hasMore = scan.next();
++                if( ! hasMore)
++                {
++                    scan.close();
++                    scan = null;
++                }
++
++                return retValue;
++            }
++            catch( StandardException se)
++            {
++                if( scan != null)
++                {
++                    try
++                    {
++                        scan.close();
++                    }
++                    catch( StandardException se1){};
++                    scan = null;
++                }
++                throw new NoSuchElementException();
++            }
++        } // end of nextElement
++    } // end of class ElementEnum
++}
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+index 9fc1eb4c..b3f9bb48 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+@@ -1918,21 +1918,13 @@ public float loadFactor()
+ 		return loadFactor;
+ 	}
+ 
+-	/** @see Optimizable#maxCapacity */
+-	public int maxCapacity()
+-	{
+-		return maxCapacity;
+-	}
+-
+ 	/**
+-	 * @see Optimizable#memoryUsage
+-	 *
+-	 * @exception StandardException		Thrown on error
++	 * @see Optimizable#memoryUsageOK
+ 	 */
+-	public double memoryUsage(double rowCount)
++	public boolean memoryUsageOK(double rowCount, int maxMemoryPerTable)
+ 			throws StandardException
+ 	{
+-		return super.memoryUsage(singleScanRowCount);
++		return super.memoryUsageOK(singleScanRowCount, maxMemoryPerTable);
+ 	}
+ 
+ 	/**
+@@ -3306,8 +3298,8 @@ private int getScanArguments(ExpressionClassBuilder acb,
+ 			}
+ 		}
+ 
+-		JoinStrategy trulyTheBestJoinStrategy =
+-			getTrulyTheBestAccessPath().getJoinStrategy();
++        AccessPath ap = getTrulyTheBestAccessPath();
++		JoinStrategy trulyTheBestJoinStrategy =	ap.getJoinStrategy();
+ 
+ 		/*
+ 		** We can only do bulkFetch on NESTEDLOOP
+@@ -3337,9 +3329,8 @@ private int getScanArguments(ExpressionClassBuilder acb,
+ 											getTrulyTheBestAccessPath().
+ 																getLockMode(),
+ 											(tableDescriptor.getLockGranularity() == TableDescriptor.TABLE_LOCK_GRANULARITY),
+-											getCompilerContext().
+-														getScanIsolationLevel()
+-											
++											getCompilerContext().getScanIsolationLevel(),
++											ap.getOptimizer().getMaxMemoryPerTable()
+ 											);
+ 
+ 		closeMethodArgument(acb, mb);
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
+index a4de8140..1b20cfd7 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromTable.java
+@@ -95,6 +95,8 @@
+ 
+ 	private FormatableBitSet refCols;
+ 
++    private double perRowUsage = -1;
++    
+ 	private boolean considerSortAvoidancePath;
+ 
+   //this flag tells you if all the columns from this table are projected using * from it.
+@@ -660,15 +662,53 @@ public float loadFactor()
+ 	}
+ 
+ 	/** @see Optimizable#maxCapacity */
+-	public int maxCapacity()
++	public int maxCapacity( JoinStrategy joinStrategy, int maxMemoryPerTable) throws StandardException
+ 	{
+-		if (SanityManager.DEBUG)
++        return joinStrategy.maxCapacity( maxCapacity, maxMemoryPerTable, getPerRowUsage());
++	}
++
++    private double getPerRowUsage() throws StandardException
+ 		{
+-			SanityManager.THROWASSERT("Not expected to be called");
++        if( perRowUsage < 0)
++        {
++            // Do not use getRefCols() because the cached refCols may no longer be valid.
++            FormatableBitSet refCols = resultColumns.getReferencedFormatableBitSet(cursorTargetTable(), true, false);
++            perRowUsage = 0.0;
++
++            /* Add up the memory usage for each referenced column */
++            for (int i = 0; i < refCols.size(); i++)
++            {
++                if (refCols.isSet(i))
++                {
++                    ResultColumn rc = (ResultColumn) resultColumns.elementAt(i);
++                    DataTypeDescriptor expressionType = rc.getExpressionType();
++                    if( expressionType != null)
++                        perRowUsage += expressionType.estimatedMemoryUsage();
++                }
+ 		}
+ 
+-		return 0;
++            /*
++            ** If the proposed conglomerate is a non-covering index, add the 
++            ** size of the RowLocation column to the total.
++            **
++            ** NOTE: We don't have a DataTypeDescriptor representing a
++            ** REF column here, so just add a constant here.
++            */
++            ConglomerateDescriptor cd =
++              getCurrentAccessPath().getConglomerateDescriptor();
++            if (cd != null)
++            {
++                if (cd.isIndex() && ( ! isCoveringIndex(cd) ) )
++                {
++                    // workaround for a jikes bug. Can't directly reference a 
++                    // double with a value of 12.0 in this classfile. 
++                    double baseIndexUsage = 1.0;
++                    perRowUsage += ( baseIndexUsage + 11 );
++                }
+ 	}
++        }
++        return perRowUsage ;
++    } // end of getPerRowUsage
+ 
+ 	/** @see Optimizable#hashKeyColumns */
+ 	public int[] hashKeyColumns()
+@@ -701,66 +741,19 @@ public boolean feasibleJoinStrategy(OptimizablePredicateList predList,
+ 								feasible(this, predList, optimizer);
+ 	}
+ 
+-	/**
+-	 * @see Optimizable#memoryUsage
+-	 *
+-	 * @exception StandardException		Thrown on error
+-	 */
+-	public double memoryUsage(double rowCount) throws StandardException
++    /** @see Optimizable#considerMemoryUsageOK */
++    public boolean memoryUsageOK( double rowCount, int maxMemoryPerTable)
++			throws StandardException
+ 	{
+-		double retval = 0.0;
+-		
+-		// workaround for a jikes bug. Can't directly reference a 
+-		// double with a value of 12.0 in this classfile. 
+-		double baseIndexUsage = 1.0;
+-
+ 		/*
+ 		** Don't enforce maximum memory usage for a user-specified join
+ 		** strategy.
+ 		*/
+-		if (userSpecifiedJoinStrategy == null)
+-		{
+-			FormatableBitSet refCols = getRefCols();
+-			double perRowUsage = 0.0;
+-
+-			/* Add up the memory usage for each referenced column */
+-			for (int i = 0; i < refCols.size(); i++)
+-			{
+-				if (refCols.isSet(i))
+-				{
+-					ResultColumn rc = (ResultColumn) resultColumns.elementAt(i);
+-                    DataTypeDescriptor expressionType = rc.getExpressionType();
+-                    if( expressionType != null)
+-                        perRowUsage += expressionType.estimatedMemoryUsage();
+-				}
+-			}
+-
+-			/*
+-			** If the proposed conglomerate is a non-covering index, add the 
+-			** size of the RowLocation column to the total.
+-			**
+-			** NOTE: We don't have a DataTypeDescriptor representing a
+-			** REF column here, so just add a constant here.
+-			*/
+-			ConglomerateDescriptor cd =
+-					getCurrentAccessPath().getConglomerateDescriptor();
+-			if (cd != null)
+-			{
+-				if (cd.isIndex() && ( ! isCoveringIndex(cd) ) )
+-				{
+-					perRowUsage += ( baseIndexUsage + 11 );
+-				}
+-			}
+-
+-			/*
+-			** Let the join strategy tell us how much memory it uses.
+-			** Some use memory and some don't.
+-			*/
+-			retval = getCurrentAccessPath().getJoinStrategy().
+-											memoryUsage(perRowUsage, rowCount);
+-		}
++        if( userSpecifiedJoinStrategy != null)
++            return true;
+ 
+-		return retval;
++        int intRowCount = (rowCount > Integer.MAX_VALUE) ? Integer.MAX_VALUE : (int) rowCount;
++        return intRowCount <= maxCapacity( getCurrentAccessPath().getJoinStrategy(), maxMemoryPerTable);
+ 	}
+ 
+ 	/**
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
+index 4b8b1b95..6ab01ef9 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/HashJoinStrategy.java
+@@ -44,6 +44,8 @@
+ 
+ import org.apache.derby.iapi.reference.SQLState;
+ 
++import org.apache.derby.iapi.services.cache.ClassSize;
++
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ 
+ import org.apache.derby.iapi.services.io.FormatableArrayHolder;
+@@ -217,9 +219,16 @@ public void estimateCost(Optimizable innerTable,
+ 		*/
+ 	}
+ 
+-	/** @see JoinStrategy#memoryUsage */
+-	public double memoryUsage(double memoryPerRow, double rowCount) {
+-		return memoryPerRow * rowCount;
++	/** @see JoinStrategy#maxCapacity */
++	public int maxCapacity( int userSpecifiedCapacity,
++                            int maxMemoryPerTable,
++                            double perRowUsage) {
++        if( userSpecifiedCapacity >= 0)
++            return userSpecifiedCapacity;
++        perRowUsage += ClassSize.estimateHashEntrySize();
++        if( perRowUsage <= 1)
++            return maxMemoryPerTable;
++        return (int)(maxMemoryPerTable/perRowUsage);
+ 	}
+ 
+ 	/** @see JoinStrategy#getName */
+@@ -265,7 +274,8 @@ public int getScanArgs(
+ 							int indexColItem,
+ 							int lockMode,
+ 							boolean tableLocked,
+-							int isolationLevel
++							int isolationLevel,
++                            int maxMemoryPerTable
+ 							)
+ 						throws StandardException {
+ 		ExpressionClassBuilder acb = (ExpressionClassBuilder) acbi;
+@@ -280,7 +290,7 @@ public int getScanArgs(
+ 		nonStoreRestrictionList.generateQualifiers(acb,	mb, innerTable, true);
+ 		mb.push(innerTable.initialCapacity());
+ 		mb.push(innerTable.loadFactor());
+-		mb.push(innerTable.maxCapacity());
++		mb.push(innerTable.maxCapacity( (JoinStrategy) this, maxMemoryPerTable));
+ 		/* Get the hash key columns and wrap them in a formattable */
+ 		int[] hashKeyColumns = innerTable.hashKeyColumns();
+ 		FormatableIntHolder[] fihArray = 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/Level2OptimizerImpl.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/Level2OptimizerImpl.java
+index a4799514..4aa0b7e5 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/Level2OptimizerImpl.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/Level2OptimizerImpl.java
+@@ -250,9 +250,7 @@ public void trace(int traceFlag, int intParam1, int intParam2,
+ 
+ 			case SKIPPING_DUE_TO_EXCESS_MEMORY:
+ 				traceString = 
+-					"Skipping access path due to excess memory usage of " +
+-					doubleParam +
+-					" bytes - maximum is " +
++					"Skipping access path due to excess memory usage, maximum is " +
+ 					maxMemoryPerTable;
+ 				break;
+ 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
+index d14611ff..a39cde21 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/NestedLoopJoinStrategy.java
+@@ -152,9 +152,11 @@ public void estimateCost(Optimizable innerTable,
+ 						costEstimate);
+ 	}
+ 
+-	/** @see JoinStrategy#memoryUsage */
+-	public double memoryUsage(double memoryPerRow, double rowCount) {
+-		return 0.0;
++	/** @see JoinStrategy#maxCapacity */
++	public int maxCapacity( int userSpecifiedCapacity,
++                            int maxMemoryPerTable,
++                            double perRowUsage) {
++		return Integer.MAX_VALUE;
+ 	}
+ 
+ 	/** @see JoinStrategy#getName */
+@@ -203,7 +205,8 @@ public int getScanArgs(
+ 							int indexColItem,
+ 							int lockMode,
+ 							boolean tableLocked,
+-							int isolationLevel
++							int isolationLevel,
++                            int maxMemoryPerTable
+ 							)
+ 						throws StandardException {
+ 		ExpressionClassBuilder acb = (ExpressionClassBuilder) acbi;
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/OptimizerImpl.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/OptimizerImpl.java
+index 9fd22269..e4e5c6ce 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/OptimizerImpl.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/OptimizerImpl.java
+@@ -215,6 +215,11 @@ protected  OptimizerImpl(OptimizableList optimizableList,
+ 		timeOptimizationStarted = System.currentTimeMillis();
+ 	}
+ 
++    public int getMaxMemoryPerTable()
++    {
++        return maxMemoryPerTable;
++    }
++    
+ 	/**
+ 	 * @see Optimizer#getNextPermutation
+ 	 *
+@@ -1440,14 +1445,11 @@ private void costBasedCostOptimizable(Optimizable optimizable,
+ 		** a single scan is the total number of rows divided by the number
+ 		** of outer rows.  The optimizable may over-ride this assumption.
+ 		*/
+-		double memusage = optimizable.memoryUsage(
+-							estimatedCost.rowCount() / outerCost.rowCount());
+-
+-		if (memusage > maxMemoryPerTable)
++		if( ! optimizable.memoryUsageOK( estimatedCost.rowCount() / outerCost.rowCount(), maxMemoryPerTable))
+ 		{
+ 			if (optimizerTrace)
+ 			{
+-				trace(SKIPPING_DUE_TO_EXCESS_MEMORY, 0, 0, memusage, null);
++				trace(SKIPPING_DUE_TO_EXCESS_MEMORY, 0, 0, 0.0, null);
+ 			}
+ 			return;
+ 		}
+@@ -1566,14 +1568,12 @@ public void	considerCost(Optimizable optimizable,
+ 		** NOTE: This is probably not necessary here, because we should
+ 		** get here only for nested loop joins, which don't use memory.
+ 		*/
+-		double memusage = optimizable.memoryUsage(
+-							estimatedCost.rowCount() / outerCost.rowCount());
+-
+-		if (memusage > maxMemoryPerTable)
++        if( ! optimizable.memoryUsageOK( estimatedCost.rowCount() / outerCost.rowCount(),
++                                         maxMemoryPerTable))
+ 		{
+ 			if (optimizerTrace)
+ 			{
+-				trace(SKIPPING_DUE_TO_EXCESS_MEMORY, 0, 0, memusage, null);
++				trace(SKIPPING_DUE_TO_EXCESS_MEMORY, 0, 0, 0.0, null);
+ 			}
+ 			return;
+ 		}
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashScanResultSet.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashScanResultSet.java
+index 7940ac56..b4cb22ec 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashScanResultSet.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashScanResultSet.java
+@@ -361,7 +361,7 @@ else if (! hashtableBuilt)
+                     keyColumns,      
+                     eliminateDuplicates,// remove duplicates?
+                     -1,                 // RESOLVE - is there a row estimate?
+-                    -1,                 // RESOLVE - when should it go to disk?
++                    maxCapacity,
+                     initialCapacity,    // in memory Hashtable initial capacity
+                     loadFactor,         // in memory Hashtable load factor
+                     runTimeStatisticsOn,
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashTableResultSet.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashTableResultSet.java
+index f5f5b84c..14504f29 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashTableResultSet.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/HashTableResultSet.java
+@@ -221,7 +221,8 @@ public void	openCore() throws StandardException
+ 										   maxInMemoryRowCount,
+ 										   (int) initialCapacity,
+ 										   loadFactor,
+-										   skipNullKeyColumns);
++										   skipNullKeyColumns,
++                                           false /* Not kept after a commit */);
+ 
+ 			if (runTimeStatsOn)
+ 			{
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/ScrollInsensitiveResultSet.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/ScrollInsensitiveResultSet.java
+index 1dcb9c5f..6aad035a 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/ScrollInsensitiveResultSet.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/ScrollInsensitiveResultSet.java
+@@ -66,7 +66,6 @@
+ 
+ 
+ 	private int							sourceRowWidth;
+-	private TransactionController		tc;
+ 
+ 	private	  BackingStoreHashtable		ht;
+ 	private	  ExecRow					resultRow;
+@@ -87,6 +86,8 @@
+ 
+     private GeneratedMethod closeCleanup;
+ 
++    private boolean keepAfterCommit;
++
+ 	/**
+ 	 * Constructor for a ScrollInsensitiveResultSet
+ 	 *
+@@ -110,6 +111,7 @@ public ScrollInsensitiveResultSet(NoPutResultSet source,
+ 			  optimizerEstimatedRowCount, optimizerEstimatedCost);
+ 		this.source = source;
+ 		this.sourceRowWidth = sourceRowWidth;
++        keepAfterCommit = activation.getResultSetHoldability();
+ 		maxRows = activation.getMaxRows();
+ 		if (SanityManager.DEBUG)
+ 		{
+@@ -160,7 +162,7 @@ public void	openCore() throws StandardException
+ 		 * We need BackingStoreHashtable to actually go to disk when it doesn't fit.
+ 		 * This is a known limitation.
+ 		 */
+-		ht = new BackingStoreHashtable(tc,
++		ht = new BackingStoreHashtable(getTransactionController(),
+ 									   null,
+ 									   keyCols,
+ 									   false,
+@@ -168,7 +170,8 @@ public void	openCore() throws StandardException
+ 									   HashScanResultSet.DEFAULT_MAX_CAPACITY,
+ 									   HashScanResultSet.DEFAULT_INITIAL_CAPACITY,
+ 									   HashScanResultSet.DEFAULT_MAX_CAPACITY,
+-									   false);
++									   false,
++                                       keepAfterCommit);
+ 
+ 		openTime += getElapsedMillis(beginTime);
+ 		setBeforeFirstRow();
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/BackingStoreHashTableFromScan.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/BackingStoreHashTableFromScan.java
+index 3d9c203f..6940f8ca 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/BackingStoreHashTableFromScan.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/BackingStoreHashTableFromScan.java
+@@ -97,7 +97,8 @@ public BackingStoreHashTableFromScan(
+             max_inmemory_rowcnt,
+             initialCapacity,
+             loadFactor,
+-			skipNullKeyColumns);
++			skipNullKeyColumns,
++            false /* Do not keep the hash table after a commit. */);
+ 
+         open_scan =  (ScanManager)
+             tc.openScan(
+diff --git a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SpillHash.java b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SpillHash.java
+index e69de29b..dce56a59 100644
+--- a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SpillHash.java
++++ b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SpillHash.java
+@@ -0,0 +1,437 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.tests.lang.bug4356
++
++   Copyright 2001, 2004 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.lang;
++
++import java.sql.Connection;
++import java.sql.DriverManager;
++import java.sql.DatabaseMetaData;
++import java.sql.ResultSet;
++import java.sql.PreparedStatement;
++import java.sql.Statement;
++import java.sql.SQLException;
++import java.sql.Types;
++import java.util.BitSet;
++
++import org.apache.derby.tools.ij;
++import org.apache.derby.tools.JDBCDisplayUtil;
++
++/**
++ * Test BackingStoreHashtable spilling to disk.
++ * BackingStoreHashtable is used to implement hash joins, distinct, scroll insensitive cursors,
++ * outer joins, and the HAVING clause.
++ */
++public class SpillHash
++{
++    private static PreparedStatement joinStmt;
++    private static PreparedStatement distinctStmt;
++    private static final int LOTS_OF_ROWS = 10000;
++    private static int errorCount = 0;
++    
++    public static void main (String args[]) 
++    {
++        try {
++            /* Load the JDBC Driver class */
++            // use the ij utility to read the property file and
++            // make the initial connection.
++            ij.getPropertyArg(args);
++            Connection conn = ij.startJBMS();
++            Statement stmt = conn.createStatement();
++
++            for( int i = 0; i < prep.length; i++)
++                stmt.executeUpdate( prep[i]);
++            PreparedStatement insA = conn.prepareStatement( "insert into ta(ca1,ca2) values(?,?)");
++            PreparedStatement insB = conn.prepareStatement( "insert into tb(cb1,cb2) values(?,?)");
++            insertDups( insA, insB, initDupVals);
++
++            joinStmt =
++              conn.prepareStatement( "select ta.ca1, ta.ca2, tb.cb2 from ta, tb where ca1 = cb1");
++            distinctStmt =
++              conn.prepareStatement( "select distinct ca1 from ta");
++
++            runStatements( conn, 0, new String[][][] {initDupVals});
++
++            System.out.println( "Growing database.");
++            
++            // Add a lot of rows so that the hash tables have to spill to disk
++            conn.setAutoCommit(false);
++            for( int i = 1; i <= LOTS_OF_ROWS; i++)
++            {
++                insA.setInt(1, i);
++                insA.setString(2, ca2Val(i));
++                insA.executeUpdate();
++                insB.setInt(1, i);
++                insB.setString(2, cb2Val(i));
++                insB.executeUpdate();
++
++                if( (i & 0xff) == 0)
++                    conn.commit();
++            }
++            conn.commit();
++            insertDups( insA, insB, spillDupVals);
++            conn.commit();
++
++            conn.setAutoCommit(true);
++            runStatements( conn, LOTS_OF_ROWS, new String[][][] {initDupVals, spillDupVals});
++            
++            conn.close();
++        } catch (Exception e) {
++            System.out.println("FAIL -- unexpected exception "+e);
++            JDBCDisplayUtil.ShowException(System.out, e);
++            e.printStackTrace();
++            errorCount++;
++        }
++        if( errorCount == 0)
++        {
++            System.out.println( "PASSED.");
++            System.exit(0);
++        }
++        else
++        {
++            System.out.println( "FAILED: " + errorCount + ((errorCount == 1) ? " error" : " errors"));
++            System.exit(1);
++        }
++    } // end of main
++    
++    private static final String[] prep =
++    {
++        "create table ta (ca1 integer, ca2 char(200))",
++        "create table tb (cb1 integer, cb2 char(200))",
++        "insert into ta(ca1,ca2) values(null, 'Anull')",
++        "insert into tb(cb1,cb2) values(null, 'Bnull')"
++    };
++
++    private static final String[][] initDupVals =
++    {
++        { "0a", "0b"},
++        { "1a", "1b"},
++        { "2a"}
++    };
++    private static final String[][] spillDupVals =
++    {
++        {},
++        { "1c"},
++        { "2b"},
++        { "3a", "3b", "3c"}
++    };
++
++    private static int expectedMincc2( int cc1)
++    {
++        return 4*cc1;
++    }
++
++    private static int expectedMaxcc2( int cc1)
++    {
++        return expectedMincc2( cc1) + (cc1 & 0x3);
++    }
++    
++    private static void insertDups( PreparedStatement insA, PreparedStatement insB, String[][] dupVals)
++        throws SQLException
++    {
++        for( int i = 0; i < dupVals.length; i++)
++        {
++            insA.setInt(1, -i);
++            insB.setInt(1, -i);
++            String[] vals = dupVals[i];
++            for( int j = 0; j < vals.length; j++)
++            {
++                insA.setString( 2, "A" + vals[j]);
++                insA.executeUpdate();
++                insB.setString( 2, "B" + vals[j]);
++                insB.executeUpdate();
++            }
++        }
++    } // end of insertDups
++    
++    private static String ca2Val( int col1Val)
++    {
++        return "A" + col1Val;
++    }
++    
++    private static String cb2Val( int col1Val)
++    {
++        return "B" + col1Val;
++    }
++    
++    private static void runStatements( Connection conn, int maxColValue, String[][][] dupVals)
++        throws SQLException
++    {
++        runJoin( conn, maxColValue, dupVals);
++        runDistinct( conn, maxColValue, dupVals);
++        runCursor( conn, maxColValue, dupVals);
++    }
++
++    private static void runJoin( Connection conn, int maxColValue, String[][][] dupVals)
++        throws SQLException
++    {
++        System.out.println( "Running join");
++        int expectedRowCount = maxColValue; // plus expected duplicates, to be counted below
++        ResultSet rs = joinStmt.executeQuery();
++        BitSet joinRowFound = new BitSet( maxColValue);
++        int dupKeyCount = 0;
++        for( int i = 0; i < dupVals.length; i++)
++        {
++            if( dupVals[i].length > dupKeyCount)
++                dupKeyCount = dupVals[i].length;
++        }
++        BitSet[] dupsFound = new BitSet[dupKeyCount];
++        int[] dupCount = new int[ dupKeyCount];
++        for( int i = 0; i < dupKeyCount; i++)
++        {
++            // count the number of rows with column(1) == -i
++            dupCount[i] = 0;
++            for( int j = 0; j < dupVals.length; j++)
++            {
++                if( i < dupVals[j].length)
++                    dupCount[i] += dupVals[j][i].length;
++            }
++            dupsFound[i] = new BitSet(dupCount[i]*dupCount[i]);
++            expectedRowCount += dupCount[i]*dupCount[i];
++        }
++        
++        int count;
++        for( count = 0; rs.next(); count++)
++        {
++            int col1Val = rs.getInt(1);
++            if( rs.wasNull())
++            {
++                System.out.println( "Null in join column.");
++                errorCount++;
++                continue;
++            }
++            if( col1Val > maxColValue)
++            {
++                System.out.println( "Invalid value in first join column.");
++                errorCount++;
++                continue;
++            }
++            if( col1Val > 0)
++            {
++                if( joinRowFound.get( col1Val - 1))
++                {
++                    System.out.println( "Multiple rows for value " + col1Val);
++                    errorCount++;
++                }
++                joinRowFound.set( col1Val - 1);
++                String col2Val = trim( rs.getString(2));
++                String col3Val = trim( rs.getString(3));
++                if( !( ca2Val( col1Val).equals( col2Val) && cb2Val( col1Val).equals( col3Val)))
++                {
++                    System.out.println( "Incorrect value in column 2 or 3 of join.");
++                    errorCount++;
++                }
++            }
++            else // col1Val <= 0, there are duplicates in the source tables
++            {
++                int dupKeyIdx = -col1Val;
++                int col2Idx = findDupVal( rs, 2, 'A', dupKeyIdx, dupVals);
++                int col3Idx = findDupVal( rs, 3, 'B', dupKeyIdx, dupVals);
++                if( col2Idx < 0 || col3Idx < 0)
++                    continue;
++
++                int idx = col2Idx + dupCount[dupKeyIdx]*col3Idx;
++                if( dupsFound[dupKeyIdx].get( idx))
++                {
++                    System.out.println( "Repeat of row with key value 0");
++                    errorCount++;
++                }
++                dupsFound[dupKeyIdx].set( idx);
++            }
++        };
++        if( count != expectedRowCount)
++        {
++            System.out.println( "Incorrect number of rows in join.");
++            errorCount++;
++        }
++        rs.close();
++    } // end of runJoin
++
++    private static int findDupVal( ResultSet rs, int col, char prefix, int keyIdx, String[][][] dupVals)
++        throws SQLException
++    {
++        String colVal = rs.getString(col);
++        if( colVal != null && colVal.length() > 1 || colVal.charAt(0) == prefix)
++        {
++            colVal = trim( colVal.substring( 1));
++            int dupIdx = 0;
++            for( int i = 0; i < dupVals.length; i++)
++            {
++                if( keyIdx < dupVals[i].length)
++                {
++                    for( int j = 0; j < dupVals[i][keyIdx].length; j++, dupIdx++)
++                    {
++                        if( colVal.equals( dupVals[i][keyIdx][j]))
++                            return dupIdx;
++                    }
++                }
++            }
++        }
++        System.out.println( "Incorrect value in column " + col + " of join with duplicate keys.");
++        errorCount++;
++        return -1;
++    } // end of findDupVal
++        
++    private static String trim( String str)
++    {
++        if( str == null)
++            return str;
++        return str.trim();
++    }
++    
++    private static void runDistinct( Connection conn, int maxColValue, String[][][] dupVals)
++        throws SQLException
++    {
++        System.out.println( "Running distinct");
++        ResultSet rs = distinctStmt.executeQuery();
++        checkAllCa1( rs, false, false, maxColValue, dupVals, "DISTINCT");
++    }
++
++    private static void checkAllCa1( ResultSet rs,
++                                     boolean expectDups,
++                                     boolean holdOverCommit,
++                                     int maxColValue,
++                                     String[][][] dupVals,
++                                     String label)
++        throws SQLException
++    {
++        int dupKeyCount = 0;
++        for( int i = 0; i < dupVals.length; i++)
++        {
++            if( dupVals[i].length > dupKeyCount)
++                dupKeyCount = dupVals[i].length;
++        }
++        int[] expectedDupCount = new int[dupKeyCount];
++        int[] dupFoundCount = new int[dupKeyCount];
++        for( int i = 0; i < dupKeyCount; i++)
++        {
++            
++            dupFoundCount[i] = 0;
++            if( !expectDups)
++                expectedDupCount[i] = 1;
++            else
++            {
++                expectedDupCount[i] = 0;
++                for( int j = 0; j < dupVals.length; j++)
++                {
++                    if( i < dupVals[j].length)
++                        expectedDupCount[i] += dupVals[j][i].length;
++                }
++            }
++        }
++        BitSet found = new BitSet( maxColValue);
++        int count = 0;
++        boolean nullFound = false;
++        try
++        {
++            for( count = 0; rs.next();)
++            {
++                int col1Val = rs.getInt(1);
++                if( rs.wasNull())
++                {
++                    if( nullFound)
++                    {
++                        System.out.println( "Too many nulls returned by " + label);
++                        errorCount++;
++                        continue;
++                    }
++                    nullFound = true;
++                    continue;
++                }
++                if( col1Val <= -dupKeyCount || col1Val > maxColValue)
++                {
++                    System.out.println( "Invalid value returned by " + label);
++                    errorCount++;
++                    continue;
++                }
++                if( col1Val <= 0)
++                {
++                    dupFoundCount[ -col1Val]++;
++                    if( !expectDups)
++                    {
++                        if( dupFoundCount[ -col1Val] > 1)
++                        {
++                            System.out.println( label + " returned a duplicate.");
++                            errorCount++;
++                            continue;
++                        }
++                    }
++                    else if( dupFoundCount[ -col1Val] > expectedDupCount[ -col1Val])
++                    {
++                        System.out.println( label + " returned too many duplicates.");
++                        errorCount++;
++                        continue;
++                    }
++                }
++                else
++                {
++                    if( found.get( col1Val))
++                    {
++                        System.out.println( label + " returned a duplicate.");
++                        errorCount++;
++                        continue;
++                    }
++                    found.set( col1Val);
++                    count++;
++                }
++                if( holdOverCommit)
++                {
++                    rs.getStatement().getConnection().commit();
++                    holdOverCommit = false;
++                }
++            }
++            if( count != maxColValue)
++            {
++                System.out.println( "Incorrect number of rows in " + label);
++                errorCount++;
++            }
++            for( int i = 0; i < dupFoundCount.length; i++)
++            {
++                if( dupFoundCount[i] != expectedDupCount[i])
++                {
++                    System.out.println( "A duplicate key row is missing in " + label);
++                    errorCount++;
++                    break;
++                }
++            }
++        }
++        finally
++        {
++            rs.close();
++        }
++    } // End of checkAllCa1
++
++    private static void runCursor( Connection conn, int maxColValue, String[][][] dupVals)
++        throws SQLException
++    {
++        System.out.println( "Running scroll insensitive cursor");
++        DatabaseMetaData dmd = conn.getMetaData();
++        boolean holdOverCommit = dmd.supportsOpenCursorsAcrossCommit();
++        Statement stmt;
++        if( holdOverCommit)
++            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                        ResultSet.CONCUR_READ_ONLY,
++                                        ResultSet.HOLD_CURSORS_OVER_COMMIT);
++        else
++            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                        ResultSet.CONCUR_READ_ONLY);
++        ResultSet rs = stmt.executeQuery( "SELECT ca1 FROM ta");
++        checkAllCa1( rs, true, holdOverCommit, maxColValue, dupVals, "scroll insensitive cursor");
++    }
++}
+diff --git a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/TestDiskHashtable.java b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/TestDiskHashtable.java
+index e69de29b..e05b4c69 100644
+--- a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/TestDiskHashtable.java
++++ b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/TestDiskHashtable.java
+@@ -0,0 +1,432 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.tests.store.TestDiskHashtable
++
++   Copyright 2005 The Apache Software Foundation or its licensors, as applicable.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.store;
++
++import java.sql.Connection;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++
++import java.util.BitSet;
++import java.util.Enumeration;
++import java.util.HashMap;
++import java.util.Vector;
++
++import org.apache.derby.iapi.error.PublicAPI;
++import org.apache.derby.iapi.error.StandardException;
++import org.apache.derby.iapi.sql.conn.ConnectionUtil;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++import org.apache.derby.iapi.store.access.DiskHashtable;
++import org.apache.derby.iapi.store.access.KeyHasher;
++import org.apache.derby.iapi.store.access.TransactionController;
++import org.apache.derby.iapi.types.DataValueDescriptor;
++import org.apache.derby.iapi.types.Orderable;
++import org.apache.derby.iapi.types.SQLInteger;
++import org.apache.derby.iapi.types.SQLLongint;
++import org.apache.derby.iapi.types.SQLVarchar;
++import org.apache.derby.tools.ij;
++import org.apache.derbyTesting.functionTests.util.TestUtil;
++
++/**
++ * This program tests the org.apache.derby.iapi.store.access.DiskHashtable class.
++ * The unit test interface is not used because that is undocumented and very difficult to decipher.
++ * Furthermore it is difficult to diagnose problems when using the unit test interface.
++ *
++ * Created: Wed Feb 09 15:44:12 2005
++ *
++ * @author <a href="mailto:klebanof@us.ibm.com">Jack Klebanoff</a>
++ * @version 1.0
++ */
++public class TestDiskHashtable 
++{
++    private TransactionController tc;
++    private int failed = 0;
++    
++    public static void main( String args[])
++    {
++        int failed = 1;
++
++		REPORT("Test DiskHashtable starting");
++        try
++        {
++			// use the ij utility to read the property file and
++			// make the initial connection.
++			ij.getPropertyArg(args);
++			Connection conn = ij.startJBMS();
++            Statement stmt = conn.createStatement();
++            stmt.execute("CREATE FUNCTION testDiskHashtable() returns INTEGER EXTERNAL NAME 'org.apache.derbyTesting.functionTests.tests.store.TestDiskHashtable.runTests' LANGUAGE JAVA PARAMETER STYLE JAVA");
++            ResultSet rs = stmt.executeQuery( "values( testDiskHashtable())");
++            if( rs.next())
++                failed = rs.getInt(1);
++            stmt.close();
++            conn.close();
++        }
++        catch( SQLException e)
++        {
++			TestUtil.dumpSQLExceptions( e);
++            failed = 1;
++        }
++        catch( Throwable t)
++        {
++			REPORT("FAIL -- unexpected exception:" + t.toString());
++            failed = 1;
++		}
++        REPORT( (failed == 0) ? "OK" : "FAILED");
++        System.exit( (failed == 0) ? 0 : 1);
++    }
++
++    private void REPORT_FAILURE(String msg)
++    {
++        failed = 1;
++        REPORT( msg);
++    }
++    
++    private static void REPORT(String msg)
++    {
++        System.out.println( msg);
++    }
++    
++    public static int runTests() throws SQLException
++    {
++        TestDiskHashtable tester = new TestDiskHashtable();
++        return tester.doIt();
++    }
++
++    private TestDiskHashtable() throws SQLException
++    {
++        LanguageConnectionContext lcc = ConnectionUtil.getCurrentLCC();
++        if( lcc == null)
++            throw new SQLException( "Cannot get the LCC");
++        tc = lcc.getTransactionExecute();
++    }
++
++    private int doIt() throws SQLException
++    {
++		try {
++
++
++            REPORT( "Starting single key, keep duplicates test");
++            testOneVariant( tc, false, singleKeyTemplate, singleKeyCols, singleKeyRows);
++            REPORT( "Starting single key, remove duplicates test");
++            testOneVariant( tc, true, singleKeyTemplate, singleKeyCols, singleKeyRows);
++            REPORT( "Starting multiple key, keep duplicates test");
++            testOneVariant( tc, false, multiKeyTemplate, multiKeyCols, multiKeyRows);
++            REPORT( "Starting multiple key, remove duplicates test");
++            testOneVariant( tc, true, multiKeyTemplate, multiKeyCols, multiKeyRows);
++
++			tc.commit();
++		}
++		catch (StandardException se)
++		{
++            throw PublicAPI.wrapStandardException( se);
++        }
++        return failed;
++    } // end of doIt
++
++    private static final DataValueDescriptor[] singleKeyTemplate = { new SQLInteger(), new SQLVarchar()};
++    private static final int[] singleKeyCols = {0};
++    private static final DataValueDescriptor[][] singleKeyRows =
++    {
++        {new SQLInteger(1), new SQLVarchar("abcd")},
++        {new SQLInteger(2), new SQLVarchar("abcd")},
++        {new SQLInteger(3), new SQLVarchar("e")},
++        {new SQLInteger(1), new SQLVarchar("zz")}
++    };
++
++    private static final DataValueDescriptor[] multiKeyTemplate = { new SQLLongint(), new SQLVarchar(), new SQLInteger()};
++    private static final int[] multiKeyCols = {1, 0};
++    private static final DataValueDescriptor[][] multiKeyRows =
++    {
++        {new SQLLongint(1), new SQLVarchar( "aa"), multiKeyTemplate[2].getNewNull()},
++        {new SQLLongint(2), new SQLVarchar( "aa"), new SQLInteger(1)},
++        {new SQLLongint(2), new SQLVarchar( "aa"), new SQLInteger(2)},
++        {new SQLLongint(2), new SQLVarchar( "b"), new SQLInteger(1)}
++    };
++
++    private static final int LOTS_OF_ROWS_COUNT = 50000;
++    
++    private void testOneVariant( TransactionController tc,
++                                 boolean removeDups,
++                                 DataValueDescriptor[] template,
++                                 int[] keyCols,
++                                 DataValueDescriptor[][] rows)
++        throws StandardException
++    {
++        DiskHashtable dht = new DiskHashtable(tc, template, keyCols, removeDups, false);
++        boolean[] isDuplicate = new boolean[ rows.length];
++        boolean[] found = new boolean[ rows.length];
++        HashMap simpleHash = new HashMap( rows.length);
++
++        testElements( removeDups, dht, keyCols, 0, rows, simpleHash, isDuplicate, found);
++
++        for( int i = 0; i < rows.length; i++)
++        {
++            Object key = KeyHasher.buildHashKey( rows[i], keyCols);
++            Vector al = (Vector) simpleHash.get( key);
++            isDuplicate[i] = (al != null);
++            if( al == null)
++            {
++                al = new Vector(4);
++                simpleHash.put( key, al);
++            }
++            if( (!removeDups) || !isDuplicate[i])
++                al.add( rows[i]);
++            
++            if( dht.put( key, rows[i]) != (removeDups ? (!isDuplicate[i]) : true))
++                REPORT_FAILURE( "  put returned wrong value on row " + i);
++
++            for( int j = 0; j <= i; j++)
++            {
++                key = KeyHasher.buildHashKey( rows[j], keyCols);
++                if( ! rowsEqual( dht.get( key), simpleHash.get( key)))
++                    REPORT_FAILURE( "  get returned wrong value on key " + j);
++            }
++
++            testElements( removeDups, dht, keyCols, i+1, rows, simpleHash, isDuplicate, found);
++        }
++        // Remove them
++        for( int i = 0; i < rows.length; i++)
++        {
++            Object key = KeyHasher.buildHashKey( rows[i], keyCols);
++            if( ! rowsEqual( dht.remove( key), simpleHash.get( key)))
++                REPORT_FAILURE( "  remove returned wrong value on key " + i);
++            simpleHash.remove( key);
++            if( dht.get( key) != null)
++                REPORT_FAILURE( "  remove did not delete key " + i);
++        }
++        testElements( removeDups, dht, keyCols, 0, rows, simpleHash, isDuplicate, found);
++
++        testLargeTable( dht, keyCols, rows[0]);
++        dht.close();
++    } // end of testOneVariant
++
++    private void testLargeTable( DiskHashtable dht,
++                                 int[] keyCols,
++                                 DataValueDescriptor[] aRow)
++        throws StandardException
++    {
++        // Add a lot of elements
++        // If there are two or more key columns then we will vary the first two key columns, using an approximately
++        // square matrix of integer key values. Because the hash generator is commutative key (i,j) hashes into the
++        // same bucket as key (j,i), testing the case where different keys hash into the same bucket.
++        int key1Count = (keyCols.length > 1) ? ((int) Math.round( Math.sqrt( (double) LOTS_OF_ROWS_COUNT))) : 1;
++        int key0Count = (LOTS_OF_ROWS_COUNT + key1Count - 1)/key1Count;
++
++        DataValueDescriptor[] row = new DataValueDescriptor[ aRow.length];
++        for( int i = 0; i < row.length; i++)
++            row[i] = aRow[i].getClone();
++        
++        for( int key0Idx = 0; key0Idx < key0Count; key0Idx++)
++        {
++            row[ keyCols[0]].setValue( key0Idx);
++            for( int key1Idx = 0; key1Idx < key1Count; key1Idx++)
++            {
++                if( keyCols.length > 1)
++                    row[ keyCols[1]].setValue( key1Idx);
++                Object key = KeyHasher.buildHashKey( row, keyCols);
++                if( ! dht.put( key, row))
++                {
++                    REPORT_FAILURE( "  put returned wrong value for key(" + key0Idx + "," + key1Idx + ")");
++                    key0Idx = key0Count;
++                    break;
++                }
++            }
++        }
++        for( int key0Idx = 0; key0Idx < key0Count; key0Idx++)
++        {
++            row[ keyCols[0]].setValue( key0Idx);
++            for( int key1Idx = 0; key1Idx < key1Count; key1Idx++)
++            {
++                if( keyCols.length > 1)
++                    row[ keyCols[1]].setValue( key1Idx);
++                Object key = KeyHasher.buildHashKey( row, keyCols);
++                if( ! rowsEqual( dht.get( key), row))
++                {
++                    REPORT_FAILURE( "  large table get returned wrong value for key(" + key0Idx + "," + key1Idx + ")");
++                    key0Idx = key0Count;
++                    break;
++                }
++            }
++        }
++        BitSet found = new BitSet(key0Count * key1Count);
++        Enumeration elements = dht.elements();
++        while( elements.hasMoreElements())
++        {
++            Object el = elements.nextElement();
++            if( ! (el instanceof DataValueDescriptor[]))
++            {
++                REPORT_FAILURE( "  large table enumeration returned wrong element type");
++                break;
++            }
++            DataValueDescriptor[] fetchedRow = (DataValueDescriptor[]) el;
++            
++            int i = fetchedRow[ keyCols[0]].getInt() * key1Count;
++            if( keyCols.length > 1)
++                i += fetchedRow[ keyCols[1]].getInt();
++            if( i >= key0Count * key1Count)
++            {
++                REPORT_FAILURE( "  large table enumeration returned invalid element");
++                break;
++            }
++                
++            if( found.get(i))
++            {
++                REPORT_FAILURE( "  large table enumeration returned same element twice");
++                break;
++            }
++            found.set(i);
++        }
++        for( int i = key0Count * key1Count - 1; i >= 0; i--)
++        {
++            if( !found.get(i))
++            {
++                REPORT_FAILURE( "  large table enumeration missed at least one element");
++                break;
++            }
++        }
++    } // end of testLargeTable
++
++    private void testElements( boolean removeDups,
++                               DiskHashtable dht,
++                               int[] keyCols,
++                               int rowCount,
++                               DataValueDescriptor[][] rows,
++                               HashMap simpleHash,
++                               boolean[] isDuplicate,
++                               boolean[] found)
++        throws StandardException
++    {
++        for( int i = 0; i < rowCount; i++)
++            found[i] = false;
++        
++        for( Enumeration e = dht.elements(); e.hasMoreElements();)
++        {
++            Object el = e.nextElement();
++            if( el == null)
++            {
++                REPORT_FAILURE( "  table enumeration returned a null element");
++                return;
++            }
++            if( el instanceof DataValueDescriptor[])
++                checkElement( (DataValueDescriptor[]) el, rowCount, rows, found);
++            else if( el instanceof Vector)
++            {
++                Vector v = (Vector) el;
++                for( int i = 0; i < v.size(); i++)
++                    checkElement( (DataValueDescriptor[]) v.get(i), rowCount, rows, found);
++            }
++            else if( el == null)
++            {
++                REPORT_FAILURE( "  table enumeration returned an incorrect element type");
++                return;
++            }
++        }
++        for( int i = 0; i < rowCount; i++)
++        {
++            if( (removeDups && isDuplicate[i]))
++            {
++                if( found[i])
++                {
++                    REPORT_FAILURE( "  table enumeration did not remove duplicates");
++                    return;
++                }
++            }
++            else if( ! found[i])
++            {
++                REPORT_FAILURE( "  table enumeration missed at least one element");
++                return;
++            }
++        }
++    } // end of testElements
++
++    private void checkElement( DataValueDescriptor[] fetchedRow,
++                               int rowCount,
++                               DataValueDescriptor[][] rows,
++                               boolean[] found)
++        throws StandardException
++    {
++        for( int i = 0; i < rowCount; i++)
++        {
++            if( rowsEqual( fetchedRow, rows[i]))
++            {
++                if( found[i])
++                {
++                    REPORT_FAILURE( "  table enumeration returned the same element twice");
++                    return;
++                }
++                found[i] = true;
++                return;
++            }
++        }
++        REPORT_FAILURE( "  table enumeration returned an incorrect element");
++    } // end of checkElement
++
++    private boolean rowsEqual( Object r1, Object r2)
++        throws StandardException
++    {
++        if( r1 == null)
++            return r2 == null;
++
++        if( r1 instanceof DataValueDescriptor[])
++        {
++            DataValueDescriptor[] row1 = (DataValueDescriptor[]) r1;
++            DataValueDescriptor[] row2;
++            
++            if( r2 instanceof Vector)
++            {
++                Vector v2 = (Vector) r2;
++                if( v2.size() != 1)
++                    return false;
++                row2 = (DataValueDescriptor[]) v2.elementAt(0);
++            }
++            else if( r2 instanceof DataValueDescriptor[])
++                row2 = (DataValueDescriptor[]) r2;
++            else
++                return false;
++            
++            if( row1.length != row2.length)
++                return false;
++            for( int i = 0; i < row1.length; i++)
++            {
++                if( ! row1[i].compare( Orderable.ORDER_OP_EQUALS, row2[i], true, true))
++                    return false;
++            }
++            return true;
++        }
++        if( r1 instanceof Vector)
++        {
++            if( !(r2 instanceof Vector))
++                return false;
++            Vector v1 = (Vector) r1;
++            Vector v2 = (Vector) r2;
++            if( v1.size() != v2.size())
++                return false;
++            for( int i = v1.size() - 1; i >= 0; i--)
++            {
++                if( ! rowsEqual( v1.elementAt( i), v2.elementAt(i)))
++                    return false;
++            }
++            return true;
++        }
++        // What is it then?
++        return r1.equals( r2);
++    } // end of rowsEqual
++}

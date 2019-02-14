@@ -1,0 +1,124 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
+index 4f0bb25a..2df7a75f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
+@@ -288,13 +288,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	void setCurrentDependent(Dependent d);
+ 
+     /**
+-     * Get the current dependent from this {@code CompilerContext}.
+-     *
+-     * @return the dependent currently being compiled
+-     */
+-    Dependent getCurrentDependent();
+-
+-	/**
+ 	 * Get the current auxiliary provider list from this CompilerContext.
+ 	 *
+ 	 * @return	The current AuxiliaryProviderList.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+index d8682ca9..2a0b4d4d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/GenericStatement.java
+@@ -92,13 +92,40 @@ public PreparedStatement prepare(LanguageConnectionContext lcc, boolean forMetaD
+ 		*/ 
+ 
+         final int depth = lcc.getStatementDepth();
++        String prevErrorId = null;
+         while (true) {
++            boolean recompile = false;
+             try {
+                 return prepMinion(lcc, true, (Object[]) null,
+                                   (SchemaDescriptor) null, forMetaData);
+-            } finally {
+-                boolean recompile = false;
++            } catch (StandardException se) {
++                // There is a chance that we didn't see the invalidation
++                // request from a DDL operation in another thread because
++                // the statement wasn't registered as a dependent until
++                // after the invalidation had been completed. Assume that's
++                // what has happened if we see a conglomerate does not exist
++                // error, and force a retry even if the statement hasn't been
++                // invalidated.
++                if (SQLState.STORE_CONGLOMERATE_DOES_NOT_EXIST.equals(
++                        se.getMessageId())) {
++                    // STORE_CONGLOMERATE_DOES_NOT_EXIST has exactly one
++                    // argument: the conglomerate id
++                    String conglomId = String.valueOf(se.getArguments()[0]);
++
++                    // Request a recompile of the statement if a conglomerate
++                    // disappears while we are compiling it. But if we have
++                    // already retried once because the same conglomerate was
++                    // missing, there's probably no hope that yet another retry
++                    // will help, so let's break out instead of potentially
++                    // looping infinitely.
++                    if (!conglomId.equals(prevErrorId)) {
++                        recompile = true;
++                    }
+ 
++                    prevErrorId = conglomId;
++                }
++                throw se;
++            } finally {
+                 // Check if the statement was invalidated while it was
+                 // compiled. If so, the newly compiled plan may not be
+                 // up to date anymore, so we recompile the statement
+@@ -112,7 +139,7 @@ public PreparedStatement prepare(LanguageConnectionContext lcc, boolean forMetaD
+                 // invalidatedWhileCompiling and isValid are protected by
+                 // synchronization on the prepared statement.
+                 synchronized (preparedStmt) {
+-                    if (preparedStmt.invalidatedWhileCompiling) {
++                    if (recompile || preparedStmt.invalidatedWhileCompiling) {
+                         preparedStmt.isValid = false;
+                         preparedStmt.invalidatedWhileCompiling = false;
+                         recompile = true;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+index 7a42b748..f60b48ba 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+@@ -274,10 +274,6 @@ public void setCurrentDependent(Dependent d) {
+ 		currentDependent = d;
+ 	}
+ 
+-    public Dependent getCurrentDependent() {
+-        return currentDependent;
+-    }
+-
+ 	/**
+ 	 * Get the current auxiliary provider list from this CompilerContext.
+ 	 *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+index 8c9b91ce..3458dd7e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+@@ -55,8 +55,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.compile.RowOrdering;
+ import org.apache.derby.iapi.sql.compile.Visitor;
+ 
+-import org.apache.derby.iapi.sql.depend.DependencyManager;
+-
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.sql.dictionary.ColumnDescriptor;
+ import org.apache.derby.iapi.sql.dictionary.ColumnDescriptorList;
+@@ -2349,20 +2347,8 @@ public ResultSetNode bindNonVTITables(DataDictionary dataDictionary,
+ 					);
+ 
+             // Bail out if the descriptor couldn't be found. The conglomerate
+-            // probably doesn't exist anymore because of concurrent DDL or
+-            // compress operations, and the compilation will have to be tried
+-            // again.
++            // probably doesn't exist anymore.
+             if (baseConglomerateDescriptor == null) {
+-                // The statement is typically invalidated by the operation
+-                // that dropped the conglomerate. However, if the invalidation
+-                // happened before we called createDependency(), we'll miss it
+-                // and we won't retry the compilation with fresh dictionary
+-                // information (DERBY-5406). So let's invalidate the statement
+-                // ourselves here.
+-                compilerContext.getCurrentDependent().makeInvalid(
+-                        DependencyManager.COMPILE_FAILED,
+-                        getLanguageConnectionContext());
+-
+                 throw StandardException.newException(
+                         SQLState.STORE_CONGLOMERATE_DOES_NOT_EXIST,
+                         new Long(tableDescriptor.getHeapConglomerateId()));

@@ -1,0 +1,160 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+index 8e9bbd42..4335e517 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+@@ -1192,6 +1192,15 @@ synchronized public void setHoldability(int holdability) throws SQLException {
+                 agent_.logWriter_.traceEntry(this, "setHoldability", holdability);
+             }
+             checkForClosedConnection();
++            // In an XA global transaction do not allow the
++            // holdability to be set to hold cursors across
++            // commits, as the engine does not support it.
++            if (this.isXAConnection_ && this.xaState_ == XA_T1_ASSOCIATED)
++            {
++                if (holdability == JDBC30Translation.HOLD_CURSORS_OVER_COMMIT)
++                    throw new SqlException(agent_.logWriter_, 
++                            new MessageId(SQLState.CANNOT_HOLD_CURSOR_XA));
++            }
+             this.holdability = holdability;
+             
+        }
+@@ -1442,6 +1451,15 @@ private Statement createStatementX(int resultSetType,
+         checkForClosedConnection();
+         resultSetType = downgradeResultSetType(resultSetType);
+         resultSetConcurrency = downgradeResultSetConcurrency(resultSetConcurrency, resultSetType);
++        // In an XA global transaction do not allow the
++        // holdability to be set to hold cursors across
++        // commits, as the engine does not support it.
++        if (this.isXAConnection_ && this.xaState_ == XA_T1_ASSOCIATED)
++        {
++            if (resultSetHoldability == JDBC30Translation.HOLD_CURSORS_OVER_COMMIT)
++                throw new SqlException(agent_.logWriter_, 
++                        new MessageId(SQLState.CANNOT_HOLD_CURSOR_XA));
++        }
+         Statement s = newStatement_(resultSetType, resultSetConcurrency, resultSetHoldability);
+         s.cursorAttributesToSendOnPrepare_ = s.cacheCursorAttributesToSendOnPrepare();
+         openStatements_.add(s);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+index a3affce8..1e57a70d 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+@@ -942,10 +942,41 @@ private static void derby966(XADataSource xads)
+             }
+             pscc.executeQuery().close();
+             
++            // Test we cannot switch the connection to holdable
++            // or create a statement with holdable.
++            try {
++                conn.setHoldability(ResultSet.HOLD_CURSORS_OVER_COMMIT);
++                System.out.println("FAIL - set holdability in global xact.");
++            } catch (SQLException sqle)
++            {
++                TestUtil.dumpSQLExceptions(sqle, true);
++            }
++            
++            try {
++                    conn.createStatement(
++                    ResultSet.TYPE_FORWARD_ONLY,
++                    ResultSet.CONCUR_READ_ONLY,
++                    ResultSet.HOLD_CURSORS_OVER_COMMIT);
++                    System.out.println("FAIL - Statement holdability in global xact.");
++            } catch (SQLException sqle) {
++                TestUtil.dumpSQLExceptions(sqle, true);
++            }
++            try {
++                conn.prepareStatement(
++                "SELECT * FROM APP.FOO",
++                ResultSet.TYPE_FORWARD_ONLY,
++                ResultSet.CONCUR_READ_ONLY,
++                ResultSet.HOLD_CURSORS_OVER_COMMIT);
++                System.out.println("FAIL - PreparedStatement holdability in global xact.");
++        } catch (SQLException sqle) {
++            TestUtil.dumpSQLExceptions(sqle, true);
++        }
+             xar.end(xid, XAResource.TMSUCCESS);
+             if (xar.prepare(xid) != XAResource.XA_RDONLY)
+                 System.out.println("FAIL prepare didn't indicate r/o");
+             
++            conn.close();
++            
+             System.out.println("derby966 complete");
+                 
+         } catch (SQLException e) {
+@@ -1050,4 +1081,77 @@ private static String holdStatus(int holdability)
+         return s + Integer.toString(holdability);
+     }
+     
++    /*
++     * 5 interleaving transactions.
++     * Taken from the SQL test xaANotherTest.
++     * <code>
++xa_connect user 'mamta' password 'mamta' ;
++
++-- global connection 1
++xa_start xa_noflags 1;
++xa_getconnection;
++insert into APP.foo values (1);
++xa_end xa_suspend 1;
++
++-- global connection 2
++xa_start xa_noflags 2;
++insert into APP.foo values (2);
++xa_end xa_suspend 2;
++
++-- global connection 3
++xa_start xa_noflags 3;
++insert into APP.foo values (3);
++xa_end xa_suspend 3;
++
++-- global connection 4
++xa_start xa_noflags 4;
++insert into APP.foo values (4);
++xa_end xa_suspend 4;
++
++-- global connection 5
++xa_start xa_noflags 5;
++insert into APP.foo values (5);
++xa_end xa_suspend 5;
++
++xa_start xa_resume 1;
++insert into APP.foo values (11);
++xa_end xa_suspend 1;
++
++xa_start xa_resume 5;
++insert into APP.foo values (55);
++xa_end xa_suspend 5;
++
++xa_start xa_resume 2;
++insert into APP.foo values (22);
++xa_end xa_suspend 2;
++
++xa_start xa_resume 4;
++insert into APP.foo values (44);
++xa_end xa_suspend 4;
++
++xa_start xa_resume 3;
++insert into APP.foo values (33);
++xa_end xa_suspend 3;
++
++-- prepare all the global connections except the first one. This way, we will see all
++-- the global transactions prepared so far after the database shutdown and restart.
++xa_end xa_success 2;
++xa_prepare 2;
++xa_end xa_success 3;
++xa_prepare 3;
++xa_end xa_success 4;
++xa_prepare 4;
++xa_end xa_success 5;
++xa_prepare 5;
++
++     * </code>
++     */
++    private static void interleavingTransactions5(XADataSource xads) throws SQLException
++    {
++        System.out.println("interleavingTransactions5");
++        
++        XAConnection xac = xads.getXAConnection("mamta", "mamtapwd");
++        
++    }
++ 
+ }

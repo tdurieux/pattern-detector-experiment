@@ -1,0 +1,286 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/gms/EndpointState.java b/cassandra/trunk/src/java/org/apache/cassandra/gms/EndpointState.java
+index e047cb11..c2a432b4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/gms/EndpointState.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/gms/EndpointState.java
+@@ -24,6 +24,7 @@
+ import java.util.*;
+ import org.apache.cassandra.io.ICompactSerializer;
+ 
++import org.cliffc.high_scale_lib.NonBlockingHashMap;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -34,25 +35,21 @@
+ 
+ public class EndpointState
+ {
+-    private static ICompactSerializer<EndpointState> serializer_;
+-    static
+-    {
+-        serializer_ = new EndpointStateSerializer();
+-    }
++    private final static ICompactSerializer<EndpointState> serializer_ = new EndpointStateSerializer();
+     
+-    HeartBeatState hbState_;
+-    Map<String, ApplicationState> applicationState_ = new Hashtable<String, ApplicationState>();
++    volatile HeartBeatState hbState_;
++    final Map<String, ApplicationState> applicationState_ = new NonBlockingHashMap<String, ApplicationState>();
+     
+     /* fields below do not get serialized */
+-    long updateTimestamp_;
+-    boolean isAlive_;
+-    boolean isAGossiper_;
++    volatile long updateTimestamp_;
++    volatile boolean isAlive_;
++    volatile boolean isAGossiper_;
+ 
+     // whether this endpoint has token associated with it or not. Initially set false for all
+     // endpoints. After certain time of inactivity, gossiper will examine if this node has a
+     // token or not and will set this true if token is found. If there is no token, this is a
+     // fat client and will be removed automatically from gossip.
+-    boolean hasToken_;
++    volatile boolean hasToken_;
+ 
+     public static ICompactSerializer<EndpointState> serializer()
+     {
+@@ -73,7 +70,7 @@ HeartBeatState getHeartBeatState()
+         return hbState_;
+     }
+     
+-    synchronized void setHeartBeatState(HeartBeatState hbState)
++    void setHeartBeatState(HeartBeatState hbState)
+     {
+         updateTimestamp();
+         hbState_ = hbState;
+@@ -84,6 +81,10 @@ public ApplicationState getApplicationState(String key)
+         return applicationState_.get(key);
+     }
+     
++    /**
++     * TODO replace this with operations that don't expose private state
++     */
++    @Deprecated
+     public Map<String, ApplicationState> getApplicationStateMap()
+     {
+         return applicationState_;
+@@ -100,7 +101,7 @@ long getUpdateTimestamp()
+         return updateTimestamp_;
+     }
+     
+-    synchronized void updateTimestamp()
++    void updateTimestamp()
+     {
+         updateTimestamp_ = System.currentTimeMillis();
+     }
+@@ -110,7 +111,7 @@ public boolean isAlive()
+         return isAlive_;
+     }
+ 
+-    synchronized void isAlive(boolean value)
++    void isAlive(boolean value)
+     {        
+         isAlive_ = value;        
+     }
+@@ -121,13 +122,13 @@ boolean isAGossiper()
+         return isAGossiper_;
+     }
+ 
+-    synchronized void isAGossiper(boolean value)
++    void isAGossiper(boolean value)
+     {                
+         //isAlive_ = false;
+         isAGossiper_ = value;        
+     }
+ 
+-    public synchronized void setHasToken(boolean value)
++    public void setHasToken(boolean value)
+     {
+         hasToken_ = value;
+     }
+@@ -136,22 +137,6 @@ public boolean getHasToken()
+     {
+         return hasToken_;
+     }
+-
+-    public List<Map.Entry<String,ApplicationState>> getSortedApplicationStates()
+-    {
+-        ArrayList<Map.Entry<String, ApplicationState>> entries = new ArrayList<Map.Entry<String, ApplicationState>>();
+-        entries.addAll(applicationState_.entrySet());
+-        Collections.sort(entries, new Comparator<Map.Entry<String, ApplicationState>>()
+-        {
+-            public int compare(Map.Entry<String, ApplicationState> lhs, Map.Entry<String, ApplicationState> rhs)
+-            {
+-                return lhs.getValue().compareTo(rhs.getValue());
+-            }
+-        });
+-
+-        return entries;
+-    }
+-
+ }
+ 
+ class EndpointStateSerializer implements ICompactSerializer<EndpointState>
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java b/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
+index 179e6154..e96d7b7c 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/gms/Gossiper.java
+@@ -21,6 +21,9 @@
+ import java.io.*;
+ import java.util.*;
+ import java.util.Map.Entry;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentSkipListSet;
++import java.util.concurrent.CopyOnWriteArrayList;
+ import java.net.InetAddress;
+ 
+ import org.apache.cassandra.concurrent.StageManager;
+@@ -52,8 +55,6 @@ public void run()
+         {
+             try
+             {
+-                synchronized( Gossiper.instance )
+-                {
+                 	/* Update the local heartbeat counter. */
+                     endpointStateMap_.get(localEndpoint_).getHeartBeatState().updateHeartBeat();
+                     List<GossipDigest> gDigests = new ArrayList<GossipDigest>();
+@@ -92,7 +93,6 @@ public void run()
+                         doStatusCheck();
+                     }
+                 }
+-            }
+             catch (Exception e)
+             {
+                 throw new RuntimeException(e);
+@@ -110,27 +110,34 @@ public void run()
+     private long aVeryLongTime_;
+     private long FatClientTimeout_;
+     private Random random_ = new Random();
++    private Comparator<InetAddress> inetcomparator = new Comparator<InetAddress>()
++    {
++        public int compare(InetAddress addr1,  InetAddress addr2)
++        {
++            return addr1.getHostAddress().compareTo(addr2.getHostAddress());
++        }
++    };
+ 
+     /* subscribers for interest in EndpointState change */
+-    private List<IEndpointStateChangeSubscriber> subscribers_ = new ArrayList<IEndpointStateChangeSubscriber>();
++    private List<IEndpointStateChangeSubscriber> subscribers_ = new CopyOnWriteArrayList<IEndpointStateChangeSubscriber>();
+ 
+     /* live member set */
+-    private Set<InetAddress> liveEndpoints_ = new HashSet<InetAddress>();
++    private Set<InetAddress> liveEndpoints_ = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
+ 
+     /* unreachable member set */
+-    private Set<InetAddress> unreachableEndpoints_ = new HashSet<InetAddress>();
++    private Set<InetAddress> unreachableEndpoints_ = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
+ 
+     /* initial seeds for joining the cluster */
+-    private Set<InetAddress> seeds_ = new HashSet<InetAddress>();
++    private Set<InetAddress> seeds_ = new ConcurrentSkipListSet<InetAddress>(inetcomparator);
+ 
+     /* map where key is the endpoint and value is the state associated with the endpoint */
+-    Map<InetAddress, EndpointState> endpointStateMap_ = new Hashtable<InetAddress, EndpointState>();
++    Map<InetAddress, EndpointState> endpointStateMap_ = new ConcurrentHashMap<InetAddress, EndpointState>();
+ 
+     /* map where key is endpoint and value is timestamp when this endpoint was removed from
+      * gossip. We will ignore any gossip regarding these endpoints for Streaming.RING_DELAY time
+      * after removal to prevent nodes from falsely reincarnating during the time when removal
+      * gossip gets propagated to all nodes */
+-    Map<InetAddress, Long> justRemovedEndpoints_ = new Hashtable<InetAddress, Long>();
++    Map<InetAddress, Long> justRemovedEndpoints_ = new ConcurrentHashMap<InetAddress, Long>();
+ 
+     private Gossiper()
+     {
+@@ -144,12 +151,12 @@ private Gossiper()
+     }
+ 
+     /** Register with the Gossiper for EndpointState notifications */
+-    public synchronized void register(IEndpointStateChangeSubscriber subscriber)
++    public void register(IEndpointStateChangeSubscriber subscriber)
+     {
+         subscribers_.add(subscriber);
+     }
+ 
+-    public synchronized void unregister(IEndpointStateChangeSubscriber subscriber)
++    public void unregister(IEndpointStateChangeSubscriber subscriber)
+     {
+         subscribers_.remove(subscriber);
+     }
+@@ -224,8 +231,7 @@ public void removeEndpoint(InetAddress endpoint)
+     }
+ 
+     /**
+-     * No locking required since it is called from a method that already
+-     * has acquired a lock. The gossip digest is built based on randomization
++     * The gossip digest is built based on randomization
+      * rather than just looping through the collection of live endpoints.
+      *
+      * @param gDigests list of Gossip Digests.
+@@ -431,7 +437,7 @@ EndpointState getEndpointStateForEndpoint(InetAddress ep)
+         return endpointStateMap_.get(ep);
+     }
+ 
+-    synchronized EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
++    EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+     {
+         if (logger_.isTraceEnabled())
+             logger_.trace("Scanning for state greater than " + version + " for " + forEndpoint);
+@@ -588,7 +594,7 @@ private void handleMajorStateChange(InetAddress ep, EndpointState epState, boole
+             subscriber.onJoin(ep, epState);
+     }
+ 
+-    synchronized void applyStateLocally(Map<InetAddress, EndpointState> epStateMap)
++    void applyStateLocally(Map<InetAddress, EndpointState> epStateMap)
+     {
+         for (Entry<InetAddress, EndpointState> entry : epStateMap.entrySet())
+         {
+@@ -657,7 +663,7 @@ void applyApplicationStateLocally(InetAddress addr, EndpointState localStatePtr,
+     {
+         Map<String, ApplicationState> localAppStateMap = localStatePtr.getApplicationStateMap();
+ 
+-        for (Map.Entry<String,ApplicationState> remoteEntry : remoteStatePtr.getSortedApplicationStates())
++        for (Map.Entry<String,ApplicationState> remoteEntry : remoteStatePtr.getApplicationStateMap().entrySet())
+         {
+             String remoteKey = remoteEntry.getKey();
+             ApplicationState remoteAppState = remoteEntry.getValue();
+@@ -706,7 +712,7 @@ void doNotifications(InetAddress addr, String stateName, ApplicationState state)
+         }
+     }
+ 
+-    synchronized void isAlive(InetAddress addr, EndpointState epState, boolean value)
++    void isAlive(InetAddress addr, EndpointState epState, boolean value)
+     {
+         epState.isAlive(value);
+         if (value)
+@@ -747,7 +753,7 @@ void sendAll(GossipDigest gDigest, Map<InetAddress, EndpointState> deltaEpStateM
+         This method is used to figure the state that the Gossiper has but Gossipee doesn't. The delta digests
+         and the delta state are built up.
+     */
+-    synchronized void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddress, EndpointState> deltaEpStateMap)
++    void examineGossiper(List<GossipDigest> gDigestList, List<GossipDigest> deltaGossipDigestList, Map<InetAddress, EndpointState> deltaEpStateMap)
+     {
+         for ( GossipDigest gDigest : gDigestList )
+         {
+@@ -837,7 +843,7 @@ public void start(InetAddress localEndpoint, int generationNbr)
+         gossipTimer_.schedule( new GossipTimerTask(), Gossiper.intervalInMillis_, Gossiper.intervalInMillis_);
+     }
+ 
+-    public synchronized void addLocalApplicationState(String key, ApplicationState appState)
++    public void addLocalApplicationState(String key, ApplicationState appState)
+     {
+         assert !StorageService.instance.isClientMode();
+         EndpointState epState = endpointStateMap_.get(localEndpoint_);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 9c96c099..d3636092 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -890,7 +890,7 @@ private void restoreReplicaCount(InetAddress endpoint)
+ 
+     public void onJoin(InetAddress endpoint, EndpointState epState)
+     {
+-        for (Map.Entry<String,ApplicationState> entry : epState.getSortedApplicationStates())
++        for (Map.Entry<String,ApplicationState> entry : epState.getApplicationStateMap().entrySet())
+         {
+             onChange(endpoint, entry.getKey(), entry.getValue());
+         }

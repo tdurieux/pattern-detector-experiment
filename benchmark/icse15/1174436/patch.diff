@@ -1,0 +1,519 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
+index 91226ad6..90294c0f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
+@@ -57,8 +57,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.util.Properties;
+ 
+-import org.apache.derby.iapi.services.io.ArrayUtil;
+-
+ /**
+ 
+   A b-tree object corresponds to an instance of a b-tree conglomerate.  It 
+@@ -192,6 +190,11 @@ Property name for the maximum number of rows to place in a btree page (leaf
+     The array of collation id's for each column in the template.
+     **/
+     protected int[]   collation_ids;
++    /**
++     * Tells if there is at least one column in the conglomerate whose collation
++     * isn't StringDataValue.COLLATION_TYPE_UCS_BASIC.
++     */
++    protected boolean hasCollatedTypes;
+ 
+ 
+ 	/*
+@@ -586,7 +589,8 @@ public long getContainerid()
+     public DynamicCompiledOpenConglomInfo getDynamicCompiledConglomInfo()
+ 		throws StandardException
+     {
+-        return(new OpenConglomerateScratchSpace(format_ids, collation_ids));
++        return(new OpenConglomerateScratchSpace(
++                format_ids, collation_ids, hasCollatedTypes));
+     }
+ 
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
+index 566ca3c6..c8777eac 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
+@@ -51,7 +51,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.services.io.FormatableBitSet;
+ import org.apache.derby.impl.store.access.conglomerate.ConglomerateUtil;
+-import org.apache.derby.impl.store.access.conglomerate.TemplateRow;
+ 
+ /**
+ 
+@@ -845,9 +844,35 @@ else if (this.getConglomerate().nUniqueColumns ==
+                             insert_slot, false, this.btree_undo);
+ 
+                         boolean update_succeeded = true;
+-
+                         try 
+                         {
++                            if (runtime_mem.hasCollatedTypes())
++                            {
++                                // See DERBY-5367.
++                                // There are types in the BTree with a 
++                                // collation different than UCS BASIC, we
++                                // update all fields to make sure they hold
++                                // the correct values.
++                                // NOTE: We could optimize here by only
++                                // updating the fields that actually hold
++                                // collated types.
++                                int rowsToUpdate = getConglomerate().nKeyFields;
++                                for (int i=0; i < rowsToUpdate; i++) {
++                                targetleaf.page.updateFieldAtSlot(
++                                    insert_slot, i, 
++                                    (DataValueDescriptor) RowUtil.getColumn(
++                                        rowToInsert, 
++                                        (FormatableBitSet) null, i),
++                                    this.btree_undo);
++                                }
++                            }
++                            else
++                            {
++                                // There are no collated types in the BTree,
++                                // which means that the values currently
++                                // stored in the undeleted row are correct.
++                                // We simply update the row location to point
++                                // to the correct row in the heap.
+                             int rowloc_index = 
+                                 this.getConglomerate().nKeyFields - 1;
+                             targetleaf.page.updateFieldAtSlot(
+@@ -857,6 +882,7 @@ else if (this.getConglomerate().nUniqueColumns ==
+                                     (FormatableBitSet) null, rowloc_index),
+                                 this.btree_undo);
+                         }
++                        }
+                         catch (StandardException se)
+                         {
+                             // check if the exception is for out of space
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/OpenBTree.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/OpenBTree.java
+index 29518b0b..18c6f319 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/OpenBTree.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/OpenBTree.java
+@@ -34,7 +34,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.store.access.SpaceInfo;
+ import org.apache.derby.iapi.store.raw.ContainerHandle;
+ import org.apache.derby.iapi.store.raw.LockingPolicy;
+-import org.apache.derby.iapi.store.raw.RecordHandle;
+ import org.apache.derby.iapi.store.raw.Transaction;
+ 
+ import org.apache.derby.iapi.types.DataValueDescriptor;
+@@ -91,7 +90,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     **/
+     protected int                           init_lock_level;
+ 
+-    private DynamicCompiledOpenConglomInfo  init_dynamic_info;
+     private boolean                         init_hold;
+ 
+     /**
+@@ -414,8 +412,6 @@ public void init(
+         // Isolation level of this btree.
+         init_lock_level     = lock_level;
+ 
+-        init_dynamic_info   = dynamic_info;
+-
+         init_hold           = hold;
+ 
+ 
+@@ -429,9 +425,8 @@ public void init(
+         this.runtime_mem    = 
+             (dynamic_info != null ? 
+              ((OpenConglomerateScratchSpace) dynamic_info) : 
+-             new OpenConglomerateScratchSpace(
+-                 conglomerate.format_ids, 
+-                 conglomerate.collation_ids));
++              (OpenConglomerateScratchSpace)
++                conglomerate.getDynamicCompiledConglomInfo());
+ 
+ 	}
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
+index 2a0266f4..45618e80 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
+@@ -29,12 +29,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.reference.SQLState;
+ 
+ import org.apache.derby.iapi.services.io.ArrayInputStream;
+-import org.apache.derby.iapi.services.io.FormatableBitSet;
+ 
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.error.StandardException;
+-import org.apache.derby.iapi.store.raw.Page;
+-import org.apache.derby.impl.store.access.btree.ControlRow;
+ 
+ import org.apache.derby.impl.store.access.conglomerate.ConglomerateUtil;
+ import org.apache.derby.iapi.store.access.conglomerate.LogicalUndo;
+@@ -66,7 +63,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.services.cache.ClassSize;
+ 
+-import org.apache.derby.iapi.services.io.CompressedNumber;
+ import org.apache.derby.iapi.services.io.FormatableBitSet;
+ import org.apache.derby.iapi.services.io.StoredFormatIds;
+ 
+@@ -596,6 +592,7 @@ public void create(
+         // conglom state.
+         collation_ids = 
+             ConglomerateUtil.createCollationIds(template.length, collationIds);
++        hasCollatedTypes = hasCollatedColumns(collation_ids);
+ 
+ 		// Do the generic part of creating the b-tree.
+ 		super.create(
+@@ -1156,6 +1153,9 @@ private final void localReadExternal(ObjectInput in)
+         
+         // In memory maintain a collation id per column in the template.
+         collation_ids = new int[format_ids.length];
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(!hasCollatedTypes);
++        }
+ 
+         // initialize all the entries to COLLATION_TYPE_UCS_BASIC, 
+         // and then reset as necessary.  For version ACCESS_B2I_V3_ID,
+@@ -1181,6 +1181,7 @@ private final void localReadExternal(ObjectInput in)
+                     "length = " + collation_ids.length);
+             }
+ 
++            hasCollatedTypes =
+             ConglomerateUtil.readCollationIdArray(collation_ids, in);
+         }
+         else if (conglom_format_id != StoredFormatIds.ACCESS_B2I_V3_ID)
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/ConglomerateUtil.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/ConglomerateUtil.java
+index 5323b59a..da6831a6 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/ConglomerateUtil.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/ConglomerateUtil.java
+@@ -28,7 +28,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.io.Formatable;
+ import org.apache.derby.iapi.services.io.FormatIdUtil;
+ 
+-import org.apache.derby.iapi.store.access.ColumnOrdering;
+ import org.apache.derby.iapi.store.access.RowUtil;
+ 
+ import org.apache.derby.iapi.store.raw.FetchDescriptor;
+@@ -310,9 +309,11 @@ public static void writeCollationIdArray(
+      *                           the sparse array from the stream.
+      *                           
+      * @param in                 The stream to read the collation info from.
++     * @return {@code true} if at least one column has a different collation
++     *      than UCS BASIC, {@code false} otherwise.
+      *
+      **/
+-    public static void readCollationIdArray(
++    public static boolean readCollationIdArray(
+     int[]           collation_id_array,
+     ObjectInput     in)
+         throws IOException
+@@ -332,6 +333,7 @@ public static void readCollationIdArray(
+             int array_index = CompressedNumber.readInt(in);
+             collation_id_array[array_index] = CompressedNumber.readInt(in);
+         }
++        return num_compressed_entries > 0;
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/GenericConglomerate.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/GenericConglomerate.java
+index ffa4c217..15999df1 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/GenericConglomerate.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/GenericConglomerate.java
+@@ -30,8 +30,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.store.access.conglomerate.Conglomerate;
+ 
+ import org.apache.derby.iapi.types.DataValueDescriptor;
+-
+ import org.apache.derby.iapi.types.DataType;
++import org.apache.derby.iapi.types.StringDataValue;
+ 
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+@@ -210,4 +210,20 @@ public int compare(DataValueDescriptor other)
+         throw(StandardException.newException(
+                 SQLState.HEAP_UNIMPLEMENTED_FEATURE));
+ 	}
++
++    /**
++     * Tells if there are columns with collations (other than UCS BASIC) in the
++     * given list of collation ids.
++     *
++     * @param collationIds collation ids for the conglomerate columns
++     * @return {@code true} if a collation other than UCS BASIC was found.
++     */
++    public static boolean hasCollatedColumns(int[] collationIds) {
++        for (int i=0; i < collationIds.length; i++) {
++            if (collationIds[i] != StringDataValue.COLLATION_TYPE_UCS_BASIC) {
++                return true;
++            }
++        }
++        return false;
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerate.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerate.java
+index 532bd97e..3f4ba6af 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerate.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerate.java
+@@ -876,7 +876,8 @@ public ContainerHandle init(
+         this.runtime_mem    = 
+             (dynamic_info != null ? 
+              ((OpenConglomerateScratchSpace) dynamic_info) : 
+-             new OpenConglomerateScratchSpace(format_ids, collation_ids));
++             ((OpenConglomerateScratchSpace)
++                conglomerate.getDynamicCompiledConglomInfo()));
+ 
+         // Is this an open for update or read?  This will
+ 		// be passed down to the raw store fetch methods, which allows
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerateScratchSpace.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerateScratchSpace.java
+index adf0b334..bd4a8144 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerateScratchSpace.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/conglomerate/OpenConglomerateScratchSpace.java
+@@ -32,6 +32,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.services.io.FormatableBitSet;
+ 
++import org.apache.derby.iapi.services.sanity.SanityManager;
++
+ /**
+ 
+ A utility class to store and use temporary scratch space associated with
+@@ -74,8 +76,15 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     /**
+      * A complete array of format id's and collation_ids for this conglomerate.
+      **/
+-    private int[]                   format_ids;
+-    private int[]                   collation_ids;
++    private final int[] format_ids;
++    private final int[] collation_ids;
++    /**
++     * Tells if there is at least one type in the conglomerate whose collation
++     * isn't StringDataValue.COLLATION_TYPE_UCS_BASIC. This can be determined
++     * by looking at the collation ids, but now the caller is passing in the
++     * value to avoid having to look at all the collation ids multiple times.
++     */
++    private final boolean hasCollatedTypes;
+ 
+ 
+     /**
+@@ -96,13 +105,21 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      *
+      * @param format_ids format identifiers for columns in the row
+      * @param collation_ids collation identifiers for the columns in the row
++     * @param hasCollatedTypes whether there is at least one collated type with
++     *      a collation other than UCS BASIC in the conglomerate
+      */
+     public OpenConglomerateScratchSpace(
+     int[]   format_ids,
+-    int[]   collation_ids)
++    int[]   collation_ids,
++    boolean hasCollatedTypes)
+     {
+         this.format_ids     = format_ids;
+         this.collation_ids  = collation_ids;
++        this.hasCollatedTypes = hasCollatedTypes;
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(GenericConglomerate.hasCollatedColumns(
++                        collation_ids) == hasCollatedTypes);
++        }
+     }
+ 
+     /**************************************************************************
+@@ -220,4 +237,15 @@ public RowPosition get_scratch_row_position()
+ 
+         return(scratch_row_position);
+     }
++    
++    /**
++     * Tells if there is at least one column with a collation different
++     * than UCS BASIC in the conglomerate.
++     *
++     * @return {@code true} if there is at least one column with a collation
++     *      different than UCS BASIC.
++     */
++    public boolean hasCollatedTypes() {
++        return hasCollatedTypes;
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
+index d191aba3..d8f07002 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/heap/Heap.java
+@@ -42,7 +42,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.store.access.conglomerate.Conglomerate;
+ import org.apache.derby.iapi.store.access.conglomerate.LogicalUndo;
+-import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+ import org.apache.derby.iapi.store.access.conglomerate.ScanManager;
+ import org.apache.derby.iapi.store.access.conglomerate.TransactionManager;
+ 
+@@ -190,6 +189,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     The array of collation id's for each column in the template.
+     **/
+     protected int[]   collation_ids;
++    /**
++     * Tells if there is at least one column in the conglomerate whose collation
++     * isn't StringDataValue.COLLATION_TYPE_UCS_BASIC.
++     */
++    private boolean hasCollatedTypes;
+ 
+     private static final int BASE_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( Heap.class);
+     private static final int CONTAINER_KEY_MEMORY_USAGE = ClassSize.estimateBaseFromCatalog( ContainerKey.class);
+@@ -305,6 +309,7 @@ protected void create(
+         collation_ids = 
+             ConglomerateUtil.createCollationIds(
+                 format_ids.length, collationIds);
++        hasCollatedTypes = hasCollatedColumns(collation_ids);
+ 
+         // need to open the container and insert the row.  Since we are
+         // creating it no need to bother with locking since no one can get
+@@ -580,7 +585,8 @@ public final long getContainerid()
+     public DynamicCompiledOpenConglomInfo getDynamicCompiledConglomInfo()
+ 		throws StandardException
+     {
+-        return(new OpenConglomerateScratchSpace(format_ids, collation_ids));
++        return(new OpenConglomerateScratchSpace(
++                format_ids, collation_ids, hasCollatedTypes));
+     }
+ 
+     /**
+@@ -1202,6 +1208,9 @@ private final void localReadExternal(ObjectInput in)
+ 
+         // In memory maintain a collation id per column in the template.
+         collation_ids = new int[format_ids.length];
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(!hasCollatedTypes);
++        }
+ 
+         // initialize all the entries to COLLATION_TYPE_UCS_BASIC, 
+         // and then reset as necessary.  For version ACCESS_HEAP_V2_ID,
+@@ -1213,6 +1222,7 @@ private final void localReadExternal(ObjectInput in)
+         {
+             // current format id, read collation info from disk
+ 
++            hasCollatedTypes =
+             ConglomerateUtil.readCollationIdArray(collation_ids, in);
+         }
+         else if (conglom_format_id != StoredFormatIds.ACCESS_HEAP_V2_ID)
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest2.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest2.java
+index bfbf6f3b..6643bd7c 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest2.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest2.java
+@@ -34,25 +34,17 @@
+ import java.util.Locale;
+ import java.util.Properties; 
+ 
+-import javax.sql.DataSource;
+-
+ import junit.framework.Assert;
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ 
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+-import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+ import org.apache.derbyTesting.junit.Decorator;
+ import org.apache.derbyTesting.junit.JDBC;
+-import org.apache.derbyTesting.junit.JDBCDataSource;
+ import org.apache.derbyTesting.junit.SystemPropertyTestSetup;
+ import org.apache.derbyTesting.junit.SupportFilesSetup;
+-import org.apache.derbyTesting.junit.SQLUtilities;
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+-import org.apache.derby.iapi.services.sanity.SanityManager;
+-
+-
+ /**
+ Junit test targeted at testing language based Collation.
+ 
+@@ -94,6 +86,10 @@
+             of Database.
+ 
+ 
++<p>
++NOTE: The prefix "ci_test" is used for tests that require a case insensitive
++      collation order.
++
+ **/
+ 
+ public class CollationTest2 extends BaseJDBCTestCase 
+@@ -902,6 +898,55 @@ private void runDERBY_2703(int db_index)
+         dropTable();
+     }
+ 
++    /**
++     * Tests that DERBY-5367 is fixed, a bug where updating the index in a
++     * database with a case insensitive collation resulted in data corruption.
++     * <p>
++     * The bug tested is where a deleted row with an incorrect key value in
++     * the index is undeleted as an optimized insert. In this case it was
++     * caused by the a case insensitive collation order, but other collation
++     * rules could cause this to happen as well.
++     */
++    public void ci_testDerby5367()
++            throws SQLException {
++        assertFalse(isDatabaseBasicCollation());
++        setAutoCommit(true);
++        String TABLE = "DERBY_5367";
++        Statement stmt = createStatement();
++        stmt.executeUpdate("create table " + TABLE + "(" +
++                "VAL varchar(10) not null unique)");
++        
++        // Run first time when the congloms were newly created.
++        runDerby5367TestCode(TABLE);
++
++        // Shut down the database, reboot. This will trigger the code to
++        // read the congloms from disk.
++        TestConfiguration.getCurrent().shutdownDatabase();
++        getConnection();
++
++        // Run second time, read congloms from disk.
++        runDerby5367TestCode(TABLE);
++        dropTable(TABLE);
++    }
++
++    /** Runs the core code for the DERBY-5367 test. */
++    private void runDerby5367TestCode(String table)
++            throws SQLException {
++        PreparedStatement sel = prepareStatement("select val from " + table +
++                " where val = 'Test'");
++        PreparedStatement ins = prepareStatement("insert into " + table +
++                " values ?");
++        ins.setString(1, "Test");
++        ins.executeUpdate();
++        JDBC.assertFullResultSet(sel.executeQuery(), new String[][] {{"Test"}});
++        Statement stmt = createStatement();
++        stmt.executeUpdate("delete from " + table + " where val = 'Test'");
++        ins.setString(1, "test");
++        ins.executeUpdate();
++        JDBC.assertFullResultSet(sel.executeQuery(), new String[][] {{"test"}});
++        stmt.executeUpdate("delete from " + table);
++    }
++
+     /**************************************************************************
+      * Private/Protected tests of This class:
+      **************************************************************************
+@@ -1920,6 +1965,7 @@ public static Test suite()
+         TestSuite suite = new TestSuite("CollationTest2");
+         suite.addTest(new CollationTest2("testDefaultCollation"));
+         suite.addTest(collatedTest("en", "testEnglishCollation"));
++        suite.addTest(caseInsensitiveCollationSuite());
+         
+         // Only add tests for other locales if they are in fact supported 
+         // by the jvm.
+@@ -1961,4 +2007,17 @@ private static Test collatedTest(String locale, String fixture)
+         return Decorator.territoryCollatedDatabase(
+                 new CollationTest2(fixture), locale);
+     }
++
++    /**
++     * Returns a suite of tests running with a collation strength resulting
++     * in case insensitivity.
++     *
++     * @return A suite of tests.
++     */
++    private static Test caseInsensitiveCollationSuite() {
++        TestSuite suite = new TestSuite("Case insensitive specific tests");
++        suite.addTest(new CollationTest2("ci_testDerby5367")); 
++        return Decorator.territoryCollatedCaseInsensitiveDatabase(
++                suite, "en_US");
++    }
+ }

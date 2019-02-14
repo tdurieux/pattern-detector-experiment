@@ -1,0 +1,363 @@
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/TasteHadoopUtils.java b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/TasteHadoopUtils.java
+index c0d1a675..a2529f6b 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/TasteHadoopUtils.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/TasteHadoopUtils.java
+@@ -17,17 +17,22 @@
+ 
+ package org.apache.mahout.cf.taste.hadoop;
+ 
+-import java.io.ByteArrayOutputStream;
+-import java.io.IOException;
+-import java.io.InputStream;
+-import java.nio.charset.Charset;
+-import java.util.regex.Pattern;
+-
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.fs.PathFilter;
+ import org.apache.hadoop.io.IOUtils;
++import org.apache.hadoop.io.SequenceFile;
++import org.apache.mahout.math.VarIntWritable;
++import org.apache.mahout.math.VarLongWritable;
++import org.apache.mahout.math.map.OpenIntLongHashMap;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.nio.charset.Charset;
++import java.util.regex.Pattern;
+ 
+ /**
+  * some helper methods for the hadoop-related stuff in org.apache.mahout.cf.taste
+@@ -68,6 +73,36 @@ public static int idToIndex(long id) {
+     return 0x7FFFFFFF & ((int) id ^ (int) (id >>> 32));
+   }
+   
++  /**
++   * reads a binary mapping file
++   * 
++   * @param itemIDIndexPathStr
++   * @param conf
++   * @return
++   */
++  public static OpenIntLongHashMap readItemIDIndexMap(String itemIDIndexPathStr, Configuration conf) {
++    OpenIntLongHashMap indexItemIDMap = new OpenIntLongHashMap();
++    try {
++      Path unqualifiedItemIDIndexPath = new Path(itemIDIndexPathStr);
++      FileSystem fs = FileSystem.get(unqualifiedItemIDIndexPath.toUri(), conf);
++      Path itemIDIndexPath = new Path(itemIDIndexPathStr).makeQualified(fs);
++
++      VarIntWritable index = new VarIntWritable();
++      VarLongWritable id = new VarLongWritable();
++      for (FileStatus status : fs.listStatus(itemIDIndexPath, PARTS_FILTER)) {
++        String path = status.getPath().toString();
++        SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(path).makeQualified(fs), conf);
++        while (reader.next(index, id)) {
++          indexItemIDMap.put(index.get(), id.get());
++        }
++        reader.close();
++      }
++    } catch (IOException ioe) {
++      throw new IllegalStateException(ioe);
++    }
++    return indexItemIDMap;
++  }
++
+   /**
+    * reads a text-based outputfile that only contains an int
+    * 
+@@ -77,7 +112,7 @@ public static int idToIndex(long id) {
+    * @throws IOException
+    */
+   public static int readIntFromFile(Configuration conf, Path outputDir) throws IOException {
+-    FileSystem fs = FileSystem.get(conf);
++    FileSystem fs = FileSystem.get(outputDir.toUri(), conf);
+     Path outputFile = fs.listStatus(outputDir, TasteHadoopUtils.PARTS_FILTER)[0].getPath();
+     InputStream in = null;
+     try  {
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/AggregateAndRecommendReducer.java b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/AggregateAndRecommendReducer.java
+index ff076eb5..28b1a601 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/AggregateAndRecommendReducer.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/AggregateAndRecommendReducer.java
+@@ -17,20 +17,11 @@
+ 
+ package org.apache.mahout.cf.taste.hadoop.item;
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.PriorityQueue;
+-import java.util.Queue;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+-import org.apache.hadoop.fs.FileStatus;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+-import org.apache.hadoop.io.SequenceFile;
++import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.mapreduce.Reducer;
+ import org.apache.mahout.cf.taste.hadoop.RecommendedItemsWritable;
+ import org.apache.mahout.cf.taste.hadoop.TasteHadoopUtils;
+@@ -40,13 +31,15 @@
+ import org.apache.mahout.cf.taste.recommender.RecommendedItem;
+ import org.apache.mahout.common.FileLineIterable;
+ import org.apache.mahout.math.RandomAccessSparseVector;
+-import org.apache.mahout.math.VarIntWritable;
+ import org.apache.mahout.math.VarLongWritable;
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.Vector.Element;
+ import org.apache.mahout.math.function.UnaryFunction;
+ import org.apache.mahout.math.map.OpenIntLongHashMap;
+ 
++import java.io.IOException;
++import java.util.*;
++
+ /**
+  * <p>computes prediction values for each user</p>
+  *
+@@ -77,40 +70,27 @@ protected void setup(Context context) {
+     Configuration jobConf = context.getConfiguration();
+     recommendationsPerUser = jobConf.getInt(NUM_RECOMMENDATIONS, DEFAULT_NUM_RECOMMENDATIONS);
+     booleanData = jobConf.getBoolean(RecommenderJob.BOOLEAN_DATA, false);
+-    try {
+-      FileSystem fs = FileSystem.get(jobConf);
+-      Path itemIDIndexPath = new Path(jobConf.get(ITEMID_INDEX_PATH)).makeQualified(fs);
+-      indexItemIDMap = new OpenIntLongHashMap();
+-      VarIntWritable index = new VarIntWritable();
+-      VarLongWritable id = new VarLongWritable();
+-      for (FileStatus status : fs.listStatus(itemIDIndexPath, TasteHadoopUtils.PARTS_FILTER)) {
+-        String path = status.getPath().toString();
+-        SequenceFile.Reader reader =
+-            new SequenceFile.Reader(fs, new Path(path).makeQualified(fs), jobConf);
+-        while (reader.next(index, id)) {
+-          indexItemIDMap.put(index.get(), id.get());
+-        }
+-        reader.close();
+-      }
+-    } catch (IOException ioe) {
+-      throw new IllegalStateException(ioe);
+-    }
++    indexItemIDMap = TasteHadoopUtils.readItemIDIndexMap(jobConf.get(ITEMID_INDEX_PATH), jobConf);
+ 
++    FSDataInputStream in = null;
+     try {
+-        FileSystem fs = FileSystem.get(jobConf);
+         String itemFilePathString = jobConf.get(ITEMS_FILE);
+         if (itemFilePathString == null) {
+         	itemsToRecommendFor = null;
+         } else {
++          Path unqualifiedItemsFilePath = new Path(itemFilePathString);
++          FileSystem fs = FileSystem.get(unqualifiedItemsFilePath.toUri(), jobConf);
+         	itemsToRecommendFor = new FastIDSet();
+-          Path usersFilePath = new Path(itemFilePathString).makeQualified(fs);
+-          FSDataInputStream in = fs.open(usersFilePath);
++          Path itemsFilePath = unqualifiedItemsFilePath.makeQualified(fs);
++          in = fs.open(itemsFilePath);
+           for (String line : new FileLineIterable(in)) {
+         	  itemsToRecommendFor.add(Long.parseLong(line));
+           }
+         }
+       } catch (IOException ioe) {
+         throw new IllegalStateException(ioe);
++      } finally {
++        IOUtils.closeStream(in);
+       }
+   }
+ 
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/RecommenderJob.java b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/RecommenderJob.java
+index a7cf2b33..db5c79c7 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/RecommenderJob.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/RecommenderJob.java
+@@ -17,13 +17,8 @@
+ 
+ package org.apache.mahout.cf.taste.hadoop.item;
+ 
+-import java.io.IOException;
+-import java.util.Map;
+-import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
+ import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.NullWritable;
+@@ -40,11 +35,7 @@
+ import org.apache.mahout.cf.taste.hadoop.RecommendedItemsWritable;
+ import org.apache.mahout.cf.taste.hadoop.TasteHadoopUtils;
+ import org.apache.mahout.cf.taste.hadoop.ToItemPrefsMapper;
+-import org.apache.mahout.cf.taste.hadoop.similarity.item.CountUsersKeyWritable;
+-import org.apache.mahout.cf.taste.hadoop.similarity.item.CountUsersMapper;
+-import org.apache.mahout.cf.taste.hadoop.similarity.item.CountUsersReducer;
+-import org.apache.mahout.cf.taste.hadoop.similarity.item.PrefsToItemUserMatrixMapper;
+-import org.apache.mahout.cf.taste.hadoop.similarity.item.PrefsToItemUserMatrixReducer;
++import org.apache.mahout.cf.taste.hadoop.similarity.item.*;
+ import org.apache.mahout.common.AbstractJob;
+ import org.apache.mahout.math.VarIntWritable;
+ import org.apache.mahout.math.VarLongWritable;
+@@ -52,6 +43,12 @@
+ import org.apache.mahout.math.hadoop.DistributedRowMatrix;
+ import org.apache.mahout.math.hadoop.similarity.RowSimilarityJob;
+ 
++import java.io.IOException;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
+ /**
+  * <p>Runs a completely distributed recommender job as a series of mapreduces.</p>
+  *
+@@ -238,6 +235,13 @@ public int run(String[] args) throws IOException, ClassNotFoundException, Interr
+         Mapper.class, VarIntWritable.class, VectorOrPrefWritable.class,
+         ToVectorAndPrefReducer.class, VarIntWritable.class, VectorAndPrefsWritable.class,
+         SequenceFileOutputFormat.class);
++
++      /* necessary to make this job (having a combined input path) work on Amazon S3 */
++      Configuration partialMultiplyConf = partialMultiply.getConfiguration();
++      FileSystem fs = FileSystem.get(tempDirPath.toUri(), partialMultiplyConf);
++      prePartialMultiplyPath1 = prePartialMultiplyPath1.makeQualified(fs);
++      prePartialMultiplyPath2 = prePartialMultiplyPath2.makeQualified(fs);
++      SequenceFileInputFormat.setInputPaths(partialMultiply, prePartialMultiplyPath1, prePartialMultiplyPath2);
+       partialMultiply.waitForCompletion(true);
+     }
+ 
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/UserVectorSplitterMapper.java b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/UserVectorSplitterMapper.java
+index 0afa4285..fafdf54b 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/UserVectorSplitterMapper.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/item/UserVectorSplitterMapper.java
+@@ -17,14 +17,11 @@
+ 
+ package org.apache.mahout.cf.taste.hadoop.item;
+ 
+-import java.io.IOException;
+-import java.util.Iterator;
+-import java.util.PriorityQueue;
+-
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.fs.FSDataInputStream;
+ import org.apache.hadoop.fs.FileSystem;
+ import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.io.IOUtils;
+ import org.apache.hadoop.mapreduce.Mapper;
+ import org.apache.mahout.cf.taste.impl.common.FastIDSet;
+ import org.apache.mahout.common.FileLineIterable;
+@@ -33,6 +30,10 @@
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.VectorWritable;
+ 
++import java.io.IOException;
++import java.util.Iterator;
++import java.util.PriorityQueue;
++
+ public final class UserVectorSplitterMapper extends
+     Mapper<VarLongWritable,VectorWritable, VarIntWritable,VectorOrPrefWritable> {
+ 
+@@ -46,23 +47,24 @@
+   @Override
+   protected void setup(Context context) {
+     Configuration jobConf = context.getConfiguration();
+-    maxPrefsPerUserConsidered = jobConf.getInt(MAX_PREFS_PER_USER_CONSIDERED,
+-                                               DEFAULT_MAX_PREFS_PER_USER_CONSIDERED);
+-    try {
+-      FileSystem fs = FileSystem.get(jobConf);
++    maxPrefsPerUserConsidered = jobConf.getInt(MAX_PREFS_PER_USER_CONSIDERED, DEFAULT_MAX_PREFS_PER_USER_CONSIDERED);
+       String usersFilePathString = jobConf.get(USERS_FILE);
+-      if (usersFilePathString == null) {
+-        usersToRecommendFor = null;
+-      } else {
++    if (usersFilePathString != null) {
++      FSDataInputStream in = null;
++      try {
++        Path unqualifiedUsersFilePath = new Path(usersFilePathString);
++        FileSystem fs = FileSystem.get(unqualifiedUsersFilePath.toUri(), jobConf);
+         usersToRecommendFor = new FastIDSet();
+-        Path usersFilePath = new Path(usersFilePathString).makeQualified(fs);
+-        FSDataInputStream in = fs.open(usersFilePath);
++        Path usersFilePath = unqualifiedUsersFilePath.makeQualified(fs);
++        in = fs.open(usersFilePath);
+         for (String line : new FileLineIterable(in)) {
+           usersToRecommendFor.add(Long.parseLong(line));
+         }
+-      }
+     } catch (IOException ioe) {
+       throw new IllegalStateException(ioe);
++      } finally {
++        IOUtils.closeStream(in);
++      }
+     }
+   }
+ 
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/similarity/item/MostSimilarItemPairsMapper.java b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/similarity/item/MostSimilarItemPairsMapper.java
+index ceee6ba0..062579c7 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/similarity/item/MostSimilarItemPairsMapper.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/cf/taste/hadoop/similarity/item/MostSimilarItemPairsMapper.java
+@@ -17,31 +17,19 @@
+ 
+ package org.apache.mahout.cf.taste.hadoop.similarity.item;
+ 
+-import java.io.IOException;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.Iterator;
+-import java.util.List;
+-import java.util.PriorityQueue;
+-import java.util.Queue;
+-
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.fs.FileStatus;
+-import org.apache.hadoop.fs.FileSystem;
+-import org.apache.hadoop.fs.Path;
+ import org.apache.hadoop.io.DoubleWritable;
+ import org.apache.hadoop.io.IntWritable;
+-import org.apache.hadoop.io.SequenceFile;
+ import org.apache.hadoop.mapreduce.Mapper;
+ import org.apache.mahout.cf.taste.hadoop.EntityEntityWritable;
+ import org.apache.mahout.cf.taste.hadoop.TasteHadoopUtils;
+-import org.apache.mahout.math.VarIntWritable;
+-import org.apache.mahout.math.VarLongWritable;
+-import org.apache.mahout.math.Vector;
+-import org.apache.mahout.math.VectorWritable;
+ import org.apache.mahout.math.Vector.Element;
++import org.apache.mahout.math.VectorWritable;
+ import org.apache.mahout.math.map.OpenIntLongHashMap;
+ 
++import java.io.IOException;
++import java.util.*;
++
+ public class MostSimilarItemPairsMapper
+     extends Mapper<IntWritable,VectorWritable,EntityEntityWritable,DoubleWritable> {
+ 
+@@ -56,25 +44,7 @@ protected void setup(Context ctx) {
+     if (maxSimilarItemsPerItem < 1) {
+       throw new IllegalStateException("maxSimilarItemsPerItem was not correctly set!");
+     }
+-
+-    try {
+-      FileSystem fs = FileSystem.get(conf);
+-      Path itemIDIndexPath = new Path(itemIDIndexPathStr).makeQualified(fs);
+-      indexItemIDMap = new OpenIntLongHashMap();
+-      VarIntWritable index = new VarIntWritable();
+-      VarLongWritable id = new VarLongWritable();
+-      for (FileStatus status : fs.listStatus(itemIDIndexPath, TasteHadoopUtils.PARTS_FILTER)) {
+-        String path = status.getPath().toString();
+-        SequenceFile.Reader reader =
+-            new SequenceFile.Reader(fs, new Path(path).makeQualified(fs), conf);
+-        while (reader.next(index, id)) {
+-          indexItemIDMap.put(index.get(), id.get());
+-        }
+-        reader.close();
+-      }
+-    } catch (IOException ioe) {
+-      throw new IllegalStateException(ioe);
+-    }
++    indexItemIDMap = TasteHadoopUtils.readItemIDIndexMap(conf.get(ItemSimilarityJob.ITEM_ID_INDEX_PATH_STR), conf);
+   }
+ 
+   @Override

@@ -1,0 +1,751 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+index 152ea358..bf2f9512 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+@@ -25,6 +25,7 @@
+ import java.nio.channels.FileChannel;
+ import java.nio.channels.SocketChannel;
+ 
++import org.apache.cassandra.streaming.StreamOutManager;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.log4j.Logger;
+ 
+@@ -95,6 +96,7 @@ private void stream(SocketChannel channel) throws IOException
+                 if (logger.isDebugEnabled())
+                     logger.debug("Bytes transferred " + bytesTransferred);
+                 start += bytesTransferred;
++                StreamOutManager.get(to).update(file, start);
+             }
+         }
+         finally
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index b284f1f6..3684c5d3 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -145,6 +145,7 @@ public Range getLocalPrimaryRange()
+     /* when intialized as a client, we shouldn't write to the system table. */
+     private boolean isClientMode;
+     private boolean initialized;
++    private String operationMode;
+ 
+     public void addBootstrapSource(InetAddress s, String table)
+     {
+@@ -175,6 +176,7 @@ private void finishBootstrapping()
+         setToken(getLocalToken());
+         Gossiper.instance.addLocalApplicationState(MOVE_STATE, new ApplicationState(STATE_NORMAL + Delimiter + partitioner_.getTokenFactory().toString(getLocalToken())));
+         logger_.info("Bootstrap/move completed! Now serving reads.");
++        setMode("Normal", false);
+     }
+ 
+     /** This method updates the local token on disk  */
+@@ -228,6 +230,10 @@ public StorageService()
+             replicationStrategies.put(table, strat);
+         }
+         replicationStrategies = Collections.unmodifiableMap(replicationStrategies);
++
++        // spin up the streaming serivice so it is available for jmx tools.
++        if (StreamingService.instance == null)
++            throw new RuntimeException("Streaming service is unavailable.");
+     }
+ 
+     public AbstractReplicationStrategy getReplicationStrategy(String table)
+@@ -279,6 +285,7 @@ public synchronized void initClient() throws IOException
+         MessagingService.instance.listen(FBUtilities.getLocalAddress());
+         Gossiper.instance.register(this);
+         Gossiper.instance.start(FBUtilities.getLocalAddress(), (int)(System.currentTimeMillis() / 1000)); // needed for node-ring gathering.
++        setMode("Client", false);
+     }
+ 
+     public synchronized void initServer() throws IOException
+@@ -313,14 +320,16 @@ public synchronized void initServer() throws IOException
+         if (DatabaseDescriptor.isAutoBootstrap()
+             && !(DatabaseDescriptor.getSeeds().contains(FBUtilities.getLocalAddress()) || SystemTable.isBootstrapped()))
+         {
+-            logger_.info("Starting in bootstrap mode");
++            setMode("Joining: getting load information", true);
+             StorageLoadBalancer.instance.waitForLoadInfo();
+-            logger_.info("... got load info");
++            if (logger_.isDebugEnabled())
++                logger_.debug("... got load info");
+             if (tokenMetadata_.isMember(FBUtilities.getLocalAddress()))
+             {
+                 String s = "This node is already a member of the token ring; bootstrap aborted. (If replacing a dead node, remove the old one from the ring first.)";
+                 throw new UnsupportedOperationException(s);
+             }
++            setMode("Joining: getting bootstrap token", true);
+             Token token = BootStrapper.getBootstrapToken(tokenMetadata_, StorageLoadBalancer.instance.getLoadInfo());
+             startBootstrap(token);
+             // don't finish startup (enabling thrift) until after bootstrap is done
+@@ -342,17 +351,25 @@ public synchronized void initServer() throws IOException
+             Token token = storageMetadata_.getToken();
+             tokenMetadata_.updateNormalToken(token, FBUtilities.getLocalAddress());
+             Gossiper.instance.addLocalApplicationState(MOVE_STATE, new ApplicationState(STATE_NORMAL + Delimiter + partitioner_.getTokenFactory().toString(token)));
++            setMode("Normal", false);
+         }
+ 
+         assert tokenMetadata_.sortedTokens().size() > 0;
+     }
+ 
++    private void setMode(String m, boolean log)
++    {
++        operationMode = m;
++        if (log)
++            logger_.info(m);
++    }
++
+     private void startBootstrap(Token token) throws IOException
+     {
+         isBootstrapMode = true;
+         SystemTable.updateToken(token); // DON'T use setToken, that makes us part of the ring locally which is incorrect until we are done bootstrapping
+         Gossiper.instance.addLocalApplicationState(MOVE_STATE, new ApplicationState(STATE_BOOTSTRAPPING + Delimiter + partitioner_.getTokenFactory().toString(token)));
+-        logger_.info("bootstrap sleeping " + RING_DELAY);
++        setMode("Joining: sleeping " + RING_DELAY + " for pending range setup", true);
+         try
+         {
+             Thread.sleep(RING_DELAY);
+@@ -361,6 +378,7 @@ private void startBootstrap(Token token) throws IOException
+         {
+             throw new AssertionError(e);
+         }
++        setMode("Bootstrapping", true);
+         new BootStrapper(FBUtilities.getLocalAddress(), token, tokenMetadata_).startBootstrap(); // handles token update
+     }
+ 
+@@ -1271,10 +1289,10 @@ public void decommission() throws InterruptedException
+                 throw new UnsupportedOperationException("data is currently moving to this node; unable to leave the ring");
+         }
+ 
+-        // leave the ring
+-        logger_.info("DECOMMISSIONING");
++        if (logger_.isDebugEnabled())
++            logger_.debug("DECOMMISSIONING");
+         startLeaving();
+-        logger_.info("decommission sleeping " + RING_DELAY);
++        setMode("Leaving: sleeping " + RING_DELAY + " for pending range setup", true);
+         Thread.sleep(RING_DELAY);
+ 
+         Runnable finishLeaving = new Runnable()
+@@ -1283,7 +1301,7 @@ public void run()
+             {
+                 Gossiper.instance.stop();
+                 MessagingService.shutdown();
+-                logger_.info("DECOMMISSION FINISHED.");
++                setMode("Decommissioned", true);
+                 // let op be responsible for killing the process
+             }
+         };
+@@ -1296,8 +1314,6 @@ private void leaveRing()
+         tokenMetadata_.removeEndpoint(FBUtilities.getLocalAddress());
+         calculatePendingRanges();
+ 
+-        if (logger_.isDebugEnabled())
+-            logger_.debug("");
+         Gossiper.instance.addLocalApplicationState(MOVE_STATE, new ApplicationState(STATE_LEFT + Delimiter + LEFT_NORMALLY + Delimiter + getLocalToken().toString()));
+         try
+         {
+@@ -1323,6 +1339,7 @@ private void unbootstrap(final Runnable onFinish)
+                 continue;
+             }
+ 
++            setMode("Leaving: streaming data to other nodes", true);
+             final Set<Map.Entry<Range, InetAddress>> pending = Collections.synchronizedSet(new HashSet<Map.Entry<Range, InetAddress>>(rangesMM.entries()));
+             for (final Map.Entry<Range, InetAddress> entry : rangesMM.entries())
+             {
+@@ -1388,10 +1405,10 @@ private void move(final Token token) throws IOException, InterruptedException
+         if (token != null && tokenMetadata_.sortedTokens().contains(token))
+             throw new IOException("target token " + token + " is already owned by another node");
+ 
+-        // leave the ring
+-        logger_.info("starting move. leaving token " + getLocalToken());
++        if (logger_.isDebugEnabled())
++            logger_.debug("Leaving: old token was " + getLocalToken());
+         startLeaving();
+-        logger_.info("move sleeping " + RING_DELAY);
++         setMode("Leaving: sleeping " + RING_DELAY + " for pending range setup", true);
+         Thread.sleep(RING_DELAY);
+ 
+         Runnable finishMoving = new WrappedRunnable()
+@@ -1481,6 +1498,11 @@ private boolean hasUnreclaimedSpace()
+         return false;
+     }
+ 
++    public String getOperationMode()
++    {
++        return operationMode;
++    }
++
+     // Never ever do this at home. Used by tests.
+     Map<String, AbstractReplicationStrategy> setReplicationStrategyUnsafe(Map<String, AbstractReplicationStrategy> replacement)
+     {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index a5d88ca4..d6bc007f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -157,4 +157,7 @@
+ 
+     /** set the logging level at runtime */
+     public void setLog4jLevel(String classQualifier, String level);
++
++    /** get the operational mode (leaving, joining, normal, decommissioned, client) **/
++    public String getOperationMode();
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index 8bcfe54a..e6f454a0 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -40,6 +40,7 @@ public IncomingStreamReader(SocketChannel socketChannel)
+         this.socketChannel = socketChannel;
+         InetSocketAddress remoteAddress = (InetSocketAddress)socketChannel.socket().getRemoteSocketAddress();
+         pendingFile = StreamInManager.getStreamContext(remoteAddress.getAddress());
++        StreamInManager.activeStreams.put(remoteAddress.getAddress(), pendingFile);
+         assert pendingFile != null;
+         streamStatus = StreamInManager.getStreamStatus(remoteAddress.getAddress());
+         assert streamStatus != null;
+@@ -56,8 +57,10 @@ public void read() throws IOException
+         long bytesRead = 0;
+         try
+         {
+-            while (bytesRead < pendingFile.getExpectedBytes())
++            while (bytesRead < pendingFile.getExpectedBytes()) {
+                 bytesRead += fc.transferFrom(socketChannel, bytesRead, FileStreamTask.CHUNK_SIZE);
++                pendingFile.update(bytesRead);
++            }
+         }
+         catch (IOException ex)
+         {
+@@ -69,6 +72,10 @@ public void read() throws IOException
+             file.delete();
+             throw ex;
+         }
++        finally
++        {
++            StreamInManager.activeStreams.remove(remoteAddress.getAddress(), pendingFile);
++        }
+ 
+         if (bytesRead == pendingFile.getExpectedBytes())
+         {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+index 61b44545..442309df 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+@@ -21,14 +21,26 @@
+     }
+ 
+     private String targetFile_;
+-    private long expectedBytes_;
+-    private String table_;
++    private final long expectedBytes_;
++    private final String table_;
++    private long ptr_;
+ 
+     public PendingFile(String targetFile, long expectedBytes, String table)
+     {
+         targetFile_ = targetFile;
+         expectedBytes_ = expectedBytes;
+         table_ = table;
++        ptr_ = 0;
++    }
++
++    public void update(long ptr)
++    {
++        ptr_ = ptr;
++    }
++
++    public long getPtr()
++    {
++        return ptr_;
+     }
+ 
+     public String getTable()
+@@ -57,7 +69,7 @@ public boolean equals(Object o)
+             return false;
+ 
+         PendingFile rhs = (PendingFile)o;
+-        return targetFile_.equals(rhs.targetFile_);
++        return targetFile_.hashCode() == rhs.hashCode();
+     }
+ 
+     public int hashCode()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
+index 45c64688..1361ca0f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInManager.java
+@@ -21,6 +21,9 @@
+ import java.util.*;
+ import java.net.InetAddress;
+ 
++import com.google.common.collect.HashMultimap;
++import com.google.common.collect.Multimap;
++import com.google.common.collect.Multimaps;
+ import org.apache.cassandra.streaming.IStreamComplete;
+ 
+ import org.apache.log4j.Logger;
+@@ -36,6 +39,8 @@
+     /* Maintains a callback handler per endpoint to notify the app that a stream from a given endpoint has been handled */
+     public static final Map<InetAddress, IStreamComplete> streamNotificationHandlers_ = new HashMap<InetAddress, IStreamComplete>();
+     
++    public static final Multimap<InetAddress, PendingFile> activeStreams = Multimaps.synchronizedMultimap(HashMultimap.<InetAddress, PendingFile>create());
++
+     public synchronized static PendingFile getStreamContext(InetAddress key)
+     {        
+         List<PendingFile> context = ctxBag_.get(key);
+@@ -58,6 +63,26 @@ public synchronized static CompletedFileStatus getStreamStatus(InetAddress key)
+         return streamStatus;
+     }
+     
++    /** query method to determine which hosts are streaming to this node. */
++    public static Set<InetAddress> getSources()
++    {
++        HashSet<InetAddress> set = new HashSet<InetAddress>();
++        set.addAll(ctxBag_.keySet());
++        set.addAll(activeStreams.keySet());
++        return set;
++    }
++
++    /** query the status of incoming files. */
++    public static List<PendingFile> getIncomingFiles(InetAddress host)
++    {
++        // avoid returning null.
++        List<PendingFile> list = new ArrayList<PendingFile>();
++        if (ctxBag_.containsKey(host))
++            list.addAll(ctxBag_.get(host));
++        list.addAll(activeStreams.get(host));
++        return list;
++    }
++
+     /*
+      * This method helps determine if the StreamCompletionHandler needs
+      * to be invoked for the data being streamed from a source. 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+index 3cfbb408..57988ed5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOut.java
+@@ -139,6 +139,7 @@ public static void transferSSTables(InetAddress target, List<SSTableReader> ssta
+         {
+             logger.info("Waiting for transfer to " + target + " to complete");
+             StreamOutManager.get(target).waitForStreamCompletion();
++            // todo: it would be good if there were a dafe way to remove the StreamManager for target.
+             // (StreamManager will delete the streamed file on completion.)
+             logger.info("Done with transfer to " + target);
+         }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+index 0524664c..04b209d2 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamOutManager.java
+@@ -21,7 +21,12 @@
+ import java.io.File;
+ import java.io.IOException;
+ import java.util.ArrayList;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ 
+@@ -37,7 +42,7 @@
+ /**
+  * This class manages the streaming of multiple files one after the other.
+ */
+-class StreamOutManager
++public class StreamOutManager
+ {   
+     private static Logger logger = Logger.getLogger( StreamOutManager.class );
+         
+@@ -55,7 +60,16 @@ public static StreamOutManager get(InetAddress to)
+         return manager;
+     }
+     
+-    private final List<File> files = new ArrayList<File>();
++    public static Set<InetAddress> getDestinations()
++    {
++        // the results of streamManagers.keySet() isn't serializable, so create a new set.
++        return new HashSet(streamManagers.keySet());
++    }
++
++    // we need sequential and random access to the files. hence, the map and the list.
++    private final List<PendingFile> files = new ArrayList<PendingFile>();
++    private final Map<String, PendingFile> fileMap = new HashMap<String, PendingFile>();
++    
+     private final InetAddress to;
+     private long totalBytes = 0L;
+     private final SimpleCondition condition = new SimpleCondition();
+@@ -71,16 +85,24 @@ public void addFilesToStream(PendingFile[] pendingFiles)
+         {
+             if (logger.isDebugEnabled())
+               logger.debug("Adding file " + pendingFile.getTargetFile() + " to be streamed.");
+-            files.add( new File( pendingFile.getTargetFile() ) );
++            files.add(pendingFile);
++            fileMap.put(pendingFile.getTargetFile(), pendingFile);
+             totalBytes += pendingFile.getExpectedBytes();
+         }
+     }
+     
++    public void update(String path, long pos)
++    {
++        PendingFile pf = fileMap.get(path);
++        if (pf != null)
++            pf.update(pos);
++    }
++    
+     public void startNext()
+     {
+         if (files.size() > 0)
+         {
+-            File file = files.get(0);
++            File file = new File(files.get(0).getTargetFile());
+             if (logger.isDebugEnabled())
+               logger.debug("Streaming " + file.length() + " length file " + file + " ...");
+             MessagingService.instance.stream(file.getAbsolutePath(), 0L, file.length(), FBUtilities.getLocalAddress(), to);
+@@ -93,7 +115,9 @@ public void finishAndStartNext(String file) throws IOException
+         if (logger.isDebugEnabled())
+           logger.debug("Deleting file " + file + " after streaming " + f.length() + "/" + totalBytes + " bytes.");
+         FileUtils.delete(file);
+-        files.remove(0);
++        PendingFile pf = files.remove(0);
++        if (pf != null)
++            fileMap.remove(pf.getTargetFile());
+         if (files.size() > 0)
+         {
+             startNext();
+@@ -117,4 +141,29 @@ public void waitForStreamCompletion()
+             throw new AssertionError(e);
+         }
+     }
++
++    List<PendingFile> getFiles()
++    {
++        return Collections.unmodifiableList(files);
++    }
++
++    public class StreamFile extends File
++    {
++        private long ptr = 0;
++        public StreamFile(String path)
++        {
++            super(path);
++            ptr = 0;
++        }
++
++        private void update(long ptr)
++        {
++            this.ptr = ptr;
++        }
++
++        public long getPtr()
++        {
++            return ptr;
++        }
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+index e69de29b..1021b096 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingService.java
+@@ -0,0 +1,91 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.streaming;
++
++import org.apache.cassandra.streaming.StreamingServiceMBean;
++import org.apache.log4j.Logger;
++
++import javax.management.MBeanServer;
++import javax.management.ObjectName;
++import java.io.IOException;
++import java.lang.management.ManagementFactory;
++import java.net.InetAddress;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Set;
++
++public class StreamingService implements StreamingServiceMBean
++{
++    private static final Logger logger = Logger.getLogger(StreamingService.class);
++    public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.streaming:type=StreamingService";
++    public static final StreamingService instance = new StreamingService();
++
++    private StreamingService()
++    {
++        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
++        try
++        {
++            mbs.registerMBean(this, new ObjectName(MBEAN_OBJECT_NAME));
++        }
++        catch (Exception e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
++
++    /** hosts receiving outgoing streams. */
++    public Set<InetAddress> getStreamDestinations()
++    {
++        return StreamOutManager.getDestinations();
++    }
++
++    /** outgoing streams */
++    public List<String> getOutgoingFiles(String host) throws IOException
++    {
++        List<String> files = new ArrayList<String>();
++        // first, verify that host is a destination. calling StreamOutManager.get will put it in the collection
++        // leading to false positives in the future.
++        Set<InetAddress> existingDestinations = getStreamDestinations();
++        InetAddress dest = InetAddress.getByName(host);
++        if (!existingDestinations.contains(dest))
++            return files;
++        
++        StreamOutManager manager = StreamOutManager.get(dest);
++        for (PendingFile f : manager.getFiles())
++            files.add(String.format("%s %d/%d", f.getTargetFile(), f.getPtr(), f.getExpectedBytes()));
++        return files;
++    }
++
++    /** hosts sending incoming streams */
++    public Set<InetAddress> getStreamSources()
++    {
++        return StreamInManager.getSources();
++    }
++
++    /** details about incoming streams. */
++    public List<String> getIncomingFiles(String host) throws IOException
++    {
++        List<String> files = new ArrayList<String>();
++        for (PendingFile pf : StreamInManager.getIncomingFiles(InetAddress.getByName(host)))
++        {
++            files.add(String.format("%s: %s %d/%d", pf.getTable(), pf.getTargetFile(), pf.getPtr(), pf.getExpectedBytes()));
++        }
++        return files;
++    }
++}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingServiceMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingServiceMBean.java
+index e69de29b..5c29defe 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingServiceMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamingServiceMBean.java
+@@ -0,0 +1,39 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.cassandra.streaming;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.util.List;
++import java.util.Set;
++
++public interface StreamingServiceMBean
++{
++    /** hosts recieving outgoing streams */
++    public Set<InetAddress> getStreamDestinations();
++
++    /** outgoing streams */
++    public List<String> getOutgoingFiles(String host) throws IOException;
++
++    /** hosts sending incoming streams. */
++    public Set<InetAddress> getStreamSources();
++
++    /** details about incoming streams */
++    public List<String> getIncomingFiles(String host) throws IOException;
++}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
+index 142f21f7..dc4a3677 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeCmd.java
+@@ -3,9 +3,11 @@
+ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.lang.management.MemoryUsage;
++import java.net.InetAddress;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.HashMap;
++import java.util.HashSet;
+ import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
+@@ -20,6 +22,7 @@
+ import org.apache.cassandra.dht.Range;
+ 
+ import org.apache.commons.cli.*;
++import org.apache.commons.lang.StringUtils;
+ 
+ public class NodeCmd {
+     private static final String HOST_OPT_LONG = "host";
+@@ -55,7 +58,8 @@ private static void printUsage()
+                 "%nAvailable commands: ring, info, cleanup, compact, cfstats, snapshot [snapshotname], clearsnapshot, " +
+                 "tpstats, flush, repair, decommission, move, loadbalance, removetoken, " +
+                 "setcachecapacity <keyspace> <cfname> <keycachecapacity> <rowcachecapacity>, " +
+-                "getcompactionthreshold, setcompactionthreshold [minthreshold] ([maxthreshold])");
++                "getcompactionthreshold, setcompactionthreshold [minthreshold] ([maxthreshold])" +
++                "streams [host]");
+         String usage = String.format("java %s --host <arg> <command>%n", NodeCmd.class.getName());
+         hf.printHelp(usage, "", options, header);
+     }
+@@ -174,6 +178,60 @@ public void printInfo(PrintStream outs)
+         outs.println(String.format("%-17s: %.2f / %.2f", "Heap Memory (MB)", memUsed, memMax));
+     }
+     
++    public void printStreamInfo(final InetAddress addr, PrintStream outs)
++    {
++        outs.println(String.format("Mode: %s", probe.getOperationMode()));
++        Set<InetAddress> hosts = addr == null ? probe.getStreamDestinations() : new HashSet<InetAddress>(){{add(addr);}};
++        if (hosts.size() == 0)
++            outs.println("Not sending any streams.");
++        for (InetAddress host : hosts)
++        {
++            try
++            {
++                List<String> files = probe.getFilesDestinedFor(host);
++                if (files.size() > 0)
++                {
++                    outs.println(String.format("Streaming to: %s", host));
++                    for (String file : files)
++                        outs.println(String.format("   %s", file));
++                }
++                else
++                {
++                    outs.println(String.format(" Nothing streaming to %s", host));
++                }
++            }
++            catch (IOException ex)
++            {
++                outs.println(String.format("   Error retrieving file data for %s", host));
++            }
++        }
++
++        hosts = addr == null ? probe.getStreamSources() : new HashSet<InetAddress>(){{add(addr); }};
++        if (hosts.size() == 0)
++            outs.println("Not receiving any streams.");
++        for (InetAddress host : hosts)
++        {
++            try
++            {
++                List<String> files = probe.getIncomingFiles(host);
++                if (files.size() > 0)
++                {
++                    outs.println(String.format("Streaming from: %s", host));
++                    for (String file : files)
++                        outs.println(String.format("   %s", file));
++                }
++                else
++                {
++                    outs.println(String.format(" Nothing streaming from %s", host));
++                }
++            }
++            catch (IOException ex)
++            {
++                outs.println(String.format("   Error retrieving file data for %s", host));
++            }
++        }
++    }
++    
+     public void printColumnFamilyStats(PrintStream outs)
+     {
+         Map <String, List <ColumnFamilyStoreMBean>> cfstoreMap = new HashMap <String, List <ColumnFamilyStoreMBean>>();
+@@ -466,6 +524,11 @@ else if (cmdName.equals("setcompactionthreshold"))
+             }
+             probe.setCompactionThreshold(minthreshold, maxthreshold);
+         }
++        else if (cmdName.equals("streams"))
++        {
++            String otherHost = arguments.length > 1 ? arguments[1] : null;
++            nodeCmd.printStreamInfo(otherHost == null ? null : InetAddress.getByName(otherHost), System.out);
++        }
+         else
+         {
+             System.err.println("Unrecognized command: " + cmdName + ".");
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 82eda6ea..5e0a1c66 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -47,6 +47,8 @@
+ import org.apache.cassandra.db.CompactionManagerMBean;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.service.StorageServiceMBean;
++import org.apache.cassandra.streaming.StreamingService;
++import org.apache.cassandra.streaming.StreamingServiceMBean;
+ 
+ /**
+  * JMX client operations for Cassandra.
+@@ -64,6 +66,7 @@
+     private MemoryMXBean memProxy;
+     private RuntimeMXBean runtimeProxy;
+     private CompactionManagerMBean mcmProxy;
++    private StreamingServiceMBean streamProxy;
+     
+     /**
+      * Creates a NodeProbe using the specified JMX host and port.
+@@ -109,6 +112,8 @@ private void connect() throws IOException
+             ssProxy = JMX.newMBeanProxy(mbeanServerConn, name, StorageServiceMBean.class);
+             name = new ObjectName(CompactionManager.MBEAN_OBJECT_NAME);
+             mcmProxy = JMX.newMBeanProxy(mbeanServerConn, name, CompactionManagerMBean.class);
++            name = new ObjectName(StreamingService.MBEAN_OBJECT_NAME);
++            streamProxy = JMX.newMBeanProxy(mbeanServerConn, name, StreamingServiceMBean.class);
+         } catch (MalformedObjectNameException e)
+         {
+             throw new RuntimeException(
+@@ -400,6 +405,31 @@ public void setCacheCapacities(String tableName, String cfName, int keyCacheCapa
+     {
+         return ssProxy.getNaturalEndpoints(key, table);
+     }
++
++    public Set<InetAddress> getStreamDestinations()
++    {
++        return streamProxy.getStreamDestinations();
++    }
++
++    public List<String> getFilesDestinedFor(InetAddress host) throws IOException
++    {
++        return streamProxy.getOutgoingFiles(host.getHostAddress());
++    }
++
++    public Set<InetAddress> getStreamSources()
++    {
++        return streamProxy.getStreamSources();
++    }
++
++    public List<String> getIncomingFiles(InetAddress host) throws IOException
++    {
++        return streamProxy.getIncomingFiles(host.getHostAddress());
++    }
++
++    public String getOperationMode()
++    {
++        return ssProxy.getOperationMode();
++    }
+ }
+ 
+ class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, ColumnFamilyStoreMBean>>

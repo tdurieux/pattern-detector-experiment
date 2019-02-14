@@ -1,0 +1,108 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/Driver20.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/Driver20.java
+index 7ac617b4..bd844ed9 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/Driver20.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/Driver20.java
+@@ -52,10 +52,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.SynchronousQueue;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.TimeUnit;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /**
+ 	This class extends the local JDBC driver in order to determine at JBMS
+@@ -66,11 +69,13 @@ then we will load the appropriate class(es) that have JDBC 2.0 new public
+ 
+ public abstract class Driver20 extends InternalDriver implements Driver {
+ 
+-    private static  ExecutorService _executorPool;
++    private static  ThreadPoolExecutor _executorPool;
+     static
+     {
+-        _executorPool = Executors.newCachedThreadPool();
+-        ((ThreadPoolExecutor) _executorPool).setThreadFactory( new DaemonThreadFactory() );
++        _executorPool = new ThreadPoolExecutor(0, Integer.MAX_VALUE,
++                                      60L, TimeUnit.SECONDS,
++                                      new SynchronousQueue<Runnable>());   
++        _executorPool.setThreadFactory( new DaemonThreadFactory() );
+     } 
+ 
+ 	private static final String[] BOOLEAN_CHOICES = {"false", "true"};
+@@ -245,22 +250,38 @@ public Connection connect( String url, Properties info )
+         return connect( url, info, DriverManager.getLoginTimeout() );
+     }
+     
++    private static final String driver20 = "driver20"; 
+     /**
+      * Use java.util.concurrent package to enforce login timeouts.
+      */
+     protected EmbedConnection  timeLogin( String url, Properties info, int loginTimeoutSeconds )
+         throws SQLException
+     {
++        try {
+         LoginCallable callable = new LoginCallable( this, url, info );
+         Future<EmbedConnection>  task = _executorPool.submit( callable );
++            long startTime = System.currentTimeMillis();
++            long interruptedTime = startTime;
+ 
++            while ((startTime - interruptedTime) / 1000.0 < loginTimeoutSeconds) {
+         try {
+             return task.get( loginTimeoutSeconds, TimeUnit.SECONDS );
+         }
+-        catch (InterruptedException ie) { throw processException( ie ); }
++                catch (InterruptedException ie) {
++                    interruptedTime = System.currentTimeMillis();
++                    InterruptStatus.setInterrupted();
++                    continue;
++                }
+         catch (ExecutionException ee) { throw processException( ee ); }
+         catch (TimeoutException te) { throw Util.generateCsSQLException( SQLState.LOGIN_TIMEOUT ); }
+     }
++            
++            // Timed out due to interrupts, throw.
++            throw Util.generateCsSQLException( SQLState.LOGIN_TIMEOUT );
++        } finally {
++            InterruptStatus.restoreIntrFlagIfSeen();
++        }
++    }
+     /** Process exceptions raised while running a timed login */
+     private SQLException    processException( Throwable t )
+     {
+@@ -270,7 +291,7 @@ private SQLException    processException( Throwable t )
+     }
+ 
+     /** Thread factory to produce daemon threads which don't block VM shutdown */
+-    public  static  final   class   DaemonThreadFactory implements ThreadFactory
++    private static  final   class   DaemonThreadFactory implements ThreadFactory
+     {
+         public  Thread newThread( Runnable r )
+         {
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
+index e10d222d..024c9554 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/InterruptResilienceTest.java
+@@ -134,6 +134,10 @@ protected void setUp()
+ 
+         thisConf = TestConfiguration.getCurrent();
+         threadNo = 0;    // counter for multiple threads tests
++
++        // test that we recover from login timeouts
++        DriverManager.setLoginTimeout( 10 );
++        
+         allDone = false; // flag for threads to terminate
+     }
+ 
+@@ -143,6 +147,8 @@ protected void setUp()
+     protected void tearDown()
+             throws java.lang.Exception {
+ 
++        DriverManager.setLoginTimeout( 0 );
++
+         // Forget about uncommitted changes
+         rollback();
+ 

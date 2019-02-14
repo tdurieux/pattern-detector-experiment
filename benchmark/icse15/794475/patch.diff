@@ -1,0 +1,161 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index dd5f2837..8a9d1625 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -530,7 +530,12 @@ private static ColumnFamily resolveAndRemoveDeleted(List<ColumnFamily> columnFam
+      */
+     static ColumnFamily removeDeleted(ColumnFamily cf)
+     {
+-        return removeDeleted(cf, (int) (System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds());
++        return removeDeleted(cf, getDefaultGCBefore());
++    }
++
++    public static int getDefaultGCBefore()
++    {
++        return (int)(System.currentTimeMillis() / 1000) - DatabaseDescriptor.getGcGraceInSeconds();
+     }
+ 
+     static ColumnFamily removeDeleted(ColumnFamily cf, int gcBefore)
+@@ -1431,12 +1436,17 @@ public ColumnFamily getColumnFamily(String key, QueryPath columnParent, long sin
+         return getColumnFamily(new TimeQueryFilter(key, columnParent, since));    
+     }
+ 
++    public ColumnFamily getColumnFamily(QueryFilter filter) throws IOException
++    {
++        return getColumnFamily(filter, getDefaultGCBefore());
++    }
++
+     /**
+      * get a list of columns starting from a given column, in a specified order.
+      * only the latest version of a column is returned.
+      * @return null if there is no data and no tombstones; otherwise a ColumnFamily
+      */
+-    public ColumnFamily getColumnFamily(QueryFilter filter) throws IOException
++    public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore) throws IOException
+     {
+         // if we are querying subcolumns of a supercolumn, fetch the supercolumn with NQF, then filter in-memory.
+         if (filter.path.superColumnName != null)
+@@ -1450,7 +1460,7 @@ public ColumnFamily getColumnFamily(QueryFilter filter) throws IOException
+                     filter.filterSuperColumn((SuperColumn) column);
+                 }
+             }
+-            return removeDeleted(cf);
++            return removeDeleted(cf, gcBefore);
+         }
+ 
+         // we are querying top-level columns, do a merging fetch with indexes.
+@@ -1500,9 +1510,9 @@ public ColumnFamily getColumnFamily(QueryFilter filter) throws IOException
+             if (!collated.hasNext())
+                 return null;
+ 
+-            filter.collectColumns(returnCF, collated);
++            filter.collectColumns(returnCF, collated, gcBefore);
+ 
+-            return removeDeleted(returnCF);
++            return removeDeleted(returnCF, gcBefore); // collect does a first pass but doesn't try to recognize e.g. the entire CF being tombstoned
+         }
+         finally
+         {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 03b0d1f6..983f9a66 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -711,7 +711,7 @@ protected String getReduced()
+                 }
+                 // make sure there is actually non-tombstone content associated w/ this key
+                 // TODO record the key source(s) somehow and only check that source (e.g., memtable or sstable)
+-                if (ColumnFamilyStore.removeDeleted(cfs.getColumnFamily(new SliceQueryFilter(current, new QueryPath(cfName), "", "", true, 1)), Integer.MAX_VALUE) != null)
++                if (cfs.getColumnFamily(new SliceQueryFilter(current, new QueryPath(cfName), "", "", true, 1), Integer.MAX_VALUE) != null)
+                 {
+                     keys.add(current);
+                 }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
+index a9214e54..c5848f47 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
+@@ -49,10 +49,11 @@ public void filterSuperColumn(SuperColumn superColumn)
+         }
+     }
+ 
+-    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns)
++    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns, int gcBefore)
+     {
+         for (IColumn column : reducedColumns)
+         {
++            if (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore)
+             returnCF.addColumn(column);
+         }
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+index 214c283b..bcacdbfb 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+@@ -36,7 +36,7 @@ protected QueryFilter(String key, QueryPath path)
+      * by the filter code, which should have some limit on the number of columns
+      * to avoid running out of memory on large rows.
+      */
+-    public abstract void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns);
++    public abstract void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns, int gcBefore);
+ 
+     /**
+      * subcolumns of a supercolumn are unindexed, so to pick out parts of those we operate in-memory.
+@@ -55,7 +55,7 @@ public int compare(IColumn c1, IColumn c2)
+         };
+     }
+     
+-    public void collectColumns(final ColumnFamily returnCF, Iterator collatedColumns)
++    public void collectColumns(final ColumnFamily returnCF, Iterator collatedColumns, int gcBefore)
+     {
+         // define a 'reduced' iterator that merges columns w/ the same name, which
+         // greatly simplifies computing liveColumns in the presence of tombstones.
+@@ -81,7 +81,7 @@ protected IColumn getReduced()
+             }
+         };
+ 
+-        collectColumns(returnCF, reduced);
++        collectColumns(returnCF, reduced, gcBefore);
+     }
+ 
+     public String getColumnFamilyName()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+index 94afce7f..e4651206 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+@@ -47,7 +47,7 @@ public void filterSuperColumn(SuperColumn superColumn)
+         return isAscending ? comparator : new ReverseComparator(comparator);
+     }
+ 
+-    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns)
++    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns, int gcBefore)
+     {
+         int liveColumns = 0;
+ 
+@@ -59,9 +59,11 @@ public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> redu
+                 && ((isAscending && column.name().compareTo(finish) > 0))
+                     || (!isAscending && column.name().compareTo(finish) < 0))
+                 break;
++
+             if (!column.isMarkedForDelete())
+                 liveColumns++;
+ 
++            if (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore)
+             returnCF.addColumn(column);
+         }
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/TimeQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/TimeQueryFilter.java
+index 90430754..a5deb22c 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/TimeQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/TimeQueryFilter.java
+@@ -33,10 +33,11 @@ public ColumnIterator getSSTableColumnIterator(SSTableReader sstable) throws IOE
+         return ColumnComparatorFactory.timestampComparator_;
+     }
+ 
+-    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns)
++    public void collectColumns(ColumnFamily returnCF, ReducingIterator<IColumn> reducedColumns, int gcBefore)
+     {
+         for (IColumn column : reducedColumns)
+         {
++            if (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore)
+             returnCF.addColumn(column);
+         }
+     }

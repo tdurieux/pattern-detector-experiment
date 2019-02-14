@@ -1,0 +1,231 @@
+diff --git a/db/derby/code/branches/10.8/java/drda/org/apache/derby/impl/drda/NetworkServerControlImpl.java b/db/derby/code/branches/10.8/java/drda/org/apache/derby/impl/drda/NetworkServerControlImpl.java
+index 786e1896..3df3652b 100644
+--- a/db/derby/code/branches/10.8/java/drda/org/apache/derby/impl/drda/NetworkServerControlImpl.java
++++ b/db/derby/code/branches/10.8/java/drda/org/apache/derby/impl/drda/NetworkServerControlImpl.java
+@@ -910,7 +910,14 @@ public Object run() {
+ 						if (passwordArg != null) {
+ 							p.setProperty("password", passwordArg);
+ 						}
+-						cloudscapeDriver.connect("jdbc:derby:;shutdown=true", p);
++                        // DERBY-6224: DriverManager.deregisterDriver() requires
++                        // an extra permission in JDBC 4.2 and later. Invoke
++                        // system shutdown with deregister=false to avoid the
++                        // need for the extre permission in the default server
++                        // policy. Since the JVM is about to terminate, we don't
++                        // care whether the JDBC driver is deregistered.
++                        cloudscapeDriver.connect(
++                            "jdbc:derby:;shutdown=true;deregister=false", p);
+ 					}
+ 				} catch (SQLException sqle) {
+ 					// If we can't shutdown Derby, perhaps, authentication has
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/jdbc/AutoloadedDriver.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/jdbc/AutoloadedDriver.java
+index 7f8fff7c..bedfe691 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/jdbc/AutoloadedDriver.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/jdbc/AutoloadedDriver.java
+@@ -27,14 +27,16 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.sql.DriverPropertyInfo;
+ import java.sql.SQLException;
+ 
+-import java.io.PrintStream;
++import java.security.AccessControlException;
++import java.security.AccessController;
++import java.security.PrivilegedActionException;
++import java.security.PrivilegedExceptionAction;
+ import java.util.Properties;
+ 
+ import org.apache.derby.iapi.reference.MessageId;
+-import org.apache.derby.iapi.reference.Attribute;
+ import org.apache.derby.iapi.services.i18n.MessageService;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+-import org.apache.derby.iapi.jdbc.JDBCBoot;
++import org.apache.derby.iapi.services.monitor.Monitor;
+ 
+ 
+ /**
+@@ -62,7 +64,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	
+ 
+     // This is the driver that memorizes the autoloadeddriver (DERBY-2905)
+-    private static Driver _autoloadedDriver;
++    private static AutoloadedDriver _autoloadedDriver;
+ 
+     // This flag is true unless the deregister attribute has been set to
+     // false by the user (DERBY-2905)
+@@ -249,13 +251,13 @@ static	void	unregisterDriverModule()
+         try {
+             // deregister is false if user set deregister=false attribute (DERBY-2905)
+             if (deregister && _autoloadedDriver != null) {
+-                DriverManager.deregisterDriver(_autoloadedDriver);
++                deregisterDriver(_autoloadedDriver);
+                 _autoloadedDriver = null;
+-            } else {
+-                DriverManager.deregisterDriver(_driverModule);
+-                //DERBY 5085, need to restore the default value
+-                deregister = true;
+             }
++
++            // DERBY-5085, need to restore the default value
++            deregister = true;
++
+             _driverModule = null;
+         } catch (SQLException e) {
+             if (SanityManager.DEBUG)
+@@ -263,6 +265,33 @@ static	void	unregisterDriverModule()
+         }
+ 	}
+ 	
++    private static void deregisterDriver(final AutoloadedDriver driver)
++            throws SQLException {
++        // DERBY-6224: DriverManager.deregisterDriver() requires a special
++        // permission in JDBC 4.2 and later. Call it in a privileged block
++        // so that the permission doesn't have to be granted to code that
++        // invokes engine shutdown.
++        try {
++            AccessController.doPrivileged(
++                    new PrivilegedExceptionAction() {
++                public Object run() throws SQLException {
++                    // Requires SQLPermission("deregisterDriver")
++                    DriverManager.deregisterDriver(driver);
++                    return null;
++                }
++            });
++        } catch (PrivilegedActionException pae) {
++            throw (SQLException) pae.getCause();
++        } catch (AccessControlException ace) {
++            // Since no permission was needed for deregisterDriver() before
++            // Java 8, applications may be surprised to find that engine
++            // shutdown fails because of it. For backward compatibility,
++            // don't fail shutdown if the permission is missing. Instead,
++            // log a message saying the driver could not be deregistered.
++            Monitor.logTextMessage(MessageId.CONN_DEREGISTER_NOT_PERMITTED);
++            Monitor.logThrowable(ace);
++        }
++    }
+ 
+ 	/*
+ 	** Return true if the engine has been booted.
+diff --git a/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/MessageId.java b/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+index 14594d04..18f8349e 100644
+--- a/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/MessageId.java
++++ b/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+@@ -174,6 +174,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     String CONN_XA_TRANSACTION_TIMED_OUT                    = "J135";
+     String CONN_CLOSE_XA_TRANSACTION_ROLLED_BACK            = "J136";
+ 
++    /** Shutdown couldn't deregister driver because of missing permission. */
++    String CONN_DEREGISTER_NOT_PERMITTED = "J137";
++
+ 	/*
+ 	** Authentication
+ 	*/
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/ShutdownWithoutDeregisterPermissionTest.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/ShutdownWithoutDeregisterPermissionTest.java
+index e69de29b..4e44e41f 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/ShutdownWithoutDeregisterPermissionTest.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/ShutdownWithoutDeregisterPermissionTest.java
+@@ -0,0 +1,83 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.tests.engine.ShutdownWithoutDeregisterPermissionTest
++
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++ */
++
++package org.apache.derbyTesting.functionTests.tests.engine;
++
++import java.sql.Driver;
++import java.sql.DriverManager;
++import java.sql.SQLException;
++import java.util.Enumeration;
++import junit.framework.Test;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.SecurityManagerSetup;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++/**
++ * Test that shutdown works even if derby.jar does not have permission to
++ * deregister the JDBC driver. Regression test case for DERBY-6224.
++ */
++public class ShutdownWithoutDeregisterPermissionTest extends BaseJDBCTestCase {
++    public ShutdownWithoutDeregisterPermissionTest(String name) {
++        super(name);
++    }
++
++    public static Test suite() {
++        return new SecurityManagerSetup(
++                TestConfiguration.embeddedSuite(
++                        ShutdownWithoutDeregisterPermissionTest.class),
++                "org/apache/derbyTesting/functionTests/tests/engine/" +
++                "noDeregisterPermission.policy");
++    }
++
++    public void testShutdownWithoutPermission() throws SQLException {
++        // First get a connection to make sure the engine is booted.
++        getConnection().close();
++
++        // Shut down the engine. This used to fail with an
++        // AccessControlException on Java 8 before DERBY-6224.
++        TestConfiguration config = TestConfiguration.getCurrent();
++        config.shutdownEngine();
++
++        // Test whether shutdown deregistered the driver. On versions prior
++        // to Java 8/JDBC 4.2, we expect the driver to be deregistered even
++        // though the permission is missing, and the call to getDrivers()
++        // should not return any instance of AutoloadedDriver.
++        // On Java 8/JDBC 4.2 and higher, we expect AutoloadedDriver to
++        // be in the list of registered drivers.
++
++        Enumeration drivers = DriverManager.getDrivers();
++        Driver found = null;
++        while (found == null && drivers.hasMoreElements()) {
++            Driver driver = (Driver) drivers.nextElement();
++            if (driver.getClass().getName().startsWith(
++                    "org.apache.derby.jdbc.AutoloadedDriver")) {
++                found = driver;
++            }
++        }
++
++        if (JDBC.vmSupportsJDBC42()) {
++            assertNotNull("Expected driver to be registered", found);
++        } else {
++            assertNull("Expected driver to be deregistered", found);
++        }
++    }
++}
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/_Suite.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/_Suite.java
+index 69cc2305..ba578e69 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/_Suite.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/engine/_Suite.java
+@@ -25,6 +25,7 @@ Licensed to the Apache Software Foundation (ASF) under one
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ import org.apache.derbyTesting.junit.BaseTestCase;
++import org.apache.derbyTesting.junit.JDBC;
+ 
+ /**
+  * Suite to run all JUnit tests in this package:
+@@ -50,6 +51,10 @@ public static Test suite() {
+         suite.addTest(ErrorStreamTest.suite());
+         suite.addTest(LockInterruptTest.suite());
+         suite.addTest(ModuleLoadingTest.suite());
++        if (JDBC.vmSupportsJDBC3()) {
++            // Test that requires DriverManager.
++            suite.addTest(ShutdownWithoutDeregisterPermissionTest.suite());
++        }
+ 
+         return suite;
+     }

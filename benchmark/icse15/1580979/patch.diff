@@ -1,0 +1,232 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandler.java b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandler.java
+index 48766f08..42ee5319 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandler.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/HttpShardHandler.java
+@@ -341,6 +341,7 @@ public void checkDistributed(ResponseBuilder rb) {
+ 
+           if (shortCircuit) {
+             rb.isDistrib = false;
++            rb.shortCircuitedURL = ZkCoreNodeProps.getCoreUrl(zkController.getBaseUrl(), coreDescriptor.getName());
+             return;
+           }
+           // We shouldn't need to do anything to handle "shard.rows" since it was previously meant to be an optimization?
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
+index 4c1f6171..7d25ce8d 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/ResponseBuilder.java
+@@ -128,7 +128,7 @@ public ResponseBuilder(SolrQueryRequest req, SolrQueryResponse rsp, List<SearchC
+   public int shards_start = -1;
+   public List<ShardRequest> outgoing;  // requests to be sent
+   public List<ShardRequest> finished;  // requests that have received responses from all shards
+-
++  public String shortCircuitedURL;
+ 
+   public int getShardNum(String shard) {
+     for (int i = 0; i < shards.length; i++) {
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/SearchHandler.java b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/SearchHandler.java
+index 1442a7b0..d7085dd0 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/SearchHandler.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/java/org/apache/solr/handler/component/SearchHandler.java
+@@ -17,12 +17,20 @@
+ 
+ package org.apache.solr.handler.component;
+ 
++import java.io.PrintWriter;
++import java.io.StringWriter;
++import java.util.ArrayList;
++import java.util.LinkedList;
++import java.util.List;
++
++import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.params.CommonParams;
+ import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.params.ShardParams;
+-import org.apache.solr.common.util.ContentStream;
++import org.apache.solr.common.util.NamedList;
++import org.apache.solr.common.util.SimpleOrderedMap;
+ import org.apache.solr.core.CloseHook;
+ import org.apache.solr.core.PluginInfo;
+ import org.apache.solr.core.SolrCore;
+@@ -36,11 +44,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import java.util.ArrayList;
+-import java.util.LinkedList;
+-import java.util.List;
+-
+-
+ /**
+  *
+  * Refer SOLR-281
+@@ -230,7 +233,6 @@ public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throw
+           rb.addDebugInfo("timing", timer.asNamedList() );
+         }
+       }
+-
+     } else {
+       // a distributed request
+ 
+@@ -330,6 +332,37 @@ public void handleRequestBody(SolrQueryRequest req, SolrQueryResponse rsp) throw
+         // we are done when the next stage is MAX_VALUE
+       } while (nextStage != Integer.MAX_VALUE);
+     }
++    
++    // SOLR-5550: still provide shards.info if requested even for a short circuited distrib request
++    if(!rb.isDistrib && req.getParams().getBool(ShardParams.SHARDS_INFO, false) && rb.shortCircuitedURL != null) {  
++      NamedList<Object> shardInfo = new SimpleOrderedMap<Object>();
++      SimpleOrderedMap<Object> nl = new SimpleOrderedMap<Object>();        
++      if (rsp.getException() != null) {
++        Throwable cause = rsp.getException();
++        if (cause instanceof SolrServerException) {
++          cause = ((SolrServerException)cause).getRootCause();
++        } else {
++          if (cause.getCause() != null) {
++            cause = cause.getCause();
++          }          
++        }
++        nl.add("error", cause.toString() );
++        StringWriter trace = new StringWriter();
++        cause.printStackTrace(new PrintWriter(trace));
++        nl.add("trace", trace.toString() );
++      }
++      else {
++        nl.add("numFound", rb.getResults().docList.matches());
++        nl.add("maxScore", rb.getResults().docList.maxScore());
++      }
++      nl.add("shardAddress", rb.shortCircuitedURL);
++      nl.add("time", rsp.getEndTime()-req.getStartTime()); // elapsed time of this request so far
++      
++      int pos = rb.shortCircuitedURL.indexOf("://");        
++      String shardInfoName = pos != -1 ? rb.shortCircuitedURL.substring(pos+3) : rb.shortCircuitedURL;
++      shardInfo.add(shardInfoName, nl);   
++      rsp.getValues().add(ShardParams.SHARDS_INFO,shardInfo);            
++    }
+   }
+ 
+   //////////////////////// SolrInfoMBeans methods //////////////////////
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/ShardRoutingTest.java b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/ShardRoutingTest.java
+index 7914f2cb..aa478af6 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/ShardRoutingTest.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/ShardRoutingTest.java
+@@ -340,31 +340,8 @@ void doAddDoc(String id) throws Exception {
+     // todo - target diff servers and use cloud clients as well as non-cloud clients
+   }
+ 
+-  // TODO: refactor some of this stuff up into a base class for use by other tests
+-  void doQuery(String expectedDocs, String... queryParams) throws Exception {
+-    Set<String> expectedIds = new HashSet<String>( StrUtils.splitSmart(expectedDocs, ",", true) );
+-
+-    QueryResponse rsp = cloudClient.query(params(queryParams));
+-    Set<String> obtainedIds = new HashSet<String>();
+-    for (SolrDocument doc : rsp.getResults()) {
+-      obtainedIds.add((String) doc.get("id"));
+-    }
+-
+-    assertEquals(expectedIds, obtainedIds);
+-  }
+-
+   void doRTG(String ids) throws Exception {
+-    cloudClient.query(params("qt","/get", "ids",ids));
+-
+-    Set<String> expectedIds = new HashSet<String>( StrUtils.splitSmart(ids, ",", true) );
+-
+-    QueryResponse rsp = cloudClient.query(params("qt","/get", "ids",ids));
+-    Set<String> obtainedIds = new HashSet<String>();
+-    for (SolrDocument doc : rsp.getResults()) {
+-      obtainedIds.add((String) doc.get("id"));
+-    }
+-
+-    assertEquals(expectedIds, obtainedIds);
++    doQuery(ids, "qt", "/get", "ids", ids);
+   }
+ 
+   // TODO: refactor some of this stuff into the SolrJ client... it should be easier to use
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/TestShortCircuitedRequests.java b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/TestShortCircuitedRequests.java
+index e69de29b..5c214b80 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/TestShortCircuitedRequests.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/core/src/test/org/apache/solr/cloud/TestShortCircuitedRequests.java
+@@ -0,0 +1,58 @@
++package org.apache.solr.cloud;
++
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++import org.apache.solr.client.solrj.SolrQuery;
++import org.apache.solr.client.solrj.SolrServer;
++import org.apache.solr.client.solrj.response.QueryResponse;
++import org.apache.solr.common.cloud.Replica;
++import org.apache.solr.common.params.ShardParams;
++import org.apache.solr.common.util.NamedList;
++
++public class TestShortCircuitedRequests extends AbstractFullDistribZkTestBase {
++
++  public TestShortCircuitedRequests() {
++    schemaString = "schema15.xml";      // we need a string id
++    super.sliceCount = 4;
++    super.shardCount = 4;
++    super.fixShardCount = true;  // we only want to test with exactly 4 slices.
++  }
++
++  @Override
++  public void doTest() throws Exception {
++    waitForRecoveriesToFinish(false);
++    assertEquals(4, cloudClient.getZkStateReader().getClusterState().getCollection(DEFAULT_COLLECTION).getSlices().size());
++    index("id", "a!doc1");  // shard3
++    index("id", "b!doc1");  // shard1
++    index("id", "c!doc1");  // shard2
++    index("id", "e!doc1");  // shard4
++    commit();
++
++    doQuery("a!doc1", "q", "*:*", ShardParams._ROUTE_, "a!"); // can go to any random node
++
++    // query shard3 directly with _route_=a! so that we trigger the short circuited request path
++    Replica shard3 = cloudClient.getZkStateReader().getClusterState().getLeader(DEFAULT_COLLECTION, "shard3");
++    String nodeName = shard3.getNodeName();
++    SolrServer shard3Client = getClient(nodeName);
++    QueryResponse response = shard3Client.query(new SolrQuery("*:*").add(ShardParams._ROUTE_, "a!").add(ShardParams.SHARDS_INFO, "true"));
++
++    assertEquals("Could not find doc", 1, response.getResults().getNumFound());
++    NamedList<?> sinfo = (NamedList<?>) response.getResponse().get(ShardParams.SHARDS_INFO);
++    assertNotNull("missing shard info for short circuited request", sinfo);
++  }
++}
+diff --git a/lucene/dev/branches/lucene_solr_4_7/solr/test-framework/src/java/org/apache/solr/cloud/AbstractFullDistribZkTestBase.java b/lucene/dev/branches/lucene_solr_4_7/solr/test-framework/src/java/org/apache/solr/cloud/AbstractFullDistribZkTestBase.java
+index 796431ae..bab1e4b3 100644
+--- a/lucene/dev/branches/lucene_solr_4_7/solr/test-framework/src/java/org/apache/solr/cloud/AbstractFullDistribZkTestBase.java
++++ b/lucene/dev/branches/lucene_solr_4_7/solr/test-framework/src/java/org/apache/solr/cloud/AbstractFullDistribZkTestBase.java
+@@ -1624,6 +1624,18 @@ public void waitForThingsToLevelOut(int waitForRecTimeSeconds) throws Exception
+     } while (retry);
+   }
+   
++  void doQuery(String expectedDocs, String... queryParams) throws Exception {
++    Set<String> expectedIds = new HashSet<String>( StrUtils.splitSmart(expectedDocs, ",", true) );
++
++    QueryResponse rsp = cloudClient.query(params(queryParams));
++    Set<String> obtainedIds = new HashSet<String>();
++    for (SolrDocument doc : rsp.getResults()) {
++      obtainedIds.add((String) doc.get("id"));
++    }
++
++    assertEquals(expectedIds, obtainedIds);
++  }
++
+   @Override
+   @After
+   public void tearDown() throws Exception {

@@ -1,0 +1,253 @@
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
+index be5eb553..34d488a6 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/iapi/sql/dictionary/SPSDescriptor.java
+@@ -418,6 +418,10 @@ public final synchronized void prepareAndRelease(LanguageConnectionContext lcc)
+ 											false,	// persistent only
+ 											cm,
+ 											tc);
++			//If this sps is for a trigger action, then add the depenency
++			// between this sps and the trigger table DERBY-5120
++			if (triggerTable != null) 
++				dm.addDependency(this, triggerTable, lcc.getContextManager());
+ 		}
+ 
+ 		// mark it as valid
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+index fab9adc9..051243ca 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+@@ -1837,9 +1837,6 @@ else if (referencedColsInTriggerAction[j] == droppedColumnPosition)
+ 				// need a current dependent for bind
+ 				newCC.setCurrentDependent(triggerActionSPSD.getPreparedStatement());
+ 				stmtnode.bindStatement();
+-				//Register the dependency between trigger table and trigger 
+-				// action SPS
+-				dm.addDependency(triggerActionSPSD, td, lcc.getContextManager());
+ 			} catch (StandardException se)
+ 			{
+ 				if (se.getMessageId().equals(SQLState.LANG_COLUMN_NOT_FOUND))
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+index 096faf3a..e74503e5 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/execute/CreateTriggerConstantAction.java
+@@ -347,7 +347,6 @@ public void	executeConstantAction(Activation activation)
+ 		}
+ 		dm.addDependency(triggerd, actionspsd, lcc.getContextManager());
+ 		dm.addDependency(triggerd, triggerTable, lcc.getContextManager());
+-		dm.addDependency(actionspsd, triggerTable, lcc.getContextManager());
+ 		//store trigger's dependency on various privileges in the dependeny system
+ 		storeViewTriggerDependenciesOnPrivileges(activation, triggerd);		
+ 	}
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+index 7136ba66..a684e6af 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/AlterTableTest.java
+@@ -1791,6 +1791,75 @@ public void testAlterColumn() throws Exception {
+                 "rename column renc_schema_2.renc_8.b to b2");
+     }
+ 
++    // DERBY-5120 Make sure that sysdepends will catch trigger
++    //  table changes and cause the triggers defined on that
++    //  table to recompile when they fire next time
++    public void testAlterTableAndSysdepends() throws Exception {
++        Statement st = createStatement();
++        createTableAndInsertData(st, "Derby5120_tab", "C11", "C12");
++        createTableAndInsertData(st, "Derby5120_tab_bkup1", "C111", "C112");
++        createTableAndInsertData(st, "Derby5120_tab_bkup2", "C211", "C212");
++        
++        int sysdependsRowCountBeforeTestStart;
++
++        sysdependsRowCountBeforeTestStart = numberOfRowsInSysdepends(st);
++        //Following trigger will add 5 rows to sysdepends. Trigger creation
++        // will send CREATE TRIGGER invalidation to trigger table but there
++        // are no other persistent dependents on trigger table at this point.
++        st.executeUpdate(
++                " create trigger Derby5120_tr1 " +
++                "after update of c11 on Derby5120_tab referencing  " +
++                "old_table as old for each statement insert into " +
++                "Derby5120_tab_bkup1 select * from old");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++
++        //Following trigger will add 5 rows to sysdepends. Trigger creation
++        // will send CREATE TRIGGER invalidation to trigger table which will
++        // invalidate trigger created earlier (Derby5120_tr1). Because of
++        // this, when Derby5120_tr1 trigger fires next, it will be recompiled.
++        st.executeUpdate(
++                " create trigger Derby5120_tr2 " +
++                "after update of c11 on Derby5120_tab referencing  " +
++                "old as oldrow for each row insert into  " +
++                "Derby5120_tab_bkup2(c211) values (oldrow.c11)");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++
++        //Following will fire the 2 triggers created above. During the firing,
++        // we will find that Derby5120_tr1 has been marked invalid. As a result
++        // we will recompile it's trigger action.
++        st.executeUpdate("update Derby5120_tab set c11=2");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++
++        //Following alter table on trigger table will mark the two triggers 
++        // created above invalid. As a result, when they are fired next
++        // time, their trigger action sps will be regenerated.
++        st.executeUpdate("alter table Derby5120_tab add column c113 int");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+10);
++
++        //Following will cause the 2 triggers to fire because they were marked
++        // invalid by alter table. During the trigger action sps regeneration
++        // of Derby5120_tr1, we will find that the trigger action sql is not
++        // valid anymore because trigger table now has 3 columns where as
++        // Derby5120_tab_bkup1 has only 2 columns and hence trigger action
++        // sps will not be able to do insert into Derby5120_tab_bkup1 select *
++        // from trigger table
++        assertStatementError("42802", st, " update Derby5120_tab set c11=2");
++
++        //Drop the errorneous trigger
++        st.executeUpdate("drop trigger Derby5120_tr1");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS will be less",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++
++        //Following update will succeed this time
++        st.executeUpdate("update Derby5120_tab set c11=2");
++        Assert.assertEquals("# of rows in SYS.SYSDEPENDS should not change",
++        		numberOfRowsInSysdepends(st),sysdependsRowCountBeforeTestStart+5);
++    }
++
+     // alter table tests for ALTER TABLE DROP COLUMN. The 
+     // overall syntax is:    ALTER TABLE tablename DROP [ 
+     // COLUMN ] columnname [ CASCADE | RESTRICT ]
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+index a90b6294..8b6c569f 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+@@ -31,6 +31,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ import org.apache.derbyTesting.junit.XML;
+ 
++import junit.framework.Assert;
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+ 
+@@ -386,6 +387,119 @@ public void testDERBY5121TriggerTest2() throws Exception
+         }
+     }
+ 
++    //Make sure that the rows lost from sysdepends with earlier release
++    // are restored when the db is in soft upgrade mode or when it has
++    // been hard upgraded to this release. DERBY-5120
++    public void preapreFortDERBY5120() throws Exception
++    {
++        Statement s = createStatement();
++        boolean modeDb2SqlOptional = oldAtLeast(10, 3);
++
++        dropTable("ATDC_BKUP2");
++        dropTable("ATDC_BKUP1");
++        dropTable("ATDC_TAB1");
++        s.execute("create table ATDC_TAB1(c11 int, c12 int)");
++        s.execute("insert into ATDC_TAB1 values (1,11)");
++        s.execute("create table ATDC_BKUP1(c111 int, c112 int)");
++        s.execute("create table ATDC_BKUP2(c211 int, c212 int)");
++        //Three rows will be added in sysdepends for following trigger
++        s.execute("create trigger ATDC_TAB1_TRG1 after update "+
++           		"of C11 on ATDC_TAB1 REFERENCING old_table as old " +
++           		"for each statement " + 
++       			(modeDb2SqlOptional?"":"MODE DB2SQL ") +
++                "insert into ATDC_BKUP1 select * from old");
++        //Three rows will be added in sysdepends for following trigger
++        s.execute("create trigger ATDC_TAB1_TRG2 after update " + 
++                "on ATDC_TAB1 for each row " + 
++     			(modeDb2SqlOptional?"":"MODE DB2SQL ") +
++                "values(1,2)");
++    }
++
++    //Make sure that the rows lost from sysdepends with earlier release
++    // are restored when the db is in soft upgrade mode or when it has
++    // been hard upgraded to this release. DERBY-5120
++    public void testDERBY5120NumRowsInSydependsForTrigger() throws Exception
++    {
++        //During the upgrade time, the clearing of stored statements(including 
++        // trigger action spses) happened conditionally before DERBY-4835 was 
++        // fixed. DERBY-4835 made changes so that the stored statements get 
++        // marked invalid unconditionally during the upgrade phase. But these
++        // changes for DERBY-4835 did not make into 10.5.1.1, 10.5.3.0, 
++        // 10.6.1.0 and 10.6.2.1. Because of this missing fix, trigger 
++        // action spses do not get marked invalid when the database is taken 
++        // after soft upgrade back to the original db release(if the original 
++        // db release is one of the releases mentioned above). Following test 
++        // relies on trigger action spses getting invalid during upgrade phase 
++        // and getting recompiled when they are fired next time around thus 
++        // altering the number of rows in sysdepends. Because of this, I have
++        // disabled this test for those 4 releases.
++        if (oldIs(10,5,1,1) || oldIs(10,5,3,0) ||
++        	oldIs(10,6,1,0) || oldIs(10,6,2,1))
++            		return;
++    
++        Statement s = createStatement();
++        int sysdependsRowCountBeforeCreateTrigger;
++        boolean modeDb2SqlOptional = oldAtLeast(10, 3);
++        
++        switch ( getPhase() )
++        {
++        case PH_CREATE: // create with old version
++        	preapreFortDERBY5120();
++            //Following update will recpmpile the first trigger since it was
++            // marked invalid during the creation of the 2nd trigger. But
++            // as part of recompiling, we accidentally erase the dependency
++            // between trigger action sps and trigger table
++            s.execute("update ATDC_TAB1 set c11=11");
++            s.executeUpdate("alter table ATDC_TAB1 add column c113 int");
++            s.execute("update ATDC_TAB1 set c11=11");
++        	break;
++
++        case PH_SOFT_UPGRADE:
++        case PH_HARD_UPGRADE:
++        	//During soft/hard upgrade, the sps regeneration in 10.9 has 
++        	// been fixed and hence we won't loose the dependency between 
++        	// trigger action sps and trigger table. During upgrade process, 
++        	// all the spses get marked invalid and hence they will be 
++        	// regenerated during the next time they get fired.
++            assertStatementError("42802", s, " update ATDC_TAB1 set c11=2");
++        	break;
++        	
++        case PH_POST_SOFT_UPGRADE:
++        	//During the path back to original release, all the spses get
++        	// marked invalid and hence they will be regenerated during 
++        	// the next time they get fired. This regeneration will cause
++        	// the dependency between trigger action sps and trigger table
++        	// be dropped.
++            assertStatementError("42802", s, " update ATDC_TAB1 set c11=2");
++
++        	preapreFortDERBY5120();
++            s.execute("update ATDC_TAB1 set c12=11");
++            s.executeUpdate("alter table ATDC_TAB1 add column c113 int");
++            s.execute("update ATDC_TAB1 set c12=11");
++        	break;
++
++        case PH_POST_HARD_UPGRADE:
++        	//We are now in trunk which has DERBY-5120 fixed and hence
++        	// dependencies between trigger action sps and trigger table
++        	// will not be lost
++            assertStatementError("42802", s, " update ATDC_TAB1 set c11=2");
++
++        	preapreFortDERBY5120();
++            s.execute("update ATDC_TAB1 set c12=11");
++            s.executeUpdate("alter table ATDC_TAB1 add column c113 int");
++            assertStatementError("42802", s, " update ATDC_TAB1 set c11=2");
++        	break;
++        }
++    }
++
++    //Get a count of number of rows in SYS.SYSDEPENDS
++    private int numberOfRowsInSysdepends(Statement st)
++    		throws SQLException {
++    	ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM SYS.SYSDEPENDS");
++    	rs.next();
++    	return(rs.getInt(1));
++    }
++    
+     /**
+      * Changes made for DERBY-1482 caused corruption which is being logged 
+      *  under DERBY-5121. The issue is that the generated trigger action

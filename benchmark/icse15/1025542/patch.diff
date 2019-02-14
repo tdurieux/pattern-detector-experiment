@@ -1,0 +1,162 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index daa8e969..b588face 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.db;
+ 
+ import java.io.File;
++import java.io.IOError;
+ import java.io.IOException;
+ import java.lang.management.ManagementFactory;
+ import java.net.InetAddress;
+@@ -30,6 +31,7 @@
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ 
++import org.apache.cassandra.config.CFMetaData;
+ import org.apache.commons.collections.PredicateUtils;
+ import org.apache.commons.collections.iterators.CollatingIterator;
+ import org.apache.commons.collections.iterators.FilterIterator;
+@@ -497,6 +499,22 @@ public int compare(Pair<T, Long> p1, Pair<T, Long> p2)
+         return tablePairs;
+     }
+ 
++    public Future submitDrop(final ColumnFamilyStore... stores)
++    {
++        Callable callable = new Callable()
++        {
++            public Object call() throws IOException
++            {
++                for (ColumnFamilyStore cfs : stores)
++                {
++                    cfs.table.dropCf(cfs.metadata.cfId);
++                }
++                return null;
++            }
++        };
++        return executor.submit(callable);
++    }
++    
+     public Future submitIndexBuild(final ColumnFamilyStore cfs, final Table.IndexBuilder builder)
+     {
+         Runnable runnable = new Runnable()
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 6463e5ff..bbea121e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -273,6 +273,7 @@ public void run()
+         flushTask = StorageService.scheduledTasks.scheduleWithFixedDelay(runnable, minCheckMs, minCheckMs, TimeUnit.MILLISECONDS);
+     }
+     
++    // best invoked on the compaction mananger.
+     public void dropCf(Integer cfId) throws IOException
+     {
+         assert columnFamilyStores.containsKey(cfId);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+index b00bb044..ca27d1cd 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropColumnFamily.java
+@@ -5,15 +5,18 @@
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.KSMetaData;
+ import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.db.SystemTable;
+ import org.apache.cassandra.db.Table;
+ import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.UUIDGen;
+ 
++import java.io.IOError;
+ import java.io.IOException;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.concurrent.ExecutionException;
+ 
+ /**
+  * Licensed to the Apache Software Foundation (ASF) under one
+@@ -85,13 +88,30 @@ public void applyModels() throws IOException
+         // reinitialize the table.
+         KSMetaData existing = DatabaseDescriptor.getTableDefinition(tableName);
+         CFMetaData cfm = existing.cfMetaData().get(cfName);
++        ColumnFamilyStore cfs = Table.open(cfm.tableName).getColumnFamilyStore(cfName);
+         KSMetaData ksm = makeNewKeyspaceDefinition(existing);
+         CFMetaData.purge(cfm);
+         DatabaseDescriptor.setTableDefinition(ksm, newVersion);
+         
+         if (!clientMode)
+         {
+-            Table.open(ksm.name).dropCf(cfm.cfId);
++            try
++            {
++                CompactionManager.instance.submitDrop(cfs).get();
++            }
++            catch (InterruptedException ex)
++            {
++                throw new IOException(ex);
++            }
++            catch (ExecutionException ex)
++            {
++                // if the compaction manager catches IOException, it wraps it in an IOError and rethrows, which should
++                // get caught be the executor and rethrown as an ExecutionException.
++                if (ex.getCause() instanceof IOException)
++                    throw (IOException)ex.getCause();
++                else
++                    throw new IOException(ex);
++            }
+         }
+     }
+     
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+index 476c136d..2718963e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/migration/DropKeyspace.java
+@@ -22,6 +22,8 @@
+ import org.apache.cassandra.config.ConfigurationException;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.config.KSMetaData;
++import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.db.HintedHandOffManager;
+ import org.apache.cassandra.db.SystemTable;
+ import org.apache.cassandra.db.Table;
+@@ -29,7 +31,9 @@
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.UUIDGen;
+ 
++import java.io.IOError;
+ import java.io.IOException;
++import java.util.concurrent.ExecutionException;
+ 
+ public class DropKeyspace extends Migration
+ {
+@@ -68,11 +72,26 @@ public void applyModels() throws IOException
+         
+         // remove all cfs from the table instance.
+         for (CFMetaData cfm : ksm.cfMetaData().values())
+-        {
+             CFMetaData.purge(cfm);
++        
+             if (!clientMode)
+             {
+-                table.dropCf(cfm.cfId);
++            try
++            {
++                CompactionManager.instance.submitDrop(table.getColumnFamilyStores().toArray(new ColumnFamilyStore[0])).get();
++            }
++            catch (InterruptedException ex)
++            {
++                throw new IOException(ex);
++            }
++            catch (ExecutionException ex)
++            {
++                // if the compaction manager catches IOException, it wraps it in an IOError and rethrows, which should
++                // get caught be the executor and rethrown as an ExecutionException.
++                if (ex.getCause() instanceof IOException)
++                    throw (IOException)ex.getCause();
++                else
++                    throw new IOException(ex);
+             }
+         }
+                         

@@ -1,0 +1,827 @@
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/AsmProxyManager.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/AsmProxyManager.java
+index 28d76d1f..2c549448 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/AsmProxyManager.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/AsmProxyManager.java
+@@ -20,9 +20,11 @@
+ 
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.InvocationHandler;
++import java.lang.reflect.Modifier;
+ import java.lang.reflect.Proxy;
+ import java.util.Collection;
+ import java.util.HashSet;
++import java.util.Iterator;
+ import java.util.Set;
+ import java.util.concurrent.Callable;
+ 
+@@ -47,43 +49,34 @@ public Object createNewProxy(Bundle clientBundle, Collection<Class<?>> classes,
+     // unless we have a class
+     // that implements all of them
+ 
+-    // default to not subclass
+-    boolean useSubclassProxy = false;
+-
+     // loop through the classes checking if they are java interfaces
+     // if we find any class that isn't an interface we need to use
+     // the subclass proxy
+     Set<Class<?>> notInterfaces = new HashSet<Class<?>>();
++    Set<Class<?>> interfaces = new HashSet<Class<?>>();
++    
+     for (Class<?> clazz : classes) {
+       if (!!!clazz.isInterface()) {
+-        useSubclassProxy = true;
+         notInterfaces.add(clazz);
++      } else {
++        interfaces.add(clazz);
+       }
+     }
+ 
+-    if (useSubclassProxy) {
++    // if we just have no classes we default to using
++    // the interface proxy because we can't dynamically
++    // subclass more than one interface
++    // unless we have a class
++    // that implements all of them
++    if (notInterfaces.isEmpty()) {
++      proxyObject = InterfaceProxyGenerator.getProxyInstance(clientBundle, null, interfaces, dispatcher, listener);
++    } else {
+       // if we need to use the subclass proxy then we need to find
+       // the most specific class
+-      Class<?> classToProxy = null;
+-      int deepest = 0;
+-      // for each of the classes find out how deep it is in the
+-      // hierarchy
+-      for (Class<?> clazz : notInterfaces) {
+-        Class<?> nextHighestClass = clazz;
+-        int depth = 0;
+-        do {
+-          nextHighestClass = nextHighestClass.getSuperclass();
+-          depth++;
+-        } while (nextHighestClass != null);
+-        if (depth > deepest) {
+-          // if we find a class deeper than the one we already
+-          // had
+-          // it becomes the new most specific
+-          deepest = depth;
+-          classToProxy = clazz;
+-        }
+-      }
++      Class<?> classToProxy = getLowestSubclass(notInterfaces);
+       if(WovenProxy.class.isAssignableFrom(classToProxy)) {
++        
++        if(isConcrete(classToProxy) && implementsAll(classToProxy, interfaces)) {
+         try {
+           Constructor<?> c = classToProxy.getDeclaredConstructor(Callable.class, 
+               InvocationListener.class);
+@@ -94,17 +87,63 @@ public Object createNewProxy(Bundle clientBundle, Collection<Class<?>> classes,
+           //to use
+           //TODO log that performance would be improved by using a non-null template
+         }
++        } else {
++          //We need to generate a class that implements the interfaces (if any) and
++          //has the classToProxy as a superclass
++          if((classToProxy.getModifiers() & Modifier.FINAL) != 0) {
++            throw new UnableToProxyException(classToProxy, "The class " + classToProxy
++                + " does not implement all of the interfaces " + interfaces + 
++                " and is final. This means that we cannot create a proxy for both the class and all of the requested interfaces.");
++          }
++          proxyObject = InterfaceProxyGenerator.getProxyInstance(clientBundle, 
++              (Class<? extends WovenProxy>)classToProxy, interfaces, dispatcher, listener);
++        }
+       } 
+       if(proxyObject == null){
+         proxyObject = ProxySubclassGenerator.newProxySubclassInstance(classToProxy, new ProxyHandler(this, dispatcher, listener));
+       }
+-    } else {
+-      proxyObject = InterfaceProxyGenerator.getProxyInstance(clientBundle, classes, dispatcher, listener);
+     }
+ 
+     return proxyObject;
+   }
+   
++  private Class<?> getLowestSubclass(Set<Class<?>> notInterfaces) throws
++       UnableToProxyException {
++    
++    Iterator<Class<?>> it = notInterfaces.iterator();
++    
++    Class<?> classToProxy = it.next();
++    
++    while(it.hasNext()) {
++      Class<?> potential = it.next();
++      if(classToProxy.isAssignableFrom(potential)) {
++        //potential can be widened to classToProxy, and is therefore
++        //a lower subclass
++        classToProxy = potential;
++      } else if (!!!potential.isAssignableFrom(classToProxy)){
++        //classToProxy is not a subclass of potential - This is
++        //an error, we can't be part of two hierarchies at once!
++        throw new UnableToProxyException(classToProxy, "The requested classes "
++            + classToProxy + " and " + potential + " are not in the same type hierarchy");
++      }
++    }
++    return classToProxy;
++  }
++  
++  private boolean isConcrete(Class<?> classToProxy) {
++    
++    return (classToProxy.getModifiers() & Modifier.ABSTRACT) == 0;
++  }
++
++  private boolean implementsAll(Class<?> classToProxy, Set<Class<?>> interfaces) {
++    //If we can't widen to one of the interfaces then we need to do some more work
++    for(Class<?> iface : interfaces) {
++      if(!!!iface.isAssignableFrom(classToProxy))
++        return false;
++    }
++    return true;
++  }
++
+   @Override
+   protected boolean isProxyClass(Class<?> clazz)
+   {
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/gen/ProxySubclassAdapter.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/gen/ProxySubclassAdapter.java
+index 9f3194d4..731061b5 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/gen/ProxySubclassAdapter.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/gen/ProxySubclassAdapter.java
+@@ -111,9 +111,13 @@ public void visit(int version, int access, String name, String signature, String
+     // move the existing class name to become the superclass
+     // modify the version of the dynamic subclass to be Java 1.6
+     int newVersion = Opcodes.V1_6;
+-    // keep the same access and signature as the superclass
++    // keep the same access and signature as the superclass (unless it's abstract)
+     // remove all the superclass interfaces because they will be inherited
+     // from the superclass anyway
++    if((access & ACC_ABSTRACT) != 0) {
++      //If the super was abstract the subclass should not be!
++      access &= ~ACC_ABSTRACT;
++    }
+     cv.visit(newVersion, access, newClassName, signature, name, null);
+ 
+     // add a private field for the invocation handler
+@@ -279,11 +283,16 @@ public MethodVisitor visitMethod(int access, String name, String desc, String si
+      * Check the method access and handle the method types we don't want to
+      * copy: final methods (issue warnings if these are not methods from
+      * java.* classes) static methods (initialiser and others) private
+-     * methods constructors (for now we don't copy any constructors)
+-     * abstract (we don't proxy/implement but we must copy the method or the
+-     * subclass is invalid) everything else we process to proxy
++     * methods, constructors (for now we don't copy any constructors)
++     * everything else we process to proxy. Abstract methods should be made
++     * non-abstract so that they can be proxied.
+      */
+ 
++    if((access & ACC_ABSTRACT) != 0) {
++      //If the method is abstract then it should not be in the concrete subclass!
++      access &= ~ACC_ABSTRACT;
++    }
++    
+     LOGGER.debug("Method name: {} with descriptor: {}", name, desc);
+ 
+     MethodVisitor methodVisitorToReturn = null;
+@@ -316,10 +325,6 @@ public MethodVisitor visitMethod(int access, String name, String desc, String si
+     } else if ((access & ACC_STATIC) != 0) {
+       // don't copy static methods
+       methodVisitorToReturn = null;
+-    } else if ((access & ACC_ABSTRACT) != 0) {
+-      // if we find an abstract method we need to copy it as is to make
+-      // the subclass valid
+-      methodVisitorToReturn = cv.visitMethod(access, name, desc, signature, exceptions);
+     } else if (!(((access & ACC_PUBLIC) != 0) || ((access & ACC_PROTECTED) != 0) || ((access & ACC_PRIVATE) != 0))) {
+       // the default (package) modifier value is 0, so by using & with any
+       // of the other
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceCombiningClassAdapter.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceCombiningClassAdapter.java
+index ed1b6dc8..e03759a1 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceCombiningClassAdapter.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceCombiningClassAdapter.java
+@@ -19,10 +19,15 @@
+ package org.apache.aries.proxy.impl.interfaces;
+ 
+ import java.io.IOException;
++import java.lang.reflect.Modifier;
++import java.util.ArrayList;
+ import java.util.Collection;
++import java.util.List;
++
+ import org.apache.aries.proxy.UnableToProxyException;
+ import org.apache.aries.proxy.impl.common.AbstractWovenProxyAdapter;
+ import org.apache.aries.proxy.impl.common.OSGiFriendlyClassWriter;
++import org.apache.aries.proxy.weaving.WovenProxy;
+ import org.objectweb.asm.ClassWriter;
+ import org.objectweb.asm.MethodVisitor;
+ import org.objectweb.asm.Opcodes;
+@@ -35,6 +40,8 @@
+  */
+ final class InterfaceCombiningClassAdapter extends EmptyVisitor implements Opcodes {
+   
++  /** The superclass we should use */
++  private final Class<? extends WovenProxy> superclass;
+   /** The interfaces we need to implement */
+   private final Collection<Class<?>> interfaces;
+   /** The {@link ClassWriter} we use to write our class */
+@@ -52,37 +59,38 @@
+    * @param interfaces
+    */
+    InterfaceCombiningClassAdapter(String className,
+-      ClassLoader loader, Collection<Class<?>> interfaces) {
++      ClassLoader loader, Class<? extends WovenProxy> superclass, Collection<Class<?>> interfaces) {
+     writer = new OSGiFriendlyClassWriter(ClassWriter.COMPUTE_FRAMES, loader);
+     adapter = new InterfaceUsingWovenProxyAdapter(writer, className, loader);
+     
+     this.interfaces = interfaces;
++    this.superclass = superclass;
+     String[] interfaceNames = new String[interfaces.size()];
+     
+     int i = 0;
+     for(Class<?> in : interfaces) {
+-      interfaceNames[i] = Type.getType(in).getInternalName();
++      interfaceNames[i] = Type.getInternalName(in);
+       i++;
+     }
+     
+     adapter.visit(V1_6, ACC_PUBLIC | ACC_SYNTHETIC, className, null,
+-        AbstractWovenProxyAdapter.OBJECT_TYPE.getInternalName(), interfaceNames);
++        (superclass == null) ? AbstractWovenProxyAdapter.OBJECT_TYPE.getInternalName() :
++                               Type.getInternalName(superclass), interfaceNames);
+   }
+ 
+ 
+   @Override
+   public final MethodVisitor visitMethod(int access, String name, String desc,
+       String sig, String[] arg4) {
+-    //We're going to implement this method, so make it non abstract!
+-    access &= ~ACC_ABSTRACT;
+     //If we already implement this method (from another interface) then we don't
+     //want a duplicate. We also don't want to copy any static init blocks (these
+     //initialize static fields on the interface that we don't copy
+     if(adapter.getKnownMethods().contains(new Method(name, desc)) || 
+         "<clinit>".equals(name))
+       return null;
+-    else 
+-      return adapter.visitMethod(access, name, desc, null, arg4);
++    else {//We're going to implement this method, so make it non abstract!
++      return adapter.visitMethod(access & ~ACC_ABSTRACT, name, desc, null, arg4);
++    }
+   }
+   
+   /**
+@@ -93,7 +101,7 @@ public final MethodVisitor visitMethod(int access, String name, String desc,
+   final byte[] generateBytes() throws UnableToProxyException {
+     if(!!!done) {
+       for(Class<?> c : interfaces) {
+-        adapter.setCurrentInterface(Type.getType(c));
++        adapter.setCurrentMethodDeclaringType(Type.getType(c), true);
+         try {
+           AbstractWovenProxyAdapter.readClass(c, this);
+         } catch (IOException e) {
+@@ -101,7 +109,15 @@ public final MethodVisitor visitMethod(int access, String name, String desc,
+         }
+       }
+       
+-      adapter.setCurrentInterface(Type.getType(Object.class));
++      Class<?> clazz = superclass;
++      
++      while(clazz != null && (clazz.getModifiers() & Modifier.ABSTRACT) != 0) {
++        adapter.setCurrentMethodDeclaringType(Type.getType(clazz), false);
++        visitAbstractMethods(clazz);
++        clazz = clazz.getSuperclass();
++      }
++      
++      adapter.setCurrentMethodDeclaringType(Type.getType(Object.class), false);
+       visitObjectMethods();
+       
+       adapter.visitEnd();
+@@ -110,6 +126,22 @@ public final MethodVisitor visitMethod(int access, String name, String desc,
+     return writer.toByteArray();
+   }
+   
++  private void visitAbstractMethods(Class<?> clazz) {
++    for(java.lang.reflect.Method m : clazz.getDeclaredMethods()) {
++      int modifiers = m.getModifiers();
++      if((modifiers & Modifier.ABSTRACT) != 0) {
++        List<String> exceptions = new ArrayList<String>();
++        for(Class<?> c : m.getExceptionTypes()) {
++          exceptions.add(Type.getInternalName(c));
++        }
++        MethodVisitor visitor = visitMethod(modifiers, m.getName(), Method.getMethod(m).getDescriptor(), 
++            null, exceptions.toArray(new String[exceptions.size()]));
++        if (visitor != null) visitor.visitEnd();
++      }
++    }
++  }
++
++
+   /**
+    * Make sure that the three common Object methods toString, equals and hashCode are redirected to the delegate
+    * even if they are not on any of the interfaces
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceProxyGenerator.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceProxyGenerator.java
+index 5486a8ad..fc1ef77e 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceProxyGenerator.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceProxyGenerator.java
+@@ -22,20 +22,26 @@
+ import java.lang.reflect.Constructor;
+ import java.util.Arrays;
+ import java.util.Collection;
+-import java.util.HashSet;
++import java.util.Comparator;
+ import java.util.LinkedHashSet;
+ import java.util.Map;
++import java.util.SortedSet;
++import java.util.TreeSet;
+ import java.util.WeakHashMap;
+ import java.util.concurrent.Callable;
+ 
+ import org.apache.aries.proxy.InvocationListener;
+ import org.apache.aries.proxy.UnableToProxyException;
++import org.apache.aries.proxy.weaving.WovenProxy;
+ import org.objectweb.asm.Opcodes;
+ import org.objectweb.asm.commons.EmptyVisitor;
+ import org.osgi.framework.Bundle;
+ 
+ /**
+  * This class is used to aggregate several interfaces into a real class which implements all of them
++ * It also allows you specify a superclass that the class should implement - this will add delegating
++ * method overrides for any abstract methods in the hierarchy, but not override any non-abstract methods.
++ * To be safely used as a supertype the superclass should be a WovenProxy.
+  */
+ public final class InterfaceProxyGenerator extends EmptyVisitor implements Opcodes {
+ 
+@@ -45,18 +51,20 @@
+   /**
+    * Generate a new proxy instance implementing the supplied interfaces and using the supplied
+    * dispatcher and listener
+-   * @param ifaces
++   * @param client the bundle that is trying to generate this proxy (can be null)
++   * @param superclass The superclass to use (or null for Object)
++   * @param ifaces The set of interfaces to implement (may be empty if superclass is non null)
+    * @param dispatcher
+    * @param listener
+    * @return
+    * @throws UnableToProxyException
+    */
+-  public static final Object getProxyInstance(Bundle client, Collection<Class<?>> ifaces, 
+-      Callable<Object> dispatcher, InvocationListener listener) throws UnableToProxyException{
++  public static final Object getProxyInstance(Bundle client, Class<? extends WovenProxy> superclass,
++      Collection<Class<?>> ifaces, Callable<Object> dispatcher, InvocationListener listener) throws UnableToProxyException{
+     
+     ProxyClassLoader pcl = null;
+     
+-    LinkedHashSet<Class<?>> classSet = createSet(ifaces);
++    SortedSet<Class<?>> interfaces = createSet(ifaces);
+     
+     synchronized (cache) {
+       WeakReference<ProxyClassLoader> ref = cache.get(client);
+@@ -64,7 +72,7 @@ public static final Object getProxyInstance(Bundle client, Collection<Class<?>>
+       if(ref != null)
+         pcl = ref.get();
+       
+-      if (pcl != null && pcl.isInvalid(classSet)) {
++      if (pcl != null && pcl.isInvalid(interfaces)) {
+           pcl = null;
+           cache.remove(client);
+       }
+@@ -75,7 +83,7 @@ public static final Object getProxyInstance(Bundle client, Collection<Class<?>>
+       }
+     }
+     
+-    Class<?> c = pcl.createProxyClass(classSet);
++    Class<?> c = pcl.createProxyClass(superclass, interfaces);
+         
+     try {
+       Constructor<?> con = c.getDeclaredConstructor(Callable.class, InvocationListener.class);
+@@ -93,8 +101,12 @@ public static final Object getProxyInstance(Bundle client, Collection<Class<?>>
+    * @param ifaces
+    * @return
+    */
+-  private static LinkedHashSet<Class<?>> createSet(Collection<Class<?>> ifaces) {
+-    LinkedHashSet<Class<?>> classes = new LinkedHashSet<Class<?>>();
++  private static SortedSet<Class<?>> createSet(Collection<Class<?>> ifaces) {
++    SortedSet<Class<?>> classes = new TreeSet<Class<?>>(new Comparator<Class<?>>() {
++      public int compare(Class<?> object1, Class<?> object2) {
++        return object1.getName().compareTo(object2.getName());
++      }
++    });
+     for(Class<?> c : ifaces) {
+       //If we already have a class contained then we have already covered its hierarchy
+       if(classes.add(c))
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyAdapter.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyAdapter.java
+index 78a20c51..3adb865e 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyAdapter.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyAdapter.java
+@@ -29,15 +29,17 @@
+  */
+ final class InterfaceUsingWovenProxyAdapter extends AbstractWovenProxyAdapter {
+ 
+-  private Type currentIfaceType;
++  private Type currentMethodDeclaringType;
++  private boolean currentMethodDeclaringTypeIsInterface;
+   
+   public InterfaceUsingWovenProxyAdapter(ClassVisitor writer, String className,
+       ClassLoader loader) {
+     super(writer, className, loader);
+   }
+ 
+-  public final void setCurrentInterface(Type type) {
+-    currentIfaceType = type;
++  public final void setCurrentMethodDeclaringType(Type type, boolean isInterface) {
++    currentMethodDeclaringType = type;
++    currentMethodDeclaringTypeIsInterface = isInterface;
+   }
+   
+   /**
+@@ -48,11 +50,12 @@ protected final MethodVisitor getWeavingMethodVisitor(int access, String name,
+       String methodStaticFieldName) {
+     return new InterfaceUsingWovenProxyMethodAdapter(cv.visitMethod(
+         access, name, desc, signature, exceptions), access, name, desc,
+-        methodStaticFieldName, currentMethod, typeBeingWoven, currentIfaceType);
++        methodStaticFieldName, currentMethod, typeBeingWoven, 
++        currentMethodDeclaringType, currentMethodDeclaringTypeIsInterface);
+   }
+ 
+   @Override
+   protected final Type getDeclaringTypeForCurrentMethod() {
+-    return currentIfaceType;
++    return currentMethodDeclaringType;
+   }
+ }
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyMethodAdapter.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyMethodAdapter.java
+index e5c293a9..f991f2b4 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyMethodAdapter.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/InterfaceUsingWovenProxyMethodAdapter.java
+@@ -30,17 +30,17 @@
+  */
+ final class InterfaceUsingWovenProxyMethodAdapter extends AbstractWovenProxyMethodAdapter {
+ 
+-  private final Type interfaceType;
++  private final Type typeToCastTo;
+   
+-  private final boolean isInterfaceType;
++  private final boolean istypeToCastToInterface;
+   
+   public InterfaceUsingWovenProxyMethodAdapter(MethodVisitor mv, int access, String name,
+       String desc, String methodStaticFieldName, Method currentTransformMethod,
+-      Type typeBeingWoven, Type interfaceType) {
++      Type typeBeingWoven, Type methodDeclaringType, boolean isMethodDeclaringTypeInterface) {
+     super(mv, access, name, desc, methodStaticFieldName, currentTransformMethod,
+         typeBeingWoven);
+-    this.interfaceType = interfaceType;
+-    this.isInterfaceType = !!!interfaceType.equals(OBJECT_TYPE);
++    this.typeToCastTo = methodDeclaringType;
++    this.istypeToCastToInterface = isMethodDeclaringTypeInterface;
+   }
+ 
+   /**
+@@ -80,11 +80,11 @@ public final void visitEnd() {
+   
+   @Override
+   protected final Type getTypeToCastTo() {
+-    return interfaceType;
++    return typeToCastTo;
+   }
+   
+   @Override
+   protected final boolean isTypeToCastToInterface() {
+-    return isInterfaceType;
++    return istypeToCastToInterface;
+   }
+ }
+diff --git a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/ProxyClassLoader.java b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/ProxyClassLoader.java
+index 1b1fe801..53b2fb02 100644
+--- a/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/ProxyClassLoader.java
++++ b/aries/trunk/proxy/proxy-impl/src/main/java/org/apache/aries/proxy/impl/interfaces/ProxyClassLoader.java
+@@ -26,6 +26,7 @@
+ import java.util.LinkedHashSet;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.SortedSet;
+ import java.util.concurrent.ConcurrentHashMap;
+ import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.locks.Lock;
+@@ -115,7 +116,11 @@ public boolean isInvalid(Set<Class<?>> createSet) {
+       return false;
+   }
+ 
+-  public Class<?> createProxyClass(LinkedHashSet<Class<?>> createSet) throws UnableToProxyException {
++  public Class<?> createProxyClass(Class<? extends WovenProxy> superclass, SortedSet<Class<?>> interfaces) throws UnableToProxyException {
++    
++    LinkedHashSet<Class<?>> createSet = new LinkedHashSet<Class<?>>(interfaces);
++    //Even a null superclass helps with key uniqueness
++    createSet.add(superclass);
+     
+     String className = classes.get(createSet);
+     
+@@ -131,7 +136,9 @@ public boolean isInvalid(Set<Class<?>> createSet) {
+     Lock wLock = ifacesLock.writeLock();
+     wLock.lock();
+     try {
+-      ifaces.addAll(createSet);
++      //We want the superclass, but only if it isn't null
++      ifaces.addAll(interfaces);
++      if(superclass != null) ifaces.add(superclass);
+     } finally {
+       wLock.unlock();
+     }
+@@ -139,7 +146,7 @@ public boolean isInvalid(Set<Class<?>> createSet) {
+     className = "Proxy" + AbstractWovenProxyAdapter.getSanitizedUUIDString();
+     
+     InterfaceCombiningClassAdapter icca = new InterfaceCombiningClassAdapter(
+-        className, this, createSet);
++        className, this, superclass, interfaces);
+     
+     //Use a special protection domain that grants AllPermission to our Proxy
+     //object. This is important so that we never get in the way of any security
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/AbstractProxyTest.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/AbstractProxyTest.java
+index fa52ab41..01f009c8 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/AbstractProxyTest.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/AbstractProxyTest.java
+@@ -24,6 +24,7 @@
+ import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ 
++import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.util.concurrent.Callable;
+@@ -349,4 +350,24 @@ public void testInner() throws Exception {
+     //get an instance
+     assertNotNull(getProxyClass(ProxyTestClassInner.class));
+   }
++  
++  /**
++   * Test an abstract class
++   */
++  @Test
++  public void testAbstractClass() throws Exception
++  {
++    Object ptca = getProxyInstance(getProxyClass(ProxyTestClassAbstract.class));
++    ptca = setDelegate(ptca, new Callable<Object>() {
++
++      public Object call() throws Exception {
++        //We have to use a proxy instance here because we need it to be a subclass
++        //of the one from the weaving loader in the weaving test...
++        return getProxyInstance(ProxyTestClassChildOfAbstract.class);
++      }
++    });
++    
++    Method m = ptca.getClass().getDeclaredMethod("getMessage");
++    assertEquals("Working", m.invoke(ptca));
++  }
+ }
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/InterfaceProxyingTest.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/InterfaceProxyingTest.java
+index c932025f..6bac14ec 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/InterfaceProxyingTest.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/InterfaceProxyingTest.java
+@@ -81,7 +81,7 @@ public void testGetProxyInstance1() throws Exception{
+     
+     Collection<Class<?>> classes = new ArrayList<Class<?>>(Arrays.asList(Closeable.class));
+     
+-    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, classes, constantly(null), null);
++    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, null, classes, constantly(null), null);
+     
+     assertTrue(o instanceof Closeable);
+   }
+@@ -92,7 +92,7 @@ public void testGetProxyInstance2() throws Exception{
+     Collection<Class<?>> classes = new ArrayList<Class<?>>(Arrays.asList(Closeable.class,
+         Iterable.class, Map.class));
+     
+-    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, classes, constantly(null), null);
++    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, null, classes, constantly(null), null);
+     
+     assertTrue(o instanceof Closeable);
+     assertTrue(o instanceof Iterable);
+@@ -111,7 +111,7 @@ public void testDelegationAndInterception() throws Exception
+     TestCallable tc = new TestCallable();
+     
+     Callable o = (Callable) InterfaceProxyGenerator.getProxyInstance(testBundle, 
+-        classes, tc, tl);
++        null, classes, tc, tl);
+     
+     assertCalled(tl, false, false, false);
+     
+@@ -167,8 +167,8 @@ public Object call() throws Exception {
+   public void testCaching() throws Exception {
+     Collection<Class<?>> classes = new ArrayList<Class<?>>(Arrays.asList(Closeable.class));
+     
+-    Object o1 = InterfaceProxyGenerator.getProxyInstance(testBundle, classes, constantly(null), null);
+-    Object o2 = InterfaceProxyGenerator.getProxyInstance(testBundle, classes, constantly(null), null);
++    Object o1 = InterfaceProxyGenerator.getProxyInstance(testBundle, null, classes, constantly(null), null);
++    Object o2 = InterfaceProxyGenerator.getProxyInstance(testBundle, null, classes, constantly(null), null);
+     
+     assertSame(o1.getClass(), o2.getClass());
+   }
+@@ -180,7 +180,7 @@ public void testComplexInterface() throws Exception {
+     final TestCallable tc = new TestCallable();
+     tc.setReturn(5);
+     
+-    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, classes, constantly(tc), null);
++    Object o = InterfaceProxyGenerator.getProxyInstance(testBundle, null, classes, constantly(tc), null);
+     
+     assertTrue(o instanceof ProxyTestInterface);
+     
+@@ -193,14 +193,16 @@ public void testComplexInterface() throws Exception {
+   public void testHandlesObjectMethods() throws Exception {
+       TestListener listener = new TestListener();
+       List<String> list = Arrays.asList("one", "two", "three");
+-      Object proxied = InterfaceProxyGenerator.getProxyInstance(testBundle, Arrays.<Class<?>>asList(List.class), constantly(list), listener);
++      Object proxied = InterfaceProxyGenerator.getProxyInstance(testBundle, null, Arrays.<Class<?>>asList(List.class), constantly(list), listener);
+       
+-      // obeys hashCode and equals, they *are* on the interface
++      // obeys hashCode and equals, they *are* on the interface (actually they're
++      // on several interfaces, we process them in alphabetical order, so Collection
++      // comes ahead of List.
+       assertTrue(proxied.equals(Arrays.asList("one", "two", "three")));
+-      assertEquals(List.class.getMethod("equals", Object.class), listener.getLastMethod());
++      assertEquals(Collection.class.getMethod("equals", Object.class), listener.getLastMethod());
+       listener.clear();
+       assertEquals(Arrays.asList("one", "two", "three").hashCode(), proxied.hashCode());
+-      assertEquals(List.class.getMethod("hashCode"), listener.getLastMethod());
++      assertEquals(Collection.class.getMethod("hashCode"), listener.getLastMethod());
+       listener.clear();
+       // and toString
+       assertEquals(list.toString(), proxied.toString());
+@@ -210,7 +212,7 @@ public void testHandlesObjectMethods() throws Exception {
+       Runnable runnable = new Runnable() {
+         public void run() {}
+       };
+-      proxied = InterfaceProxyGenerator.getProxyInstance(testBundle, Arrays.<Class<?>>asList(Runnable.class), constantly(runnable), listener);
++      proxied = InterfaceProxyGenerator.getProxyInstance(testBundle, null, Arrays.<Class<?>>asList(Runnable.class), constantly(runnable), listener);
+       
+       // obeys hashCode and equals, they *are not* on the interface
+       assertTrue(proxied.equals(runnable));
+@@ -250,7 +252,7 @@ public void testNoStaleProxiesForRefreshedBundle() throws Exception {
+       
+       Class<?> clazz = loader.loadClass("org.apache.aries.blueprint.proxy.TestInterface");
+       
+-      Object proxy = InterfaceProxyGenerator.getProxyInstance(bundle, Arrays.<Class<?>>asList(clazz), constantly(null), null);
++      Object proxy = InterfaceProxyGenerator.getProxyInstance(bundle, null, Arrays.<Class<?>>asList(clazz), constantly(null), null);
+       assertTrue(clazz.isInstance(proxy));
+       
+       /* Now again but with a changed classloader as if the bundle had refreshed */
+@@ -261,7 +263,7 @@ public void testNoStaleProxiesForRefreshedBundle() throws Exception {
+       
+       Class<?> clazzToo = loaderToo.loadClass("org.apache.aries.blueprint.proxy.TestInterface");
+       
+-      Object proxyToo = InterfaceProxyGenerator.getProxyInstance(bundle, Arrays.<Class<?>>asList(clazzToo), constantly(null), null);
++      Object proxyToo = InterfaceProxyGenerator.getProxyInstance(bundle, null, Arrays.<Class<?>>asList(clazzToo), constantly(null), null);
+       assertTrue(clazzToo.isInstance(proxyToo));
+   }
+   
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxySubclassGeneratorTest.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxySubclassGeneratorTest.java
+index 8970b9c6..63dc9862 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxySubclassGeneratorTest.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxySubclassGeneratorTest.java
+@@ -276,6 +276,9 @@ protected Object getProxyInstance(Class<?> proxyClass) {
+   
+   private Object getProxyInstance(Class<?> proxyClass, InvocationHandler ih) {
+     try {
++      if(proxyClass.equals(ProxyTestClassChildOfAbstract.class))
++        return proxyClass.newInstance();
++      
+       return proxyClass.getConstructor(InvocationHandler.class).newInstance(ih);
+     } catch (Exception e) {
+       return null;
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassAbstract.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassAbstract.java
+index e69de29b..d05d8b4f 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassAbstract.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassAbstract.java
+@@ -0,0 +1,25 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.blueprint.proxy;
++
++public abstract class ProxyTestClassAbstract {
++
++  public abstract String getMessage();
++  
++}
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassChildOfAbstract.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassChildOfAbstract.java
+index e69de29b..6af36399 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassChildOfAbstract.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/ProxyTestClassChildOfAbstract.java
+@@ -0,0 +1,16 @@
++package org.apache.aries.blueprint.proxy;
++
++import java.util.concurrent.Callable;
++
++public class ProxyTestClassChildOfAbstract extends ProxyTestClassAbstract implements Callable<String>{
++
++  @Override
++  public String getMessage() {
++    return "Working";
++  }
++
++  public String call() throws Exception {
++    return "Callable Works too!";
++  }
++
++}
+diff --git a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/WovenProxyGeneratorTest.java b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/WovenProxyGeneratorTest.java
+index b2039157..0cffd7fa 100644
+--- a/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/WovenProxyGeneratorTest.java
++++ b/aries/trunk/proxy/proxy-impl/src/test/java/org/apache/aries/blueprint/proxy/WovenProxyGeneratorTest.java
+@@ -31,6 +31,7 @@
+ import java.net.URL;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -43,12 +44,17 @@
+ import org.apache.aries.proxy.FinalModifierException;
+ import org.apache.aries.proxy.InvocationListener;
+ import org.apache.aries.proxy.UnableToProxyException;
++import org.apache.aries.proxy.impl.AsmProxyManager;
+ import org.apache.aries.proxy.impl.SingleInstanceDispatcher;
+ import org.apache.aries.proxy.impl.gen.ProxySubclassMethodHashSet;
+ import org.apache.aries.proxy.impl.weaving.WovenProxyGenerator;
+ import org.apache.aries.proxy.weaving.WovenProxy;
++import org.apache.aries.unittest.mocks.MethodCall;
++import org.apache.aries.unittest.mocks.Skeleton;
++import org.apache.aries.util.ClassLoaderProxy;
+ import org.junit.BeforeClass;
+ import org.junit.Test;
++import org.osgi.framework.Bundle;
+ 
+ 
+ public class WovenProxyGeneratorTest extends AbstractProxyTest
+@@ -80,10 +86,10 @@
+     ProxyTestClassUnweavableChildWithDefaultMethodWrongPackageParent.class, 
+     ProxyTestClassSerializable.class, ProxyTestClassSerializableWithSVUID.class,
+     ProxyTestClassSerializableChild.class, ProxyTestClassSerializableInterface.class,
+-    ProxyTestClassStaticInitOfChild.class});
++    ProxyTestClassStaticInitOfChild.class, ProxyTestClassAbstract.class});
+   
+   /** An array of classes that are loaded by the WeavingLoader, but not actually woven **/
+-  private static final List<Class<?>> OTHER_CLASSES = Arrays.asList(new Class<?>[] {ProxyTestClassStaticInitOfChildParent.class});
++  private static final List<Class<?>> OTHER_CLASSES = Arrays.asList(new Class<?>[] {ProxyTestClassStaticInitOfChildParent.class, ProxyTestClassChildOfAbstract.class});
+  
+   private static final Map<String, byte[]> rawClasses = new HashMap<String, byte[]>();
+   
+@@ -418,6 +424,14 @@ public void testSuperStaticInitOfChild() throws Exception {
+   @Override
+   protected Object getProxyInstance(Class<?> proxyClass) {
+     try {
++      if(proxyClass.getName().equals(ProxyTestClassAbstract.class.getName())) {
++        Collection<Class<?>> coll = new ArrayList<Class<?>>();
++        coll.add(proxyClass);
++        return new AsmProxyManager().createNewProxy(null, coll, new Callable() {
++          public Object call() throws Exception {
++            return null;
++          }}, null);
++      }
+       return proxyClass.newInstance();
+     } catch (Exception e) {
+       return null;
+@@ -461,5 +475,36 @@ protected Object getP3() {
+   public void testWovenProxyIsSynthetic(){
+     assertTrue(WovenProxy.class.isSynthetic());
+   }
++  
++  /**
++   * This test checks that we can add interfaces to classes that don't implement
++   * them using dynamic subclassing. This is a little odd, but it came for
++   * free with support for proxying abstract classes!
++   * @throws Exception 
++   */
++  @Test
++  public void testWovenClassPlusInterfaces() throws Exception {
++    Bundle b = (Bundle) Skeleton.newMock(new Class<?>[] {Bundle.class, ClassLoaderProxy.class});
++    
++    Skeleton.getSkeleton(b).setReturnValue(new MethodCall(
++        ClassLoaderProxy.class, "getClassLoader"), weavingLoader);
++    
++    Object toCall = new AsmProxyManager().createDelegatingProxy(b, Arrays.asList(
++        getProxyClass(ProxyTestClassAbstract.class), Callable.class), new Callable() {
++
++          public Object call() throws Exception {
++            return weavingLoader.loadClass(ProxyTestClassChildOfAbstract.class.getName()).newInstance();
++          }
++      
++    }, null);
++    
++    //Should proxy the abstract method on the class
++    Method m = getProxyClass(ProxyTestClassAbstract.class).getMethod("getMessage");
++    assertEquals("Working", m.invoke(toCall));
++    
++    //Should be a callable too!
++    assertEquals("Callable Works too!", ((Callable)toCall).call());
++    
++  }
+ }
+ 

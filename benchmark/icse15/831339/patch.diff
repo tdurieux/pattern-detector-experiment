@@ -1,0 +1,144 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterEndPointSnitch.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterEndPointSnitch.java
+index 866193c6..d4a22eea 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterEndPointSnitch.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterEndPointSnitch.java
+@@ -49,7 +49,6 @@
+     public DatacenterEndPointSnitch() throws IOException,
+                                              ParserConfigurationException, SAXException
+     {
+-        super();
+         xmlUtils = new XMLUtils(DEFAULT_RACK_CONFIG_FILE);
+         reloadConfiguration();
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
+index e3686323..7980f675 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/locator/DatacenterShardStategy.java
+@@ -48,11 +48,12 @@
+      *
+      * @param tokenToEndPointMap - Provided the endpoint map which will be mapped with the DC's
+      */
+-    private void loadEndPoints(Map<Token, InetAddress> tokenToEndPointMap, Collection<Token> tokens) throws IOException
++    private synchronized void loadEndPoints(Map<Token, InetAddress> tokenToEndPointMap, Collection<Token> tokens) throws IOException
+     {
+         endPointSnitch = (DatacenterEndPointSnitch) StorageService.instance().getEndPointSnitch();
+         this.tokens = new ArrayList<Token>(tokens);
+         String localDC = endPointSnitch.getLocation(InetAddress.getLocalHost());
++        dcMap = new HashMap<String, List<Token>>();
+         for (Token token : this.tokens)
+         {
+             InetAddress endPoint = tokenToEndPointMap.get(token);
+@@ -150,6 +151,7 @@ public DatacenterShardStategy(TokenMetadata tokenMetadata, IPartitioner<Token> p
+                 if ((replicas_ - 1) > foundCount)
+                 {
+                     forloopReturn.add(endPointOfIntrest);
++                    foundCount++;
+                     continue;
+                 }
+                 else
+@@ -205,7 +207,7 @@ public DatacenterShardStategy(TokenMetadata tokenMetadata, IPartitioner<Token> p
+         if (consistency_level == ConsistencyLevel.DCQUORUM)
+         {
+             List<InetAddress> endpoints = getLocalEndPoints();
+-            return new DatacenterQuorumResponseHandler<T>(endpoints, locQFactor, responseResolver);
++            return new DatacenterQuorumResponseHandler<T>(locQFactor, responseResolver);
+         }
+         else if (consistency_level == ConsistencyLevel.DCQUORUMSYNC)
+         {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterQuorumResponseHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterQuorumResponseHandler.java
+index b3859981..bf51e361 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterQuorumResponseHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/DatacenterQuorumResponseHandler.java
+@@ -4,9 +4,13 @@
+ package org.apache.cassandra.service;
+ 
+ import java.net.InetAddress;
++import java.net.UnknownHostException;
+ import java.util.List;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.locator.IEndPointSnitch;
+ import org.apache.cassandra.net.Message;
++import org.apache.cassandra.utils.FBUtilities;
+ 
+ /**
+  * This class will basically will block for the replication factor which is
+@@ -15,36 +19,47 @@
+  */
+ public class DatacenterQuorumResponseHandler<T> extends QuorumResponseHandler<T>
+ {
+-    private final List<InetAddress> waitList;
+     private int blockFor;
++    private IEndPointSnitch endpointsnitch;
++    private InetAddress localEndpoint;
+ 
+-    public DatacenterQuorumResponseHandler(List<InetAddress> waitList, int blockFor, IResponseResolver<T> responseResolver)
++    public DatacenterQuorumResponseHandler(int blockFor, IResponseResolver<T> responseResolver)
+     throws InvalidRequestException
+     {
+         // Response is been managed by the map so the waitlist size really doesnt matter.
+         super(blockFor, responseResolver);
+         this.blockFor = blockFor;
+-        this.waitList = waitList;
++        endpointsnitch = DatabaseDescriptor.getEndPointSnitch();
++        localEndpoint = FBUtilities.getLocalAddress();
+     }
+ 
+     @Override
+     public void response(Message message)
+     {
++        // IF done look no futher.
+         if (condition_.isSignaled())
+         {
+             return;
+         }
+-
+-        if (waitList.contains(message.getFrom()))
++            //Is optimal to check if same datacenter than comparing Arrays.
++        try
++        {
++            if (endpointsnitch.isInSameDataCenter(localEndpoint, message.getFrom()))
+         {
+             blockFor--;
+         }
++        }
++        catch (UnknownHostException e)
++        {
++            throw new RuntimeException(e);
++        }
+         responses_.add(message);
+-        // If done then the response count will be empty after removing
+-        // everything.
+         if (blockFor <= 0)
+         {
++            //Singnal when Quorum is recived.
+             condition_.signal();
+         }
++        if (logger_.isDebugEnabled())
++            logger_.debug("Processed Message: " + message.toString());
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index afc12be6..c296c278 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -204,7 +204,6 @@ public static void insertBlocking(RowMutation rm, int consistency_level) throws
+ 
+     private static int determineBlockFor(int naturalTargets, int hintedTargets, int consistency_level)
+     {
+-        // TODO this is broken for DC quorum / DC quorum sync
+         int bootstrapTargets = hintedTargets - naturalTargets;
+         int blockFor;
+         if (consistency_level == ConsistencyLevel.ONE)
+@@ -215,6 +214,11 @@ else if (consistency_level == ConsistencyLevel.QUORUM)
+         {
+             blockFor = (naturalTargets / 2) + 1 + bootstrapTargets;
+         }
++        else if (consistency_level == ConsistencyLevel.DCQUORUM || consistency_level == ConsistencyLevel.DCQUORUMSYNC)
++        {
++            // TODO this is broken
++            blockFor = naturalTargets;
++        }
+         else if (consistency_level == ConsistencyLevel.ALL)
+         {
+             blockFor = naturalTargets + bootstrapTargets;

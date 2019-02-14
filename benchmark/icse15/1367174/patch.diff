@@ -1,0 +1,358 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+index 74dd04f5..41e0317d 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+@@ -887,7 +887,7 @@ public void inform(SolrCore core) {
+           }
+ 
+           // reboot the writer on the new index
+-          core.getUpdateHandler().newIndexWriter();
++          core.getUpdateHandler().newIndexWriter(true);
+ 
+         } catch (IOException e) {
+           LOG.warn("Unable to get IndexCommit on startup", e);
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+index eb49e5e8..3fbba7dc 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+@@ -535,7 +535,7 @@ private void doCommit() throws IOException {
+     SolrQueryRequest req = new LocalSolrQueryRequest(solrCore,
+         new ModifiableSolrParams());
+     // reboot the writer on the new index and get a new searcher
+-    solrCore.getUpdateHandler().newIndexWriter();
++    solrCore.getUpdateHandler().newIndexWriter(true);
+     
+     try {
+       // first try to open an NRT searcher so that the new 
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitTracker.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
+index 8df3d1e0..375d2e5f 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitTracker.java
+@@ -39,8 +39,10 @@
+  * definitely change in the future, so the interface should not be relied-upon
+  * 
+  * Note: all access must be synchronized.
++ * 
++ * Public for tests.
+  */
+-final class CommitTracker implements Runnable {
++public final class CommitTracker implements Runnable {
+   protected final static Logger log = LoggerFactory.getLogger(CommitTracker.class);
+   
+   // scheduler delay for maxDoc-triggered autocommits
+@@ -248,7 +250,8 @@ void setDocsUpperBound(int docsUpperBound) {
+     this.docsUpperBound = docsUpperBound;
+   }
+ 
+-  void setTimeUpperBound(long timeUpperBound) {
++  // only for testing - not thread safe
++  public void setTimeUpperBound(long timeUpperBound) {
+     this.timeUpperBound = timeUpperBound;
+   }
+ }
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+index f0de4224..2d94e25f 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+@@ -35,6 +35,10 @@
+   private final boolean SKIP_AUTO_RECOVERY = Boolean.getBoolean("solrcloud.skip.autorecovery");
+   
+   private final Object recoveryLock = new Object();
++  
++  // protects pauseWriter and writerFree
++  private final Object writerPauseLock = new Object();
++  
+   private int refCnt = 1;
+   private SolrIndexWriter indexWriter = null;
+   private DirectoryFactory directoryFactory;
+@@ -55,49 +59,53 @@ public DefaultSolrCoreState(DirectoryFactory directoryFactory) {
+   @Override
+   public synchronized RefCounted<IndexWriter> getIndexWriter(SolrCore core)
+       throws IOException {
+-
++    synchronized (writerPauseLock) {
+     if (core == null) {
+-      // core == null is a signal to just return the current writer, or null if none.
++        // core == null is a signal to just return the current writer, or null
++        // if none.
+       if (refCntWriter != null) refCntWriter.incref();
+       return refCntWriter;
+     }
+ 
+     while (pauseWriter) {
+       try {
+-        wait();
++          writerPauseLock.wait();
+       } catch (InterruptedException e) {}
+     }
+ 
+     if (indexWriter == null) {
+-      indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false,
+-          false);
++        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2",
++            false, false);
+     }
+     if (refCntWriter == null) {
+       refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
+         @Override
+         public void close() {
+-          synchronized (DefaultSolrCoreState.this) {
++            synchronized (writerPauseLock) {
+             writerFree = true;
+-            DefaultSolrCoreState.this.notifyAll();
++              writerPauseLock.notifyAll();
+           }
+         }
+       };
+     }
+     writerFree = false;
+-    notifyAll();
++      writerPauseLock.notifyAll();
+     refCntWriter.incref();
+     return refCntWriter;
+   }
++  }
+ 
+   @Override
+-  public synchronized void newIndexWriter(SolrCore core) throws IOException {
++  public synchronized void newIndexWriter(SolrCore core, boolean rollback) throws IOException {
++    
++    synchronized (writerPauseLock) {
+     // we need to wait for the Writer to fall out of use
+     // first lets stop it from being lent out
+     pauseWriter = true;
+     // then lets wait until its out of use
+-    while(!writerFree) {
++      while (!writerFree) {
+       try {
+-        wait();
++          writerPauseLock.wait();
+       } catch (InterruptedException e) {}
+     }
+     
+@@ -110,13 +118,15 @@ public synchronized void newIndexWriter(SolrCore core) throws IOException {
+         }
+       }
+       
+-      indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false,
+-          true);
++        indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2",
++            false, true);
+       // we need to null this so it picks up the new writer next get call
+       refCntWriter = null;
+     } finally {
++        
+       pauseWriter = false;
+-      notifyAll();
++        writerPauseLock.notifyAll();
++      }
+     }
+   }
+ 
+@@ -161,7 +171,7 @@ public synchronized void incref() {
+   @Override
+   public synchronized void rollbackIndexWriter(SolrCore core) throws IOException {
+     indexWriter.rollback();
+-    newIndexWriter(core);
++    newIndexWriter(core, true);
+   }
+   
+   protected SolrIndexWriter createMainIndexWriter(SolrCore core, String name,
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index cee969c4..4b1120b0 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -343,7 +343,7 @@ public void deleteByQuery(DeleteUpdateCommand cmd) throws IOException {
+ 
+       // currently for testing purposes.  Do a delete of complete index w/o worrying about versions, don't log, clean up most state in update log, etc
+       if (delAll && cmd.getVersion() == -Long.MAX_VALUE) {
+-        synchronized (solrCoreState) {
++        synchronized (solrCoreState.getUpdateLock()) {
+           deleteAll();
+           ulog.deleteAll();
+           return;
+@@ -356,7 +356,7 @@ public void deleteByQuery(DeleteUpdateCommand cmd) throws IOException {
+       // a realtime view of the index.  When a new searcher is opened after a DBQ, that
+       // flag can be cleared.  If those thing happen concurrently, it's not thread safe.
+       //
+-      synchronized (solrCoreState) {
++      synchronized (solrCoreState.getUpdateLock()) {
+         if (delAll) {
+           deleteAll();
+         } else {
+@@ -392,7 +392,7 @@ private void addAndDelete(AddUpdateCommand cmd, List<Query> dbqList)
+     Term idTerm = new Term(idField.getName(), cmd.getIndexedId());
+     
+     // see comment in deleteByQuery
+-    synchronized (solrCoreState) {
++    synchronized (solrCoreState.getUpdateLock()) {
+       RefCounted<IndexWriter> iw = solrCoreState.getIndexWriter(core);
+       try {
+         IndexWriter writer = iw.get();
+@@ -518,7 +518,7 @@ public void commit(CommitUpdateCommand cmd) throws IOException {
+         }
+         
+         if (!cmd.softCommit) {
+-          synchronized (solrCoreState) { // sync is currently needed to prevent preCommit
++          synchronized (solrCoreState.getUpdateLock()) { // sync is currently needed to prevent preCommit
+                                 // from being called between preSoft and
+                                 // postSoft... see postSoft comments.
+             if (ulog != null) ulog.preCommit(cmd);
+@@ -547,14 +547,14 @@ public void commit(CommitUpdateCommand cmd) throws IOException {
+ 
+       if (cmd.softCommit) {
+         // ulog.preSoftCommit();
+-        synchronized (solrCoreState) {
++        synchronized (solrCoreState.getUpdateLock()) {
+           if (ulog != null) ulog.preSoftCommit(cmd);
+           core.getSearcher(true, false, waitSearcher, true);
+           if (ulog != null) ulog.postSoftCommit(cmd);
+         }
+         // ulog.postSoftCommit();
+       } else {
+-        synchronized (solrCoreState) {
++        synchronized (solrCoreState.getUpdateLock()) {
+           if (ulog != null) ulog.preSoftCommit(cmd);
+           if (cmd.openSearcher) {
+             core.getSearcher(true, false, waitSearcher);
+@@ -606,8 +606,8 @@ public void commit(CommitUpdateCommand cmd) throws IOException {
+   }
+ 
+   @Override
+-  public void newIndexWriter() throws IOException {
+-    solrCoreState.newIndexWriter(core);
++  public void newIndexWriter(boolean rollback) throws IOException {
++    solrCoreState.newIndexWriter(core, rollback);
+   }
+   
+   /**
+@@ -705,7 +705,7 @@ public void closeWriter(IndexWriter writer) throws IOException {
+           // TODO: keep other commit callbacks from being called?
+          //  this.commit(cmd);        // too many test failures using this method... is it because of callbacks?
+ 
+-          synchronized (solrCoreState) {
++          synchronized (solrCoreState.getUpdateLock()) {
+             ulog.preCommit(cmd);
+           }
+ 
+@@ -714,7 +714,7 @@ public void closeWriter(IndexWriter writer) throws IOException {
+           commitData.put(SolrIndexWriter.COMMIT_TIME_MSEC_KEY, String.valueOf(System.currentTimeMillis()));
+           writer.commit(commitData);
+ 
+-          synchronized (solrCoreState) {
++          synchronized (solrCoreState.getUpdateLock()) {
+             ulog.postCommit(cmd);
+           }
+         }
+@@ -823,4 +823,14 @@ public void decref() {
+   public void incref() {
+     solrCoreState.incref();
+   }
++
++  // allow access for tests
++  public CommitTracker getCommitTracker() {
++    return commitTracker;
++  }
++
++  // allow access for tests
++  public CommitTracker getSoftCommitTracker() {
++    return softCommitTracker;
++  }
+ }
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+index 0c0559bc..398a407b 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+@@ -31,15 +31,21 @@
+  * 
+  */
+ public abstract class SolrCoreState {
++  private final Object deleteLock = new Object();
++  
++  public Object getUpdateLock() {
++    return deleteLock;
++  }
+   
+   /**
+    * Force the creation of a new IndexWriter using the settings from the given
+    * SolrCore.
+    * 
+    * @param core
++   * @param rollback close IndexWriter if false, else rollback
+    * @throws IOException
+    */
+-  public abstract void newIndexWriter(SolrCore core) throws IOException;
++  public abstract void newIndexWriter(SolrCore core, boolean rollback) throws IOException;
+   
+   /**
+    * Get the current IndexWriter. If a new IndexWriter must be created, use the
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/UpdateHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+index 99de26be..abd21d07 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/UpdateHandler.java
+@@ -127,9 +127,11 @@ public UpdateHandler(SolrCore core)  {
+    * Called when the Writer should be opened again - eg when replication replaces
+    * all of the index files.
+    * 
++   * @param rollback IndexWriter if true else close
++   * 
+    * @throws IOException
+    */
+-  public abstract void newIndexWriter() throws IOException;
++  public abstract void newIndexWriter(boolean rollback) throws IOException;
+ 
+   public abstract SolrCoreState getSolrCoreState();
+ 
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
+index e1671508..194d1c88 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
+@@ -22,6 +22,9 @@
+ 
+ import org.apache.solr.client.solrj.SolrQuery;
+ import org.apache.solr.common.SolrInputDocument;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.servlet.SolrDispatchFilter;
++import org.apache.solr.update.DirectUpdateHandler2;
+ import org.junit.After;
+ import org.junit.AfterClass;
+ import org.junit.Before;
+@@ -77,9 +80,10 @@ public void doTest() throws Exception {
+     handle.put("QTime", SKIPVAL);
+     handle.put("timestamp", SKIPVAL);
+     
+-    // we cannot do delete by query
+-    // as it's not supported for recovery
+-    //del("*:*");
++    // randomly turn on 5 seconds 'soft' commit
++    randomlyEnableAutoSoftCommit();
++
++    del("*:*");
+     
+     List<StopableIndexingThread> threads = new ArrayList<StopableIndexingThread>();
+     int threadCount = 2;
+@@ -117,6 +121,24 @@ public void doTest() throws Exception {
+     if (VERBOSE) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
+   }
+   
++  private void randomlyEnableAutoSoftCommit() {
++    if (r.nextBoolean()) {
++      log.info("Turning on auto soft commit");
++      for (CloudJettyRunner jetty : shardToJetty.get("shard1")) {
++        SolrCore core = ((SolrDispatchFilter) jetty.jetty.getDispatchFilter()
++            .getFilter()).getCores().getCore("collection1");
++        try {
++          ((DirectUpdateHandler2) core.getUpdateHandler()).getCommitTracker()
++              .setTimeUpperBound(5000);
++        } finally {
++          core.close();
++        }
++      }
++    } else {
++      log.info("Not turning on auto soft commit");
++    }
++  }
++  
+   // skip the randoms - they can deadlock...
+   protected void indexr(Object... fields) throws Exception {
+     SolrInputDocument doc = new SolrInputDocument();

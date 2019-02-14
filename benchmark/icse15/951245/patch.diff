@@ -1,0 +1,178 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/HintedHandOffManager.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+index 10e82a50..07960845 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -18,6 +18,7 @@
+ 
+ package org.apache.cassandra.db;
+ 
++import java.net.UnknownHostException;
+ import java.util.Collection;
+ import java.util.Arrays;
+ import java.util.concurrent.TimeoutException;
+@@ -82,27 +83,11 @@
+     public static final HintedHandOffManager instance = new HintedHandOffManager();
+ 
+     private static final Logger logger_ = Logger.getLogger(HintedHandOffManager.class);
+-    final static long INTERVAL_IN_MS = 3600 * 1000; // check for ability to deliver hints this often
+     public static final String HINTS_CF = "HintsColumnFamily";
+     private static final int PAGE_SIZE = 10000;
+ 
+     private final ExecutorService executor_ = new JMXEnabledThreadPoolExecutor("HINTED-HANDOFF-POOL");
+ 
+-    protected HintedHandOffManager()
+-    {
+-        new Thread(new WrappedRunnable()
+-        {
+-            public void runMayThrow() throws Exception
+-            {
+-                while (true)
+-                {
+-                    Thread.sleep(INTERVAL_IN_MS);
+-                    deliverAllHints();
+-                }
+-            }
+-        }, "Hint delivery").start();
+-    }
+-
+     private static boolean sendMessage(InetAddress endPoint, String tableName, String key) throws IOException
+     {
+         if (!Gossiper.instance.isKnownEndpoint(endPoint))
+@@ -152,67 +137,6 @@ private static void deleteHintKey(String tableName, byte[] key) throws IOExcepti
+         rm.apply();
+     }
+ 
+-    /** hintStore must be the hints columnfamily from the system table */
+-    private static void deliverAllHints() throws DigestMismatchException, IOException, InvalidRequestException, TimeoutException
+-    {
+-        if (logger_.isDebugEnabled())
+-          logger_.debug("Started deliverAllHints");
+-
+-        // 1. Scan through all the keys that we need to handoff
+-        // 2. For each key read the list of recipients and send
+-        // 3. Delete that recipient from the key if write was successful
+-        // 4. If all writes were success for a given key we can even delete the key .
+-        // 5. Now force a flush
+-        // 6. Do major compaction to clean up all deletes etc.
+-        // 7. I guess we are done
+-        ColumnFamilyStore hintStore = Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(HINTS_CF);
+-        for (String tableName : DatabaseDescriptor.getTables())
+-        {
+-            byte[] startColumn = ArrayUtils.EMPTY_BYTE_ARRAY;
+-            while (true)
+-            {
+-                QueryFilter filter = new SliceQueryFilter(tableName, new QueryPath(HINTS_CF), startColumn, ArrayUtils.EMPTY_BYTE_ARRAY, false, PAGE_SIZE);
+-                ColumnFamily hintColumnFamily = ColumnFamilyStore.removeDeleted(hintStore.getColumnFamily(filter), Integer.MAX_VALUE);
+-                if (pagingFinished(hintColumnFamily, startColumn))
+-                    break;
+-                Collection<IColumn> keys = hintColumnFamily.getSortedColumns();
+-
+-                for (IColumn keyColumn : keys)
+-                {
+-                    Collection<IColumn> endpoints = keyColumn.getSubColumns();
+-                    String keyStr = new String(keyColumn.name(), "UTF-8");
+-                    int deleted = 0;
+-                    for (IColumn endpoint : endpoints)
+-                    {
+-                        if (sendMessage(InetAddress.getByAddress(endpoint.name()), tableName, keyStr))
+-                        {
+-                            deleteEndPoint(endpoint.name(), tableName, keyColumn.name(), System.currentTimeMillis());
+-                            deleted++;
+-                        }
+-                    }
+-                    if (deleted == endpoints.size())
+-                    {
+-                        deleteHintKey(tableName, keyColumn.name());
+-                    }
+-
+-                    startColumn = keyColumn.name();
+-                }
+-            }
+-        }
+-        hintStore.forceFlush();
+-        try
+-        {
+-            CompactionManager.instance.submitMajor(hintStore).get();
+-        }
+-        catch (Exception e)
+-        {
+-            throw new RuntimeException(e);
+-        }
+-
+-        if (logger_.isDebugEnabled())
+-          logger_.debug("Finished deliverAllHints");
+-    }
+-
+     private static boolean pagingFinished(ColumnFamily hintColumnFamily, byte[] startColumn)
+     {
+         // done if no hints found or the start column (same as last column processed in previous iteration) is the only one
+@@ -229,6 +153,8 @@ private static void deliverHintsToEndpoint(InetAddress endPoint) throws IOExcept
+         // 1. Scan through all the keys that we need to handoff
+         // 2. For each key read the list of recipients if the endpoint matches send
+         // 3. Delete that recipient from the key if write was successful
++        // 4. Now force a flush
++        // 5. Do major compaction to clean up all deletes etc.
+         ColumnFamilyStore hintStore = Table.open(Table.SYSTEM_TABLE).getColumnFamilyStore(HINTS_CF);
+         for (String tableName : DatabaseDescriptor.getTables())
+         {
+@@ -261,6 +187,15 @@ private static void deliverHintsToEndpoint(InetAddress endPoint) throws IOExcept
+                 }
+             }
+         }
++        hintStore.forceFlush();
++        try
++        {
++            CompactionManager.instance.submitMajor(hintStore, 0, Integer.MAX_VALUE).get();
++        }
++        catch (Exception e)
++        {
++            throw new RuntimeException(e);
++        }
+ 
+         if (logger_.isDebugEnabled())
+           logger_.debug("Finished hinted handoff for endpoint " + endPoint);
+@@ -282,4 +217,9 @@ public void runMayThrow() throws Exception
+         };
+     	executor_.submit(r);
+     }
++
++    public void deliverHints(String to) throws UnknownHostException
++    {
++        deliverHints(InetAddress.getByName(to));
++    }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+index 1ba99733..973de33e 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+@@ -22,6 +22,7 @@
+ import java.io.IOError;
+ import java.lang.management.ManagementFactory;
+ import java.lang.reflect.Constructor;
++import java.net.UnknownHostException;
+ import java.util.*;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutionException;
+@@ -919,6 +920,11 @@ public final void deliverHints(InetAddress endpoint)
+         HintedHandOffManager.instance.deliverHints(endpoint);
+     }
+ 
++    public final void deliverHints(String host) throws UnknownHostException
++    {
++        HintedHandOffManager.instance.deliverHints(host);
++    }
++
+     public Token getLocalToken()
+     {
+         return storageMetadata_.getToken();
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 5d9c12dc..dfc6f33a 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -170,4 +170,6 @@
+     /** makes node unavailable for writes, flushes memtables and replays commitlog. */
+     public void drain() throws IOException, InterruptedException, ExecutionException;
+     
++    /** force hint delivery to an endpoint **/
++    public void deliverHints(String host) throws UnknownHostException;
+ }

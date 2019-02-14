@@ -1,0 +1,572 @@
+diff --git a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAXAProtocol.java b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAXAProtocol.java
+index e3143297..eb721b50 100644
+--- a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAXAProtocol.java
++++ b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAXAProtocol.java
+@@ -20,8 +20,12 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+  */
+ 
+ package org.apache.derby.impl.drda;
++import org.apache.derby.iapi.jdbc.ResourceAdapter;
++import org.apache.derby.iapi.services.monitor.Monitor;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
++import org.apache.derby.iapi.store.access.xa.XAXactId;
+ import javax.transaction.xa.*;
++import org.apache.derby.shared.common.reference.MessageId;
+ 
+ /**
+  * This class translates DRDA XA protocol from an application requester to XA
+@@ -715,6 +719,15 @@ private int processXAException(XAException xe)
+ 		return xaRetVal;
+ 	}
+ 
++    /**
++     * @return The ResourceAdapter instance for
++     *         the underlying database.
++     */
++    ResourceAdapter getResourceAdapter()
++    {
++        return ((XADatabase)connThread.getDatabase()).getResourceAdapter();
++    }
++
+     /**
+      * This function rollbacks the current global transaction associated
+      * with the XAResource or a local transaction. The function should
+@@ -724,31 +737,25 @@ void rollbackCurrentTransaction()
+     {
+         if (xid != null) {
+             boolean local  = ( xid.getFormatId() == -1);
+-            try {
+-                // if the transaction is not local disassociate the transaction from
+-                // the connection first because the rollback can not be performed
+-                // on a transaction associated with the XAResource
+-                try {
+                     if (!local) {
+-                        XAResource xaResource = getXAResource();
+-                        // this will throw the XAException (because TMFAIL
+-                        // will throw an exception)
+-                        xaResource.end(xid, XAResource.TMFAIL);
+-                    }
++                try {
++                    XAXactId xid_im = new XAXactId(xid);
++                    getResourceAdapter().cancelXATransaction(
++                        xid_im,
++                        MessageId.CONN_CLOSE_XA_TRANSACTION_ROLLED_BACK
++                    );
+                 } catch (XAException e) {
+-                    // do not print out the exception generally thrown
+-                    // when TMFAIL flag is present
+-                    if (e.errorCode < XAException.XA_RBBASE
+-                        || e.errorCode > XAException.XA_RBEND) {
+-                        connThread.getServer().consoleExceptionPrint(e);
+-                    }
++                    Monitor.logThrowable(e);
+                 }
++            } else {
++                try {
+                 rollbackTransaction(xid, false);
+             } catch  (DRDAProtocolException e) {
+                 // because we do not dump any DRDA stuff to the socket
+                 // the exception can not be thrown in this case
+-                // However, we will dump the exception to the console
+-                connThread.getServer().consoleExceptionPrint(e);
++                    // However, we will log the exception to the monitor
++                    Monitor.logThrowable(e);
++                }
+             }
+             xid = null;
+         }
+diff --git a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/XADatabase.java b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/XADatabase.java
+index c98c7afd..75aff766 100644
+--- a/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/XADatabase.java
++++ b/db/derby/code/trunk/java/drda/org/apache/derby/impl/drda/XADatabase.java
+@@ -34,9 +34,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ 
+ import org.apache.derby.jdbc.EmbeddedXADataSource;
+-import org.apache.derby.impl.drda.DRDAXid;
+ import  org.apache.derby.iapi.jdbc.BrokeredConnection;
+ import org.apache.derby.iapi.jdbc.EngineConnection;
++import org.apache.derby.iapi.jdbc.ResourceAdapter;
+ 
+ /**
+  * This class contains database state specific to XA,
+@@ -51,6 +51,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ 	private XAResource xaResource;
+ 	private XAConnection xaConnection;
++	private ResourceAdapter ra;
+ 
+ 	
+ 	XADatabase (String dbName)
+@@ -81,6 +82,7 @@ synchronized void makeConnection(Properties p) throws
+ 		if (conn == null)
+ 		{
+ 			xaConnection = xaDataSource.getXAConnection(userId,password);
++			ra = xaDataSource.getResourceAdapter();
+ 			setXAResource(xaConnection.getXAResource());
+ 		}
+ 		else // this is just a connection reset. Close the logical connection.
+@@ -114,14 +116,13 @@ protected XAResource getXAResource ()
+ 		return this.xaResource;
+ 	}
+ 
+-
++	/**
++	 * @return The ResourceAdapter instance for
++	 *         the underlying database.
++	 */
++	ResourceAdapter getResourceAdapter()
++	{
++		return this.ra;
++	}
+ }
+ 
+-
+-
+-
+-
+-
+-
+-
+-
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/ResourceAdapter.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/ResourceAdapter.java
+index 30de1759..13088a78 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/ResourceAdapter.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/ResourceAdapter.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.iapi.jdbc;
+ 
++import javax.transaction.xa.XAException;
+ import org.apache.derby.iapi.services.context.ContextService;
+ import org.apache.derby.iapi.store.access.xa.XAResourceManager;
+ import org.apache.derby.iapi.store.access.xa.XAXactId;
+@@ -410,4 +411,14 @@ the inheritence (XAConnection need to extend PooledConnection and XAConnect
+ 
+ 	public Object removeConnection(XAXactId xid);
+ 
++	/**
++	 * Cancel the XA transaction identified by the specified xid.  The
++	 * method will atomically cancel any running statement on behalf
++	 * of the transaction, end the transaction association with the
++	 * XAResource instance, and rollback of the global transaction.
++	 * @param xid tranaction id to cancel
++	 * @param messageId error to report when canceling
++	 */
++	public void cancelXATransaction(XAXactId xid, String messageId) 
++		throws XAException;
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbeddedXADataSource.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbeddedXADataSource.java
+index e1808d98..7a9ce0b5 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbeddedXADataSource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbeddedXADataSource.java
+@@ -231,4 +231,14 @@ protected XAConnection createXAConnection (ResourceAdapter ra,
+             this, ra, user, password, requestPassword);
+     }
+ 
++
++    /**
++     *
++     * @return The ResourceAdapter instance for
++     *         the underlying database
++     */
++    public ResourceAdapter getResourceAdapter()
++    {
++        return ra;
++    }
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/ResourceAdapterImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/ResourceAdapterImpl.java
+index 5a365759..eb7b694f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/ResourceAdapterImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/ResourceAdapterImpl.java
+@@ -29,7 +29,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ 
+ import org.apache.derby.iapi.jdbc.ResourceAdapter;
+-//import org.apache.derby.iapi.jdbc.XATransactionResource;
+ 
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.store.access.AccessFactory;
+@@ -40,6 +39,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.util.Properties;
+ import java.util.Hashtable;
+ import java.util.Enumeration;
++import javax.transaction.xa.XAException;
+ 
+ 
+ public class ResourceAdapterImpl
+@@ -121,6 +121,18 @@ public synchronized Object removeConnection(XAXactId xid) {
+ 
+ 	}
+ 
++	/** @see org.apache.derby.iapi.jdbc.ResourceAdapter#cancelXATransaction(XAXactId, String)
++	 */
++	public void cancelXATransaction(XAXactId xid, String messageId)
++	throws XAException
++	{
++		XATransactionState xaState = (XATransactionState) findConnection(xid);
++
++		if (xaState != null) {
++			xaState.cancel(messageId);
++		}
++	}
++
+ 
+ 	/**
+ 		Return the XA Resource manager to the XA Connection
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
+index 0881d3fc..ba26f578 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/XATransactionState.java
+@@ -37,6 +37,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.reference.SQLState;
+ import java.util.HashMap;
+ import javax.transaction.xa.XAException;
++import org.apache.derby.shared.common.reference.MessageId;
+ 
+ /** 
+ */
+@@ -81,9 +82,8 @@ When an XAResource suspends a transaction (end(TMSUSPEND)) it must be resumed
+ 	*/
+ 	boolean isPrepared;
+ 
+-    /** Has this transaction been finished (committed
+-      * or rolled back)? */
+-    boolean isFinished;
++    /** Indicates whether this transaction is supposed to be rolled back by timeout. */
++    boolean performTimeoutRollback;
+ 
+     /** A timer task scheduled for the time when the transaction will timeout. */
+     CancelXATransactionTask timeoutTask = null;
+@@ -100,9 +100,9 @@ public CancelXATransactionTask() {
+         /** Runs the cancel task of the global transaction */
+         public void run() {
+             try {
+-                XATransactionState.this.cancel();
+-            } catch (XAException ex) {
+-                Monitor.logThrowable(ex);
++                XATransactionState.this.cancel(MessageId.CONN_XA_TRANSACTION_TIMED_OUT);
++            } catch (Throwable th) {
++                Monitor.logThrowable(th);
+             }
+         }
+     }
+@@ -118,8 +118,7 @@ public void run() {
+ 		this.creatingResource = resource;
+ 		this.associationState = XATransactionState.T1_ASSOCIATED;
+ 		this.xid = xid;
+-        this.isFinished = false;
+-
++		this.performTimeoutRollback = false; // there is no transaction yet
+ 	}
+ 
+ 	public void cleanupOnError(Throwable t) {
+@@ -309,6 +308,8 @@ boolean end(EmbedXAResource resource, int flags,
+     *                      the transaction will be rolled back.
+     */
+     synchronized void scheduleTimeoutTask(long timeoutMillis) {
++        // Mark the transaction to be rolled back bby timeout
++        performTimeoutRollback = true;
+         // schedule a time out task if the timeout was specified
+         if (timeoutMillis > 0) {
+             // take care of the transaction timeout
+@@ -347,14 +348,14 @@ synchronized int xa_prepare() throws SQLException {
+         return retVal;
+     }
+ 
+-    /** This method cancels timeoutTask and marks the transaction
+-      * as finished by assigning 'isFinished = true'.
++    /** This method cancels timeoutTask and assigns
++      * 'performTimeoutRollback = false'.
+       */
+     synchronized void xa_finalize() {
+         if (timeoutTask != null) {
+             timeoutTask.cancel();
+         }
+-        isFinished = true;
++        performTimeoutRollback = false;
+     }
+ 
+     /**
+@@ -363,12 +364,17 @@ synchronized void xa_finalize() {
+      *
+      * @see CancelXATransactionTask
+      */
+-    private synchronized void cancel() throws XAException {
+-        // Check isFinished just to be sure that
++    synchronized void cancel(String messageId) throws XAException {
++        // Check performTimeoutRollback just to be sure that
+         // the cancellation task was not started
+         // just before the xa_commit/rollback
+         // obtained this object's monitor.
+-        if (!isFinished) {
++        if (performTimeoutRollback) {
++
++            // Log the message about the transaction cancelled
++            if (messageId != null)
++                Monitor.logTextMessage(messageId, xid.toString());
++
+             // Check whether the transaction is associated
+             // with any EmbedXAResource instance.
+             if (associationState == XATransactionState.T1_ASSOCIATED) {
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+index dfc47814..cb13051c 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+@@ -152,6 +152,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      * of data sources supporting statement pooling.
+      */
+     String CONN_NEGATIVE_MAXSTATEMENTS                      = "J134";
++    String CONN_XA_TRANSACTION_TIMED_OUT                    = "J135";
++    String CONN_CLOSE_XA_TRANSACTION_ROLLED_BACK            = "J136";
+ 
+ 	/*
+ 	** Authentication
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATransactionTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATransactionTest.java
+index 03409f5d..c72253a4 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATransactionTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATransactionTest.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derbyTesting.functionTests.tests.jdbcapi;
+ 
++import java.sql.CallableStatement;
+ import java.sql.Connection;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+@@ -39,6 +40,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.shared.common.reference.SQLState;
+ 
++import org.apache.derbyTesting.junit.DatabasePropertyTestSetup;
+ import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.J2EEDataSource;
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+@@ -48,6 +50,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+   */
+ public class XATransactionTest extends BaseJDBCTestCase {
+ 
++    /** Tests whether it is possible to reconstruct the original Xid value
++      * correctly from SYSCS_DIAG.TRANSACTION_TABLE. */
+     public void testGlobalXIDinTransactionTable() throws Exception {
+         Statement stm = getConnection().createStatement();
+         stm.execute("create table XATT2 (i int, text char(10))");
+@@ -86,8 +90,8 @@ public void testGlobalXIDinTransactionTable() throws Exception {
+         stm = null;
+ 
+         try {
+-
+-            // check the output of the global xid in syscs_diag.transaction_table
++            // check the output of the global xid in 
++            // syscs_diag.transaction_table
+             stm = getConnection().createStatement();
+ 
+             String query = "select global_xid from syscs_diag.transaction_table"
+@@ -97,14 +101,14 @@ public void testGlobalXIDinTransactionTable() throws Exception {
+             rs = stm.executeQuery(query);
+ 
+             // there should be at least one globaltransaction in progress
+-            Assert.assertTrue(rs.next());
++            assertTrue(rs.next());
+ 
+             // check whether the xid obtained matches the original xid
+             Xid rXid = parseXid(rs.getString(1));
+-            Assert.assertEquals(xid, rXid);
++            assertEquals(xid, rXid);
+ 
+             // there should be at most one global transaction in progress
+-            Assert.assertFalse(rs.next());
++            assertFalse(rs.next());
+ 
+         } catch (Exception ex) {
+             try {
+@@ -140,7 +144,7 @@ public void testGlobalXIDinTransactionTable() throws Exception {
+ 
+     /** Tests the functionality of the XA transaction timeout.
+       * <p>
+-      * It executes 1000 global transactions during the test. Everyone
++      * It executes 66 global transactions during the test. Everyone
+       * of them just inserts a row into XATT table. The rows inserted
+       * by the transactions are different. Some of these transactions
+       * are committed and some of them are left in different stages.
+@@ -164,14 +168,14 @@ public void testGlobalXIDinTransactionTable() throws Exception {
+     public void testXATransactionTimeout() throws Exception {
+ 
+         /* The number of statements to execute in timeout related test. */
+-        int timeoutStatementsToExecute = 1000;
++        int timeoutStatementsToExecute = 66;
+ 
+         /* Specifies the number of total executed statements per one
+-           commited statement in timout related test. */
++           commited statement in timeout related test. */
+         int timeoutCommitEveryStatement = 3;
+ 
+         /* Specifies the number of statements that should be commited
+-           during a timout related test. */
++           during a timeout related test. */
+         int timeoutStatementsCommitted
+             = (timeoutStatementsToExecute + timeoutCommitEveryStatement - 1)
+                 / timeoutCommitEveryStatement;
+@@ -180,17 +184,17 @@ public void testXATransactionTimeout() throws Exception {
+         stm.execute("create table XATT (i int, text char(10))");
+ 
+         XADataSource xaDataSource = J2EEDataSource.getXADataSource();
+-        XAConnection xaConn = null;
++        XAConnection[] xaConn = new XAConnection[timeoutStatementsToExecute];
+         XAResource xaRes = null;
+         Connection conn = null;
+ 
+         for (int i=0; i < timeoutStatementsToExecute; i++) {
+-            xaConn = xaDataSource.getXAConnection();
+-            xaRes = xaConn.getXAResource();
+-            conn = xaConn.getConnection();
++            xaConn[i] = xaDataSource.getXAConnection();
++            xaRes = xaConn[i].getXAResource();
++            conn = xaConn[i].getConnection();
+ 
+             Xid xid = createXid(123, i);
+-            xaRes.setTransactionTimeout(5);
++            xaRes.setTransactionTimeout(8);
+             xaRes.start(xid, XAResource.TMNOFLAGS);
+ 
+             stm = conn.createStatement();
+@@ -201,13 +205,12 @@ public void testXATransactionTimeout() throws Exception {
+                 xaRes.end(xid, XAResource.TMSUCCESS);
+                 xaRes.prepare(xid);
+                 xaRes.commit(xid, false);
+-                xaConn.close();
+             } else if (i % 11 != 0) {
+-                // check the timout for transactions disassociated
++                // check the tiemout for transactions disassociated
+                 // with failure.
+                 try {
+                     xaRes.end(xid, XAResource.TMFAIL);
+-                    Assert.fail();
++                    fail();
+                 } catch (XAException ex) {
+                     if (ex.errorCode < XAException.XA_RBBASE
+                         || ex.errorCode > XAException.XA_RBEND)
+@@ -216,31 +219,28 @@ public void testXATransactionTimeout() throws Exception {
+                     }
+                 }
+                 stm.close();
+-                xaConn.close();
+             } else if (i % 2 == 0) {
+-                // check the timout for transactions disassociated
++                // check the timeout for transactions disassociated
+                 // with success.
+                 xaRes.end(xid, XAResource.TMSUCCESS);
+                 stm.close();
+-                xaConn.close();
+-            } else {
+-                // check the timout for associated transactions
+-                ;
+             }
+         }
+ 
++        ResultSet rs = null;
++
+         stm = getConnection().createStatement();
+-        ResultSet rs = stm.executeQuery("select count(*) from XATT");
++        rs = stm.executeQuery("select count(*) from XATT");
+         rs.next();
+ 
+         // Check whether the correct number of transactions
+         // was rolled back
+-        Assert.assertTrue(rs.getInt(1) == timeoutStatementsCommitted);
++        assertTrue(rs.getInt(1) == timeoutStatementsCommitted);
+ 
+-        // test the timout during the statement is run
+-        xaConn = xaDataSource.getXAConnection();
+-        xaRes = xaConn.getXAResource();
+-        conn = xaConn.getConnection();
++        // test the timeout during the statement run
++        XAConnection xaConn2 = xaDataSource.getXAConnection();
++        xaRes = xaConn2.getXAResource();
++        conn = xaConn2.getConnection();
+ 
+         Xid xid = createXid(124, 100);
+         xaRes.setTransactionTimeout(10);
+@@ -250,28 +250,40 @@ public void testXATransactionTimeout() throws Exception {
+ 
+         // Check whether the statement was correctly timed out
+         // and the appropriate exception was thrown
+-        boolean exceptionThrown = false;
+         try {
++            // Run this kind of statement just to be sure
++            // it will not finish before it will time out
+             rs = stm.executeQuery(
+-                 "select * from XATT a, XATT b, XATT c, XATT d, XATT e "
+-               + "order by a.i");
++                 "select count(*) from sys.syscolumns a, sys.syscolumns b, "
++               + "sys.syscolumns c, sys.syscolumns d, sys.syscolumns e "
++               + "group by a.referenceid, b.referenceid, c.referenceid, "
++               + "d.referenceid");
++            fail("An exception is expected here");
+         } catch (SQLException ex) {
+             // Check the sql state of the thrown exception
+             assertSQLState(
+                 SQLState.LANG_STATEMENT_CANCELLED_OR_TIMED_OUT.substring(0,5),
+-                ex
+-            );
+-            exceptionThrown = true;
++                ex);
+         }
+-        Assert.assertTrue(exceptionThrown);
+ 
++        // perform a select on the table just to be sure that all
++        // the transactions were rolled back.
+         stm = getConnection().createStatement();
+         rs = stm.executeQuery("select count(*) from XATT");
+         rs.next();
+ 
++        // Go throught the XA Connections just to be sure that no code
++        // optimization would garbage collect them before (and thus
++        // the transactions might get rolled back by a different
++        // code).
++        for (int i=0; i < timeoutStatementsToExecute; i++) {
++            assertNotNull(xaConn[i]);
++            xaConn[i].close();
++        }
++
+         // Again, check whether the correct number of transactions
+         // was rolled back
+-        Assert.assertTrue(rs.getInt(1) == timeoutStatementsCommitted);
++        assertTrue(rs.getInt(1) == timeoutStatementsCommitted);
+     }
+ 
+ 
+@@ -296,15 +308,15 @@ static Xid createXid(int gtrid, int bqual) throws XAException {
+       * @return The xid object corresponding to the xid specified in a string.
+       */
+     private static Xid parseXid(String str) {
+-        Assert.assertNotNull(str);
+-        Assert.assertTrue(str.matches("\\(\\p{Digit}+,\\p{XDigit}+,\\p{XDigit}+\\)"));
++        assertNotNull(str);
++        assertTrue(str.matches("\\(\\p{Digit}+,\\p{XDigit}+,\\p{XDigit}+\\)"));
+ 
+         String formatIdS = str.substring(1, str.indexOf(','));
+         String gtidS = str.substring(str.indexOf(',')+1, str.lastIndexOf(','));
+         String bqualS = str.substring(str.lastIndexOf(',')+1, str.length()-1);
+ 
+-        Assert.assertTrue(gtidS.length() % 2 == 0);
+-        Assert.assertTrue(bqualS.length() % 2 == 0);
++        assertTrue(gtidS.length() % 2 == 0);
++        assertTrue(bqualS.length() % 2 == 0);
+ 
+         int fmtid = Integer.parseInt(formatIdS);
+         byte[] gtid = new byte[gtidS.length()/2];
+@@ -332,7 +344,12 @@ public XATransactionTest(String name) {
+     public static Test suite() {
+         // the test requires XADataSource to run
+         if (JDBC.vmSupportsJDBC3()) {
+-            return TestConfiguration.defaultSuite(XATransactionTest.class);
++            Test test = TestConfiguration.defaultSuite(XATransactionTest.class);
++            // Set the lock timeout back to the default, because when
++            // running in a bigger suite the value may have been
++            // altered by an earlier test
++            test = DatabasePropertyTestSetup.setLockTimeouts(test, 20, 60);
++            return test;
+         }
+ 
+         return new TestSuite("XATransactionTest cannot run without XA support");

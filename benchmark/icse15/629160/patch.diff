@@ -1,0 +1,557 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
+index 78fb2fa0..8dd66d5d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConglomerateDescriptor.java
+@@ -378,12 +378,104 @@ public ConglomerateDescriptor drop(LanguageConnectionContext lcc,
+ 	    
+         // only drop the conglomerate if no similar index but with different
+ 	    // name. Get from dd in case we drop other dup indexes with a cascade operation	    
+-	    if (dd.getConglomerateDescriptors(getConglomerateNumber()).length == 1)
++	    ConglomerateDescriptor [] congDescs =
++	        dd.getConglomerateDescriptors(getConglomerateNumber());
++
++		boolean dropConglom = false;
++		ConglomerateDescriptor physicalCD = null;
++		if (congDescs.length == 1)
++			dropConglom = true;
++		else
++		{
++		 	/* There are multiple conglomerate descriptors which share
++			 * the same physical conglomerate.  That said, if we are
++			 * dropping the *ONLY* conglomerate descriptor that fully
++			 * matches the physical conglomerate, then we have to do
++			 * a little extra work.  Namely, if the physical conglomerate
++			 * is unique and this descriptor is unique, but none of the
++			 * other descriptors which share with this one are unique,
++			 * then we have to "update" the physical conglomerate to
++			 * be non-unique. This ensures correct behavior for the
++			 * remaining descriptors. (DERBY-3299)
++			 *
++			 * Note that "update the physical conglomerate" above is
++			 * currently implemented as "drop the old conglomerate"
++			 * (now) and "create a new (replacement) one" (later--let
++			 * the caller do it).  Possible improvements to that logic
++			 * may be desirable in the future...
++			 */
++
++			boolean needNewConglomerate;
++
++			/* Find a conglomerate descriptor that fully describes what
++			 * a physical conglomerate would have to look like in order
++			 * to fulfill the requirements (esp. uniqueness) of _all_
++			 * conglomerate descriptors which share a physical conglomerate
++			 * with this one. "true" in the next line means that when we
++			 * search for such a conglomerate, we should ignore "this"
++			 * descriptor--because we're going to drop this one and we
++			 * want to see what the physical conglomerate must look like
++			 * when "this" descriptor does not exist.  Note that this
++			 * call should never return null because we only get here
++			 * if more than one descriptor shares a conglom with this
++			 * one--so at the very least we'll have two descriptors,
++			 * which means the following call should return the "other"
++			 * one.
++			 */
++
++			physicalCD = describeSharedConglomerate(congDescs, true);
++			IndexRowGenerator othersIRG = physicalCD.getIndexDescriptor();
++
++			/* Let OTHERS denote the set of "other" descriptors which
++			 * share a physical conglomerate with this one.  Recall
++			 * that (for now) 1) sharing descriptors must always have
++			 * the same columns referenced in the same order, and
++			 * 2) if a unique descriptor shares a conglomerate with
++			 * a non-unique descriptor, the physical conglomerate
++			 * must itself be unique. So given that, we have four
++			 * possible cases:
++			 *
++			 *  1. "this" is unique, none of OTHERS are unique
++			 *  2. "this" is unique, 1 or more of OTHERS is unique
++			 *  3. "this" is not unique, none of OTHERS are unique
++			 *  4. "this" is not unique, 1 or more of OTHERS is unique
++			 *
++			 * In case 1 "this" conglomerate descriptor must be the
++			 * _only_ one which fully matches the physical conglom.
++			 * In case 4, "this" descriptor does _not_ fully match
++			 * the physical conglomerate. In cases 2 and 3, "this"
++			 * descriptor fully matches the physical conglom, but it
++			 * is NOT the only one to do so--which means we don't need
++			 * to update the physical conglomerate when we drop "this"
++			 * (because OTHERS need the exact same physical conglom).
++			 * The only case that actually requires an "updated"
++			 * conglomerate, then, is case 1, since the physical
++			 * conglomerate for the remaining descriptors no longer
++			 * has a uniqueness requirement.
++			 */
++			needNewConglomerate =
++				indexRowGenerator.isUnique() && !othersIRG.isUnique();
++
++			if (needNewConglomerate)
++			{
++				/* We have to create a new backing conglomerate
++				 * to correctly represent the remaing (sharing)
++				 * descriptors, so drop the physical conglomerate
++				 * now.  The caller of the method can then create
++				 * new conglomerate as/if needed.
++				 */
++				dropConglom = true;
++			}
++			else
++				physicalCD = null;
++		}
++
++	    if (dropConglom)
+ 	    {
+ 	        /* Drop statistics */
+ 	        dd.dropStatisticsDescriptors(td.getUUID(), getUUID(), tc);
+ 	        
+-	        /* Drop the conglomerate */
++	        /* Drop the physical conglomerate */
+ 	        tc.dropConglomerate(getConglomerateNumber());
+         }	    
+ 	    
+@@ -395,11 +487,135 @@ public ConglomerateDescriptor drop(LanguageConnectionContext lcc,
+ 	     ** table descriptor
+ 	     */
+ 	    td.removeConglomerateDescriptor(this);
++	    return physicalCD;
++	}
+ 
+-	    /* TODO: DERBY-3299 incremental development; just return null
+-	     * for now.
++	/**
++	 * This method searches the received array of conglom descriptors
++	 * to find all descriptors that currently share a physical conglom
++	 * with "this".  The method then searches within those sharing
++	 * descriptors to find one that fully describes what a physical
++	 * conglom would have to look like in order to support _all_ of
++	 * the sharing descriptors in the array--esp. one that correctly
++	 * enforces the uniqueness requirements for those descriptors.
++	 *
++	 * @param descriptors Array of conglomerate descriptors in
++	 *  which to search; the array may include an entry for "this";
++	 *  it should not be null.
++	 *
++	 * @param ignoreThis If true then we will NOT consider "this"
++	 *  conglomerate descriptor in our search.  That is, we will
++	 *  find a descriptor to describe what a physical conglomerate
++	 *  would have to look like in order to support all sharing
++	 *  descriptors OTHER THAN this one.
++	 *
++	 * @return A conglomerate descriptor, pulled from the received
++	 *  array, that describes what a physical conglomerate would
++	 *  have to look to like in order to support all sharing
++	 *  descriptors (minus "this" if ignoreThis is true).
++	 */
++	public ConglomerateDescriptor describeSharedConglomerate(
++		ConglomerateDescriptor [] descriptors, boolean ignoreThis)
++		throws StandardException
++	{
++		/* Descriptor for the heap always correctly describes the
++		 * physical conglomerate, as sharing of the heap is not
++		 * allowed.  So if this is a heap descriptor and "descriptors"
++		 * has any entries whose conglomerate number matches this
++		 * descriptor's conglomerate number, then that element should
++		 * be the same descriptor as "this".
+ 	     */
+-	    return null;
++		if (!isIndex())
++		{
++			ConglomerateDescriptor heap = null;
++			for (int i = 0; i < descriptors.length; i++)
++			{
++				if (getConglomerateNumber() !=
++					descriptors[i].getConglomerateNumber())
++				{
++					continue;
++				}
++
++				if (SanityManager.DEBUG)
++				{
++					if (!descriptors[i].getUUID().equals(getUUID()))
++					{
++						SanityManager.THROWASSERT(
++							"Should not have multiple descriptors for " +
++							"heap conglomerate " + getConglomerateNumber());
++					}
++				}
++
++				heap = descriptors[i];
++			}
++
++			return heap;
+ 	}
+ 	
++		/* In order to be shared by multiple conglomerate descriptors
++		 * the physical conglomerate must necessarily satisfy the
++		 * following criteria:
++		 *
++		 *  1. If any of the sharing descriptors is unique, then
++		 *     the physical conglomerate must also be unique.
++		 *
++		 *  2. If none of the sharing descriptors are unique, the
++		 *     physical conglomerate must not be unique.
++		 *
++		 *  3. If the physical conglomerate has n columns, then all
++		 *     sharing descriptors must have n columns, as well.
++		 *
++		 * These criteria follow from the "share conglom" detection logic
++		 * found in CreateIndexConstantAction.executeConstantAction().
++		 * See that class for details.
++		 *
++		 * So walk through the conglomerate descriptors that share
++		 * a conglomerate with this one and see if any of them is
++		 * unique.
++		 */
++
++		ConglomerateDescriptor returnDesc = null;
++		for (int i = 0; i < descriptors.length; i++)
++		{
++			// Skip if it's not an index (i.e. it's a heap descriptor).
++			if (!descriptors[i].isIndex())
++				continue;
++
++			// Skip if it doesn't share with "this".
++			if (getConglomerateNumber() !=
++				descriptors[i].getConglomerateNumber())
++			{
++				continue;
++			}
++
++			// Skip if ignoreThis is true and it describes "this".
++			if (ignoreThis &&
++				getUUID().equals(descriptors[i].getUUID()))
++			{
++				continue;
++			}
++
++			returnDesc = descriptors[i];
++			if (returnDesc.getIndexDescriptor().isUnique())
++			{
++				/* Given criteria #1 and #3 described above, if we
++				 * have a unique conglomerate descriptor then we've
++				 * found what we need, so we're done.
++				 */
++				break;
++			}
++		}
++
++		if (SanityManager.DEBUG)
++		{
++			if (returnDesc == null)
++			{
++				SanityManager.THROWASSERT(
++					"Failed to find sharable conglomerate descriptor " +
++					"for index conglomerate # " + getConglomerateNumber());
++			}
++		}
++
++		return returnDesc;
++	}
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConstraintDescriptor.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConstraintDescriptor.java
+index a277c789..92ea9313 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConstraintDescriptor.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/dictionary/ConstraintDescriptor.java
+@@ -606,7 +606,25 @@ public void makeInvalid(int action, LanguageConnectionContext lcc)
+ 			//depend on a privilege. None of the other constraint types 
+ 			//can be dependent on a privilege becuse those constraint types
+ 			//can not reference a table/routine.
+-			drop(lcc, true);
++			ConglomerateDescriptor newBackingConglomCD = drop(lcc, true);
++			if (newBackingConglomCD != null)
++			{
++				/* Since foreign keys can never be unique, and since
++				 * we only (currently) share conglomerates if two
++				 * constraints/indexes have identical columns, dropping
++				 * a foreign key should not necessitate the creation of
++				 * another physical conglomerate.  That will change if
++				 * DERBY-2204 is implemented, but for now we don't expect
++				 * it to happen...
++				 */
++				if (SanityManager.DEBUG)
++				{
++					SanityManager.THROWASSERT(
++						"Dropped shared conglomerate due to a REVOKE " +
++						"and found that a new conglomerate was needed " +
++						"to replace it...but that shouldn't happen!");
++				}
++			}
+ 			return;
+ 		}
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+index eae27d41..38ce9835 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/AlterTableConstantAction.java
+@@ -21,6 +21,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ package org.apache.derby.impl.sql.execute;
+ 
++import java.util.ArrayList;
+ import java.util.Enumeration;
+ import java.util.Iterator;
+ import java.util.List;
+@@ -813,6 +814,8 @@ else if (referencedCols[j] == droppedColumnPosition)
+ 		ConstraintDescriptorList csdl = dd.getConstraintDescriptors(td);
+ 		int csdl_size = csdl.size();
+ 
++		ArrayList newCongloms = new ArrayList();
++
+ 		// we want to remove referenced primary/unique keys in the second
+ 		// round.  This will ensure that self-referential constraints will
+ 		// work OK.
+@@ -872,8 +875,8 @@ else if (referencedCols[j] == droppedColumnPosition)
+ 			// drop now in all other cases
+ 			dm.invalidateFor(cd, DependencyManager.DROP_CONSTRAINT,
+ 									lcc);
+-            cd.drop(lcc, true);
+ 
++			dropConstraint(cd, td, newCongloms, activation, lcc, true);
+ 			activation.addWarning(
+                 StandardException.newWarning(SQLState.LANG_CONSTRAINT_DROPPED,
+ 				cd.getConstraintName(), td.getName()));
+@@ -882,7 +885,7 @@ else if (referencedCols[j] == droppedColumnPosition)
+ 		for (int i = tbr_size - 1; i >= 0; i--)
+ 		{
+ 			ConstraintDescriptor cd = toBeRemoved[i];
+-			cd.drop(lcc, false);
++			dropConstraint(cd, td, newCongloms, activation, lcc, false);
+ 
+ 			activation.addWarning(
+                 StandardException.newWarning(SQLState.LANG_CONSTRAINT_DROPPED,
+@@ -900,7 +903,8 @@ else if (referencedCols[j] == droppedColumnPosition)
+ 									DependencyManager.DROP_CONSTRAINT,
+ 									lcc);
+ 
+-                    fkcd.drop(lcc, true);
++					dropConstraint(fkcd, td,
++						newCongloms, activation, lcc, true);
+ 
+ 					activation.addWarning(
+                         StandardException.newWarning(
+@@ -914,6 +918,18 @@ else if (referencedCols[j] == droppedColumnPosition)
+ 			dm.clearDependencies(lcc, cd);
+ 		}
+ 
++		/* If there are new backing conglomerates which must be
++		 * created to replace a dropped shared conglomerate
++		 * (where the shared conglomerate was dropped as part
++		 * of a "drop constraint" call above), then create them
++		 * now.  We do this *after* dropping all dependent
++		 * constraints because we don't want to waste time
++		 * creating a new conglomerate if it's just going to be
++		 * dropped again as part of another "drop constraint".
++		 */
++		createNewBackingCongloms(
++			newCongloms, (long[])null, activation, dd);
++
+         /*
+          * The work we've done above, specifically the possible
+          * dropping of primary key, foreign key, and unique constraints
+@@ -1733,6 +1749,7 @@ private void getAffectedIndexes(Activation activation)
+ 		numIndexes = compressIRGs.length;
+ 		indexConglomerateNumbers = indexLister.getIndexConglomerateNumbers();
+ 
++		ArrayList newCongloms = new ArrayList();
+ 		if (! (compressTable || truncateTable))		// then it's drop column
+ 		{
+ 			for (int i = 0; i < compressIRGs.length; i++)
+@@ -1753,7 +1770,9 @@ private void getAffectedIndexes(Activation activation)
+ 					 */
+ 					ConglomerateDescriptor cd = td.getConglomerateDescriptor
+ 												(indexConglomerateNumbers[i]);
+-					cd.drop(activation.getLanguageConnectionContext(), td);
++
++					dropConglomerate(cd, td, true, newCongloms, activation,
++						activation.getLanguageConnectionContext());
+ 
+ 					compressIRGs[i] = null;		// mark it
+ 					continue;
+@@ -1771,6 +1790,20 @@ private void getAffectedIndexes(Activation activation)
+ 										cd.getConglomerateName() );
+ 				}
+ 			}
++
++			/* If there are new backing conglomerates which must be
++			 * created to replace a dropped shared conglomerate
++			 * (where the shared conglomerate was dropped as part
++			 * of a "drop conglomerate" call above), then create
++			 * them now.  We do this *after* dropping all dependent
++			 * conglomerates because we don't want to waste time
++			 * creating a new conglomerate if it's just going to be
++			 * dropped again as part of another "drop conglomerate"
++			 * call.
++			 */
++			createNewBackingCongloms(newCongloms,
++				indexConglomerateNumbers, activation, dd);
++
+ 			IndexRowGenerator[] newIRGs = new IndexRowGenerator[numIndexes];
+ 			long[] newIndexConglomNumbers = new long[numIndexes];
+ 
+@@ -1846,6 +1879,93 @@ else if (baseColumnPositions[k] == droppedColumnPosition)
+ 		}
+ 	}
+ 
++	/**
++	 * Iterate through the received list of CreateIndexConstantActions and
++	 * execute each one, It's possible that one or more of the constant
++	 * actions in the list has been rendered "unneeded" by the time we get
++	 * here (because the index that the constant action was going to create
++	 * is no longer needed), so we have to check for that.
++	 *
++	 * @param newConglomActions Potentially empty list of constant actions
++	 *   to execute, if still needed
++	 * @param ixCongNums Optional array of conglomerate numbers; if non-null
++	 *   then any entries in the array which correspond to a dropped physical
++	 *   conglomerate (as determined from the list of constant actions) will
++	 *   be updated to have the conglomerate number of the newly-created
++	 *   physical conglomerate.
++	 */
++	private void createNewBackingCongloms(ArrayList newConglomActions,
++		long [] ixCongNums, Activation activation, DataDictionary dd)
++		throws StandardException
++	{
++		int sz = newConglomActions.size();
++		for (int i = 0; i < sz; i++)
++		{
++			CreateIndexConstantAction ca =
++				(CreateIndexConstantAction)newConglomActions.get(i);
++
++			if (dd.getConglomerateDescriptor(ca.getCreatedUUID()) == null)
++			{
++				/* Conglomerate descriptor was dropped after
++				 * being selected as the source for a new
++				 * conglomerate, so don't create the new
++				 * conglomerate after all.  Either we found
++				 * another conglomerate descriptor that can
++				 * serve as the source for the new conglom,
++				 * or else we don't need a new conglomerate
++				 * at all because all constraints/indexes
++				 * which shared it had a dependency on the
++				 * dropped column and no longer exist.
++				 */
++				continue;
++			}
++
++			executeConglomReplacement(ca, activation);
++			long oldCongNum = ca.getReplacedConglomNumber();
++			long newCongNum = ca.getCreatedConglomNumber();
++
++			/* The preceding call to executeConglomReplacement updated all
++			 * relevant ConglomerateDescriptors with the new conglomerate
++			 * number *WITHIN THE DATA DICTIONARY*.  But the table
++			 * descriptor that we have will not have been updated.
++			 * There are two approaches to syncing the table descriptor
++			 * with the dictionary: 1) refetch the table descriptor from
++			 * the dictionary, or 2) update the table descriptor directly.
++			 * We choose option #2 because the caller of this method (esp.
++			 * getAffectedIndexes()) has pointers to objects from the
++			 * table descriptor as it was before we entered this method.
++			 * It then changes data within those objects, with the
++			 * expectation that, later, those objects can be used to
++			 * persist the changes to disk.  If we change the table
++			 * descriptor here the objects that will get persisted to
++			 * disk (from the table descriptor) will *not* be the same
++			 * as the objects that were updated--so we'll lose the updates
++			 * and that will in turn cause other problems.  So we go with
++			 * option #2 and just change the existing TableDescriptor to
++			 * reflect the fact that the conglomerate number has changed.
++			 */
++			ConglomerateDescriptor [] tdCDs =
++				td.getConglomerateDescriptors(oldCongNum);
++
++			for (int j = 0; j < tdCDs.length; j++)
++				tdCDs[j].setConglomerateNumber(newCongNum);
++
++			/* If we received a list of index conglomerate numbers
++			 * then they are the "old" numbers; see if any of those
++			 * numbers should now be updated to reflect the new
++			 * conglomerate, and if so, update them.
++			 */
++			if (ixCongNums != null)
++			{
++				for (int j = 0; j < ixCongNums.length; j++)
++				{
++					if (ixCongNums[j] == oldCongNum)
++						ixCongNums[j] = newCongNum;
++				}
++			}
++		}
++	}
++
+ 	/**
+ 	 * Set up to update all of the indexes on a table when doing a bulk insert
+ 	 * on an empty table.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropConstraintConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropConstraintConstantAction.java
+index 3b0b579b..8900838a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropConstraintConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropConstraintConstantAction.java
+@@ -227,7 +227,7 @@ public void	executeConstantAction( Activation activation )
+ 		** be repeatedly changing the reference count of the referenced
+ 		** key and generating unnecessary I/O.
+ 		*/
+-        conDesc.drop(lcc, !cascadeOnRefKey);
++		dropConstraint(conDesc, activation, lcc, !cascadeOnRefKey);
+ 
+ 		if (cascadeOnRefKey) 
+ 		{
+@@ -243,7 +243,7 @@ public void	executeConstantAction( Activation activation )
+ 			{
+ 				fkcd = (ForeignKeyConstraintDescriptor) cdl.elementAt(index);
+ 				dm.invalidateFor(fkcd, DependencyManager.DROP_CONSTRAINT, lcc);
+-				fkcd.drop(lcc, true);
++				dropConstraint(fkcd, activation, lcc, true);
+ 			}
+ 	
+ 			/*
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropIndexConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropIndexConstantAction.java
+index db9ca5a2..15cd4a15 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropIndexConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropIndexConstantAction.java
+@@ -171,6 +171,14 @@ public void	executeConstantAction(Activation activation)
+ 			throw StandardException.newException(SQLState.LANG_INDEX_NOT_FOUND_DURING_EXECUTION, fullIndexName);
+ 		}
+ 
+-		cd.drop(lcc, td);
++		/* Since we support the sharing of conglomerates across
++		 * multiple indexes, dropping the physical conglomerate
++		 * for the index might affect other indexes/constraints
++		 * which share the conglomerate.  The following call will
++		 * deal with that situation by creating a new physical
++		 * conglomerate to replace the dropped one, if necessary.
++		 */
++		dropConglomerate(cd, td, activation, lcc);
++		return;
+ 	}
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropTableConstantAction.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropTableConstantAction.java
+index 4cb73f45..d28ba400 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropTableConstantAction.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/DropTableConstantAction.java
+@@ -312,7 +312,7 @@ private void dropAllConstraintDescriptors(TableDescriptor td, Activation activat
+ 			}
+ 
+ 			dm.invalidateFor(cd, DependencyManager.DROP_CONSTRAINT, lcc);
+-			cd.drop(lcc, true);
++			dropConstraint(cd, td, activation, lcc, true);
+ 		}
+ 
+ 		/*
+@@ -343,7 +343,7 @@ private void dropAllConstraintDescriptors(TableDescriptor td, Activation activat
+ 			** Pass in false to dropConstraintsAndIndex so it
+ 			** doesn't clear dependencies, we'll do that ourselves.
+ 			*/
+-			cd.drop(lcc, false);
++			dropConstraint(cd, td, activation, lcc, false);
+ 
+ 			/*
+ 			** If we are going to cascade, get all the
+@@ -366,7 +366,7 @@ private void dropAllConstraintDescriptors(TableDescriptor td, Activation activat
+ 				{
+ 					fkcd = (ConstraintDescriptor) fkcdl.elementAt(inner);
+ 					dm.invalidateFor(fkcd, DependencyManager.DROP_CONSTRAINT, lcc);
+-					fkcd.drop(lcc, true);
++					dropConstraint(fkcd, td, activation, lcc, true);
+ 					activation.addWarning(
+ 						StandardException.newWarning(SQLState.LANG_CONSTRAINT_DROPPED,
+  							fkcd.getConstraintName(),

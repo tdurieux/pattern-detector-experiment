@@ -1,0 +1,265 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+index 1adffd55..8098e651 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/raw/log/LogFactory.java
+@@ -284,9 +284,16 @@ public void checkpointInRFR(LogInstant cinstant, long redoLWM,
+ 
+     /*
+      * Set that the database is encrypted , all the transaction log has 
+-     * to be encrypted.
++     * to be encrypted, and flush the log if requesed. Log needs to 
++	 * be flushed  first, if this is  being set during (re) encryption 
++	 * of an existing  database. 
++	 *
++	 * @param flushLog  true, if log needs to be flushed, 
++	 *                  otherwise false.  
+      */
+-    public void setDatabaseEncrypted();
++    public  void setDatabaseEncrypted(boolean flushLog)
++		throws StandardException;
++
+     
+     /*
+      * set up a new log file to start writing 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+index 2630f788..95bb8975 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/RawStore.java
+@@ -302,7 +302,7 @@ public void	boot(boolean create, Properties properties)
+ 
+         if (databaseEncrypted) {
+             // let log factory know if the database is encrypted . 
+-            logFactory.setDatabaseEncrypted();
++            logFactory.setDatabaseEncrypted(false);
+             // let data factory know if the database is encrypted. 
+             dataFactory.setDatabaseEncrypted();
+         }
+@@ -1398,7 +1398,8 @@ public Serializable changeBootPassword(Properties properties, Serializable chang
+      * when the input debug flag is set, an expception 
+      * is throw when run in the debug mode.
+      */
+-    private void crashOnDebugFlag(String debugFlag) 
++    private void crashOnDebugFlag(String debugFlag, 
++                                  boolean reEncrypt) 
+         throws StandardException
+     {
+         if (SanityManager.DEBUG)
+@@ -1407,9 +1408,10 @@ private void crashOnDebugFlag(String debugFlag)
+             // exception to simulate error cases.
+             if (SanityManager.DEBUG_ON(debugFlag))
+             {
+-                StandardException se= StandardException.newException(
+-                       SQLState.LOG_IO_ERROR, 
+-                       new IOException(debugFlag));
++               StandardException se = StandardException.newException(
++                                      (reEncrypt ? SQLState.DATABASE_REENCRYPTION_FAILED :
++                                      SQLState.DATABASE_ENCRYPTION_FAILED),
++                                      debugFlag);
+                 markCorrupt(se);
+                 throw se;
+             }
+@@ -1488,37 +1490,48 @@ public void configureDatabaseForEncryption(Properties properties,
+                    this,
+                     ContextService.getFactory().getCurrentContextManager(),
+                     AccessFactoryGlobals.USER_TRANS_NAME);
+-        boolean error = true;
+-        try {
+-            dataFactory.encryptAllContainers(transaction);
+-            error = false;
+-        }finally {
+             
+-            // if (re) encryption failed, abort the transaction.
+-            if (error) { 
+-                transaction.abort();
+-            }
+-            else {
++        try 
++		{
+ 
+-                // (re) encryption of all the containers is complete 
+-                // update the encryption properties in the 
++            dataFactory.encryptAllContainers(transaction);
++
++            // all the containers are (re) encrypted, now mark the database as
++            // encrypted if a plain database is getting configured for encryption
++            // or update the encryption the properties, in the 
+                 // service.properties ..etc.
+ 
++            
+                 if (SanityManager.DEBUG) {
+-                    crashOnDebugFlag(TEST_REENCRYPT_CRASH_BEFORE_COMMT);
++                crashOnDebugFlag(TEST_REENCRYPT_CRASH_BEFORE_COMMT, reEncrypt);
++            }
++
++            // check if the checkpoint is currently in the last log file, 
++            // otherwise force a checkpoint and then do a log switch, 
++            // after setting up a new encryption key
++            if (!logFactory.isCheckpointInLastLogFile()) 
++            {
++                // perfrom a checkpoint, this is a reference checkpoint 
++                // to find if the re(encryption) is complete. 
++                logFactory.checkpoint(this, dataFactory, xactFactory, true);
+                 }
+                 
++
++            encryptDatabase = false;
++
++            // let the log factory know that database is 
++            // (re) encrypted and ask it to flush the log, 
++            // before enabling encryption of the log with 
++            // the new key.
++            logFactory.setDatabaseEncrypted(true);
++            
+                 // let the log factory and data factory know that 
+                 // database is encrypted.
+                 if (!reEncrypt) {
+                     // mark in the raw store that the database is 
+                     // encrypted. 
+-                    encryptDatabase = false;
+                     databaseEncrypted = true;
+                     dataFactory.setDatabaseEncrypted();
+-                    logFactory.setDatabaseEncrypted();
+-
+-
+                 } else {
+                     // switch the encryption/decryption engine to the new ones.
+                     decryptionEngine = newDecryptionEngine;  
+@@ -1600,7 +1613,8 @@ public void configureDatabaseForEncryption(Properties properties,
+  
+                 if (SanityManager.DEBUG) {
+                     crashOnDebugFlag(
+-                                 TEST_REENCRYPT_CRASH_AFTER_SWITCH_TO_NEWKEY);
++                                 TEST_REENCRYPT_CRASH_AFTER_SWITCH_TO_NEWKEY,
++                                 reEncrypt);
+                 }
+ 
+                 // commit the transaction that is used to 
+@@ -1611,14 +1625,16 @@ public void configureDatabaseForEncryption(Properties properties,
+                 transaction.commit();
+ 
+                 if (SanityManager.DEBUG) {
+-                    crashOnDebugFlag(TEST_REENCRYPT_CRASH_AFTER_COMMT);
++                crashOnDebugFlag(TEST_REENCRYPT_CRASH_AFTER_COMMT, 
++                                 reEncrypt);
+                 }
+ 
+                 // force the checkpoint with new encryption key.
+                 logFactory.checkpoint(this, dataFactory, xactFactory, true);
+ 
+                 if (SanityManager.DEBUG) {
+-                    crashOnDebugFlag(TEST_REENCRYPT_CRASH_AFTER_CHECKPOINT);
++                crashOnDebugFlag(TEST_REENCRYPT_CRASH_AFTER_CHECKPOINT, 
++                                 reEncrypt);
+                 }
+ 
+                 // once the checkpont makes it to the log, re-encrption 
+@@ -1653,13 +1669,23 @@ public void configureDatabaseForEncryption(Properties properties,
+ 
+                 // (re) encrypion is done,  remove the (re) 
+                 // encryption status property. 
++
+                 properties.remove(RawStoreFactory.DB_ENCRYPTION_STATUS);
+ 
+-            }                
++            // close the transaction. 
++            transaction.close(); 
++
++        } catch (StandardException se) {
+ 
++            throw StandardException.newException(
++                      (reEncrypt ? SQLState.DATABASE_REENCRYPTION_FAILED :
++                      SQLState.DATABASE_ENCRYPTION_FAILED),
++                      se,
++                      se.getMessage()); 
++        } finally {
++            // clear the new encryption engines.
+             newDecryptionEngine = null;   
+             newEncryptionEngine = null;
+-            transaction.close(); 
+         }
+     }
+ 
+@@ -1741,7 +1767,8 @@ public void handleIncompleteDatabaseEncryption(Properties properties)
+                 
+             if (SanityManager.DEBUG) {
+                 crashOnDebugFlag(
+-                   TEST_REENCRYPT_CRASH_AFTER_RECOVERY_UNDO_LOGFILE_DELETE);
++                   TEST_REENCRYPT_CRASH_AFTER_RECOVERY_UNDO_LOGFILE_DELETE, 
++                   reEncryption);
+             }
+ 
+             // Note : If a crash occurs at this point, then on reboot 
+@@ -1825,7 +1852,8 @@ public void handleIncompleteDatabaseEncryption(Properties properties)
+ 
+             if (SanityManager.DEBUG) {
+                 crashOnDebugFlag(
+-                    TEST_REENCRYPT_CRASH_AFTER_RECOVERY_UNDO_REVERTING_KEY);
++                    TEST_REENCRYPT_CRASH_AFTER_RECOVERY_UNDO_REVERTING_KEY, 
++                    reEncryption);
+             }
+ 
+         } // end of UNDO
+@@ -1839,7 +1867,8 @@ public void handleIncompleteDatabaseEncryption(Properties properties)
+         
+         if (SanityManager.DEBUG) {
+                 crashOnDebugFlag(
+-                   TEST_REENCRYPT_CRASH_BEFORE_RECOVERY_FINAL_CLEANUP);
++                   TEST_REENCRYPT_CRASH_BEFORE_RECOVERY_FINAL_CLEANUP, 
++                   reEncryption);
+         }
+ 
+         // either the (re) encryption was complete , 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+index 4aae1439..5382509f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+@@ -3973,11 +3973,19 @@ public final boolean databaseEncrypted()
+ 
+ 
+     /*
+-     * Set that the database is encrypted, all the data in the 
+-     * transaction log  should be encrypted. 
++     * Set that the database is encrypted , all the transaction log has 
++     * to be encrypted, and flush the log if requesed. Log needs to 
++     * be flushed  first, if this is  being set during (re) encryption 
++     * of an existing  database. 
++     *
++     * @param flushLog  true, if log needs to be flushed, 
++     *                  otherwise false.  
+      */
+-    public  void setDatabaseEncrypted() 
++    public  void setDatabaseEncrypted(boolean flushLog) 
++        throws StandardException
+     {
++        if (flushLog) 
++            flushAll();
+         databaseEncrypted = true;
+     }
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
+index 621ce457..5910c3d2 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/ReadOnly.java
+@@ -360,7 +360,7 @@ public void abortLogBackup()
+      * Set that the database is encrypted. Read-only database can not 
+      * be reencrypted, nothing to do in this case. 
+      */
+-    public void setDatabaseEncrypted()
++    public void setDatabaseEncrypted(boolean flushLog)
+     {
+         // nothing to do for a read-only database.
+     }
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index 52e1833f..9c049298 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -229,7 +229,8 @@ The message identifier (ie. the value that matches a field in this class)
+     String CANNOT_REENCRYPT_READONLY_DATABASE         = "XBCXR.S";
+     String CANNOT_ENCRYPT_LOG_ARCHIVED_DATABASE       = "XBCXS.S";
+     String CANNOT_REENCRYPT_LOG_ARCHIVED_DATABASE     = "XBCXT.S";
+-
++    String DATABASE_ENCRYPTION_FAILED                 = "XBCXU.S";
++    String DATABASE_REENCRYPTION_FAILED               = "XBCXV.S";
+ 
+ 	/*
+ 	** Cache Service

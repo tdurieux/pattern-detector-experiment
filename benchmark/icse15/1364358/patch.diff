@@ -1,0 +1,181 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+index 24efe958..ff49e144 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+@@ -25,12 +25,16 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.ArrayBlockingQueue;
++import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.CompletionService;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.ExecutorCompletionService;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.SynchronousQueue;
++import java.util.concurrent.RejectedExecutionException;
++import java.util.concurrent.Semaphore;
++import java.util.concurrent.ThreadFactory;
+ import java.util.concurrent.ThreadPoolExecutor;
+ import java.util.concurrent.TimeUnit;
+ 
+@@ -50,17 +54,13 @@
+ import org.slf4j.LoggerFactory;
+ 
+ 
+-
+-
+ public class SolrCmdDistributor {
+   private static final int MAX_RETRIES_ON_FORWARD = 6;
+   public static Logger log = LoggerFactory.getLogger(SolrCmdDistributor.class);
+   
+   // TODO: shut this thing down
+   // TODO: this cannot be per instance...
+-  static ThreadPoolExecutor commExecutor = new ThreadPoolExecutor(0,
+-      Integer.MAX_VALUE, 5, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(),
+-      new DefaultSolrThreadFactory("cmdDistribExecutor"));
++  static BoundedExecutor commExecutor;
+ 
+   static final HttpClient client;
+   
+@@ -92,8 +92,22 @@
+     ModifiableSolrParams params;
+   }
+   
+-  public SolrCmdDistributor() {
++  public SolrCmdDistributor(int numHosts) {
++
++    BoundedExecutor executor = null;
++    synchronized (SolrCmdDistributor.class) {
++      if (commExecutor == null || commExecutor.getMaximumPoolSize() != numHosts) {
++        // we don't shutdown the previous because all it's threads will die
++        int maxPoolSize = Math.max(8, (numHosts-1) * 8);
++        commExecutor = new BoundedExecutor(0, maxPoolSize, 5,
++            TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(maxPoolSize * 2),
++            new DefaultSolrThreadFactory("cmdDistribExecutor"));
++      }
++      executor = commExecutor;
++    }
+    
++    completionService = new ExecutorCompletionService<Request>(executor);
++    pending = new HashSet<Future<Request>>();
+   }
+   
+   public void finish() {
+@@ -298,10 +312,7 @@ void submit(UpdateRequestExt ureq, Node node) {
+   }
+   
+   public void submit(final Request sreq) {
+-    if (completionService == null) {
+-      completionService = new ExecutorCompletionService<Request>(commExecutor);
+-      pending = new HashSet<Future<Request>>();
+-    }
++
+     final String url = sreq.node.getUrl();
+ 
+     Callable<Request> task = new Callable<Request>() {
+@@ -503,4 +514,40 @@ public ZkCoreNodeProps getNodeProps() {
+       return nodeProps;
+     }
+   }
++  
++  public class BoundedExecutor extends ThreadPoolExecutor {
++    private final Semaphore semaphore;
++    
++    public BoundedExecutor(int corePoolSize,
++        int maximumPoolSize, long keepAliveTime, TimeUnit unit,
++        BlockingQueue<Runnable> workQueue, ThreadFactory threadFactory) {
++      super(corePoolSize, maximumPoolSize, keepAliveTime, unit, workQueue, threadFactory);
++      this.semaphore = new Semaphore(maximumPoolSize);
++    }
++
++    @Override
++    public void execute(final Runnable command) {
++      try {
++        semaphore.acquire();
++      } catch (InterruptedException e1) {
++        throw new RuntimeException();
++      }
++      try {
++        super.execute(new Runnable() {
++          public void run() {
++            try {
++              command.run();
++            } finally {
++              semaphore.release();
++            }
++          }
++        });
++      } catch (RejectedExecutionException e) {
++        semaphore.release();
++        throw e;
++      }
++    }
++}
+ }
++
++
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+index f7323c9f..3ab86395 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+@@ -130,6 +130,8 @@ public static DistribPhase parseParam(final String param) {
+   private boolean forwardToLeader = false;
+   private List<Node> nodes;
+ 
++  private int numNodes;
++
+   
+   public DistributedUpdateProcessor(SolrQueryRequest req,
+       SolrQueryResponse rsp, UpdateRequestProcessor next) {
+@@ -164,7 +166,7 @@ public DistributedUpdateProcessor(SolrQueryRequest req,
+       collection = cloudDesc.getCollectionName();
+     }
+     
+-    cmdDistrib = new SolrCmdDistributor();
++    cmdDistrib = new SolrCmdDistributor(numNodes);
+   }
+ 
+   private List<Node> setupRequest(int hash) {
+@@ -172,6 +174,9 @@ public DistributedUpdateProcessor(SolrQueryRequest req,
+ 
+     // if we are in zk mode...
+     if (zkEnabled) {
++      // set num nodes
++      numNodes = zkController.getCloudState().getLiveNodes().size();
++      
+       // the leader is...
+       // TODO: if there is no leader, wait and look again
+       // TODO: we are reading the leader from zk every time - we should cache
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/update/SolrCmdDistributorTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/update/SolrCmdDistributorTest.java
+index 730f5c46..16a8077c 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/update/SolrCmdDistributorTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/update/SolrCmdDistributorTest.java
+@@ -82,7 +82,7 @@ protected void createServers(int numShards) throws Exception {
+   public void doTest() throws Exception {
+     //del("*:*");
+     
+-    SolrCmdDistributor cmdDistrib = new SolrCmdDistributor();
++    SolrCmdDistributor cmdDistrib = new SolrCmdDistributor(8);
+     
+     ModifiableSolrParams params = new ModifiableSolrParams();
+     List<Node> nodes = new ArrayList<Node>();
+@@ -116,7 +116,7 @@ public void doTest() throws Exception {
+     nodes.add(new StdNode(new ZkCoreNodeProps(nodeProps)));
+     
+     // add another 2 docs to control and 3 to client
+-    cmdDistrib = new SolrCmdDistributor();
++    cmdDistrib = new SolrCmdDistributor(8);
+     cmd.solrDoc = sdoc("id", 2);
+     cmdDistrib.distribAdd(cmd, nodes, params);
+     
+@@ -149,7 +149,7 @@ public void doTest() throws Exception {
+     DeleteUpdateCommand dcmd = new DeleteUpdateCommand(null);
+     dcmd.id = "2";
+     
+-    cmdDistrib = new SolrCmdDistributor();
++    cmdDistrib = new SolrCmdDistributor(8);
+     cmdDistrib.distribDelete(dcmd, nodes, params);
+     
+     cmdDistrib.distribCommit(ccmd, nodes, params);

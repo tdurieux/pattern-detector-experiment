@@ -1,0 +1,966 @@
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/db/OnlineCompress.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/db/OnlineCompress.java
+index 8d243813..db4a4aec 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/db/OnlineCompress.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/db/OnlineCompress.java
+@@ -61,12 +61,66 @@
+ 
+ import java.sql.SQLException;
+ 
++/**
++
++Implementation of SYSCS_UTIL.SYSCS_INPLACE_COMPRESS_TABLE().
++<p>
++Code which implements the following system procedure:
++
++void SYSCS_UTIL.SYSCS_INPLACE_COMPRESS_TABLE(
++    IN SCHEMANAME        VARCHAR(128),
++    IN TABLENAME         VARCHAR(128),
++    IN PURGE_ROWS        SMALLINT,
++    IN DEFRAGMENT_ROWS   SMALLINT,
++    IN TRUNCATE_END      SMALLINT)
++<p>
++This system procedure can be used to force 3 levels of in place
++compression of a SQL table.  The table is specified using the
++SCHEMANAME and TABLENAME arguments.  
++<p>
++If PURGE_ROWS is set to non-zero then a single pass is made through the table 
++which will purge committed deleted rows from the table.  This space is then
++available for future inserted rows, but remains allocated to the table.
++As this option scans every page of the table, it's performance is linearly 
++related to the size of the table.
++<p>
++If DEFRAGMENT_ROWS is set to non-zero then a single defragment pass is made
++which will move existing rows from the end of the table towards the front
++of the table.  The goal of the defragment run is to empty a set of pages
++at the end of the table which can then be returned to the OS by the
++TRUNCATE_END option.  It is recommended to only run DEFRAGMENT_ROWS, if also
++specifying the TRUNCATE_END option.  This option scans the whole table and
++needs to update index entries for every base table row move, and thus execution
++time is linearly related to the size of the table.
++<p>
++If TRUNCATE_END is set to non-zero then all contiguous pages at the end of
++the table will be returned to the OS.  Running the DEFRAGMENT_ROWS option may
++increase the number of pages affected.  This option itself does no scans of
++the table, so performs on the order of a few system calls.
++
++**/
+ public class OnlineCompress
+ {
+ 
+ 	/** no requirement for a constructor */
+ 	private OnlineCompress() {
+ 	}
++
++    /**
++     * Implementation of SYSCS_UTIL.SYSCS_INPLACE_COMPRESS_TABLE().
++     * <p>
++     * Top level implementation of the system procedure.  All the 
++     * real work is found in the other routines in this file implementing
++     * the 3 phases of inplace compression:  purge, defragment, and truncate.
++     * <p>
++     * @param schemaName        schema name of table, required
++     * @param tableName         table name to be compressed
++     * @param purgeRows         if true, do a purge pass on the table
++     * @param defragmentRows    if true, do a defragment pass on the table
++     * @param truncateEnd       if true, return empty pages at end to OS.
++     *
++	 * @exception  SQLException  Errors returned by throwing SQLException.
++     **/
+ 	public static void compressTable(
+     String  schemaName, 
+     String  tableName,
+@@ -84,6 +138,10 @@ public static void compressTable(
+ 
+             // Each of the following may give up locks allowing ddl on the
+             // table, so each phase needs to do the data dictionary lookup.
++            // The order is important as it makes sense to first purge
++            // deleted rows, then defragment existing non-deleted rows, and
++            // finally to truncate the end of the file which may have been
++            // made larger by the previous purge/defragment pass.
+ 
+             if (purgeRows)
+                 purgeRows(schemaName, tableName, data_dictionary, tc);
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
+index 286d641d..23f138cd 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTree.java
+@@ -232,7 +232,6 @@ abstract protected BTreeLockingPolicy getBtreeLockingPolicy(
+      * raw store will be providing this.
+      *
+      * @param xact_manager Transaction to associate the lock with.
+-     * @param forUpdate    Whether to lock exclusive or share.
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
+index 5d160068..cc896dbf 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeController.java
+@@ -921,7 +921,7 @@ public void init(
+ 	*/
+ 
+     /**
+-    Close the conglomerate controller
++    Close the conglomerate controller.
+ 	<p>
+ 	Any changes to this method will probably have to be reflected in close as 
+     well.
+@@ -960,7 +960,7 @@ public void close()
+      * RESOLVE (mikem) - move this call to ConglomerateManager so it is
+      * obvious that non-access clients should not call this.
+      *
+-     * @param closeHeldController     If true, means to close controller even if
++     * @param closeHeldScan     If true, means to close controller even if
+      *                                it has been opened to be kept opened 
+      *                                across commit.  This is
+      *                                used to close these controllers on abort.
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeCostController.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeCostController.java
+index 4e35cca6..2771d84d 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeCostController.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeCostController.java
+@@ -185,7 +185,6 @@ public BTreeCostController()
+ 	 * @return The identifier to be used to open the conglomerate later.
+      *
+      * @param xact_manager access manager transaction.
+-     * @param sementid     The id of the segment where container can be found.
+      * @param rawtran      Raw store transaction.
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+@@ -457,7 +456,7 @@ public double getFetchFromFullKeyCost(
+      *                        conglomerate.  The startKeyValue must only
+      *                        reference columns included in the scanColumnList.
+      *
+-	 * @param startSearchOperation 
++	 * @param startSearchOperator 
+      *                        an operator which defines how the startKeyValue
+      *                        is to be searched for.  If startSearchOperation 
+      *                        is ScanController.GE, the scan starts on the 
+@@ -476,7 +475,7 @@ public double getFetchFromFullKeyCost(
+      *                        stopKeyValue must only reference columns included
+      *                        in the scanColumnList.
+      *
+-	 * @param stopSearchOperation
++	 * @param stopSearchOperator
+      *                        an operator which defines how the stopKeyValue
+      *                        is used to determine the scan stopping position. 
+      *                        If stopSearchOperation is ScanController.GE, the
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeLockingPolicy.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeLockingPolicy.java
+index 2464cea7..927abe88 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeLockingPolicy.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeLockingPolicy.java
+@@ -87,7 +87,7 @@ in one operation by calling lockScanRow() and requesting the scan lock be
+      */
+ 
+     /**
+-     * Lock the current leaf page (vs. a row on the page).
++     * Lock the current leaf page.
+      * <p>
+      * Logically lock the record id's on a leaf page.  This protocol is used
+      * by splits/row purgers and scans to coordinate between themselves.
+@@ -132,7 +132,7 @@ in one operation by calling lockScanRow() and requesting the scan lock be
+      * @param aux_control_row   If non-null, this control row is unlatched 
+      *                          if the routine has to wait on the lock.
+      * @param forUpdate         Whether to wait for lock.
+-     * @param lock_oper         For what operation are we requesting the lock, 
++     * @param lock_operation    For what operation are we requesting the lock, 
+      *                          this should be one of the following 4 options:
+      *                          LOCK_READ [read lock], 
+      *                          (LOCK_INS | LOCK_UPD) [ lock for insert], 
+@@ -209,14 +209,13 @@ abstract public boolean lockScanCommittedDeletedRow(
+      * @param open_btree        The open_btree to associate latches with - 
+      *                          used if routine has to scan backward.
+      * @param btree             the conglomerate info.
+-     * @param leaf              The control row of the current leaf to lock.
+-     * @param slot              The slot position of the row to lock.
++     * @param pos               Description of position of row to lock.
+      * @param request_scan_lock Whether to request the page scan lock, should
+      *                          only be requested once per page in the scan.
+-     * @param scratch_template  A scratch area to use to read in rows.
++     * @param lock_template     A scratch area to use to read in rows.
+      * @param previous_key_lock Is this a previous key lock call?
+      * @param forUpdate         Is the scan for update or for read only.
+-     * @param lock_oper         For what operation are we requesting the lock, 
++     * @param lock_operation    For what operation are we requesting the lock, 
+      *                          this should be one of the following 4 options:
+      *                          LOCK_READ [read lock], 
+      *                          (LOCK_INS | LOCK_UPD) [ lock for insert], 
+@@ -312,10 +311,10 @@ abstract public void unlockScanRecordAfterRead(
+      * @param btree             The conglomerate we are locking.
+      * @param current_leaf      Latched current leaf where "current" key is.
+      * @param current_slot      The slot of row on "current_leaf" 
+-     * @param template          Empty full template row, to read row into.
++     * @param lock_template     Empty full template row, to read row into.
+      * @param open_btree        The open_btree to associate latches with - 
+      *                          used if routine has to scan backward.
+-     * @param lock_oper         For what operation are we requesting the lock, 
++     * @param lock_operation    For what operation are we requesting the lock, 
+      *                          this should be one of the following 4 options:
+      *                          LOCK_READ [read lock], 
+      *                          (LOCK_INS | LOCK_UPD) [ lock for insert], 
+@@ -369,7 +368,7 @@ abstract public boolean lockNonScanPreviousRow(
+      * @param aux_leaf          If non-null, this leaf is unlatched if the 
+      *                          routine has to wait on the lock.
+      * @param current_row       In memory, objectified "current" row.
+-     * @param lock_oper         For what operation are we requesting the lock, 
++     * @param lock_operation    For what operation are we requesting the lock, 
+      *                          this should be one of the following 4 options:
+      *                          LOCK_READ [read lock], 
+      *                          (LOCK_INS | LOCK_UPD) [ lock for insert], 
+@@ -398,13 +397,11 @@ abstract public boolean lockNonScanRow(
+      *
+ 	 * @return Whether locks were acquired without releasing latch on leaf.
+      *
+-     * @param open_btree        The open_btree to associate latches with - 
+-     *                          used if routine has to scan backward.
+      * @param btree             the conglomerate info.
+      * @param leaf              The control row of the current leaf to lock.
+      * @param slot              The slot position of the row to lock.
+-     * @param scratch_template  A scratch area to use to read in rows.
+-     * @param lock_oper         For what operation are we requesting the lock, 
++     * @param lock_template     A scratch area to use to read in rows.
++     * @param lock_operation    For what operation are we requesting the lock, 
+      *                          this should be one of the following 4 options:
+      *                          LOCK_READ [read lock], 
+      *                          (LOCK_INS | LOCK_UPD) [ lock for insert], 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeScan.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeScan.java
+index d692af49..8e6c8c22 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeScan.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BTreeScan.java
+@@ -104,9 +104,9 @@
+ 
+     /**
+      * A constant FetchDescriptor which describes the position of the 
+-     * RowLocation field within the btree (ie. the last column).  Used by 
+-     * lock/unlock to fetch the RowLocation.  Only needs to be allocated once
+-     * per scan.
++     * RowLocation field within the btree, currently always the last column).  
++     * Used by lock/unlock to fetch the RowLocation.  
++     * Only needs to be allocated once per scan.
+      **/
+     protected FetchDescriptor       init_lock_fetch_desc;
+ 
+@@ -1724,7 +1724,7 @@ equivalent to making a next() call followed by a fetch(row)
+     call.  This interface allows implementations to optimize 
+     the 2 calls if possible.
+ 
+-    @param template The template row into which the value
++    @param row The template row into which the value
+ 	of the next position in the scan is to be stored.
+ 
+     @return True if there is a next position in the scan,
+@@ -1995,7 +1995,7 @@ the current scan had been closed and a openScan() had been called instead.
+ 	the scan.  If null, the starting position of the scan
+ 	is the first row of the conglomerate.
+ 
+-	@param startSearchOperation an operator which defines
++	@param startSearchOperator an operator which defines
+ 	how the startKeyValue is to be searched for.  If
+     startSearchOperation is ScanController.GE, the scan starts on
+ 	the first row which is greater than or equal to the
+@@ -2015,7 +2015,7 @@ the current scan had been closed and a openScan() had been called instead.
+ 	the scan.  If null, the ending position of the scan
+ 	is the last row of the conglomerate.
+ 
+-	@param stopSearchOperation an operator which defines
++	@param stopSearchOperator an operator which defines
+ 	how the stopKeyValue is used to determine the scan stopping
+ 	position. If stopSearchOperation is ScanController.GE, the scan
+ 	stops just before the first row which is greater than or
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BranchControlRow.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BranchControlRow.java
+index ff4de6b2..0aa6b550 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BranchControlRow.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/BranchControlRow.java
+@@ -569,11 +569,11 @@ protected boolean shrinkFor(
+      *
+ 	 * @return page number of the newly allocated leaf page created by split.
+      *
+-     * @param btree      The open btree to associate latches with.
++     * @param open_btree The open btree to associate latches with.
+      * @param template   A scratch area to use while searching for split pass.
+-     * @param parentpage The parent page of the current page in the split pass.
++     * @param parent     The parent page of the current page in the split pass.
+      *                   starts at null for root.
+-     * @param row        The key to make room for during the split pass.
++     * @param splitrow   The key to make room for during the split pass.
+      * @param flag       A flag used to direct where point of split should be
+      *                   chosen.
+      *
+@@ -1431,7 +1431,7 @@ protected ControlRow getChildPageAtSlot(
+      *
+ 	 * @return The page which is the leftmost child of this page.
+      *
+-     * @param btree  The open btree to associate latches/locks with.
++     * @param open_btree  The open btree to associate latches/locks with.
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/ControlRow.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/ControlRow.java
+index cbc0bc2e..d2f6e037 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/ControlRow.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/ControlRow.java
+@@ -293,7 +293,6 @@ protected ControlRow()
+ 	 * corresponding accessor(s).
+      *
+      * @param btree      Static information about the btree.
+-     * @param container  The container in which this btree resides.
+      * @param page       The page described by this control row.
+      * @param parent     The parent page of this page, "null" if this page is 
+      *                   root or if not maintaining parent links.
+@@ -1980,7 +1979,7 @@ protected abstract boolean shrinkFor(
+      *
+ 	 * @return page number of the newly allocated leaf page created by split.
+      *
+-     * @param btree      The open btree to associate latches with.
++     * @param open_btree The open btree to associate latches with.
+      * @param template   A scratch area to use while searching for split pass.
+      * @param parentpage The parent page of the current page in the split pass.
+      *                   starts at null for root.
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/LeafControlRow.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/LeafControlRow.java
+index 949b6360..b4c29c9b 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/LeafControlRow.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/LeafControlRow.java
+@@ -511,11 +511,11 @@ protected boolean shrinkFor(
+      *
+ 	 * @return page number of the newly allocated leaf page created by split.
+      *
+-     * @param btree      The open btree to associate latches with.
++     * @param open_btree  The open btree to associate latches with.
+      * @param template   A scratch area to use while searching for split pass.
+-     * @param parentpage The parent page of the current page in the split pass.
++     * @param parent_page The parent page of the current page in the split pass.
+      *                   starts at null for root.
+-     * @param row        The key to make room for during the split pass.
++     * @param splitrow    The key to make room for during the split pass.
+      * @param flag       A flag used to direct where point of split should be
+      *                   chosen.
+      *
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
+index 3888eec7..8810e1c4 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2I.java
+@@ -302,7 +302,6 @@ else if (isolation_level ==
+      * raw store will be providing this.
+      *
+      * @param xact_manager Transaction to associate the lock with.
+-     * @param forUpdate    Whether to lock exclusive or share.
+      *
+ 	 * @exception  StandardException  Standard exception policy.
+      **/
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IController.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IController.java
+index 8c62ee24..93469aa1 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IController.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IController.java
+@@ -162,7 +162,7 @@ else if (lock_level == TransactionController.MODE_RECORD)
+ 	*/
+ 
+     /**
+-    Close the conglomerate controller
++    Close the conglomerate controller.
+ 	<p>
+ 	Any changes to this method will probably have to be reflected in close as 
+     well.
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IFactory.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IFactory.java
+index 8e6d28c6..624ee16f 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IFactory.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IFactory.java
+@@ -205,8 +205,6 @@ public Conglomerate createConglomerate(
+      * <p>
+      * The btree object returned by this routine may be installed in a cache
+      * so the object must not change.
+-     *
+-     * @param conglomid      The unique id of the existing conglomerate.
+      *
+ 	 * @return An instance of the conglomerate.
+      *
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2INoLocking.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2INoLocking.java
+index 1211b0f4..bc8bf5b0 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2INoLocking.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2INoLocking.java
+@@ -165,8 +165,7 @@ public boolean lockScanCommittedDeletedRow(
+      *
+ 	 * @return Whether locks were acquired without releasing latch on leaf.
+      *
+-     * @param leaf              The control row of the current leaf to lock.
+-     * @param slot              The slot position of the row to lock.
++     * @param pos               The position of the row to lock.
+      * @param request_scan_lock Whether to request the page scan lock, should
+      *                          only be requested once per page in the scan.
+      *
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IStaticCompiledInfo.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IStaticCompiledInfo.java
+index 7bae54d0..722cf271 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IStaticCompiledInfo.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IStaticCompiledInfo.java
+@@ -114,7 +114,7 @@ public B2IStaticCompiledInfo()
+      */
+ 
+     /**
+-     * return the "Conglomerate"
++     * return the "Conglomerate".
+      * <p>
+      * For secondaryindex compiled info return the secondary index conglomerate.
+      * <p>
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IUndo.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IUndo.java
+index a3341191..43b6e49e 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IUndo.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/access/btree/index/B2IUndo.java
+@@ -102,14 +102,16 @@ has it will call the findUndo() interface, to find the page where the record
+ 	 * RecordHandle so that the logging system can update the compensation
+ 	 * Operation with the new location.
+      *
+-	 * @param transaction the transaction doing the rollback
++	 * @param rawtran   the transaction doing the rollback
+ 	 * @param pageOp the page operation that supports logical undo.  This
+-	 * 		LogicalUndo function pointer is a field of that pageOperation
+-	 * @param in data stored in the log stream that contains the record data
+-	 * 		necessary to restore the row.
++	 * 		            LogicalUndo function pointer is a field of that 
++     * 		            pageOperation
++	 * @param in        data stored in the log stream that contains the record 
++     *                  data necessary to restore the row.
+      *
+      *	@exception StandardException Standard Cloudscape error policy
+ 	 *  @exception IOException Method may read from InputStream
++     *
+ 	 */
+ 	public Page findUndo(
+     Transaction     rawtran, 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseContainer.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseContainer.java
+index 8348f34b..6e58346a 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseContainer.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseContainer.java
+@@ -222,6 +222,7 @@ public void compressContainer(BaseContainerHandle handle)
+ 		finally
+ 		{
+             ntt.commitNoSync(Transaction.RELEASE_LOCKS);
++
+ 			ntt.close();
+ 		}
+     }
+@@ -718,7 +719,8 @@ protected abstract BasePage getPageForCompress(
+     long                pageno)
+ 		 throws StandardException;
+ 
+-	protected abstract void truncatePages(long lastValidPagenum);
++	protected abstract void truncatePages(long lastValidPagenum)
++        throws StandardException;
+ 
+ 
+ 	/**
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+index cb3c54c0..d341e5dd 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+@@ -1382,11 +1382,12 @@ protected void compressContainer(
+                 alloc_page.compress(this);
+ 
+ 				allocCache.invalidate(); 
++
+             }
++
+ 		}
+-		catch (StandardException se)
++        finally
+ 		{
+-
+ 			if (alloc_page != null)
+             {
+ 				alloc_page.unlatch();
+@@ -1397,6 +1398,21 @@ protected void compressContainer(
+ 				prev_alloc_page.unlatch();
+ 				prev_alloc_page = null;
+             }
++
++            System.out.println("calling flushAll()");
++
++            // flush all changes to this file from cache.
++            flushAll();
++
++            System.out.println("calling discard."); 
++
++            // make sure all truncated pages are removed from the cache,
++            // as it will get confused in the future if we allocate the same
++            // page again, but find an existing copy of it in the cache - 
++            // it expects to not find new pages in the cache.  Could just
++            // get rid of truncated pages, iterface allows one page or
++            // all pages.
++            pageCache.discard(identity);
+         }
+ 	}
+ 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index df61d54b..86e90275 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -550,8 +550,9 @@ protected int preAllocate(long lastPreallocPagenum,
+      **/
+ 	protected void truncatePages(
+     long lastValidPagenum)
++        throws StandardException
+ 	{  
+-		// int n = doTruncatePages(lastValidPagenum); 
++
+ 
+         synchronized(this)
+         {
+diff --git a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/BaseTest.java b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/BaseTest.java
+index cadba84c..6199fdd4 100644
+--- a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/BaseTest.java
++++ b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/BaseTest.java
+@@ -20,9 +20,13 @@
+ 
+ package org.apache.derbyTesting.functionTests.tests.store;
+ 
++import org.apache.derby.iapi.services.sanity.SanityManager;
++
+ import org.apache.derby.tools.ij;
+ 
+ import java.sql.Connection;
++import java.sql.Statement;
++import java.sql.ResultSet;
+ import java.sql.SQLException;
+ 
+ 
+@@ -63,6 +67,13 @@ protected void beginTest(
+         conn.commit();
+     }
+ 
++    protected void testProgress(
++    String      str)
++        throws SQLException
++    {
++        log("Executing test: " + str);
++    }
++
+     protected void endTest(
+     Connection  conn,
+     String      str)
+@@ -71,8 +82,49 @@ protected void endTest(
+         conn.commit();
+         log("Ending test: " + str);
+     }
++
+     protected void log(String   str)
+     {
+         System.out.println(str);
+     }
++
++    protected void logError(String   str)
++    {
++        System.out.println("ERROR: " + str);
++    }
++
++    /**
++     * Call consistency checker on the table.
++     * <p>
++     **/
++    protected boolean checkConsistency(
++    Connection  conn,
++    String      schemaName,
++    String      tableName)
++		throws SQLException
++    {
++        Statement s = conn.createStatement();
++
++        ResultSet rs = 
++            s.executeQuery(
++                "values SYSCS_UTIL.SYSCS_CHECK_TABLE('" + 
++                schemaName + "', '" + 
++                tableName  + "')");
++
++        if (!rs.next())
++        {
++            if (SanityManager.DEBUG)
++            {
++                SanityManager.THROWASSERT("no value from values clause.");
++            }
++        }
++
++        boolean consistent = rs.getBoolean(1);
++
++        rs.close();
++
++        conn.commit();
++
++        return(consistent);
++    }
+ }
+diff --git a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
+index 7db7c7c0..fa50128a 100644
+--- a/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
++++ b/incubator/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineCompressTest.java
+@@ -22,8 +22,12 @@
+ 
+ import org.apache.derby.iapi.db.OnlineCompress;
+ 
++import org.apache.derby.iapi.services.sanity.SanityManager;
++
++import java.sql.CallableStatement;
+ import java.sql.Connection;
+ import java.sql.PreparedStatement;
++import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ 
+@@ -32,22 +36,177 @@
+ 
+ public class OnlineCompressTest extends BaseTest
+ {
++    boolean verbose = true;
+ 
+     OnlineCompressTest()
+     {
+     }
+ 
++    /**
++     * call SYSCS_UTIL.SYSCS_INPLACE_COMPRESS_TABLE() system procedure.
++     * <p>
++     * Utility test function to call the system procedure.
++     *
++     **/
++    private void callCompress(
++    Connection  conn,
++    String      schemaName,
++    String      tableName,
++    boolean     purgeRows,
++    boolean     defragmentRows,
++    boolean     truncateEnd)
++        throws SQLException
++    {
++        CallableStatement cstmt = 
++            conn.prepareCall(
++                "call SYSCS_UTIL.SYSCS_INPLACE_COMPRESS_TABLE(?, ?, ?, ?, ?)");
++        cstmt.setString(1, schemaName);
++        cstmt.setString(2, tableName);
++        cstmt.setInt   (3, purgeRows      ? 1 : 0);
++        cstmt.setInt   (4, defragmentRows ? 1 : 0);
++        cstmt.setInt   (5, truncateEnd    ? 1 : 0);
++
++        cstmt.execute();
++
++        conn.commit();
++    }
++
++    /**
++     * call the space table vti.
++     * <p>
++     * Utility test function to call the space table vti to get information
++     * about allocated and free pages.  Information is passed back in an
++     * int array as follows:
++     *   is_index                 = ret_info[0];
++     *   num_alloc                = ret_info[1];
++     *   num_free                 = ret_info[2];
++     *   page_size                = ret_info[3];
++     *   estimate_space_savings   = ret_info[4];
++     * <p>
++     *
++	 * @return the space information about the table.
++     *
++	 * @exception  StandardException  Standard exception policy.
++     **/
++    private static final int SPACE_INFO_IS_INDEX        = 0;
++    private static final int SPACE_INFO_NUM_ALLOC       = 1;
++    private static final int SPACE_INFO_NUM_FREE        = 2;
++    private static final int SPACE_INFO_PAGE_SIZE       = 3;
++    private static final int SPACE_INFO_ESTIMSPACESAVING = 4;
++    private int[] getSpaceInfo(
++    Connection  conn,
++    String      schemaName,
++    String      tableName)
++		throws SQLException
++    {
++        String stmt_str = 
++            "select conglomeratename, isindex, numallocatedpages, numfreepages, pagesize, estimspacesaving from new org.apache.derby.diag.SpaceTable('" +
++            tableName + "') t where isindex = 0";
++        PreparedStatement space_stmt = conn.prepareStatement(stmt_str);
++        ResultSet rs = space_stmt.executeQuery();
++
++        if (!rs.next())
++        {
++            if (SanityManager.DEBUG)
++            {
++                SanityManager.THROWASSERT(
++                    "No rows returned from space table query on table: " +
++                    schemaName + "." + tableName);
++            }
++        }
++
++        int[] ret_info = new int[5];
++        String conglomerate_name        = rs.getString(1);
++        for (int i = 0; i < 5; i++)
++        {
++            ret_info[i] = rs.getInt(i + 2);
++        }
++
++        if (rs.next())
++        {
++            if (SanityManager.DEBUG)
++            {
++                SanityManager.THROWASSERT(
++                    "More than one row returned from space query on table: " +
++                    schemaName + "." + tableName);
++            }
++        }
++
++        if (verbose)
++        {
++            System.out.println(
++                "Space information for " + schemaName + "." + tableName + ":");
++            System.out.println("isindex = " + ret_info[SPACE_INFO_IS_INDEX]);
++            System.out.println("num_alloc = " + ret_info[SPACE_INFO_NUM_ALLOC]);
++            System.out.println("num_free = " + ret_info[SPACE_INFO_NUM_FREE]);
++            System.out.println("page_size = " + ret_info[SPACE_INFO_PAGE_SIZE]);
++            System.out.println(
++                "estimspacesaving = " + ret_info[SPACE_INFO_ESTIMSPACESAVING]);
++        }
++
++        rs.close();
++
++        conn.commit();
++
++        return(ret_info);
++    }
++
++
++    /**
++     * Determine if inplace compress did it's job.
++     * <p>
++     * Figuring out if inplace compress in a fully reproducible way is hard
++     * because derby has background threads which when given a chance do some
++     * of the space reclamation work that this routine does, so the absolute
++     * number of pages sometimes varies depending on machine/OS/JVM issues.
++     * <p>
++     * The approach here is to verify that at least N pages where reclaimed,
++     * assuming other varience is an acceptable difference based on background
++     * thread activity.  
++     * <p>
++     *
++	 * @return The identifier to be used to open the conglomerate later.
++     *
++     **/
++    private boolean checkBaseTableSpaceParameters(
++    Connection  conn,
++    String      schemaName,
++    String      tableName,
++    boolean     check_allocated_pages,
++    int         max_allocated_pages,
++    boolean     check_free_pages,
++    int         max_free_pages)
++		throws SQLException
++    {
++        int[] ret_info = getSpaceInfo(conn, schemaName, tableName);
++
++        int    is_index                 = ret_info[0];
++        int    num_alloc                = ret_info[1];
++        int    num_free                 = ret_info[2];
++        int    page_size                = ret_info[3];
++        int    estimate_space_savings   = ret_info[4];
++
++        return(true);
++    }
++
++
+ 
+     private void createAndLoadTable(
+     Connection  conn,
+-    String      tblname)
++    boolean     create_table,
++    String      tblname,
++    int         num_rows)
+         throws SQLException
+     {
++        if (create_table)
++        {
+         Statement s = conn.createStatement();
+ 
+         s.execute(
+             "create table " + tblname + 
+                 "(keycol int, indcol1 int, indcol2 int, indcol3 int, data1 varchar(2000), data2 varchar(2000))");
++            s.close();
++        }
+ 
+         PreparedStatement insert_stmt = 
+             conn.prepareStatement(
+@@ -65,7 +224,7 @@ private void createAndLoadTable(
+         String  data1_str = new String(data1_data);
+         String  data2_str = new String(data2_data);
+ 
+-        for (int i = 0; i < 10000; i++)
++        for (int i = 0; i < num_rows; i++)
+         {
+             insert_stmt.setInt(1, i);               // keycol
+             insert_stmt.setInt(2, i * 10);          // indcol1
+@@ -73,19 +232,172 @@ private void createAndLoadTable(
+             insert_stmt.setInt(4, -i);              // indcol3
+             insert_stmt.setString(5, data1_str);   // data1_data
+             insert_stmt.setString(6, data2_str);   // data2_data
++
++            insert_stmt.execute();
++        }
++
++        if (create_table)
++        {
++            Statement s = conn.createStatement();
++
++            s.execute(
++                "create index " + tblname + "_idx_keycol on " + tblname +
++                    "(keycol)");
++            s.execute(
++                "create index " + tblname + "_idx_indcol1 on " + tblname +
++                    "(indcol1)");
++            s.execute(
++                "create index " + tblname + "_idx_indcol2 on " + tblname +
++                    "(indcol2)");
++            s.execute(
++                "create unique index " + tblname + "_idx_indcol3 on " + tblname +
++                    "(indcol3)");
++            s.close();
+         }
+ 
+         conn.commit();
+     }
+ 
++    private void executeQuery(
++    Connection  conn,
++    String      stmt_str)
++        throws SQLException
++    {
++        Statement stmt = conn.createStatement();
++        stmt.executeUpdate(stmt_str);
++        conn.commit();
++    }
++
++    private void log_wrong_count(
++    String  error_msg,
++    String  table_name,
++    int     num_rows,
++    int     expected_val,
++    int     actual_val,
++    int[]   before_info,
++    int[]   after_info)
++    {
++        System.out.println(error_msg);
++        System.out.println("ERROR: for " + num_rows + " row  test. Expected " + expected_val + ", but got " + actual_val );
++    }
++
++
++    private void row_count_based_tests(
++    Connection  conn,
++    boolean     create_table,
++    boolean     drop_table,
++    String      schemaName,
++    String      table_name,
++    int         num_rows) 
++        throws SQLException 
++    {
++        testProgress(
++            "begin " + num_rows + " row test, create = " + 
++                create_table + ", drop = " + drop_table + ".");
++
++
++        createAndLoadTable(conn, create_table, table_name, num_rows);
++
++        if (verbose)
++            testProgress("Calling compress.");
++
++        // compress with no deletes should not affect size
++        int[] ret_before = getSpaceInfo(conn, "APP", table_name);
++        callCompress(conn, "APP", table_name, true, true, true);
++        int[] ret_after  = getSpaceInfo(conn, "APP", table_name);
++
++        if (ret_after[SPACE_INFO_NUM_ALLOC] != ret_before[SPACE_INFO_NUM_ALLOC])
++        {
++            log_wrong_count(
++                "Expected no alloc page change.", 
++                table_name, num_rows, 
++                ret_before[SPACE_INFO_NUM_ALLOC], 
++                ret_after[SPACE_INFO_NUM_ALLOC],
++                ret_before, ret_after);
++        }
++
++        if (verbose)
++            testProgress("calling consistency checker.");
++
++        if (!checkConsistency(conn, schemaName, table_name))
++        {
++            logError("conistency check failed.");
++        }
++
++        testProgress("no delete case complete.");
++
++        // delete all the rows.
++        ret_before = getSpaceInfo(conn, "APP", table_name);
++        executeQuery(conn, "delete from " + table_name);
++        conn.commit();
++
++        if (verbose)
++            testProgress("deleted all rows, now calling compress.");
++
++        callCompress(conn, "APP", table_name, true, true, true);
++        ret_after  = getSpaceInfo(conn, "APP", table_name);
++
++        // An empty table has 2 pages, one allocation page and the 1st page
++        // which will have a system row in it.  The space vti only reports
++        // a count of the user pages so the count is 1.
++        if (ret_after[SPACE_INFO_NUM_ALLOC] != 1)
++        {
++            log_wrong_count(
++                "Expected all pages to be truncated.",
++                table_name, num_rows, 1, ret_after[SPACE_INFO_NUM_ALLOC],
++                ret_before, ret_after);
++    }
++
++        if (verbose)
++            testProgress("calling consistency checker.");
++
++        if (!checkConsistency(conn, schemaName, table_name))
++        {
++            logError("conistency check failed.");
++        }
++
++        testProgress("delete all rows case succeeded.");
++
++
++        if (drop_table)
++            executeQuery(conn, "drop table " + table_name);
++
++        conn.commit();
++
++        testProgress("end " + num_rows + " row test.");
++    }
++
++    /**
++     * Test 1 alloc page test cases.
++     * <p>
++     * loop through testing interesting row count cases.  The cases are
++     * 0  rows     - basic edge case, 2 page table: 1 alloc, 1 user page
++     * 1  row      - another edge case, 2 page table: 1 alloc, 1 user page
++     * TODO        - 3 page table case: 1 alloc, 1 user page, 1 user page freed
++     * 10000 rows  - reasonable number of pages to test out, still 1 alloc page
++     *
++     * These tests can be run relatively quickly, not a lot of rows needed.
++     * <p>
++     *
++     **/
+     private void test1(Connection conn) 
+         throws SQLException 
+     {
+         beginTest(conn, "test1");
+ 
+-        createAndLoadTable(conn, "test1");
++        int[] test_cases = {0, 1, 50, 10000};
+ 
+-        OnlineCompress.compressTable("APP", "TEST1", true, true, true);
++        for (int i = 0; i < test_cases.length; i++)
++        {
++            // first create new table and run the tests.
++            row_count_based_tests(
++                conn, true, false, "APP", "TEST1", test_cases[i]);
++
++            // now rerun tests on existing table, which had all rows deleted
++            // and truncated.
++            row_count_based_tests(
++                conn, false, true, "APP", "TEST1", test_cases[i]);
++        }
+ 
+         endTest(conn, "test1");
+     }

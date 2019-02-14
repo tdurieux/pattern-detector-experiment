@@ -1,0 +1,364 @@
+diff --git a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+index f4a05c22..a0eba16c 100644
+--- a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
++++ b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+@@ -560,12 +560,10 @@ private void sessionInitialState()
+ 		else
+ 		{
+ 			// exchange attributes with application requester
+-			if (exchangeServerAttributes())
+-				session.state = Session.ATTEXC;
+-			else
+-				closeSession();
++			exchangeServerAttributes();
+ 		}
+ 	}
++
+ 	/**
+ 	 * Process DRDA commands we can receive once server attributes have been
+ 	 * exchanged.
+@@ -577,11 +575,16 @@ private void processCommands() throws DRDAProtocolException
+ 		DRDAStatement stmt = null;
+ 		int updateCount = 0;
+ 		boolean PRPSQLSTTfailed = false;
++		boolean checkSecurityCodepoint = session.requiresSecurityCodepoint();
+ 		do
+ 		{
+ 			correlationID = reader.readDssHeader();
+ 			int codePoint = reader.readLengthAndCodePoint();
+ 			int writerMark = writer.markDSSClearPoint();
++			
++			if (checkSecurityCodepoint)
++				verifyInOrderACCSEC_SECCHK(codePoint,session.getRequiredSecurityCodepoint());
++
+ 			switch(codePoint)
+ 			{
+ 				case CodePoint.CNTQRY:
+@@ -801,7 +804,19 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					break;
+ 				case CodePoint.EXCSAT:
+-					parseDRDAConnection();
++					parseEXCSAT();
++					writeEXCSATRD();
++					finalizeChain();
++					break;
++				case CodePoint.ACCSEC:
++					int securityCheckCode = parseACCSEC();
++					writeACCSECRD(securityCheckCode); 
++					checkSecurityCodepoint = true;
++					break;
++				case CodePoint.SECCHK:
++					if(parseDRDAConnection())
++						// security all checked and connection ok
++						checkSecurityCodepoint = false;
+ 					break;
+ 				/* since we don't support sqlj, we won't get bind commands from jcc, we
+ 				 * might get it from ccc; just skip them.
+@@ -916,11 +931,10 @@ private void errorInChain(SQLException e) throws DRDAProtocolException
+ 	/**
+ 	 * Exchange server attributes with application requester
+ 	 *
+- 	 * @return true if the session was started successfully; false otherwise
+-	 * @exception DRDAProtocolException, SQLException
++	 * @exception DRDAProtocolException
+ 	 */
+-	private boolean exchangeServerAttributes()
+-		throws  DRDAProtocolException, SQLException
++	private void exchangeServerAttributes()
++		throws  DRDAProtocolException
+ 	{
+ 		int codePoint;
+ 		correlationID = reader.readDssHeader();
+@@ -944,10 +958,10 @@ private boolean exchangeServerAttributes()
+ 										  CodePoint.PRCCNVCD_EXCSAT_FIRST_AFTER_CONN);
+ 		}
+ 
+-		// set up a new Application Requester to store information about the
+-		// application requester for this session
+-		
+-		return parseDRDAConnection();
++		parseEXCSAT();
++		writeEXCSATRD();
++		finalizeChain();
++		session.setState(session.ATTEXC);
+ 	}
+ 	
+ 
+@@ -956,49 +970,8 @@ private boolean parseDRDAConnection() throws DRDAProtocolException
+ 		int codePoint;
+ 		boolean sessionOK = true;
+ 
+-		appRequester = new AppRequester();
+-		parseEXCSAT();
+-		writeEXCSATRD();
+-		finalizeChain();
+ 
+-		//we may have to do the access security more than once if we don't
+-		//provide the requested security mechanism or we run into errors
+-		//if we don't know the requested security mechanism
+-		//we'll send our known security mechanisms and the requester will pick
+-		//if he picks one that requires a security token then another ACCSEC 
+-		//will flow
+-		int securityCheckCode = 0;
+-		boolean notdone = true;
+-		while (notdone)
+-		{
+-			correlationID = reader.readDssHeader();
+-			codePoint = reader.readLengthAndCodePoint();
+-			verifyInOrderACCSEC_SECCHK(codePoint,CodePoint.ACCSEC);
+-			securityCheckCode = parseACCSEC();
+-			// need security token
+-			if (securityCheckCode == 0  && 
+-				database.securityMechanism == CodePoint.SECMEC_EUSRIDPWD &&
+-				database.publicKeyIn == null)
+-					securityCheckCode = CodePoint.SECCHKCD_SECTKNMISSING;
+-
+-			// shouldn't have security token
+-			if (securityCheckCode == 0 &&
+-				database.securityMechanism == CodePoint.SECMEC_USRIDPWD &&
+-				database.publicKeyIn != null)
+-					securityCheckCode = CodePoint.SECCHKCD_SECTKNMISSING;
+-			if (SanityManager.DEBUG)
+-				trace("** ACCSECRD securityCheckCode is: "+securityCheckCode);
+-			writeACCSECRD(securityCheckCode);
+-			// everything is O.K., we're done
+-			if (securityCheckCode == 0) 
+-			{
+-				notdone = false;
+-			}
+-		}
+-		correlationID = reader.readDssHeader();
+-		codePoint = reader.readLengthAndCodePoint();
+-		verifyInOrderACCSEC_SECCHK(codePoint,CodePoint.SECCHK);
+-		securityCheckCode = parseSECCHK();
++		int securityCheckCode = parseSECCHK();
+ 		if (SanityManager.DEBUG)
+ 			trace("*** SECCHKRM securityCheckCode is: "+securityCheckCode);
+ 		writeSECCHKRM(securityCheckCode);
+@@ -1231,6 +1204,31 @@ private void parseEXCSAT() throws DRDAProtocolException
+ 		int codePoint;
+ 		String strVal;
+ 
++		// There are three kinds of EXCSAT's we might get.
++		// 1) Initial Exchange attributes.
++		//    For this we need to initialize the apprequester.
++		//    Session state is set to ATTEXC and then the AR must 
++		//    follow up with ACCSEC and SECCHK to get the connection.
++		//  2) Send of EXCSAT as ping or mangager level adjustment. 
++		//     (see parseEXCSAT2())
++		//     For this we just ignore the EXCSAT objects that
++		//     are already set.
++		//  3) Send of EXCSAT for connection reset. (see parseEXCSAT2())
++		//     This is treated just like ping and will be followed up 
++		//     by an ACCSEC request if in fact it is a connection reset.
++
++		// If we have already exchanged attributes once just 
++		// process any new manager levels and return (case 2 and 3 above)
++		if (appRequester != null)
++		{
++			parseEXCSAT2();
++			return;
++		}
++
++		// set up a new Application Requester to store information about the
++		// application requester for this session
++
++		appRequester = new AppRequester();
+ 
+ 		reader.markCollection();
+ 
+@@ -1611,9 +1609,32 @@ private int parseACCSEC() throws  DRDAProtocolException
+ 		database.securityMechanism = securityMechanism;
+ 		database.publicKeyIn = publicKeyIn;
+ 
++		// need security token
++		if (securityCheckCode == 0  && 
++			database.securityMechanism == CodePoint.SECMEC_EUSRIDPWD &&
++			database.publicKeyIn == null)
++			securityCheckCode = CodePoint.SECCHKCD_SECTKNMISSING;
++
++		// shouldn't have security token
++		if (securityCheckCode == 0 &&
++			database.securityMechanism == CodePoint.SECMEC_USRIDPWD &&
++			database.publicKeyIn != null)
++			securityCheckCode = CodePoint.SECCHKCD_SECTKNMISSING;
++		if (SanityManager.DEBUG)
++			trace("** ACCSECRD securityCheckCode is: "+securityCheckCode);
++		
++		// If the security check was successful set the session state to
++		// security accesseed.  Otherwise go back to attributes exchanged so we
++		// require another ACCSEC
++		if (securityCheckCode == 0)
++			session.setState(session.SECACC);
++		else
++			session.setState(session.ATTEXC);
++
+ 		return securityCheckCode;
+ 
+ 	}
++
+ 	/**
+ 	 * Parse OPNQRY
+ 	 * Instance Variables
+@@ -2612,6 +2633,11 @@ else if (database.decryptedPassword == null)
+ 		{
+ 			securityCheckCode = verifyUserIdPassword();
+ 		}
++
++		// Security all checked 
++		if (securityCheckCode == 0)
++			session.setState(session.CHKSEC);
++		
+ 		return securityCheckCode;
+ 
+ 	}
+diff --git a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+index b5dafb2c..e2e6a7c9 100644
+--- a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
++++ b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAStatement.java
+@@ -39,6 +39,7 @@
+ import org.apache.derby.impl.jdbc.Util;
+ import org.apache.derby.impl.jdbc.EmbedConnection;
+ import  org.apache.derby.iapi.jdbc.BrokeredConnection;
++import  org.apache.derby.iapi.jdbc.BrokeredPreparedStatement;
+ import org.apache.derby.impl.jdbc.EmbedResultSet;
+ import org.apache.derby.impl.jdbc.EmbedParameterSetMetaData;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+@@ -276,7 +277,7 @@ protected int getResultSetHoldability() throws SQLException
+ 		try {
+ 			Method sh =
+ 				rsstmt.getClass().getMethod("getResultSetHoldability", getResultSetHoldabilityParam);
+-			holdValue =  ((Integer) sh.invoke(ps,null)).intValue();
++			holdValue =  ((Integer) sh.invoke(rsstmt,null)).intValue();
+ 		}
+ 		catch (Exception e) {
+ 			handleReflectionException(e);
+@@ -518,8 +519,12 @@ protected PreparedStatement prepare(String sqlStmt)   throws SQLException
+ 	 *
+ 	 * @return prepared statement
+ 	 */
+-	protected PreparedStatement getPreparedStatement() 
++	protected PreparedStatement getPreparedStatement() throws SQLException
+ 	{
++		if (ps instanceof BrokeredPreparedStatement)
++			return (PreparedStatement)(
++						   ((BrokeredPreparedStatement) ps).getStatement());
++		else
+ 		return ps;
+ 	}
+ 
+diff --git a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/Session.java b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/Session.java
+index e517244a..c524f6cb 100644
+--- a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/Session.java
++++ b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/Session.java
+@@ -38,8 +38,10 @@
+ 
+ 	// session states
+ 	protected static final int INIT = 1;	// before exchange of server attributes
+-	protected static final int ATTEXC = 2;	// after exchange of server attributes
+-	protected static final int CLOSED = 3;	// session has ended
++	protected static final int ATTEXC = 2;	// after first exchange of server attributes
++	protected static final int SECACC = 3;	// after ACCSEC (Security Manager Accessed)
++	protected static final int CHKSEC = 4;	// after SECCHK  (Checked Security)
++	protected static final int CLOSED = 5;	// session has ended
+ 
+ 	// session types
+ 	protected static final int DRDA_SESSION = 1;
+@@ -196,6 +198,49 @@ protected Database getDatabase(String dbName)
+ 		return (Database)dbtable.get(dbName);
+ 	}
+ 
++	/**
++	 * Get requried security checkpoint.
++	 * Used to verify EXCSAT/ACCSEC/SECCHK order.
++	 *
++	 *  @return next required Security checkpoint or -1 if 
++	 *          neither ACCSEC or SECCHK are required at this time.
++	 *
++	 */
++	protected int getRequiredSecurityCodepoint()
++	{
++		switch (state)
++		{
++			case ATTEXC:
++				// On initial exchange of attributes we require ACCSEC 
++				// to access security manager
++				return CodePoint.ACCSEC;
++			case SECACC:
++				// After security manager has been accessed successfully we
++				// require SECCHK to check security
++				return CodePoint.SECCHK;
++			default:
++				return -1;
++		}	 
++	}
++
++	/**
++	 * Check if a security codepoint is required
++	 *
++	 * @return true if ACCSEC or SECCHK are required at this time.
++	 */
++	protected boolean requiresSecurityCodepoint()
++	{
++		return (getRequiredSecurityCodepoint() != -1);
++	}
++
++	/**
++	 * Set Session state
++	 * 
++	 */
++	protected void setState(int s)
++	{
++		state = s;
++	}
+ 
+ 	/**
+ 	 * Get session into initial state
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredCallableStatement.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredCallableStatement.java
+index 17289af6..ffb52659 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredCallableStatement.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredCallableStatement.java
+@@ -217,7 +217,7 @@ public final void registerOutParameter(int paramIndex,
+ 	protected final CallableStatement getCallableStatement() throws SQLException {
+ 		return control.getRealCallableStatement();
+ 	}
+-	protected final PreparedStatement getPreparedStatement() throws SQLException {
++	public final PreparedStatement getPreparedStatement() throws SQLException {
+ 		return getCallableStatement();
+ 	}
+ 	/**
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
+index eb320bb0..90d48983 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredPreparedStatement.java
+@@ -491,14 +491,14 @@ public final void setTimestamp(int i,
+ 	** Control methods.
+ 	*/
+ 
+-	protected PreparedStatement getPreparedStatement() throws SQLException {
++	public PreparedStatement getPreparedStatement() throws SQLException {
+ 		return control.getRealPreparedStatement();
+ 	}
+ 
+ 	/**
+ 		Override the BrokeredStatement's getStatement() to always return a PreparedStatement.
+ 	*/
+-	protected final Statement getStatement() throws SQLException {
++	public final Statement getStatement() throws SQLException {
+ 		return getPreparedStatement();
+ 	}
+ 
+diff --git a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredStatement.java b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredStatement.java
+index a5830003..ab10318b 100644
+--- a/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredStatement.java
++++ b/incubator/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredStatement.java
+@@ -510,7 +510,7 @@ protected void setStatementState(Statement oldStatement, Statement newStatement)
+ 		newStatement.setQueryTimeout(oldStatement.getQueryTimeout());
+ 	}
+ 
+-	protected Statement getStatement() throws SQLException {
++	public Statement getStatement() throws SQLException {
+ 		return control.getRealStatement();
+ 	}
+ 	protected final ResultSet wrapResultSet(ResultSet rs) {

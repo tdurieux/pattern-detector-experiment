@@ -1,0 +1,229 @@
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+index e04e15a6..94f6ab2d 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+@@ -636,8 +636,10 @@ private void tempTablesAndCommit(boolean in_xa_transaction)
+         TransactionController tran_for_drop = 
+             (in_xa_transaction ? null : getTransactionExecute());
+ 
+-        try
+-        {
++        // in XA use nested user updatable transaction.  Delay creating
++        // the transaction until loop below finds one it needs to 
++        // process.
++        
+             for (int i=0; i<allDeclaredGlobalTempTables.size(); i++)
+             {
+                 TableDescriptor td = 
+@@ -656,30 +658,47 @@ else if (checkIfAnyActivationHasHoldCursor(td.getName()) ==
+                     getDataDictionary().getDependencyManager().invalidateFor(
+                         td, DependencyManager.DROP_TABLE, this);
+ 
+-                    // handle delayed creation of nested xact for XA.
+-                    if (in_xa_transaction)
+-                    {
+-                        if (xa_tran == null)
++                if (!in_xa_transaction)
+                         {
+-                            xa_tran = 
+-                                getTransactionExecute().
+-                                    startNestedUserTransaction(false);
+-                            tran_for_drop = xa_tran;
++                    // delay physical cleanup to after the commit for XA
++                    // transactions.   In XA the transaction is likely in
++                    // prepare state at this point and physical changes to
++                    // store are not allowed until after the commit.
++                    // Do the work here for non-XA so that fast path does
++                    // have to do the 2 commits that the XA path will.
++                    cleanupTempTableOnCommitOrRollback(td, true);
+                         }
+                     }
+-
+-                    cleanupTempTableOnCommitOrRollback(tran_for_drop, td, true);
+                 }
+             }
+-        }
+-        finally
++
++    private void tempTablesXApostCommit() 
++        throws StandardException
+         {
+-            // if we created a nested user transaction for XA get rid of it.
+-            if (xa_tran != null)
++        TransactionController tc = getTransactionExecute();
++
++        // at commit time for an XA transaction drop all temporary tables.
++        // A transaction context may not be maintained from one
++        // XAResource.xa_commit to the next in the case of XA with
++        // network server and thus there is no way to get at the temp
++        // tables again.  To provide consistent behavior in embedded vs
++        // network server, consistently remove temp tables at XA commit
++        // transaction boundary.
++        for (int i=0; i < allDeclaredGlobalTempTables.size(); i++)
+             {
+-                xa_tran.destroy();
+-            }
++            // remove all temp tables from this context.
++            TableDescriptor td = 
++                ((TempTableInfo) 
++                 (allDeclaredGlobalTempTables.get(i))).getTableDescriptor();
++
++            //remove the conglomerate created for this temp table
++            tc.dropConglomerate(td.getHeapConglomerateId()); 
++
++            //remove it from the list of temp tables
++            allDeclaredGlobalTempTables.remove(i); 
+         }
++
++        tc.commit();
+     }
+ 
+ 	/**
+@@ -796,8 +815,8 @@ private void tempTablesAndRollback()
+ 			{
+ 				//restore the old definition of temp table because drop is being rolledback
+ 				TableDescriptor td = tempTableInfo.getTableDescriptor();
+-				td = cleanupTempTableOnCommitOrRollback(
+-                        getTransactionExecute(), td, false);
++				td = cleanupTempTableOnCommitOrRollback(td, false);
++
+ 				//In order to store the old conglomerate information for the temp table, we need to replace the
+ 				//existing table descriptor with the old table descriptor which has the old conglomerate information
+ 				tempTableInfo.setTableDescriptor(td);
+@@ -811,8 +830,7 @@ private void tempTablesAndRollback()
+ 				tempTableInfo.setModifiedInSavepointLevel(-1);
+ 				TableDescriptor td = tempTableInfo.getTableDescriptor();
+ 				getDataDictionary().getDependencyManager().invalidateFor(td, DependencyManager.DROP_TABLE, this);
+-				cleanupTempTableOnCommitOrRollback(
+-                        getTransactionExecute(), td, true);
++				cleanupTempTableOnCommitOrRollback(td, true);
+ 			} // there is no else here because there is no special processing required for temp tables declares in earlier work of unit/transaction and not modified
+ 		}
+     
+@@ -1318,7 +1336,8 @@ protected void doCommit(boolean commitStore,
+ 											 commitflag == XA_TWO_PHASE,
+ 											   "invalid commit flag");
+ 
+-					((XATransactionController)tc).xa_commit(commitflag == XA_ONE_PHASE);
++                    ((XATransactionController)tc).xa_commit(
++                            commitflag == XA_ONE_PHASE);
+ 
+ 				}
+ 			}
+@@ -1331,6 +1350,13 @@ protected void doCommit(boolean commitStore,
+ 			// location, since any outer nesting
+ 			// levels expect there to be a savepoint
+ 			resetSavepoints();
++
++            // Do post commit XA temp table cleanup if necessary.
++            if ((allDeclaredGlobalTempTables != null) &&
++                (commitflag != NON_XA))
++            {
++                tempTablesXApostCommit();
++            }
+ 		}
+ 	}
+ 
+@@ -1346,11 +1372,12 @@ protected void doCommit(boolean commitStore,
+      * temp table (because the drop on it is being rolled back).
+ 	 */
+ 	private TableDescriptor cleanupTempTableOnCommitOrRollback(
+-    TransactionController   tc,
+     TableDescriptor         td, 
+     boolean                 dropAndRedeclare)
+ 		 throws StandardException
+ 	{
++        TransactionController tc = getTransactionExecute();
++
+ 		//create new conglomerate with same properties as the old conglomerate 
+         //and same row template as the old conglomerate
+ 		long conglomId = 
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+index 6ebf33dc..d2b12c87 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/XATest.java
+@@ -1093,12 +1093,12 @@ public void testDerby966() throws SQLException, XAException {
+      */
+     public void testXATempTableD4731_RawStore() 
+         throws SQLException, XAException {
+-        doXATempTableD4731Work(true, XATestUtil.getXid(997, 9, 49));
++        doXATempTableD4731Work(true, false, XATestUtil.getXid(997, 9, 49));
+     }
+     
+ 
+     /**
+-     * DERBY-XXXX Temp tables with XA transactions
++     * DERBY-4735 Temp tables with XA transactions
+      * an Assert will occur on prepare if only
+      * temp table work is done in the xact.
+      *
+@@ -1106,10 +1106,27 @@ public void testXATempTableD4731_RawStore()
+      * @throws SQLException 
+      * 
+      */
+-    public void xtestXATempTableDXXXX_Assert() 
++    public void xtestXATempTableD4735_Assert() 
+         throws SQLException, XAException {
+ 
+-          doXATempTableD4731Work(false, XATestUtil.getXid(998, 10, 50));
++          doXATempTableD4731Work(false, false, XATestUtil.getXid(999,  11, 51));
++          doXATempTableD4731Work(false, true,  XATestUtil.getXid(1000, 12, 52));
++    }
++
++    /**
++     * DERBY-4743 Temp tables with XA transactions
++     *
++     * Will throw an error in network server when attempt is made to 
++     * access the global temporary table after the end and commit.
++     *
++     * @throws XAException 
++     * @throws SQLException 
++     * 
++     */
++    public void xtestXATempTableD4743() 
++        throws SQLException, XAException {
++
++          doXATempTableD4731Work(true, true, XATestUtil.getXid(998, 10, 50));
+     }
+  
+     
+@@ -1124,6 +1141,7 @@ public void xtestXATempTableDXXXX_Assert()
+      */
+     private void doXATempTableD4731Work(
+     boolean doLoggedWorkInXact,
++    boolean access_temp_table_after_xaendandcommit,
+     Xid     xid)
+         throws SQLException, XAException{
+ 
+@@ -1154,6 +1172,7 @@ private void doXATempTableD4731Work(
+         ps.executeUpdate();
+         ResultSet rs = s.executeQuery("SELECT count(*) FROM SESSION.t1");
+         JDBC.assertFullResultSet(rs, new String[][] {{"1"}});
++        rs.close();
+         // You could work around the issue by dropping the TEMP table
+         //s.executeUpdate("DROP TABLE SESSION.T1");
+         xar.end(xid, XAResource.TMSUCCESS);
+@@ -1163,11 +1182,23 @@ private void doXATempTableD4731Work(
+             xar.prepare(xid));
+ 
+         xar.commit(xid,false); 
++
++        if (access_temp_table_after_xaendandcommit)
++        {
++            // is temp table empty after the commit?
++            rs = s.executeQuery("SELECT count(*) FROM SESSION.t1");
++            JDBC.assertFullResultSet(rs, new String[][] {{"0"}});
++            rs.close();
++            conn.commit();
++        }
++
++
+         s.close();
+         conn.close();
+         xaconn.close();
+     }
+ 
++
+     private void makeARealTable(Statement s) throws SQLException {
+         try {
+             s.executeUpdate("DROP TABLE REALTABLE1");

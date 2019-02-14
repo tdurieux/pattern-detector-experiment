@@ -1,0 +1,121 @@
+diff --git a/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/Cassandra.java b/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/Cassandra.java
+index 22bc8e93..2c6d2bf1 100644
+--- a/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/Cassandra.java
++++ b/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/Cassandra.java
+@@ -116,6 +116,7 @@
+      * Insert Columns or SuperColumns across different Column Families for the same row key. batch_mutation is a
+      * map<string, list<ColumnOrSuperColumn>> -- a map which pairs column family names with the relevant ColumnOrSuperColumn
+      * objects to insert.
++     * @deprecated; use batch_mutate instead
+      * 
+      * @param keyspace
+      * @param key
+diff --git a/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/ConsistencyLevel.java b/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/ConsistencyLevel.java
+index ba00896f..27d7c838 100644
+--- a/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/ConsistencyLevel.java
++++ b/incubator/cassandra/trunk/interface/gen-java/org/apache/cassandra/service/ConsistencyLevel.java
+@@ -21,12 +21,14 @@
+  * 
+  * Write:
+  *      ZERO    Ensure nothing. A write happens asynchronously in background
++ *      ANY     Ensure that the write has been written once somewhere, including possibly being hinted in a non-target node.
+  *      ONE     Ensure that the write has been written to at least 1 node's commit log and memory table before responding to the client.
+  *      QUORUM  Ensure that the write has been written to <ReplicationFactor> / 2 + 1 nodes before responding to the client.
+  *      ALL     Ensure that the write is written to <code>&lt;ReplicationFactor&gt;</code> nodes before responding to the client.
+  * 
+  * Read:
+  *      ZERO    Not supported, because it doesn't make sense.
++ *      ANY     Not supported. You probably want ONE instead.
+  *      ONE     Will return the record returned by the first node to respond. A consistency check is always done in a
+  *              background thread to fix any consistency issues when ConsistencyLevel.ONE is used. This means subsequent
+  *              calls will have correct data even if the initial read gets an older value. (This is called 'read repair'.)
+@@ -40,7 +42,8 @@
+   QUORUM(2),
+   DCQUORUM(3),
+   DCQUORUMSYNC(4),
+-  ALL(5);
++  ALL(5),
++  ANY(6);
+ 
+   private static final Map<Integer, ConsistencyLevel> BY_VALUE = new HashMap<Integer,ConsistencyLevel>() {{
+     for(ConsistencyLevel val : ConsistencyLevel.values()) {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
+index 1d146769..9a8dcb20 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
+@@ -85,6 +85,10 @@ public CassandraServer()
+         {
+             throw new InvalidRequestException("Consistency level all is not yet supported on read operations");
+         }
++        if (consistency_level == ConsistencyLevel.ANY)
++        {
++            throw new InvalidRequestException("Consistency level any may not be applied to read operations");
++        }
+ 
+         List<Row> rows;
+         try
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index b58291d2..5d25df1b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -178,7 +178,7 @@ public static void mutateBlocking(List<RowMutation> mutations, ConsistencyLevel
+                 int blockFor = determineBlockFor(naturalEndpoints.size(), endpointMap.size(), consistency_level);
+     
+                 // avoid starting a write we know can't achieve the required consistency
+-                assureSufficientLiveNodes(endpointMap, blockFor);
++                assureSufficientLiveNodes(endpointMap, blockFor, consistency_level);
+                 
+                 // send out the writes, as in insert() above, but this time with a callback that tracks responses
+                 final WriteResponseHandler responseHandler = StorageService.instance.getWriteResponseHandler(blockFor, consistency_level);
+@@ -211,9 +211,11 @@ public static void mutateBlocking(List<RowMutation> mutations, ConsistencyLevel
+                     }
+                     else
+                     {
+-                        // (hints aren't part of the callback since they don't count towards consistency until they are on the final destination node)
+                         Message hintedMessage = rm.makeRowMutationMessage();
+                         hintedMessage.addHeader(RowMutation.HINT, naturalTarget.getAddress());
++                        // (hints are part of the callback and count towards consistency only under CL.ANY
++                        if (consistency_level == ConsistencyLevel.ANY)
++                            MessagingService.instance.addCallback(responseHandler, hintedMessage.getMessageId());
+                         if (logger.isDebugEnabled())
+                             logger.debug("insert writing key " + rm.key() + " to " + hintedMessage.getMessageId() + "@" + maybeHintedTarget + " for " + naturalTarget);
+                         MessagingService.instance.sendOneWay(hintedMessage, maybeHintedTarget);
+@@ -240,9 +242,18 @@ public static void mutateBlocking(List<RowMutation> mutations, ConsistencyLevel
+ 
+     }
+ 
+-    private static void assureSufficientLiveNodes(Map<InetAddress, InetAddress> endpointMap, int blockFor)
++    private static void assureSufficientLiveNodes(Map<InetAddress, InetAddress> endpointMap, int blockFor, ConsistencyLevel consistencyLevel)
+             throws UnavailableException
+     {
++        if (consistencyLevel == ConsistencyLevel.ANY)
++        {
++            // ensure there are blockFor distinct living nodes (hints are ok).
++            if (new HashSet(endpointMap.values()).size() < blockFor)
++                throw new UnavailableException();
++        }
++        else
++        {
++            // only count live + unhinted nodes.
+         int liveNodes = 0;
+         for (Map.Entry<InetAddress, InetAddress> entry : endpointMap.entrySet())
+         {
+@@ -256,6 +267,7 @@ private static void assureSufficientLiveNodes(Map<InetAddress, InetAddress> endp
+             throw new UnavailableException();
+         }
+     }
++    }
+ 
+     private static void insertLocalMessage(final RowMutation rm, final WriteResponseHandler responseHandler)
+     {
+@@ -296,6 +308,10 @@ else if (consistency_level == ConsistencyLevel.ALL)
+         {
+             blockFor = naturalTargets + bootstrapTargets;
+         }
++        else if (consistency_level == ConsistencyLevel.ANY)
++        {
++            blockFor = 1;
++        }
+         else
+         {
+             throw new UnsupportedOperationException("invalid consistency level " + consistency_level);

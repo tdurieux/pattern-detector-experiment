@@ -1,0 +1,494 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+index 457624ee..e28076ef 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+@@ -33,6 +33,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.sql.SQLException;
+ import java.sql.Blob;
++import java.io.EOFException;
+ import java.io.InputStream;
+ import java.io.IOException;
+ 
+@@ -101,15 +102,16 @@ multiple threads and sucks data from the stream (returned from
+      */
+     private long streamLength = -1;
+     
+-    // note: cannot control position of the stream since user can do a getBinaryStream
+-    private long            pos;
+-    // this stream sits on top of myStream
+-    private BinaryToRawStream biStream;
+-
+-    // buffer for reading in blobs from a stream (long column)
+-    // and trashing them (to set the position of the stream etc.)
+-    private static int BLOB_BUF_SIZE = 4096;
+-    private byte buf[];
++    /**
++     * Position offset for the stream representing the Blob, if any.
++     * <p>
++     * This offset accounts for the bytes encoding the stream length at the
++     * head of the stream. Data byte {@code pos} is at
++     * {@code pos + streamPositionOffset} in the underlying stream.
++     * Set to {@code Integer.MIN_VALUE} if the Blob isn't represented by a
++     * store stream.
++     */
++    private final int streamPositionOffset;
+     
+     //This boolean variable indicates whether the Blob object has
+     //been invalidated by calling free() on it
+@@ -133,6 +135,7 @@ multiple threads and sucks data from the stream (returned from
+          try {
+              control = new LOBStreamControl (con.getDBName(), blobBytes);
+              materialized = true;
++             streamPositionOffset = Integer.MIN_VALUE;
+              //add entry in connection so it can be cleared 
+              //when transaction is not valid
+              con.addLOBReference (this);
+@@ -161,6 +164,7 @@ protected EmbedBlob(DataValueDescriptor dvd, EmbedConnection con)
+         if (dvdStream == null)
+         {
+             materialized = true;
++            streamPositionOffset = Integer.MIN_VALUE;
+             // copy bytes into memory so that blob can live after result set
+             // is closed
+             byte[] dvdBytes = dvd.getBytes();
+@@ -203,50 +207,70 @@ implementing the getStream() method for dvd.getStream(), does not
+                     throw se;
+                 }
+             }
+-            // set up the buffer for trashing the bytes to set the position of
+-            // the
+-            // stream, only need a buffer when we have a long column
+-            buf = new byte[BLOB_BUF_SIZE];
++            try {
++                // The BinaryToRawStream will read the encoded length bytes.
++                BinaryToRawStream tmpStream =
++                        new BinaryToRawStream(myStream, con);
++                streamPositionOffset = (int)myStream.getPosition();
++                // Check up front if the stream length is specified.
++                streamLength = tmpStream.getLength();
++                tmpStream.close();
++            } catch (IOException ioe) {
++                throw StandardException.newException(
++                        SQLState.LANG_STREAMING_COLUMN_I_O_EXCEPTION, ioe);
++            }
+         }
+-        pos = 0;
+         //add entry in connection so it can be cleared 
+         //when transaction is not valid
+         con.addLOBReference (this);
+     }
+ 
+ 
+-    /*
+-        Sets the position of the stream to position newPos, where position 0 is
+-        the beginning of the stream.
+-
+-        @param newPos the position to set to
+-        @exception StandardException (BLOB_SETPOSITION_FAILED) throws this if
+-        the stream runs out before we get to newPos
++    /**
++     * Sets the position of the Blob to {@code logicalPos}, where position 0 is
++     * the beginning of the Blob content.
++     * <p>
++     * The position is only guaranteed to be valid from the time this method is
++     * invoked until the synchronization monitor is released, or until the next
++     * invokation of this method.
++     * <p>
++     * The position is logical in the sense that it specifies the requested
++     * position in the Blob content. This position might be at a different
++     * position in the underlying representation, for instance the Derby store
++     * stream prepends the Blob content with a length field.
++     *
++     * @param logicalPos requested Blob position, 0-based
++     * @return The new position, which will be equal to the requested position.
++     * @throws IOException if reading/accessing the Blob fails
++     * @throws StandardException throws BLOB_POSITION_TOO_LARGE if the requested
++     *      position is larger than the Blob length, throws other SQL states if
++     *      resetting the stream fails
+     */
+-    private void setPosition(long newPos)
++    //@GuardedBy(getConnectionSynchronization())
++    private long setBlobPosition(long logicalPos)
+         throws StandardException, IOException
+     {
+         if (SanityManager.DEBUG)
+-            SanityManager.ASSERT(newPos >= 0);
+-        if (materialized)
+-            pos = newPos;
+-        else {
+-            // Always resets the stream to the beginning first, because user can
+-            // influence the state of the stream without letting us know.
+-            ((Resetable)myStream).resetStream();
+-            // PT could try to save creating a new object each time
+-            biStream = new BinaryToRawStream(myStream, this);
+-            pos = 0;
+-            while (pos < newPos)
+-            {
+-                int size = biStream.read(
+-                    buf,0,(int) Math.min((newPos-pos), (long) BLOB_BUF_SIZE));
+-                if (size <= 0)   // ran out of stream
+-                    throw StandardException.newException(SQLState.BLOB_LENGTH_TOO_LONG);
+-                pos += size;
++            SanityManager.ASSERT(logicalPos >= 0);
++        if (materialized) {
++            // Nothing to do here, except checking if the position is valid.
++            if (logicalPos >= control.getLength()) {
++                throw StandardException.newException(
++                        SQLState.BLOB_POSITION_TOO_LARGE, new Long(logicalPos));
+             }
++        } else {
++            // Reposition the store stream, account for the length field offset.
++            try {
++                this.myStream.reposition(
++                        logicalPos + this.streamPositionOffset);
++            } catch (EOFException eofe) {
++                throw StandardException.newException(
++                        SQLState.BLOB_POSITION_TOO_LARGE, eofe,
++                        new Long(logicalPos));
+         }
+     }
++        return logicalPos;
++    }
+ 
+ 
+     /**
+@@ -260,23 +284,20 @@ private void setPosition(long newPos)
+      * @throws IOException if reading from the underlying data representation
+      *      fails
+      */
+-    private int read() throws IOException, SQLException {
++    private int read(long pos)
++            throws IOException, StandardException {
+         int c;
+-        if (materialized)
+-        {
+-            try {
++        if (materialized) {
+                 if (pos >= control.getLength())
+                     return -1;
+                 else
+                     c = control.read (pos);
++        } else {
++            // Make sure we're at the right position.
++            this.myStream.reposition(pos + this.streamPositionOffset);
++            // Read one byte from the stream.
++            c = this.myStream.read();
+             }
+-            catch (StandardException se) {
+-                throw Util.generateCsSQLException (se);
+-            }
+-        }
+-        else
+-            c = biStream.read();
+-        pos++;
+         return c;
+     }
+ 
+@@ -314,35 +335,34 @@ public long length()
+                 if (pushStack)
+                     setupContextStack();
+ 
+-                setPosition(0);
+-                // If possible get the length from the encoded
+-                // length at the front of the raw stream.
+-                if ((streamLength = biStream.getLength()) != -1) {
+-                    biStream.close();
+-                   return streamLength;
++                // We have to read the entire stream!
++                myStream.resetStream();
++                BinaryToRawStream tmpStream =
++                        new BinaryToRawStream(myStream, this);
++                streamLength = 0;
++                if (SanityManager.DEBUG) {
++                    SanityManager.ASSERT(tmpStream.getLength() == -1);
+                 }
+                 
+-                // Otherwise have to read the entire stream!
+                 for (;;)
+                 {
+-                    long skipped = biStream.skip(Limits.DB2_LOB_MAXWIDTH);
++                    long skipped = tmpStream.skip(Limits.DB2_LOB_MAXWIDTH);
+                     if (SanityManager.DEBUG) {
+                         SanityManager.ASSERT(skipped >= 0);
+                     }
+-                    pos += skipped;
++                    streamLength += skipped;
+                     // If skip reports zero bytes skipped, verify EOF.
+                     if (skipped == 0) {
+-                        if (biStream.read() == -1) {
++                        if (tmpStream.read() == -1) {
+                             break; // Exit the loop, no more data.
+                         } else {
+-                            pos++;
++                            streamLength++;
+                         }
+                     }
+                 }
++                tmpStream.close();
+                 // Save for future uses.
+-                streamLength = pos;
+-                biStream.close();
+-                return pos;
++                return streamLength;
+             }
+         }
+         catch (Throwable t)
+@@ -418,11 +438,10 @@ public long length()
+                     if (pushStack)
+                         setupContextStack();
+ 
+-                    setPosition(startPos-1);
++                    setBlobPosition(startPos-1);
+                     // read length bytes into a string
+                     result = new byte[length];
+-                    int n = InputStreamUtil.readLoop(biStream,result,0,length);
+-                    pos += n;
++                    int n = InputStreamUtil.readLoop(myStream,result,0,length);
+                     /*
+                      According to the spec, if there are only n < length bytes
+                      to return, we should just return these bytes. Rather than
+@@ -550,32 +569,28 @@ public long position(byte[] pattern, long start)
+                 if (pushStack)
+                     setupContextStack();
+ 
+-                setPosition(start-1);
++                long pos = setBlobPosition(start -1);
+                 // look for first character
+                 int lookFor = pattern[0];
+                 long curPos;
+                 int c;
+                 while (true)
+                 {
+-                    c = read();
++                    c = read(pos++); // Note the position increment.
+                     if (c == -1)  // run out of stream
+                         return -1;
+                     if (c == lookFor)
+                     {
+                         curPos = pos;
+-                        if (checkMatch(pattern))
++                        if (checkMatch(pattern, pos))
+                             return curPos;
+                         else
+-                            setPosition(curPos);
++                            pos = setBlobPosition(curPos);
+                     }
+                 }
+             }
+         }
+-        catch (StandardException e)
+-        {  // if this is a setPosition exception then not found
+-            if (e.getMessageId().equals(SQLState.BLOB_LENGTH_TOO_LONG))
+-                return -1;
+-            else
++        catch (StandardException e) {
+                 throw handleMyExceptions(e);
+         }
+         catch (Throwable t)
+@@ -590,21 +605,24 @@ public long position(byte[] pattern, long start)
+ 
+     }
+ 
+-
+-    /*
+-     check whether pattern (starting from the second byte) appears inside
+-     posStream (at the current position)
+-     @param posStream the stream to search inside
+-     @param pattern the byte array passed in by the user to search with
+-     @return true if match, false otherwise
++    /**
++     * Checks if the pattern (starting from the second byte) appears inside
++     * the Blob content.
++     * <p>
++     * At this point, the first byte of the pattern must already have been
++     * matched, and {@code pos} must be pointing at the second byte to compare.
++     *
++     * @param pattern the byte array to search for, passed in by the user
++     * @param pos the position in the Blob content to start searching from
++     * @return {@code true} if a match is found, {@code false} if not.
+      */
+-    private boolean checkMatch(byte[] pattern)
+-        throws IOException, SQLException {
++    private boolean checkMatch(byte[] pattern, long pos)
++            throws IOException, StandardException {
+        // check whether rest matches
+        // might improve performance by reading more
+         for (int i = 1; i < pattern.length; i++)
+         {
+-            int b = read();
++            int b = read(pos++);
+             if ((b < 0) || (b != pattern[i]))  // mismatch or stream runs out
+                 return false;
+         }
+@@ -645,7 +663,7 @@ public long position(Blob pattern, long start)
+                 if (pushStack)
+                     setupContextStack();
+ 
+-                setPosition(start-1);
++                long pos = setBlobPosition(start-1);
+                 // look for first character
+                 byte[] b;
+                 try
+@@ -663,25 +681,21 @@ public long position(Blob pattern, long start)
+                 long curPos;
+                 while (true)
+                 {
+-                    c = read();
++                    c = read(pos++); // Note the position increment.
+                     if (c == -1)  // run out of stream
+                         return -1;
+                     if (c == lookFor)
+                     {
+                         curPos = pos;
+-                        if (checkMatch(pattern))
++                        if (checkMatch(pattern, pos))
+                             return curPos;
+                         else
+-                            setPosition(curPos);
++                            pos = setBlobPosition(curPos);
+                     }
+                 }
+             }
+         }
+-        catch (StandardException e)
+-        {  // if this is a setPosition exception then not found
+-            if (e.getMessageId().equals(SQLState.BLOB_LENGTH_TOO_LONG))
+-                return -1;
+-            else
++        catch (StandardException e) {
+                 throw handleMyExceptions(e);
+         }
+         catch (Throwable t)
+@@ -697,16 +711,16 @@ public long position(Blob pattern, long start)
+     }
+ 
+ 
+-    /*
+-     check whether pattern (starting from the second byte) appears inside
+-     posStream (at the current position)
+-     @param posStream the stream to search inside
+-     @param pattern the blob passed in by the user to search with
+-     @return true if match, false otherwise
++    /**
++     * Checks if the pattern (starting from the second byte) appears inside
++     * the Blob content.
++     *
++     * @param pattern the Blob to search for, passed in by the user
++     * @param pos the position in the Blob (this) content to start searching
++     * @return {@code true} if a match is found, {@code false} if not.
+      */
+-    private boolean checkMatch(Blob pattern)
+-        throws IOException, SQLException
+-    {
++    private boolean checkMatch(Blob pattern, long pos)
++            throws IOException, StandardException {
+         // check whether rest matches
+         // might improve performance by reading buffer at a time
+         InputStream pStream;
+@@ -730,7 +744,7 @@ private boolean checkMatch(Blob pattern)
+             b1 = pStream.read();
+             if (b1 < 0)  // search blob runs out
+                 return true;
+-            int b2 = read();
++            int b2 = read(pos++);
+             if ((b1 != b2) || (b2 < 0))  // mismatch or stream runs out
+                 return false;
+         }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
+index 45396ae0..a8c9ab28 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobClob4BlobTest.java
+@@ -21,6 +21,7 @@
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.CharArrayReader;
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.Reader;
+ import java.io.StringReader;
+@@ -43,6 +44,7 @@
+ import junit.framework.*;
+ import java.sql.*;
+ 
++import org.apache.derbyTesting.functionTests.util.streams.ByteAlphabet;
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+ /**
+@@ -1866,6 +1868,76 @@ public void testPositionBytes() throws Exception {
+         stmt.close();
+     }
+ 
++    /**
++     * Tests the {@code Blob.position} using a deterministic sequence of
++     * actions and arguments.
++     */
++    public void testPositionBlobDeterministic()
++            throws IOException, SQLException {
++        getConnection().setAutoCommit(false);
++        final int size = 100000;
++        PreparedStatement ps = prepareStatement(
++                "INSERT INTO testBlob (a, b) VALUES (?, ?)");
++        ps.setBinaryStream(1, new LoopingAlphabetStream(size), size);
++        ps.setInt(2, size);
++        ps.executeUpdate();
++        ps.close();
++        ps = prepareStatement("select a from testBlob where b = ?");
++        ps.setInt(1, size);
++        ResultSet rs = ps.executeQuery();
++        assertTrue("No data found", rs.next());
++        Blob blob = rs.getBlob(1);
++        // Try with a one-byte pattern.
++        byte[] pattern = new byte[] {(byte)'k'}; // k number 11 in the alphabet
++        assertEquals(11, blob.position(pattern, 1));
++        // Try with a non-existing pattern.
++        pattern = new byte[] {(byte)'p', (byte)'o'};
++        assertEquals(-1, blob.position(pattern, size / 3));
++
++        // Loop through all matches 
++        pattern = new byte[] {(byte)'d', (byte)'e'};
++        long foundAtPos = 1;
++        int index = 0;
++        int stepSize = ByteAlphabet.modernLatinLowercase().byteCount();
++        while ((foundAtPos = blob.position(pattern, foundAtPos +1)) != -1) {
++            assertEquals((stepSize * index++) + 4, foundAtPos);
++            byte[] fetchedPattern = blob.getBytes(foundAtPos, pattern.length);
++            assertTrue(Arrays.equals(pattern, fetchedPattern));
++        }
++
++        // Try a longer pattern.
++        int pSize = 65*1024; // 65 KB
++        pattern = new byte[pSize];
++        assertEquals(pSize, new LoopingAlphabetStream(pSize).read(pattern));
++        assertEquals(1, blob.position(pattern, 1));
++        assertEquals(stepSize * 100 +1,
++                blob.position(pattern, stepSize * 99 + 7));
++        // Try again after getting the length.
++        assertEquals(size, blob.length());
++        assertEquals(stepSize * 100 +1,
++                blob.position(pattern, stepSize * 99 + 7));
++
++        // Try specifing a starting position that's too big.
++        try {
++            blob.position(pattern, size*2);
++            fail("Accepted position after end of Blob");
++        } catch (SQLException sqle) {
++            assertSQLState("XJ076", sqle);
++        }
++
++        // Fetch the last 5 bytes, try with a partial match at the end.
++        byte[] blobEnd = blob.getBytes(size - 4, 5);
++        pattern = new byte[6];
++        System.arraycopy(blobEnd, 0, pattern, 0, blobEnd.length);
++        pattern[5] = 'X'; // Only lowercase in the looping alphabet stream.
++        assertEquals(-1, blob.position(pattern, size - 10));
++
++        // Get the very last byte, try with a partial match at the end.
++        blobEnd = blob.getBytes(size, 1);
++        pattern = new byte[] {blobEnd[0], 'X'};
++        assertEquals(-1, blob.position(pattern, size - 5));
++    }
++
+     /**
+      * Test Blob.position() with blob argument
+      */

@@ -1,0 +1,218 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
+index 578a5cba..2a64e1a8 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyInputFormat.java
+@@ -50,11 +50,10 @@
+  * You can also configure the number of rows per InputSplit with
+  *   ConfigHelper.setInputSplitSize
+  * This should be "as big as possible, but no bigger."  Each InputSplit is read from Cassandra
+- * with a single get_slice_range query, and the per-call overhead of get_slice_range is high,
+- * so larger split sizes are better -- but if it is too large, you will run out of memory,
+- * since no paging is done (yet).
++ * with multiple get_slice_range queries, and the per-call overhead of get_slice_range is high,
++ * so larger split sizes are better -- but if it is too large, you will run out of memory.
+  *
+- * The default split size is 4096 rows.
++ * The default split size is 64k rows.
+  */
+ public class ColumnFamilyInputFormat extends InputFormat<String, SortedMap<byte[], IColumn>>
+ {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyRecordReader.java b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyRecordReader.java
+index 4ff88096..c18b17cd 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyRecordReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ColumnFamilyRecordReader.java
+@@ -28,12 +28,11 @@
+ import java.util.SortedMap;
+ import java.util.TreeMap;
+ 
+-import org.apache.commons.lang.ArrayUtils;
+-
+ import com.google.common.collect.AbstractIterator;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.marshal.AbstractType;
++import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.thrift.*;
+ import org.apache.cassandra.thrift.Column;
+ import org.apache.cassandra.thrift.SuperColumn;
+@@ -52,7 +51,8 @@
+     private RowIterator iter;
+     private Pair<String, SortedMap<byte[], IColumn>> currentRow;
+     private SlicePredicate predicate;
+-    private int rowCount;
++    private int totalRowCount; // total number of rows to fetch
++    private int batchRowCount; // fetch this many per batch
+     private String cfName;
+     private String keyspace;
+ 
+@@ -70,7 +70,8 @@ public String getCurrentKey()
+     
+     public float getProgress()
+     {
+-        return ((float)iter.rowsRead()) / iter.size();
++        // the progress is likely to be reported slightly off the actual but close enough
++        return ((float)iter.rowsRead()) / totalRowCount;
+     }
+     
+     public void initialize(InputSplit split, TaskAttemptContext context) throws IOException
+@@ -78,7 +79,8 @@ public void initialize(InputSplit split, TaskAttemptContext context) throws IOEx
+         this.split = (ColumnFamilySplit) split;
+         Configuration conf = context.getConfiguration();
+         predicate = ConfigHelper.getSlicePredicate(conf);
+-        rowCount = ConfigHelper.getInputSplitSize(conf);
++        totalRowCount = ConfigHelper.getInputSplitSize(conf);
++        batchRowCount = ConfigHelper.getRangeBatchSize(conf);
+         cfName = ConfigHelper.getColumnFamily(conf);
+         keyspace = ConfigHelper.getKeyspace(conf);
+         iter = new RowIterator();
+@@ -96,11 +98,17 @@ public boolean nextKeyValue() throws IOException
+     {
+ 
+         private List<KeySlice> rows;
++        private String startToken;
++        private int totalRead = 0;
+         private int i = 0;
+         private AbstractType comparator = DatabaseDescriptor.getComparator(keyspace, cfName);
+ 
+         private void maybeInit()
+         {
++            // check if we need another batch 
++            if (rows != null && i >= rows.size())
++                rows = null;
++            
+             if (rows != null)
+                 return;
+             TSocket socket = new TSocket(getLocation(),
+@@ -115,8 +123,19 @@ private void maybeInit()
+             {
+                 throw new RuntimeException(e);
+             }
+-            KeyRange keyRange = new KeyRange(rowCount)
+-                                .setStart_token(split.getStartToken())
++            
++            if (startToken == null)
++            {
++                startToken = split.getStartToken();
++            } 
++            else if (startToken.equals(split.getEndToken()))
++            {
++                rows = null;
++                return;
++            }
++            
++            KeyRange keyRange = new KeyRange(batchRowCount)
++                                .setStart_token(startToken)
+                                 .setEnd_token(split.getEndToken());
+             try
+             {
+@@ -125,6 +144,21 @@ private void maybeInit()
+                                                predicate,
+                                                keyRange,
+                                                ConsistencyLevel.ONE);
++                    
++                // nothing new? reached the end
++                if (rows.isEmpty())
++                {
++                    rows = null;
++                    return;
++                }
++                               
++                // reset to iterate through this new batch
++                i = 0;
++                
++                // prepare for the next slice to be read
++                KeySlice lastRow = rows.get(rows.size() - 1);
++                IPartitioner p = DatabaseDescriptor.getPartitioner();
++                startToken = p.getTokenFactory().toString(p.getToken(lastRow.getKey()));
+             }
+             catch (Exception e)
+             {
+@@ -167,23 +201,22 @@ private String getLocation()
+             return split.getLocations()[0];
+         }
+ 
+-        public int size()
+-        {
+-            maybeInit();
+-            return rows.size();
+-        }
+-
++        /**
++         * @return total number of rows read by this record reader
++         */
+         public int rowsRead()
+         {
+-            return i;
++            return totalRead;
+         }
+ 
+         @Override
+         protected Pair<String, SortedMap<byte[], IColumn>> computeNext()
+         {
+             maybeInit();
+-            if (i == rows.size())
++            if (rows == null)
+                 return endOfData();
++            
++            totalRead++;
+             KeySlice ks = rows.get(i++);
+             SortedMap<byte[], IColumn> map = new TreeMap<byte[], IColumn>(comparator);
+             for (ColumnOrSuperColumn cosc : ks.columns)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ConfigHelper.java b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
+index 2afe8aeb..b6d40cfe 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/hadoop/ConfigHelper.java
+@@ -4,7 +4,6 @@
+ import org.apache.cassandra.thrift.SlicePredicate;
+ import org.apache.cassandra.thrift.ThriftValidation;
+ import org.apache.hadoop.conf.Configuration;
+-import org.apache.hadoop.mapreduce.Job;
+ import org.apache.thrift.TDeserializer;
+ import org.apache.thrift.TException;
+ import org.apache.thrift.TSerializer;
+@@ -16,7 +15,9 @@
+     private static final String COLUMNFAMILY_CONFIG = "cassandra.input.columnfamily";
+     private static final String PREDICATE_CONFIG = "cassandra.input.predicate";
+     private static final String INPUT_SPLIT_SIZE_CONFIG = "cassandra.input.split.size";
+-    private static final int DEFAULT_SPLIT_SIZE = 4096;
++    private static final int DEFAULT_SPLIT_SIZE = 64*1024;
++    private static final String RANGE_BATCH_SIZE_CONFIG = "cassandra.range.batch.size";
++    private static final int DEFAULT_RANGE_BATCH_SIZE = 4096;
+ 
+     /**
+      * Set the keyspace and column family for this job.
+@@ -47,6 +48,34 @@ public static void setColumnFamily(Configuration conf, String keyspace, String c
+         conf.set(COLUMNFAMILY_CONFIG, columnFamily);
+     }
+ 
++    /**
++     * The number of rows to request with each get range slices request.
++     * Too big and you can either get timeouts when it takes Cassandra too
++     * long to fetch all the data. Too small and the performance
++     * will be eaten up by the overhead of each request. 
++     *
++     * @param conf Job configuration you are about to run
++     * @param batchsize Number of rows to request each time
++     */
++    public static void setRangeBatchSize(Configuration conf, int batchsize)
++    {
++        conf.setInt(RANGE_BATCH_SIZE_CONFIG, batchsize);
++    }
++
++    /**
++     * The number of rows to request with each get range slices request.
++     * Too big and you can either get timeouts when it takes Cassandra too
++     * long to fetch all the data. Too small and the performance
++     * will be eaten up by the overhead of each request. 
++     *
++     * @param conf Job configuration you are about to run
++     * @return Number of rows to request each time
++     */
++    public static int getRangeBatchSize(Configuration conf)
++    {
++        return conf.getInt(RANGE_BATCH_SIZE_CONFIG, DEFAULT_RANGE_BATCH_SIZE);
++    }
++    
+     /**
+      * Set the size of the input split.
+      * This affects the number of maps created, if the number is too small

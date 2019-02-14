@@ -1,0 +1,1400 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Blob.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Blob.java
+index 4fab68da..aa5256bb 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Blob.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Blob.java
+@@ -267,8 +267,12 @@ long getLocatorLength() throws SqlException
+         {
+             return binaryStream_;
+         } else if (isLocator()) {
+-            return new BufferedInputStream(
+-                    new BlobLocatorInputStream(agent_.connection_, this));
++            //The Blob is locator enabled. Return a instance of the 
++            //UpdateSensitive stream which wraps inside it a 
++            //Buffered Locator stream. The wrapper watches out 
++            //for updates.
++            return new UpdateSensitiveBlobLocatorInputStream
++                    (agent_.connection_, this);
+         } else {  // binary string
+             return new java.io.ByteArrayInputStream(binaryString_, dataOffset_,
+                                            binaryString_.length - dataOffset_);
+@@ -487,6 +491,11 @@ public int setBytesX(long pos, byte[] bytes, int offset, int len) throws SqlExce
+                 // Update length
+                 setSqlLength(pos + length - 1);
+             } 
++            //The Blob value has been
++            //modified. Increment the
++            //updateCount to reflect the
++            //change.
++            incrementUpdateCount();
+         } else {
+             if ((binaryString_.length - dataOffset_ - (int)pos + 1) < length) {
+                 byte newbuf[] = new byte[(int) pos + length + dataOffset_ - 1];
+@@ -562,6 +571,11 @@ public void truncate(long len) throws SQLException {
+                     agent_.connection_.locatorProcedureCall()
+                         .blobTruncate(locator_, len);
+                     setSqlLength(len);
++                    //The Blob value has been
++                    //updated Increment the
++                    //update count to reflect
++                    //the change.
++                    incrementUpdateCount();
+                 } else {
+                     long newLength = (int) len + dataOffset_;
+                     byte newbuf[] = new byte[(int) len + dataOffset_];
+@@ -655,11 +669,16 @@ public InputStream getBinaryStream(long pos, long length)
+                 
+                 InputStream retVal;
+                 if (isLocator()) {
+-                    retVal = new BufferedInputStream(
+-                            new BlobLocatorInputStream(agent_.connection_,
++                    //The Blob is locator enabled. Return an
++                    //instance of the update sensitive stream
++                    //that wraps inside it a Buffered InputStream.
++                    //The wrapper watches out for updates to the
++                    //underlying Blob.
++                    retVal = new UpdateSensitiveBlobLocatorInputStream
++                                                      (agent_.connection_,
+                                                        this,
+                                                        pos,
+-                                                       length));
++                                                       length);
+                 } else {  // binary string
+                     retVal = new java.io.ByteArrayInputStream
+                         (binaryString_, 
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorInputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorInputStream.java
+index 137dabd7..40ede515 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorInputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorInputStream.java
+@@ -67,7 +67,13 @@ public BlobLocatorInputStream(Connection connection, Blob blob)
+         this.connection = connection;
+         this.blob = blob;
+         this.currentPos = 1;
+-        this.maxPos = blob.sqlLength();
++        
++        //In this case a subset of the Blob has
++        //not been requested for. We set maxPos 
++        //to -1 and instead will call 
++        //blob.sqlLength() each time we want 
++        //the maximum length.
++        this.maxPos = -1;
+     }
+     
+     /**
+@@ -95,8 +101,13 @@ public BlobLocatorInputStream(Connection connection, Blob blob,
+         this.connection = connection;
+         this.blob = blob;
+         this.currentPos = position;
++        if (length != -1) {//verify if length is -1
+         this.maxPos = Math.min(blob.sqlLength(), position + length - 1);
+     }
++        else {
++            this.maxPos = -1;
++        }
++    }
+     
+     /**
+      * @see java.io.InputStream#read()
+@@ -145,8 +156,26 @@ public int read(byte[] b, int off, int len) throws IOException
+     private byte[] readBytes(int len) throws IOException
+     {
+         try {
+-            int actualLength 
++            //stores the actual length that can be read
++            //based on the value of the current position
++            //in the stream(currentPos) and the length of
++            //the stream.
++            int actualLength = -1;
++            //check if maxPos has been set and calculate actualLength
++            //based on that.
++            if(maxPos != -1) {
++                //maxPos has been set. use maxPos to calculate the
++                //actual length based on the value set for maxPos.
++                actualLength 
+                 = (int )Math.min(len, maxPos - currentPos + 1);
++            }
++            else {
++                //The subset of the Blob was not requested for
++                //hence maxPos is -1. Here we use blob.sqllength
++                //instead.
++                actualLength 
++                    = (int )Math.min(len, blob.sqlLength() - currentPos + 1);
++            }
+             byte[] result = connection.locatorProcedureCall()
+                 .blobGetBytes(blob.getLocator(), currentPos, actualLength);
+             currentPos += result.length;
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorOutputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorOutputStream.java
+index 921abd60..be8aae10 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorOutputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/BlobLocatorOutputStream.java
+@@ -118,13 +118,8 @@ public void write(byte[] b, int off, int len) throws IOException
+     private void writeBytes(byte[] b) throws IOException
+     {
+         try {         
+-            connection.locatorProcedureCall()
+-                .blobSetBytes(blob.locator_, currentPos, b.length, b);
++            blob.setBytesX(currentPos, b, 0, b.length);
+             currentPos += b.length;
+-            if (currentPos-1 > blob.sqlLength()) {
+-                // Wrote past the old end of the Blob value, update length
+-                blob.setSqlLength(currentPos - 1);
+-            }
+         } catch (SqlException ex) {
+             IOException ioEx= new IOException();
+             ioEx.initCause(ex);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Clob.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Clob.java
+index 2d936147..bcdad168 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Clob.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Clob.java
+@@ -368,10 +368,12 @@ private String getSubStringX(long pos, int length) throws SqlException
+ 
+         //check is this Lob is locator enabled
+         if (isLocator()) {
+-            //The Lob is locator enabled. Return an instance of the Locator
+-            //enabled Writer implementation
+-            return new BufferedReader
+-                    (new ClobLocatorReader(agent_.connection_, this));
++            //The Lob is locator enabled. Return an instance of the
++            //update sensitive Reader that wraps inside it a
++            //Buffered Locator Reader. The wrapper class
++            //watches out for updates.
++            return new UpdateSensitiveClobLocatorReader
++                    (agent_.connection_, this);
+         }
+         else if (isCharacterStream())  // this Lob is used for input
+         {
+@@ -416,10 +418,12 @@ else if (isCharacterStream())  // this Lob is used for input
+         }
+         else if(isLocator()) { // Check to see if this Lob is locator enabled
+             //The Lob is locator enabled. Return an instance
+-            //of the Locator enabled Clob specific InputStream
+-            //implementation.
+-            return new BufferedInputStream(
+-                    new ClobLocatorInputStream(agent_.connection_,this));
++            //of the update sensitive wrappers that wrap inside
++            //it a Buffered Locator enabled InputStream. The
++            //wrapper watches out for updates to the underlying
++            //Clob.
++            return new UpdateSensitiveClobLocatorInputStream
++                    (agent_.connection_,this);
+         }
+         else {
+             return new AsciiStream(string_, new java.io.StringReader(string_));
+@@ -662,6 +666,10 @@ public int setStringX(long pos, String str, int offset, int len) throws SqlExcep
+                 // Update length
+                 setSqlLength(pos + length - 1);
+             }
++            //The Clob value has been
++            //updated. Increment the
++            //update count.
++            incrementUpdateCount();
+         }
+         else {
+             //The Clob is not locator enabled.
+@@ -781,6 +789,10 @@ public void truncate(long len) throws SQLException {
+                     //procedure CLOBTRUNCATE to truncate this Lob.
+                     agent_.connection_.locatorProcedureCall().
+                             clobTruncate(locator_, len);
++                    //The Clob value has been
++                    //modified. Increment the
++                    //update count.
++                    incrementUpdateCount();
+                 }
+                 else {
+                     //The Lob is not locator enabled.
+@@ -892,17 +904,20 @@ public Reader getCharacterStream(long pos, long length)
+             Reader retVal = null;
+             //check if the Lob is locator enabled.
+             if(isLocator()) {
+-                //1) The Lob is locator enabled. Return the locator
+-                //   enabled Implementation of a Clob Reader.
++                //1) The Lob is locator enabled. Return the update
++                //   sensitive wrapper that wraps inside it a
++                //   locator enabled Clob Reader. The wrapper
++                //   watches out for updates to the underlying
++                //   Clob.
+                 //2) len is the number of characters in the
+                 //   stream starting from pos.
+                 //3) checkPosAndLength will ensure that pos and
+                 //   length fall within the boundaries of the
+                 //   Clob object.
+                 try {
+-                    retVal = new BufferedReader(
+-                            new ClobLocatorReader(agent_.connection_, this,
+-                            pos, length));
++                    retVal = new UpdateSensitiveClobLocatorReader
++                            (agent_.connection_, this,
++                            pos, length);
+                 }
+                 catch(SqlException sqle) {
+                     throw sqle.getSQLException();
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorInputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorInputStream.java
+index 4cc67173..0630f3c6 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorInputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorInputStream.java
+@@ -62,12 +62,6 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+      */
+     private long currentPos;
+     
+-    /**
+-     * Position in Clob where to stop reading.
+-     * maxPos starts counting from 1.
+-     */
+-    private final long maxPos;
+-
+     /**
+      * Create an <code>InputStream</code> for reading the
+      * <code>Clob</code> value represented by the given locator based
+@@ -86,7 +80,23 @@ public ClobLocatorInputStream(Connection connection, Clob clob)
+         this.connection = connection;
+         this.clob = clob;
+         this.currentPos = 1;
+-        this.maxPos = clob.sqlLength();
++    }
++    
++    /**
++     * Create an <code>InputStream</code> for reading the
++     * <code>Clob</code> value represented by the given locator based
++     * <code>Clob</code> object.
++     * @param connection connection to be used to read the
++     *        <code>Clob</code> value from the server
++     * @param clob <code>Clob</code> object that contains locator for
++     *        the <code>Clob</code> value on the server.
++     * @param pos the position inside the <code>Clob<code> from which
++     *            the reading must begin.
++     */
++    public ClobLocatorInputStream(Connection connection, Clob clob, long pos)
++    throws SqlException{
++        this(connection, clob);
++        this.currentPos = pos;
+     }
+     
+     /**
+@@ -134,7 +144,7 @@ public int read(byte[] b, int off, int len) throws IOException {
+     private byte[] readBytes(int len) throws IOException {
+         try {
+             int actualLength
+-                    = (int )Math.min(len, maxPos - currentPos + 1);
++                    = (int )Math.min(len, clob.sqlLength() - currentPos + 1);
+             String resultStr = connection.locatorProcedureCall().
+                     clobGetSubString(clob.getLocator(),
+                     currentPos, actualLength);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorOutputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorOutputStream.java
+index 327acedc..12eb6a08 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorOutputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorOutputStream.java
+@@ -134,13 +134,8 @@ public void flush() {
+     private void writeBytes(byte[] b) throws IOException {
+         try {
+             String clobStr = new String(b, "ISO-8859-1");
+-            connection.locatorProcedureCall().clobSetString
+-                    (clob.locator_, currentPos, b.length, clobStr);
++            clob.setStringX(currentPos, clobStr, 0, clobStr.length());
+             currentPos += b.length;
+-            if (currentPos-1 > clob.sqlLength()) {
+-                // Wrote past the old end of the Clob value, update length
+-                clob.setSqlLength(currentPos - 1);
+-            }
+         } catch (SqlException ex) {
+             IOException ioEx= new IOException();
+             ioEx.initCause(ex);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorReader.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorReader.java
+index 2978a2d1..88f8457c 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorReader.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorReader.java
+@@ -84,7 +84,13 @@ public ClobLocatorReader(Connection connection, Clob clob)
+         this.connection = connection;
+         this.clob = clob;
+         this.currentPos = 1;
+-        this.maxPos = clob.sqlLength();
++       
++        //In this case a subset of the Clob has
++        //not been requested for. We set maxPos 
++        //to -1 and instead will call 
++        //clob.sqlLength() each time we want 
++        //the maximum length.
++        this.maxPos = -1;
+     }
+     
+     /**
+@@ -108,8 +114,13 @@ public ClobLocatorReader(Connection connection, Clob clob,
+         this.connection = connection;
+         this.clob = clob;
+         this.currentPos = pos;
++        if(len != -1) {
+         this.maxPos = Math.min(clob.sqlLength(), pos + len - 1);
+     }
++        else {
++            this.maxPos = -1;
++        }
++    }
+     
+     /**
+      * @see java.io.Reader#read()
+@@ -188,8 +199,26 @@ private void checkClosed() throws IOException {
+      */
+     private char[] readCharacters(int len) throws IOException {
+         try {
+-            int actualLength
++            //stores the actual length that can be read
++            //based on the value of the current position
++            //in the stream(currentPos) and the length of
++            //the stream.
++            int actualLength = -1;
++            //check if maxPos has been set and calculate actualLength
++            //based on that.
++            if(maxPos != -1) {
++                //maxPos has been set. use maxPos to calculate the
++                //actual length based on the value set for maxPos.
++                actualLength 
+                     = (int )Math.min(len, maxPos - currentPos + 1);
++            }
++            else {
++                //The subset of the Blob was not requested for
++                //hence maxPos is -1. Here we use clob.sqllength
++                //instead.
++                actualLength 
++                    = (int )Math.min(len, clob.sqlLength() - currentPos + 1);
++            }
+             String resultStr = connection.locatorProcedureCall().
+                     clobGetSubString(clob.getLocator(),
+                     currentPos, actualLength);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorWriter.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorWriter.java
+index aad842a5..750cc1e4 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorWriter.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/ClobLocatorWriter.java
+@@ -162,14 +162,8 @@ public void write(char[] c, int off, int len) throws IOException {
+     private void writeCharacters(char[] c, int off, int len)
+     throws IOException {
+         try {
+-            connection.locatorProcedureCall().clobSetString
+-                    (clob.locator_, currentPos, len,
+-                    new String(c, off, len));
++            clob.setStringX(currentPos, new String(c, off, len), 0, len);
+             currentPos += len;
+-            if (currentPos-1 > clob.sqlLength()) {
+-                // Wrote past the old end of the Clob value, update length
+-                clob.setSqlLength(currentPos - 1);
+-            }
+         } catch (SqlException ex) {
+             IOException ioEx= new IOException();
+             ioEx.initCause(ex);
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Lob.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Lob.java
+index 623be930..218c1c5a 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Lob.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Lob.java
+@@ -56,6 +56,17 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     
+     final private boolean willBeLayerBStreamed_;
+ 
++        
++    //A running counter that keeps track
++    //of whether a update has been done
++    //on this LOB value. We do not need
++    //to bother about the limit imposed
++    //by this counter because we just check
++    //whether its latest value matches hence
++    //for all practical purposes there is no 
++    //limit imposed.
++    private long updateCount;
++
+     //-----------------------------messageId------------------------------------------
+     final static protected ClientMessageId LOB_OBJECT_LENGTH_UNKNOWN_YET =
+         new ClientMessageId( SQLState.LOB_OBJECT_LENGTH_UNKNOWN_YET );
+@@ -319,4 +330,48 @@ protected void checkPosAndLength(long pos, long length)
+                 new Long(pos), new Long(length)).getSQLException();
+         }
+     }
++    
++        
++    /**
++     * Increments and returns the new updateCount 
++     * of this <code>Lob</code>. The method needs to be 
++     * synchronized since multiple updates can 
++     * happen on this <code>Lob</code> simultaneously. 
++     * It will be called from the
++     * 1) Locator Writers
++     * 2) Locator OutputStreams
++     * 3) From the update methods
++     *    within the Lobs like setString, truncate.
++     * since all of the above acesses are inside
++     * the am package, this method will have
++     * default access. We do not need to worry
++     * about the non-locator streams since
++     * non-locator InputStreams would not
++     * depend on updateCount for invalidation
++     */
++    protected synchronized void incrementUpdateCount() {
++        updateCount++;
++    }
++    
++    /**
++     * Returns the current updateCount of the Clob.
++     */
++    long getUpdateCount() {
++        return updateCount;
++    }
++    
++    /**
++     * Calls SqlLength() to check if the Locator associated
++     * with the underlying Lob is valid. If it is not
++     * it throws an exception.
++     *
++     * @throws SqlException
++     * 
++     */
++    void checkForLocatorValidity() throws SqlException {
++        // As of now there is no other way of determining that
++        //the locator associated with the underlying LOB is not
++        //valid
++        sqlLength();
++    }
+ }
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveBlobLocatorInputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveBlobLocatorInputStream.java
+index e69de29b..c8f00f1c 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveBlobLocatorInputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveBlobLocatorInputStream.java
+@@ -0,0 +1,109 @@
++/*
++ 
++   Derby - Class org.apache.derby.client.am.UpdateSensitiveBlobLocatorInputStream
++ 
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++ 
++      http://www.apache.org/licenses/LICENSE-2.0
++ 
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ 
++ */
++
++package org.apache.derby.client.am;
++
++import java.io.BufferedInputStream;
++import java.io.InputStream;
++
++/**
++ * This class extends from the UpdateSensitiveLOBLocatorInputStream
++ * and creates and returns an implementation of the Blob specific
++ * locator InputStream. It also over-rides the reCreateStream method
++ * which re-creates the underlying Blob locator stream whenever a
++ * update happens on the Blob object associated with this stream.
++ */
++public class UpdateSensitiveBlobLocatorInputStream 
++        extends UpdateSensitiveLOBLocatorInputStream {
++    //Stores the Blob instance associated with
++    //this InputStream.
++    private Blob blob = null;
++    
++    /**
++     * Creates an instance of the BlobLocatorInputStream
++     * and and calls the super class constructors with 
++     * appropriate initializers.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Blob</code> value from the server
++     * @param blob <code>Blob</code> object that contains locator for
++     *        the <code>Blob</code> value on the server.
++     *
++     * @throws SqlException If any exception occurs during stream
++     *                      creation.
++     */
++    public UpdateSensitiveBlobLocatorInputStream(Connection con, Blob blob)
++    throws SqlException {
++        super(con, blob, new BlobLocatorInputStream(con, blob));
++        this.blob = blob;
++    }
++    
++    /**
++     * Creates an instance of the BlobLocatorInputStream.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Blob</code> value from the server
++     * @param blob <code>Blob</code> object that contains locator for
++     *        the <code>Blob</code> value on the server.
++     * @param position the position in the <code>Blob</code> of the first
++     *        byte to read.
++     * @param length the maximum number of bytes to read from
++     *        the <code>Blob</code>.
++     *
++     * @throws SqlException If any exception occurs during stream
++     *                      creation.
++     */
++    public UpdateSensitiveBlobLocatorInputStream(Connection con, Blob blob,
++            long position, long length) throws SqlException {
++        super(con, blob, 
++                new BlobLocatorInputStream(con, blob, position, length), 
++                position, length);
++        this.blob = blob;
++    }
++    
++    /**
++     * Re-creates the underlying Locator stream
++     * with the current position and the length
++     * values if specified.
++     *
++     * @throws SqlException If any exception occurs while
++     *                      re-creating the underlying streams.
++     */
++    protected InputStream reCreateStream() throws SqlException {
++        InputStream is_ = null;
++        
++        //Verify if a subset of the underlying
++        //LOB data was requested.
++        if(length != -1) {
++            //The length information is available.
++            //It should be used while re-creating
++            //the stream.
++            is_ = new BlobLocatorInputStream(con, blob, currentPos, 
++                    length - currentPos +1);
++        }
++        else {
++            //The length information is not
++            //available.
++            is_ = new BlobLocatorInputStream(con, blob, currentPos, -1);
++        }
++        return is_;
++    }
++}
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorInputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorInputStream.java
+index e69de29b..9ea146b5 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorInputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorInputStream.java
+@@ -0,0 +1,68 @@
++/*
++ 
++   Derby - Class org.apache.derby.client.am.UpdateSensitiveClobLocatorInputStream
++ 
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++ 
++      http://www.apache.org/licenses/LICENSE-2.0
++ 
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ 
++ */
++
++package org.apache.derby.client.am;
++
++import java.io.BufferedInputStream;
++import java.io.InputStream;
++
++/**
++ * This class extends from the UpdateSensitiveLOBLocatorInputStream
++ * and creates and returns an implementation of the Clob specific
++ * locator InputStream. It also over-rides the reCreateStream method
++ * which re-creates the underlying Clob locator stream whenever a
++ * update happens on the Clob object associated with this stream.
++ */
++public class UpdateSensitiveClobLocatorInputStream 
++        extends UpdateSensitiveLOBLocatorInputStream {
++    //Stores the Clob instance associated with
++    //this InputStream.
++    private Clob clob = null;
++    
++    /**
++     * Creates an instance of the ClobLocatorInputStream
++     * wrapped in a BufferedInputStream and and calls the 
++     * super class constructor with appropriate initializers.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Clob</code> value from the server
++     * @param clob <code>Clob</code> object that contains locator for
++     *        the <code>Clob</code> value on the server.
++     *
++     * @throws SqlException If any exception occurs during stream
++     *                      creation.
++     */
++    public UpdateSensitiveClobLocatorInputStream(Connection con, Clob clob)
++    throws SqlException {
++        super(con, clob, new BufferedInputStream
++                (new ClobLocatorInputStream(con, clob)));
++        this.clob = clob;
++    }
++    
++    /**
++     * Re-creates the underlying Locator stream
++     * with the current position and the length
++     * values if specified.
++     */
++    protected InputStream reCreateStream() throws SqlException {
++        return new ClobLocatorInputStream(con, clob, currentPos);
++    }
++}
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorReader.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorReader.java
+index e69de29b..09d68885 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorReader.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveClobLocatorReader.java
+@@ -0,0 +1,235 @@
++/*
++ 
++   Derby - Class org.apache.derby.client.am.UpdateSensitiveClobLocatorReader
++ 
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++ 
++      http://www.apache.org/licenses/LICENSE-2.0
++ 
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ 
++ */
++
++package org.apache.derby.client.am;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.Reader;
++
++/**
++ * Wraps a Buffered Clob locator reader and watches out
++ * for updates on the Clob associated with it.
++ * Before a read operation is performed on the Reader
++ * this stream verifies that the underlying Clob has not
++ * changed and if it has it recreates the specific streams.
++ */
++public class UpdateSensitiveClobLocatorReader extends Reader {
++    //The ClobLocatorReader instance
++    //wrapped inside a BufferedReader
++    private BufferedReader r = null;
++    
++    //The connection object from which
++    //this Clob is obtained.
++    private Connection con = null;
++    
++    //Stores the Clob instance
++    //this class refers to.
++    private Clob clob = null;
++    
++    //stores the current value of
++    //the updateCount in the Clob.
++    private long updateCount;
++    
++    
++    //Current position in the underlying Clob.
++    //lobs are indexed from 1
++    private long currentPos;
++    
++    //Stores the length of the partial value
++    //contained in this stream.
++    private long length;
++    
++    /**
++     * Initializes the Reader, updateCount, currentPos
++     * and the connection to the appropriate values.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Clob</code> value from the server
++     * @param clob the <code>Clob</code> object associated with
++     *            this stream.
++     * @param r a <code>Reader</code> that contains an instance
++     *          of <code>ClobLocatorReader</code>.
++     */
++    protected UpdateSensitiveClobLocatorReader(Connection con, Clob clob) 
++    throws SqlException {
++        //check if the locator associated with the
++        //underlying Clob is valid.
++        clob.checkForLocatorValidity();
++        
++        //Wrap the ClobLocator instance inside a
++        //Buffered reader.
++        this.r = new BufferedReader(new ClobLocatorReader(con, clob));
++        //Since the position has
++        //not been mentioned it starts
++        //with 1.
++        this.currentPos = 1;
++        this.con = con;
++        this.clob = clob;
++        //store the current update
++        //count.
++        updateCount = clob.getUpdateCount();
++        //The length has not been mentioned
++        //hence initialize it to -1.
++        this.length = -1;
++    }
++    
++    /**
++     * Initializes the Reader, updateCount, currentPos,
++     * length and the connection to the appropriate values.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Clob</code> value from the server
++     * @param clob the <code>Clob</code> object associated with
++     *             this reader.
++     * @param r an <code>Reader</code> that contains the
++     *           <code>ClobLocatorReader</code> instance.
++     * @param pos the position from which the first read begins.
++     * @param len the length in bytes of the partial value to be
++     *            retrieved.
++     *
++     */
++    protected UpdateSensitiveClobLocatorReader(Connection con, Clob clob, 
++            long pos, long len) throws SqlException {
++        //check if the locator associated with the
++        //underlying Clob is valid.
++        clob.checkForLocatorValidity();
++        
++        this.r = new BufferedReader(new ClobLocatorReader(con, clob, pos, len));
++        this.con = con;
++        this.clob = clob;
++        this.currentPos = pos;
++        this.length = len;
++        //store the current update
++        //count.
++        updateCount = clob.getUpdateCount();
++    }
++    
++    /**
++     * @see java.io.Reader#read()
++     */
++    public int read() throws IOException {
++        //verify if the underlying Clob has
++        //been modified and if yes recreate
++        //the streams.
++        identifyAndReplaceObseleteStream();
++        int ret = r.read();
++        if (ret == -1) {
++            return ret;
++        }
++        currentPos++;
++        return ret;
++    }
++    
++    /**
++     * @see java.io.Reader#read(char[], int, int)
++     */
++    public int read(char[] c, int off, int len) throws IOException {
++        //verify if the underlying Clob has
++        //been modified and if yes recreate
++        //the streams.
++        identifyAndReplaceObseleteStream();
++        int ret = r.read(c, off, len);
++        if (ret == -1) {
++            return ret;
++        }
++        currentPos += ret;
++        return ret;
++    }
++    
++    /**
++     * @see java.io.Reader#close()
++     */
++    public void close() throws IOException {
++        r.close();
++    }
++    
++    /**
++     * Verifies whether the current updateCount matches
++     * the updateCount of the Clob object and if it does
++     * not it recreates the stream.
++     *
++     * @throws IOException If any exception occurs upon
++     *                     Locator stream creation.
++     */
++    private void identifyAndReplaceObseleteStream() throws IOException {
++        //Stores the current update count
++        //value obtained from the Clob.
++        long newUpdateCount;
++        //Get the current update count.
++        newUpdateCount = clob.getUpdateCount();
++        //verify if the updateCount of the stream
++        //and the current value present in the Clob
++        //matches.
++        if (updateCount != newUpdateCount) {
++            //The values do not match.
++            //This means that the data
++            //in the Clob has changed and
++            //hence the streams need
++            //to be re-created.
++            
++            //re-create the stream
++            try {
++                //Wrap the re-created stream in a
++                //BufferedReader before returning
++                //it to he user.
++                r = new BufferedReader(reCreateStream());
++            }
++            catch(SqlException sqle) {
++                IOException ioe = new IOException();
++                ioe.initCause(sqle);
++                throw ioe;
++            }
++            
++            //update the current update count
++            //with the new update count value.
++            updateCount = newUpdateCount;
++        } else {
++            //The underlying Clob value is
++            //the same. Hence do nothing.
++            return;
++        }
++    }
++    
++    /**
++     * Re-creates the underlying Locator stream
++     * with the current position and the length
++     * values if specified.
++     */
++    protected Reader reCreateStream() throws SqlException {
++        Reader r_ = null;
++        //Verify if a subset of the underlying
++        //Clob data was requested.
++        if (length != -1) {
++            //The length information is available.
++            //It should be used while re-creating
++            //the stream.
++            r_ = new ClobLocatorReader(con, clob, currentPos, 
++                    length - currentPos +1);
++        }
++        else {
++            //The length information is not
++            //available.
++            r_ = new ClobLocatorReader(con, clob, currentPos, -1);
++        }
++        return r_;
++    }
++}
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveLOBLocatorInputStream.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveLOBLocatorInputStream.java
+index 3f24d583..2714db68 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveLOBLocatorInputStream.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/UpdateSensitiveLOBLocatorInputStream.java
+@@ -1 +1,215 @@
+   + native
++/*
++ 
++   Derby - Class org.apache.derby.client.am.UpdateSensitiveLOBLocatorInputStream
++ 
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++ 
++      http://www.apache.org/licenses/LICENSE-2.0
++ 
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++ 
++ */
++
++package org.apache.derby.client.am;
++
++import java.io.BufferedInputStream;
++import java.io.IOException;
++import java.io.InputStream;
++
++/**
++ *
++ * Super-class of the Update sensitive locator streams.
++ * Before a read operation if performed on the stream
++ * this stream verifies that the underlying LOB has not
++ * changed and if it has it recreates the specific streams.
++ * Since Locator streams are specific to Blob and Clob the
++ * sub-classes would take care of creating the appropriate
++ * streams.
++ *
++ */
++public abstract class UpdateSensitiveLOBLocatorInputStream extends InputStream {
++    //The ClobLocatorInputStream or
++    //BlobLocatorInputStream instance
++    //wrapped inside a BufferedInputStream
++    //this class will hold
++    //Will be used while re-creating the stream
++    //in the sub-class hence protected.
++    private BufferedInputStream is = null;
++    
++    //The connection object from which
++    //this LOB is obtained.
++    //Will be used while re-creating the stream
++    //in the sub-class hence protected.
++    protected Connection con = null;
++    
++    //Stores the Blob instance
++    //this class refers to.
++    private Lob lob = null;
++    
++    //stores the current value of
++    //the updateCount in the Clob
++    //or Blob.
++    private long updateCount;
++    
++    
++    //Current position in the underlying lob.
++    //lobs are indexed from 1
++    //Will be used while re-creating the stream
++    //in the sub-class hence protected.
++    protected long currentPos;
++    
++    //Stores the length of the partial value
++    //contained in this stream.
++    //Will be used while re-creating the stream
++    //in the sub-class hence protected.
++    protected long length;
++    
++    /**
++     * Initializes the InputStream, updateCount, currentPos
++     * and the connection to the appropriate values.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Lob</code> value from the server
++     * @param lob <code>Lob</code> object which could be a
++     *            <code>Blob</code> or a <code>Clob</code>.
++     * @param is an <code>InputStream</code> that contains the
++     *           appropriate locator stream instance.
++     */
++    protected UpdateSensitiveLOBLocatorInputStream(Connection con, Lob lob,
++            InputStream is) throws SqlException {
++        //check if the locator associated with the
++        //underlying Lob is valid.
++        lob.checkForLocatorValidity();
++        
++        this.is = new BufferedInputStream(is);
++        //Since the position has
++        //not been mentioned it starts
++        //with 1.
++        this.currentPos = 1;
++        this.con = con;
++        this.lob = lob;
++        //store the current update
++        //count.
++        updateCount = lob.getUpdateCount();
++        //The length has not been mentioned
++        //hence initialize it to -1.
++        this.length = -1;
++    }
++    
++    /**
++     * Initializes the InputStream, updateCount, currentPos,
++     * length and the connection to the appropriate values.
++     *
++     * @param connection connection to be used to read the
++     *        <code>Lob</code> value from the server
++     * @param lob <code>Lob</code> object which could be a
++     *            <code>Blob</code> or a <code>Clob</code>.
++     * @param is an <code>InputStream</code> that contains the
++     *           appropriate locator stream instance.
++     * @param pos the position from which the first read begins.
++     * @param len the length in bytes of the partial value to be
++     *            retrieved.
++     *
++     */
++    protected UpdateSensitiveLOBLocatorInputStream(Connection con, Lob lob,
++            InputStream is, long pos, long len) throws SqlException {
++        this(con, lob, is);
++        //Initialize with the mentioned
++        //position and length values.
++        this.currentPos = pos;
++        this.length = len;
++    }
++    
++    /**
++     * @see java.io.InputStream#read()
++     */
++    public int read() throws IOException {
++        //verify if the underlying LOB has
++        //been modified and if yes recreate
++        //the streams.
++        identifyAndReplaceObseleteStream();
++        int ret = is.read();
++        if (ret == -1) {
++            return ret;
++        }
++        currentPos++;
++        return ret;
++    }
++    
++    /**
++     * @see java.io.InputStream#read(byte[], int, int)
++     */
++    public int read(byte[] b, int off, int len) throws IOException {
++        //verify if the underlying LOB has
++        //been modified and if yes recreate
++        //the streams.
++        identifyAndReplaceObseleteStream();
++        int ret = is.read(b, off, len);
++        if (ret == -1) {
++            return ret;
++        }
++        currentPos += ret;
++        return ret;
++    }
++    
++    /**
++     * Verifies whether the current updateCount matches
++     * the updateCount of the LOB object and if it does
++     * not it recreates the stream.
++     *
++     * @throws IOException If any exception occurs upon
++     *                     Locator stream creation.
++     */
++    private void identifyAndReplaceObseleteStream() throws IOException {
++        //Stores the current update count
++        //value obtained from the LOB.
++        long newUpdateCount;
++        //Get the current update count.
++        newUpdateCount = lob.getUpdateCount();
++        //verify if the updateCount of the stream
++        //and the current value present in the LOB
++        //matches.
++        if(updateCount != newUpdateCount) {
++            //The values do not match.
++            //This means that the data
++            //in the LOB has changed and
++            //hence the streams need
++            //to be re-created.
++            
++            //re-create the stream
++            try {
++                is = new BufferedInputStream(reCreateStream());
++            }
++            catch(SqlException sqle) {
++                IOException ioe = new IOException();
++                ioe.initCause(sqle);
++                throw ioe;
++            }
++            
++            //update the current update count
++            //with the new update count value.
++            updateCount = newUpdateCount;
++        } else {
++            //The underlying LOB value is
++            //the same. Hence do nothing.
++            return;
++        }
++    }
++    
++    /**
++     * Abstract method that will be implemented by
++     * the underlying streams specific to Clob and
++     * Blob.
++     */
++    protected abstract InputStream reCreateStream() throws SqlException;
++}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/BlobTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/BlobTest.java
+index 1c2b6af9..08c33319 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/BlobTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/BlobTest.java
+@@ -515,6 +515,96 @@ public void testGetBinaryStreamLongExceptionConditions()
+     }
+ 
+     
++    /**
++     * Tests that the InputStream got from
++     * a empty Blob reflects new data in the
++     * underlying Blob.
++     *
++     * @throws Exception
++     */
++     public void testGetBinaryStreamCreateBlob() throws Exception {
++         //The bytes that will be used
++         //to do the inserts into the
++         //Blob.
++         byte[] bytes1 = {
++            0x65, 0x66, 0x67, 0x68, 0x69,
++            0x69, 0x68, 0x67, 0x66, 0x65
++         };
++         
++         //The InputStream corresponding to the
++         //Byte array
++         ByteArrayInputStream is_bytes1 = new ByteArrayInputStream(bytes1);
++         
++         //create the empty Blob.
++         Blob blob = getConnection().createBlob();
++         
++         //Get the InputStream from this
++         //Blob
++         InputStream is = blob.getBinaryStream();
++         
++         //set the bytes into the blob.
++         blob.setBytes(1, bytes1);
++         
++         //Now compare the ByteArrayInputStream
++         //and the stream from the Blob to
++         //ensure that they are equal
++         assertEquals(is_bytes1, is);
++     }
++     
++    /**
++     * Tests that the data updated in a Blob
++     * is always reflected in the InputStream
++     * got. Here we do updates in the Blob
++     * both using Blob.setBytes and
++     * using the OutputStream obtained from
++     * the Blob.
++     *
++     * @throws Exception
++     */
++     public void testGetBinaryStreamBlobUpdates() throws Exception {
++         //The bytes that will be used
++         //to do the inserts into the
++         //Blob using Blob.setBytes.
++         byte[] bytes1 = {
++            0x65, 0x66, 0x67, 0x68, 0x69,
++            0x69, 0x68, 0x67, 0x66, 0x65
++         };
++         
++         //The Byte array that will be used to do the
++         //updates into the Blob using the OutputStream
++         //obtained from the Blob
++         byte[] bytes2 = {
++            0x65, 0x66, 0x67, 0x68, 0x69,
++            0x65, 0x66, 0x67, 0x68, 0x69
++         };
++         
++         //create the empty Blob.
++         Blob blob = getConnection().createBlob();
++         
++         //Get the InputStream from this
++         //Blob
++         InputStream is_BeforeWrite = blob.getBinaryStream();
++         
++         //Get an OutputStream from this Blob
++         //into which the data can be written
++         OutputStream os = blob.setBinaryStream(1);
++         os.write(bytes1);
++         
++         //Doing a setBytes now on the Blob
++         //should reflect the same extension
++         //in the InputStream also.
++         blob.setBytes(bytes1.length+1, bytes2);
++         
++         //Get the InputStream from this Blob
++         //after the update has happened.
++         InputStream is_AfterWrite = blob.getBinaryStream();
++         
++         //Compare the two streams to check that they
++         //match
++         assertEquals(is_BeforeWrite, is_AfterWrite);
++     }
++    
++
+     /**
+      * Create test suite for this test.
+      */
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ClobTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ClobTest.java
+index 32013b1f..1bc798c8 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ClobTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbc4/ClobTest.java
+@@ -496,6 +496,170 @@ public void testGetCharacterStreamLongExceptionConditions()
+         }
+     }
+ 
++    /**
++     * Tests that the InputStream got from
++     * a empty Clob reflects new data in the
++     * underlying Clob.
++     *
++     * @throws Exception
++     */
++     public void testGetAsciiStreamCreateClob() throws Exception {
++         //The String that will be used
++         //to do the inserts into the
++         //Clob.
++         String str = "Hi I am the insert String";
++         
++         //Create the InputStream that will
++         //be used for comparing the Stream
++         //that is obtained from the Blob after
++         //the update.
++         ByteArrayInputStream str_is = new ByteArrayInputStream
++                 (str.getBytes());
++         
++         //create the empty Clob.
++         Clob clob = getConnection().createClob();
++         
++         //Get the InputStream from this
++         //Clob
++         InputStream is = clob.getAsciiStream();
++         
++         //set the String into the clob.
++         clob.setString(1, str);
++         
++         //Ensure that the Stream obtained from
++         //the clob contains the expected bytes
++         assertEquals(str_is, is);
++     }
++     
++     /**
++     * Tests that the Reader got from
++     * a empty Clob reflects new data in the
++     * underlying Clob.
++     *
++     * @throws Exception
++     */
++     public void testGetCharacterStreamCreateClob() throws Exception {
++         //The String that will be used
++         //to do the inserts into the
++         //Clob.
++         String str = "Hi I am the insert String";
++
++         //The string reader corresponding to this
++         //string that will be used in the comparison.
++         StringReader r_string = new StringReader(str);
++         
++         //create the empty Clob.
++         Clob clob = getConnection().createClob();
++         
++         //Get the Reader from this
++         //Clob
++         Reader r_clob = clob.getCharacterStream();
++         
++         //set the String into the clob.
++         clob.setString(1, str);
++         
++         //Now compare the reader corresponding
++         //to the string and the reader obtained
++         //form the clob to see if they match.
++         assertEquals(r_string, r_clob);
++     }
++     
++    /**
++     * Tests that the data updated in a Clob
++     * is always reflected in the InputStream
++     * got. Here the updates into the Clob are
++     * done using both an OutputStream obtained
++     * from this Clob as well as using Clob.setString.
++     *
++     * @throws Exception
++     */
++     public void testGetAsciiStreamClobUpdates() throws Exception {
++         //The String that will be used
++         //to do the inserts into the
++         //Clob.
++         String str1 = "Hi I am the insert string";
++         
++         //Stores the byte array representation of 
++         //the insert string.
++         byte[] str1_bytes = str1.getBytes();
++         
++         //The String that will be used in the
++         //second series of updates
++         String str2 = "Hi I am the update string";
++         
++         //create the empty Clob.
++         Clob clob = getConnection().createClob();
++         
++         //Get the InputStream from this
++         //Clob before any writes happen.
++         InputStream is_BeforeWrite = clob.getAsciiStream();
++         
++         //Get an OutputStream from this Clob
++         //into which the data can be written
++         OutputStream os = clob.setAsciiStream(1);
++         os.write(str1_bytes);
++         
++         //Doing a setString now on the Clob
++         //should reflect the same extension
++         //in the InputStream also.
++         clob.setString((str1_bytes.length)+1, str2);
++         
++         //Get the input stream from the
++         //Clob after the update
++         InputStream is_AfterWrite = clob.getAsciiStream();
++         
++         //Now check if the two InputStreams
++         //match
++         assertEquals(is_BeforeWrite, is_AfterWrite);
++     }
++     
++    /**
++     * Tests that the data updated in a Clob
++     * is always reflected in the Reader
++     * got. Here the updates are done using
++     * both a Writer obtained from this Clob
++     * and using Clob.setString.
++     *
++     * @throws Exception
++     */
++     public void testGetCharacterStreamClobUpdates() throws Exception {
++         //The String that will be used
++         //to do the inserts into the
++         //Clob.
++         String str1 = "Hi I am the insert string";
++         
++         //The String that will be used in the
++         //second series of updates
++         String str2 = "Hi I am the update string";
++         
++         //create the empty Clob.
++         Clob clob = getConnection().createClob();
++         
++         //Get the Reader from this
++         //Clob
++         Reader r_BeforeWrite = clob.getCharacterStream();
++         
++         //Get a writer from this Clob
++         //into which the data can be written
++         Writer w = clob.setCharacterStream(1);
++         char [] chars_str1 = new char[str1.length()];
++         str2.getChars(0, str1.length(), chars_str1, 0);
++         w.write(chars_str1);
++         
++         //Doing a setString now on the Clob
++         //should reflect the same extension
++         //in the InputStream also.
++         clob.setString((str1.getBytes().length)+1, str2);
++         
++         //Now get the reader from the Clob after
++         //the update has been done.
++         Reader r_AfterWrite = clob.getCharacterStream();
++         
++         //Now compare the two readers to see that they
++         //contain the same data.
++         assertEquals(r_BeforeWrite, r_AfterWrite);
++     }
++
+ 
+     /**
+      * Create test suite for this test.
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobUpdateableStreamTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobUpdateableStreamTest.java
+index 82aab0cd..e20e3831 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobUpdateableStreamTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BlobUpdateableStreamTest.java
+@@ -82,7 +82,7 @@ public void testUpdateableBlob () throws Exception {
+     }
+     
+     public static Test suite () {
+-        return TestConfiguration.embeddedSuite (
++        return TestConfiguration.defaultSuite (
+                 BlobUpdateableStreamTest.class);
+     }
+     
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ClobUpdateableReaderTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ClobUpdateableReaderTest.java
+index 6d2ced51..50e4c249 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ClobUpdateableReaderTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/ClobUpdateableReaderTest.java
+@@ -216,7 +216,7 @@ public void setUp() throws Exception {
+     
+     public static Test suite() {
+         TestSuite ts = new TestSuite ("ClobUpdateableReaderTest");
+-        ts.addTest(TestConfiguration.embeddedSuite(
++        ts.addTest(TestConfiguration.defaultSuite(
+                     ClobUpdateableReaderTest.class));
+         TestSuite encSuite = new TestSuite ("ClobUpdateableReaderTest:encrypted");
+         encSuite.addTestSuite (ClobUpdateableReaderTest.class);

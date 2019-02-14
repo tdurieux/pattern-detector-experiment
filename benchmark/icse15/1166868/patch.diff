@@ -1,0 +1,129 @@
+diff --git a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+index aada6918..485d44c7 100644
+--- a/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
++++ b/db/derby/code/branches/10.8/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+@@ -29,10 +29,13 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.cache.CacheManager;
+ import org.apache.derby.iapi.services.context.ContextManager;
+ import org.apache.derby.iapi.services.context.ContextService;
++import org.apache.derby.iapi.services.i18n.MessageService;
++import org.apache.derby.iapi.services.monitor.Monitor;
+ import org.apache.derby.iapi.services.property.PropertyUtil;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
+ import org.apache.derby.iapi.sql.dictionary.SequenceDescriptor;
++import org.apache.derby.iapi.store.access.AccessFactory;
+ import org.apache.derby.iapi.store.access.TransactionController;
+ import org.apache.derby.iapi.types.NumberDataValue;
+ import org.apache.derby.iapi.types.RowLocation;
+@@ -195,10 +198,24 @@ public void clean(boolean forRemove) throws StandardException
+         //
+         // Flush current value to disk. This prevents us from leaking values when DDL
+         // is performed. The metadata caches are invalidated and cleared when DDL is performed.
++        // We flush the current value to disk on database shutdown also.
+         //
+         if ( _sequenceGenerator != null )
+         {
+-            updateCurrentValueOnDisk( null, peekAtCurrentValue() );
++            boolean gapClosed = updateCurrentValueOnDisk( null, peekAtCurrentValue() );
++
++            // log an error message if we failed to flush the preallocated values.
++            if ( !gapClosed )
++            {
++                String  errorMessage = MessageService.getTextMessage
++                    (
++                     SQLState.LANG_CANT_FLUSH_PREALLOCATOR,
++                     _sequenceGenerator.getSchemaName(),
++                     _sequenceGenerator.getName()
++                     );
++
++                Monitor.getStream().println( errorMessage );
++            }
+         }
+ 
+         _uuidString = null;
+@@ -400,7 +417,33 @@ private Long peekAtCurrentValue() throws StandardException
+      */
+     public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws StandardException
+     {
+-        TransactionController executionTransaction = getLCC().getTransactionExecute();
++        LanguageConnectionContext   lcc = getLCC();
++
++        //
++        // Not having an LCC should mean that we are in the middle of engine
++        // shutdown. We get here only to flush the current value to disk so that
++        // we don't leak unused sequence numbers. See DERBY-5398.
++        //
++        if ( lcc == null )
++        {
++            if (SanityManager.DEBUG)
++            {
++				SanityManager.ASSERT( oldValue == null, "We should be flushing unused sequence values here." );
++			}
++            
++            ContextService csf = ContextService.getFactory();
++            ContextManager cm = csf.getCurrentContextManager();
++            AccessFactory af = _dd.af;
++            TransactionController   dummyTransaction = af.getTransaction( cm );
++
++            boolean retval = updateCurrentValueOnDisk( dummyTransaction, oldValue, newValue, false );
++            dummyTransaction.commit();
++            dummyTransaction.destroy();
++
++            return retval;
++		}
++
++        TransactionController executionTransaction = lcc.getTransactionExecute();
+         TransactionController nestedTransaction = null;
+ 
+         try {
+diff --git a/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index a2733be2..78d37f35 100644
+--- a/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/branches/10.8/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -1371,6 +1371,7 @@ The message identifier (ie. the value that matches a field in this class)
+     String LANG_IGNORE_MISSING_INDEX_ROW_DURING_DELETE                 = "X0Y83.S";
+     String LANG_TOO_MUCH_CONTENTION_ON_SEQUENCE                 = "X0Y84.S";
+ 	String LANG_UNKNOWN_SEQUENCE_PREALLOCATOR                                = "X0Y85.S";
++	String LANG_CANT_FLUSH_PREALLOCATOR                                = "X0Y86.S";
+ 
+ 
+ 	// TEMPORARY EXECUTION RESTRICTIONS
+diff --git a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+index ba7f7d04..c9acee23 100644
+--- a/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
++++ b/db/derby/code/branches/10.8/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+@@ -654,6 +654,33 @@ public void test_09_defaultRangeSize() throws Exception
+              );
+     }
+     
++    /**
++     * <p>
++     * Test that sequence values are not leaked during an orderly system shutdown.
++     * See DERBY-5398.
++     * </p>
++     */
++    public void test_10_5398() throws Exception
++    {
++        Connection  conn = openUserConnection( TEST_DBO );
++
++        goodStatement( conn, "create sequence seq_10\n" );
++
++        int seq_10_value = Integer.MIN_VALUE;
++        long seq_10_upperBound;
++
++        seq_10_upperBound = seq_10_value + ALLOCATION_COUNT;
++        vetBumping( conn, TEST_DBO, "SEQ_10", seq_10_value++, seq_10_upperBound );
++
++        // bring down the engine, then reboot the database
++        getTestConfiguration().shutdownEngine();
++        conn = openUserConnection( TEST_DBO );
++
++        // verify that we did not leak any values
++        seq_10_upperBound = seq_10_value + ALLOCATION_COUNT;
++        vetBumping( conn, TEST_DBO, "SEQ_10", seq_10_value++, seq_10_upperBound );
++    }
++    
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // MINIONS

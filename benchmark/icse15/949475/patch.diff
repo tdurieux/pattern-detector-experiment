@@ -1,0 +1,160 @@
+diff --git a/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrCore.java b/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrCore.java
+index dca3e14f..3a6de84c 100644
+--- a/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrCore.java
+@@ -585,7 +585,7 @@ public Object call() throws Exception {
+ 
+       // Finally tell anyone who wants to know
+       resourceLoader.inform( resourceLoader );
+-      resourceLoader.inform( this );
++      resourceLoader.inform( this );  // last call before the latch is released.
+       instance = this;   // set singleton for backwards compatibility
+     } catch (IOException e) {
+       throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, e);
+diff --git a/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrResourceLoader.java b/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrResourceLoader.java
+index a47857b2..f7632adb 100644
+--- a/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrResourceLoader.java
++++ b/lucene/solr/branches/branch-1.4/src/java/org/apache/solr/core/SolrResourceLoader.java
+@@ -69,13 +69,15 @@
+   private final String instanceDir;
+   private String dataDir;
+   
+-  private final List<SolrCoreAware> waitingForCore = new ArrayList<SolrCoreAware>();
+-  private final List<SolrInfoMBean> infoMBeans = new ArrayList<SolrInfoMBean>();
+-  private final List<ResourceLoaderAware> waitingForResources = new ArrayList<ResourceLoaderAware>();
++  private final List<SolrCoreAware> waitingForCore = Collections.synchronizedList(new ArrayList<SolrCoreAware>());
++  private final List<SolrInfoMBean> infoMBeans = Collections.synchronizedList(new ArrayList<SolrInfoMBean>());
++  private final List<ResourceLoaderAware> waitingForResources = Collections.synchronizedList(new ArrayList<ResourceLoaderAware>());
+   private static final Charset UTF_8 = Charset.forName("UTF-8");
+ 
+   private final Properties coreProperties;
+ 
++  private volatile boolean live;
++
+   /**
+    * <p>
+    * This loader will delegate to the context classloader when possible,
+@@ -400,6 +402,7 @@ public Object newInstance(String cname, String ... subpackages) {
+           "Error instantiating class: '" + clazz.getName()+"'", e, false );
+     }
+     
++    if (!live) {
+     if( obj instanceof SolrCoreAware ) {
+       assertAwareCompatibility( SolrCoreAware.class, obj );
+       waitingForCore.add( (SolrCoreAware)obj );
+@@ -412,6 +415,7 @@ public Object newInstance(String cname, String ... subpackages) {
+       //TODO: Assert here?
+       infoMBeans.add((SolrInfoMBean) obj);
+     }
++    }
+     return obj;
+   }
+ 
+@@ -431,12 +435,16 @@ public Object newAdminHandlerInstance(final CoreContainer coreContainer, String
+       throw new SolrException( SolrException.ErrorCode.SERVER_ERROR,
+           "Error instantiating class: '" + clazz.getName()+"'", e, false );
+     }
++
++    if (!live) {
+     //TODO: Does SolrCoreAware make sense here since in a multi-core context
+     // which core are we talking about ? 
+     if( obj instanceof ResourceLoaderAware ) {
+       assertAwareCompatibility( ResourceLoaderAware.class, obj );
+       waitingForResources.add( (ResourceLoaderAware)obj );
+     }
++    }
++
+     return obj;
+   }
+ 
+@@ -460,6 +468,7 @@ public Object newInstance(String cName, String [] subPackages, Class[] params, O
+           "Error instantiating class: '" + clazz.getName()+"'", e, false );
+     }
+ 
++    if (!live) {
+     if( obj instanceof SolrCoreAware ) {
+       assertAwareCompatibility( SolrCoreAware.class, obj );
+       waitingForCore.add( (SolrCoreAware)obj );
+@@ -472,6 +481,8 @@ public Object newInstance(String cName, String [] subPackages, Class[] params, O
+       //TODO: Assert here?
+       infoMBeans.add((SolrInfoMBean) obj);
+     }
++    }
++
+     return obj;
+   }
+ 
+@@ -482,10 +493,24 @@ public Object newInstance(String cName, String [] subPackages, Class[] params, O
+   public void inform(SolrCore core) 
+   {
+     this.dataDir = core.getDataDir();
+-    for( SolrCoreAware aware : waitingForCore ) {
++
++    // make a copy to avoid potential deadlock of a callback calling newInstance and trying to
++    // add something to waitingForCore.
++    SolrCoreAware[] arr;
++
++    while (waitingForCore.size() > 0) {
++      synchronized (waitingForCore) {
++        arr = waitingForCore.toArray(new SolrCoreAware[waitingForCore.size()]);
++        waitingForCore.clear();
++      }
++
++      for( SolrCoreAware aware : arr) {
+       aware.inform( core );
+     }
+-    waitingForCore.clear();
++    }
++
++    // this is the last method to be called in SolrCore before the latch is released.
++    live = true;
+   }
+   
+   /**
+@@ -493,21 +518,42 @@ public void inform(SolrCore core)
+    */
+   public void inform( ResourceLoader loader ) 
+   {
+-    for( ResourceLoaderAware aware : waitingForResources ) {
+-      aware.inform( loader );
+-    }
++
++     // make a copy to avoid potential deadlock of a callback adding to the list
++    ResourceLoaderAware[] arr;
++
++    while (waitingForResources.size() > 0) {
++      synchronized (waitingForResources) {
++        arr = waitingForResources.toArray(new ResourceLoaderAware[waitingForResources.size()]);
+     waitingForResources.clear();
+   }
+ 
++      for( ResourceLoaderAware aware : arr) {
++        aware.inform(loader);
++      }
++    }
++  }
++
+   /**
+    * Register any {@link org.apache.solr.core.SolrInfoMBean}s
+    * @param infoRegistry The Info Registry
+    */
+   public void inform(Map<String, SolrInfoMBean> infoRegistry) {
+-    for (SolrInfoMBean bean : infoMBeans) {
++    // this can currently happen concurrently with requests starting and lazy components
++    // loading.  Make sure infoMBeans doesn't change.
++
++    SolrInfoMBean[] arr;
++    synchronized (infoMBeans) {
++      arr = infoMBeans.toArray(new SolrInfoMBean[infoMBeans.size()]);
++      waitingForResources.clear();
++    }
++
++
++    for (SolrInfoMBean bean : arr) {
+       infoRegistry.put(bean.getName(), bean);
+     }
+   }
++  
+   /**
+    * Determines the solrhome from the environment.
+    * Tries JNDI (java:comp/env/solr/home) then system property (solr.solr.home);

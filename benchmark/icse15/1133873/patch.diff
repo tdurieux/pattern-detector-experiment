@@ -1,0 +1,276 @@
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/RowRepairResolver.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/RowRepairResolver.java
+index 53d28807..4428bb27 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/RowRepairResolver.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/RowRepairResolver.java
+@@ -22,13 +22,17 @@
+ import java.io.IOException;
+ import java.net.InetAddress;
+ import java.nio.ByteBuffer;
+-import java.util.ArrayList;
+-import java.util.List;
+-import java.util.Map;
++import java.util.*;
++
++import org.apache.commons.collections.iterators.CollatingIterator;
+ 
+ import org.apache.cassandra.db.*;
++import org.apache.cassandra.db.columniterator.IdentityQueryFilter;
++import org.apache.cassandra.db.filter.QueryFilter;
++import org.apache.cassandra.db.filter.QueryPath;
+ import org.apache.cassandra.net.Message;
+ import org.apache.cassandra.net.MessagingService;
++import org.apache.cassandra.utils.FBUtilities;
+ 
+ public class RowRepairResolver extends AbstractRowResolver
+ {
+@@ -121,19 +125,30 @@ static ColumnFamily resolveSuperset(List<ColumnFamily> versions)
+         ColumnFamily resolved = null;
+         for (ColumnFamily cf : versions)
+         {
+-            if (cf != null)
+-            {
+-                resolved = cf.cloneMe();
+-                break;
+-            }
++            if (cf == null)
++                continue;
++
++            if (resolved == null)
++                resolved = cf.cloneMeShallow();
++            else
++                resolved.delete(cf);
+         }
+         if (resolved == null)
+             return null;
+ 
+-        for (ColumnFamily cf : versions)
+-            resolved.resolve(cf);
+-
+-        return resolved;
++        // mimic the collectCollatedColumn + removeDeleted path that getColumnFamily takes.
++        // this will handle removing columns and subcolumns that are supressed by a row or
++        // supercolumn tombstone.
++        QueryFilter filter = new QueryFilter(null, new QueryPath(resolved.metadata().cfName), new IdentityQueryFilter());
++        CollatingIterator iter = new CollatingIterator(resolved.metadata().comparator.columnComparator);
++        for (ColumnFamily version : versions)
++        {
++            if (version == null)
++                continue;
++            iter.addIterator(version.getColumnsMap().values().iterator());
++        }
++        filter.collectCollatedColumns(resolved, iter, Integer.MIN_VALUE);
++        return ColumnFamilyStore.removeDeleted(resolved, Integer.MIN_VALUE);
+     }
+ 
+     public Row getData() throws IOException
+diff --git a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/Util.java b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/Util.java
+index 518c045d..a83b57bc 100644
+--- a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/Util.java
++++ b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/Util.java
+@@ -51,6 +51,14 @@ public static Column column(String name, String value, long timestamp)
+         return new Column(ByteBufferUtil.bytes(name), ByteBufferUtil.bytes(value), timestamp);
+     }
+ 
++    public static SuperColumn superColumn(ColumnFamily cf, String name, Column... columns)
++    {
++        SuperColumn sc = new SuperColumn(ByteBufferUtil.bytes(name), cf.metadata().comparator);
++        for (Column c : columns)
++            sc.addColumn(c);
++        return sc;
++    }
++
+     public static Token token(String key)
+     {
+         return StorageService.getPartitioner().getToken(ByteBufferUtil.bytes(key));
+diff --git a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/TableTest.java b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/TableTest.java
+index 227a1b6d..7c34570c 100644
+--- a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/TableTest.java
++++ b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/TableTest.java
+@@ -510,7 +510,21 @@ public void runMayThrow() throws Exception
+ 
+     public static void assertColumns(ColumnFamily cf, String... columnNames)
+     {
+-        Collection<IColumn> columns = cf == null ? new TreeSet<IColumn>() : cf.getSortedColumns();
++        assertColumns((IColumnContainer)cf, columnNames);
++    }
++
++    public static void assertSubColumns(ColumnFamily cf, String scName, String... columnNames)
++    {
++        IColumnContainer sc = cf == null ? null : ((IColumnContainer)cf.getColumn(ByteBufferUtil.bytes(scName)));
++        assertColumns(sc, columnNames);
++    }
++
++    public static void assertColumns(IColumnContainer container, String... columnNames)
++    {
++        Collection<IColumn> columns = container == null
++                                      ? new TreeSet<IColumn>()
++                                      : (container instanceof ColumnFamily) ? ((ColumnFamily) container).getSortedColumns()
++                                      : ((SuperColumn) container).getSubColumns();
+         List<String> L = new ArrayList<String>();
+         for (IColumn column : columns)
+         {
+@@ -539,9 +553,28 @@ public static void assertColumns(ColumnFamily cf, String... columnNames)
+ 
+         assert Arrays.equals(la, columnNames1)
+                 : String.format("Columns [%s(as string: %s)])] is not expected [%s]",
+-                                ((cf == null) ? "" : cf.getComparator().getColumnsString(columns)),
++                                ((container == null) ? "" : container.getComparator().getColumnsString(columns)),
+                                 lasb.toString(),
+                                 StringUtils.join(columnNames1, ","));
+     }
+ 
++    public static void assertColumn(ColumnFamily cf, String name, String value, long timestamp)
++    {
++        assertColumn(cf.getColumn(ByteBufferUtil.bytes(name)), value, timestamp);
++    }
++
++    public static void assertSubColumn(ColumnFamily cf, String scName, String name, String value, long timestamp)
++    {
++        SuperColumn sc = (SuperColumn)cf.getColumn(ByteBufferUtil.bytes(scName));
++        assertColumn(sc.getSubColumn(ByteBufferUtil.bytes(name)), value, timestamp);
++    }
++
++    public static void assertColumn(IColumn column, String value, long timestamp)
++    {
++        assertNotNull(column);
++        assertEquals(0, ByteBufferUtil.compareUnsigned(column.value(), ByteBufferUtil.bytes(value)));
++        assertEquals(timestamp, column.timestamp());
++    }
++
++
+ }
+diff --git a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/service/RowResolverTest.java b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/service/RowResolverTest.java
+index 4c847cc4..9d944aee 100644
+--- a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/service/RowResolverTest.java
++++ b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/service/RowResolverTest.java
+@@ -23,14 +23,16 @@
+ 
+ import java.util.Arrays;
+ 
+-import org.apache.cassandra.SchemaLoader;
+ import org.junit.Test;
+ 
++import org.apache.cassandra.SchemaLoader;
+ import org.apache.cassandra.db.ColumnFamily;
++import org.apache.cassandra.db.SuperColumn;
+ 
+-import static org.apache.cassandra.db.TableTest.assertColumns;
++import static junit.framework.Assert.*;
+ import static org.apache.cassandra.Util.column;
+-import static junit.framework.Assert.assertNull;
++import static org.apache.cassandra.Util.superColumn;
++import static org.apache.cassandra.db.TableTest.*;
+ 
+ public class RowResolverTest extends SchemaLoader
+ {
+@@ -93,4 +95,110 @@ public void testResolveSupersetNullBoth()
+     {
+         assertNull(RowRepairResolver.resolveSuperset(Arrays.<ColumnFamily>asList(null, null)));
+     }
++
++    @Test
++    public void testResolveDeleted()
++    {
++        // one CF with columns timestamped before a delete in another cf
++        ColumnFamily cf1 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf1.addColumn(column("one", "A", 0));
++
++        ColumnFamily cf2 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf2.delete((int) (System.currentTimeMillis() / 1000), 1);
++
++        ColumnFamily resolved = RowRepairResolver.resolveSuperset(Arrays.asList(cf1, cf2));
++        // no columns in the cf
++        assertColumns(resolved);
++        assertTrue(resolved.isMarkedForDelete());
++        assertEquals(1, resolved.getMarkedForDeleteAt());
++
++        ColumnFamily scf1 = ColumnFamily.create("Keyspace1", "Super1");
++        scf1.addColumn(superColumn(scf1, "super-foo", column("one", "A", 0)));
++
++        ColumnFamily scf2 = ColumnFamily.create("Keyspace1", "Super1");
++        scf2.delete((int) (System.currentTimeMillis() / 1000), 1);
++
++        ColumnFamily superResolved = RowRepairResolver.resolveSuperset(Arrays.asList(scf1, scf2));
++        // no columns in the cf
++        assertColumns(superResolved);
++        assertTrue(superResolved.isMarkedForDelete());
++        assertEquals(1, superResolved.getMarkedForDeleteAt());
++    }
++
++    @Test
++    public void testResolveDeletedSuper()
++    {
++        // subcolumn is newer than a tombstone on its parent, but not newer than the row deletion
++        ColumnFamily scf1 = ColumnFamily.create("Keyspace1", "Super1");
++        SuperColumn sc = superColumn(scf1, "super-foo", column("one", "A", 1));
++        sc.markForDeleteAt((int) (System.currentTimeMillis() / 1000), 0);
++        scf1.addColumn(sc);
++
++        ColumnFamily scf2 = ColumnFamily.create("Keyspace1", "Super1");
++        scf2.delete((int) (System.currentTimeMillis() / 1000), 2);
++
++        ColumnFamily superResolved = RowRepairResolver.resolveSuperset(Arrays.asList(scf1, scf2));
++        // no columns in the cf
++        assertColumns(superResolved);
++        assertTrue(superResolved.isMarkedForDelete());
++        assertEquals(2, superResolved.getMarkedForDeleteAt());
++    }
++
++    @Test
++    public void testResolveMultipleDeleted()
++    {
++        // deletes and columns with interleaved timestamp, with out of order return sequence
++
++        ColumnFamily cf1 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf1.delete((int) (System.currentTimeMillis() / 1000), 0);
++
++        // these columns created after the previous deletion
++        ColumnFamily cf2 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf2.addColumn(column("one", "A", 1));
++        cf2.addColumn(column("two", "A", 1));
++
++        //this column created after the next delete
++        ColumnFamily cf3 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf3.addColumn(column("two", "B", 3));
++
++        ColumnFamily cf4 = ColumnFamily.create("Keyspace1", "Standard1");
++        cf4.delete((int) (System.currentTimeMillis() / 1000), 2);
++
++        ColumnFamily resolved = RowRepairResolver.resolveSuperset(Arrays.asList(cf1, cf2, cf3, cf4));
++        // will have deleted marker and one column
++        assertColumns(resolved, "two");
++        assertColumn(resolved, "two", "B", 3);
++        assertTrue(resolved.isMarkedForDelete());
++        assertEquals(2, resolved.getMarkedForDeleteAt());
++
++
++        ColumnFamily scf1 = ColumnFamily.create("Keyspace1", "Super1");
++        scf1.delete((int) (System.currentTimeMillis() / 1000), 0);
++
++        // these columns created after the previous deletion
++        ColumnFamily scf2 = ColumnFamily.create("Keyspace1", "Super1");
++        scf2.addColumn(superColumn(scf2, "super1", column("one", "A", 1), column("two", "A", 1)));
++
++        //these columns created after the next delete
++        ColumnFamily scf3 = ColumnFamily.create("Keyspace1", "Super1");
++        scf3.addColumn(superColumn(scf3, "super1", column("two", "B", 3)));
++        scf3.addColumn(superColumn(scf3, "super2", column("three", "A", 3), column("four", "A", 3)));
++
++        ColumnFamily scf4 = ColumnFamily.create("Keyspace1", "Super1");
++        scf4.delete((int) (System.currentTimeMillis() / 1000), 2);
++
++        ColumnFamily superResolved = RowRepairResolver.resolveSuperset(Arrays.asList(scf1, scf2, scf3, scf4));
++        // will have deleted marker and two super cols
++        assertColumns(superResolved, "super1", "super2");
++
++        assertSubColumns(superResolved, "super1", "two");
++        assertSubColumn(superResolved, "super1", "two", "B", 3);
++
++        assertSubColumns(superResolved, "super2", "four", "three");
++        assertSubColumn(superResolved, "super2", "three", "A", 3);
++        assertSubColumn(superResolved, "super2", "four", "A", 3);
++
++        assertTrue(superResolved.isMarkedForDelete());
++        assertEquals(2, superResolved.getMarkedForDeleteAt());
++    }
+ }

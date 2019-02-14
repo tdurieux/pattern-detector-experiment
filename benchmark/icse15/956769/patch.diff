@@ -1,0 +1,333 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
+index a41f6cf8..7e4bdc77 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableNamesIterator.java
+@@ -35,6 +35,7 @@
+ import org.apache.cassandra.io.sstable.IndexHelper;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.util.FileDataInput;
++import org.apache.cassandra.io.util.FileMark;
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.utils.FBUtilities;
+ 
+@@ -112,14 +113,14 @@ public SSTableNamesIterator(SSTableReader ssTable, FileDataInput file, Decorated
+                 ranges.add(indexInfo);
+             }
+ 
+-            file.mark();
++            FileMark mark = file.mark();
+             for (IndexHelper.IndexInfo indexInfo : ranges)
+             {
+-                file.reset();
++                file.reset(mark);
+                 long curOffsert = file.skipBytes((int) indexInfo.offset);
+                 assert curOffsert == indexInfo.offset;
+                 // TODO only completely deserialize columns we are interested in
+-                while (file.bytesPastMark() < indexInfo.offset + indexInfo.width)
++                while (file.bytesPastMark(mark) < indexInfo.offset + indexInfo.width)
+                 {
+                     final IColumn column = cf.getColumnSerializer().deserialize(file);
+                     // we check vs the original Set, not the filtered List, for efficiency
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+index 74b1af5c..56088a1a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SSTableSliceIterator.java
+@@ -33,6 +33,7 @@
+ import org.apache.cassandra.io.sstable.IndexHelper;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.util.FileDataInput;
++import org.apache.cassandra.io.util.FileMark;
+ 
+ import com.google.common.base.Predicate;
+ import com.google.common.collect.AbstractIterator;
+@@ -172,6 +173,7 @@ public void close() throws IOException
+ 
+         private int curRangeIndex;
+         private Deque<IColumn> blockColumns = new ArrayDeque<IColumn>();
++        private final FileMark mark;
+ 
+         public ColumnGroupReader(SSTableReader ssTable, FileDataInput input)
+         {
+@@ -188,7 +190,7 @@ public ColumnGroupReader(SSTableReader ssTable, FileDataInput input)
+             {
+                 throw new IOError(e);
+             }
+-            file.mark();
++            this.mark = file.mark();
+             curRangeIndex = IndexHelper.indexFor(startColumn, indexes, comparator, reversed);
+             if (reversed && curRangeIndex == indexes.size())
+                 curRangeIndex--;
+@@ -241,10 +243,10 @@ public boolean getNextBlock() throws IOException
+ 
+             boolean outOfBounds = false;
+ 
+-            file.reset();
++            file.reset(mark);
+             long curOffset = file.skipBytes((int) curColPosition.offset); 
+             assert curOffset == curColPosition.offset;
+-            while (file.bytesPastMark() < curColPosition.offset + curColPosition.width && !outOfBounds)
++            while (file.bytesPastMark(mark) < curColPosition.offset + curColPosition.width && !outOfBounds)
+             {
+                 IColumn column = emptyColumnFamily.getColumnSerializer().deserialize(file);
+                 if (reversed)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/IndexHelper.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
+index e1efd6dc..ae1badae 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/IndexHelper.java
+@@ -25,6 +25,7 @@
+ import org.apache.cassandra.utils.BloomFilter;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.io.util.FileDataInput;
++import org.apache.cassandra.io.util.FileMark;
+ 
+ /**
+  * Provides helper to serialize, deserialize and use column indexes.
+@@ -70,12 +71,12 @@ public static void skipIndex(DataInput file) throws IOException
+         ArrayList<IndexInfo> indexList = new ArrayList<IndexInfo>();
+ 
+ 		int columnIndexSize = in.readInt();
+-        in.mark();
+-        while (in.bytesPastMark() < columnIndexSize)
++        FileMark mark = in.mark();
++        while (in.bytesPastMark(mark) < columnIndexSize)
+         {
+             indexList.add(IndexInfo.deserialize(in));
+         }
+-        assert in.bytesPastMark() == columnIndexSize;
++        assert in.bytesPastMark(mark) == columnIndexSize;
+ 
+         return indexList;
+ 	}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java b/cassandra/trunk/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
+index 0ab62284..cacd40c9 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/util/BufferedRandomAccessFile.java
+@@ -56,7 +56,6 @@
+     private long maxHi_; // this.lo + this.buff.length
+     private boolean hitEOF_; // buffer contains last file block?
+     private long diskPos_; // disk position
+-    private long markedPointer;
+     private long fileLength = -1; // cache for file size
+ 
+     /*
+@@ -408,22 +407,34 @@ public long bytesRemaining() throws IOException
+         return length() - getFilePointer();
+     }
+ 
+-    public void mark()
++    public FileMark mark()
+     {
+-        markedPointer = getFilePointer();
++        return new BufferedRandomAccessFileMark(getFilePointer());
+     }
+ 
+-    public void reset() throws IOException
++    public void reset(FileMark mark) throws IOException
+     {
+-        seek(markedPointer);
++        assert mark instanceof BufferedRandomAccessFileMark;
++        seek(((BufferedRandomAccessFileMark) mark).pointer);
+     }
+ 
+-    public int bytesPastMark()
++    public int bytesPastMark(FileMark mark)
+     {
+-        long bytes = getFilePointer() - markedPointer;
++        assert mark instanceof BufferedRandomAccessFileMark;
++        long bytes = getFilePointer() - ((BufferedRandomAccessFileMark) mark).pointer;
+         assert bytes >= 0;
+         if (bytes > Integer.MAX_VALUE)
+             throw new UnsupportedOperationException("Overflow: " + bytes);
+         return (int) bytes;
+     }
++
++    private static class BufferedRandomAccessFileMark implements FileMark
++    {
++        long pointer;
++
++        BufferedRandomAccessFileMark(long pointer)
++        {
++            this.pointer = pointer;
++        }
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileDataInput.java b/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileDataInput.java
+index a48a1516..41c10496 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileDataInput.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileDataInput.java
+@@ -33,9 +33,9 @@
+ 
+     public long bytesRemaining() throws IOException;
+ 
+-    public void mark();
++    public FileMark mark();
+ 
+-    public void reset() throws IOException;
++    public void reset(FileMark mark) throws IOException;
+ 
+-    public int bytesPastMark();
++    public int bytesPastMark(FileMark mark);
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileMark.java b/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileMark.java
+index e69de29b..d45ab42b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileMark.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/util/FileMark.java
+@@ -0,0 +1,23 @@
++package org.apache.cassandra.io.util;
++/*
++ * 
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ * 
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ * 
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ * 
++ */
++
++public interface FileMark {}
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/util/MappedFileDataInput.java b/cassandra/trunk/src/java/org/apache/cassandra/io/util/MappedFileDataInput.java
+index feaa2c47..1b57a822 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/util/MappedFileDataInput.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/util/MappedFileDataInput.java
+@@ -29,7 +29,6 @@
+     private final MappedByteBuffer buffer;
+     private final String filename;
+     private int position;
+-    private int markedPosition;
+ 
+     public MappedFileDataInput(MappedByteBuffer buffer, String filename, int position)
+     {
+@@ -48,30 +47,26 @@ private void seekInternal(int pos) throws IOException
+     @Override
+     public boolean markSupported()
+     {
+-        return true;
++        return false;
+     }
+ 
+     @Override
+-    public void mark(int ignored)
++    public void reset(FileMark mark) throws IOException
+     {
+-        markedPosition = position;
++        assert mark instanceof MappedFileDataInputMark;
++        seekInternal(((MappedFileDataInputMark) mark).position);
+     }
+ 
+-    @Override
+-    public void reset() throws IOException
++    public FileMark mark()
+     {
+-        seekInternal(markedPosition);
++        return new MappedFileDataInputMark(position);
+     }
+ 
+-    public void mark()
++    public int bytesPastMark(FileMark mark)
+     {
+-        mark(-1);
+-    }
+-
+-    public int bytesPastMark()
+-    {
+-        assert position >= markedPosition;
+-        return position - markedPosition;
++        assert mark instanceof MappedFileDataInputMark;
++        assert position >= ((MappedFileDataInputMark) mark).position;
++        return position - ((MappedFileDataInputMark) mark).position;
+     }
+ 
+     public boolean isEOF() throws IOException
+@@ -423,4 +418,14 @@ public final int readUnsignedShort() throws IOException {
+     public final String readUTF() throws IOException {
+         return DataInputStream.readUTF(this);
+     }
++
++    private static class MappedFileDataInputMark implements FileMark
++    {
++        int position;
++
++        MappedFileDataInputMark(int position)
++        {
++            this.position = position;
++        }
++    }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/RowIterationTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/RowIterationTest.java
+index e69de29b..fa0cec08 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/RowIterationTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/RowIterationTest.java
+@@ -0,0 +1,62 @@
++/*
++* Licensed to the Apache Software Foundation (ASF) under one
++* or more contributor license agreements.  See the NOTICE file
++* distributed with this work for additional information
++* regarding copyright ownership.  The ASF licenses this file
++* to you under the Apache License, Version 2.0 (the
++* "License"); you may not use this file except in compliance
++* with the License.  You may obtain a copy of the License at
++*
++*    http://www.apache.org/licenses/LICENSE-2.0
++*
++* Unless required by applicable law or agreed to in writing,
++* software distributed under the License is distributed on an
++* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++* KIND, either express or implied.  See the License for the
++* specific language governing permissions and limitations
++* under the License.
++*/
++package org.apache.cassandra.db;
++
++import java.io.IOException;
++import java.net.InetAddress;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
++import java.util.ArrayList;
++import java.util.Set;
++import java.util.HashSet;
++
++import org.apache.cassandra.Util;
++
++import org.junit.Test;
++
++import org.apache.cassandra.io.sstable.SSTableReader;
++import org.apache.cassandra.CleanupHelper;
++import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.utils.FBUtilities;
++import static junit.framework.Assert.assertEquals;
++
++public class RowIterationTest extends CleanupHelper
++{
++    public static final String TABLE1 = "Keyspace2";
++    public static final InetAddress LOCAL = FBUtilities.getLocalAddress();
++
++    @Test
++    public void testRowIteration() throws IOException, ExecutionException, InterruptedException
++    {
++        Table table = Table.open(TABLE1);
++        ColumnFamilyStore store = table.getColumnFamilyStore("Super3");
++
++        final int ROWS_PER_SSTABLE = 10;
++        Set<DecoratedKey> inserted = new HashSet<DecoratedKey>();
++        for (int i = 0; i < ROWS_PER_SSTABLE; i++) {
++            DecoratedKey key = Util.dk(String.valueOf(i));
++            RowMutation rm = new RowMutation(TABLE1, key.key);
++            rm.add(new QueryPath("Super3", "sc".getBytes(), String.valueOf(i).getBytes()), new byte[ROWS_PER_SSTABLE * 10 - i * 2], new TimestampClock(i));
++            rm.apply();
++            inserted.add(key);
++        }
++        store.forceBlockingFlush();
++        assertEquals(inserted.toString(), inserted.size(), Util.getRangeSlice(store).size());
++    }
++}

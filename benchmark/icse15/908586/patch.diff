@@ -1,0 +1,132 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/OverflowInputStream.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/OverflowInputStream.java
+index 7d3e12f7..a304235b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/OverflowInputStream.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/OverflowInputStream.java
+@@ -25,6 +25,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.reference.SQLState;
+ 
+ import org.apache.derby.iapi.services.io.CloneableStream;
++import org.apache.derby.iapi.services.i18n.MessageService;
+ 
+ import org.apache.derby.iapi.store.raw.RecordHandle;
+ 
+@@ -33,6 +34,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.store.raw.LockingPolicy;
+ import org.apache.derby.iapi.store.access.TransactionController;
+ 
++import org.apache.derby.shared.common.reference.MessageId;
++
++import java.io.EOFException;
+ import java.io.InputStream;
+ import java.io.IOException;
+ 
+@@ -151,6 +155,11 @@ public void fillByteHolder()
+                     columnOverflowPage.restorePortionLongColumn(this);
+                     columnOverflowPage.unlatch();
+                     columnOverflowPage = null;
++                } else {
++                    // An overflow page was specified, but we failed to get it.
++                    // Probably the value got deleted under our feet.
++                    throw new EOFException(MessageService.getTextMessage(
++                            MessageId.STORE_STREAM_OVERFLOW_PAGE_NOT_FOUND));
+                 }
+ 
+             }
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+index e30fa614..ac38ba6b 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/MessageId.java
+@@ -89,7 +89,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     String STORE_DURABILITY_TESTMODE_NO_SYNC = "D013"; // for derby.system.durability is 
+                                                        // set to test
+     String STORE_BOOT_READONLY_MSG          = "D014";
+-
++    /**
++     * When the specified overflow page isn't found while streaming from a
++     * page overflow chain (large data values, typically BLOB or CLOB).
++     */
++    String STORE_STREAM_OVERFLOW_PAGE_NOT_FOUND = "D015";
+ 
+ 	/*
+ 	** ClassManager
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+index 00e76339..4faf6cd8 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/BLOBTest.java
+@@ -35,6 +35,7 @@
+ import java.sql.Connection;
+ import java.sql.SQLException;
+ import java.sql.Types;
++import java.io.EOFException;
+ import java.io.IOException;
+ import java.io.InputStream;
+ import java.util.Random;
+@@ -544,6 +545,68 @@ public void testDerby4477_2349_Repro() throws SQLException, IOException {
+         rollback();
+     }
+ 
++    /**
++     * Checks that Derby fails with an exception when a transaction using
++     * READ_UNCOMMITTED obtains a stream from a BLOB (reads one byte) and at
++     * the same time another connection deletes the BLOB.
++     * <p>
++     * Earlier only parts of the BLOB was returned, without errors. It was
++     * impossible to tell for the user that only parts of the value was
++     * retrieved.
++     * <p>
++     * See DERBY-2992.
++     */
++    public void testDerby2992_Repro()
++            throws IOException, SQLException {
++        // Autocommit doesn't seem to be enabled here in all cases.
++        setAutoCommit(true);
++
++        final String TBL = "D2992BLOB";
++        // Switch to READ UNCOMMITTED.
++        getConnection().setTransactionIsolation(
++                Connection.TRANSACTION_READ_UNCOMMITTED);
++        Statement stmt = createStatement();
++        dropTable(TBL);
++        stmt.executeUpdate("create table " + TBL + " (b blob)");
++        stmt.close();
++
++        PreparedStatement ps = prepareStatement("insert into " + TBL +
++                " values (?)");
++        int length = 65*1024*1024; // 65K
++        ps.setBinaryStream(1, new LoopingAlphabetStream(length), length);
++        ps.executeUpdate();
++        ps.close();
++
++        stmt = createStatement();
++        ResultSet rs = stmt.executeQuery("select B from " + TBL);
++        assertTrue(rs.next());
++
++        // Read one byte, keep the stream / rs open.
++        InputStream is = rs.getBinaryStream(1);
++        int i = is.read();
++        assertTrue(i != -1);
++
++        // Open a second connection and delete the BLOB.
++        Connection secondCon = openUserConnection("APP");
++        Statement secondStmt = secondCon.createStatement();
++        assertEquals(1, secondStmt.executeUpdate("delete from " + TBL));
++        secondCon.close();
++
++        // Continue reading the BLOB through the stream.
++        // The stream has now probably read one page of data, and as we progress
++        // it will have to fetch the next page. However, the next page has been
++        // deleted.
++        byte[] buf = new byte[4096];
++        try {
++            // Drain the stream.
++            while (is.read(buf) != -1) { }
++            // Expect the read call above to fail at some point.
++            fail("The read should have failed, value has been deleted");
++        } catch (EOFException eofe) {
++            // As we expected, everything's fine.
++        }
++    }
++
+     public static void setRandomValue(
+         Random r,
+         PreparedStatement ps,

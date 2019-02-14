@@ -1,0 +1,144 @@
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/config/CFMetaData.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/config/CFMetaData.java
+index 871a69b6..c3f7c622 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -244,6 +244,7 @@ private static CFMetaData newSystemMetadata(String cfName, int cfId, String comm
+     public static CFMetaData newIndexMetadata(CFMetaData parent, ColumnDefinition info, AbstractType columnComparator)
+     {
+         return new CFMetaData(parent.ksName, parent.indexColumnFamilyName(info), ColumnFamilyType.Standard, columnComparator, null)
++                             .keyValidator(info.getValidator())
+                              .keyCacheSize(0.0)
+                              .readRepairChance(0.0)
+                              .gcGraceSeconds(parent.gcGraceSeconds)
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 157c0a06..047d6a10 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1544,9 +1544,10 @@ public int getKeyCacheSize()
+      * For testing.  no effort is made to clear historical memtables, nor for
+      * thread safety
+      */
+-    void clearUnsafe()
++    public void clearUnsafe()
+     {
+-        data.init();
++        for (ColumnFamilyStore cfs : concatWithIndexes())
++            cfs.data.init();
+     }
+ 
+     /**
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Table.java
+index 0c372986..9b51703b 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Table.java
+@@ -514,7 +514,9 @@ public AbstractReplicationStrategy getReplicationStrategy()
+ 
+     public static void indexRow(DecoratedKey<?> key, ColumnFamilyStore cfs, SortedSet<ByteBuffer> indexedColumns)
+     {
+-        logger.debug("Indexing row {} ", key);
++        if (logger.isDebugEnabled())
++            logger.debug("Indexing row {} ", cfs.metadata.getKeyValidator().getString(key.key));
++
+         switchLock.readLock().lock();
+         try
+         {
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysIndex.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysIndex.java
+index c970a29b..12994ab2 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysIndex.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysIndex.java
+@@ -56,7 +56,7 @@ public void init()
+         assert baseCfs != null && columnDefs != null;
+ 
+         ColumnDefinition columnDef = columnDefs.iterator().next();
+-        CFMetaData indexedCfMetadata = CFMetaData.newIndexMetadata(baseCfs.metadata, columnDef,indexComparator());
++        CFMetaData indexedCfMetadata = CFMetaData.newIndexMetadata(baseCfs.metadata, columnDef, indexComparator());
+         indexCfs = ColumnFamilyStore.createColumnFamilyStore(baseCfs.table,
+                                                                indexedCfMetadata.cfName,
+                                                                new LocalPartitioner(columnDef.getValidator()),
+@@ -99,7 +99,7 @@ public void insertColumn(DecoratedKey<?> valueKey, ByteBuffer rowKey, IColumn co
+             cfi.addColumn(new Column(rowKey, ByteBufferUtil.EMPTY_BYTE_BUFFER, column.timestamp()));
+         }
+         if (logger.isDebugEnabled())
+-            logger.debug("applying index row {}:{}", valueKey, cfi);
++            logger.debug("applying index row {} in {}", indexCfs.metadata.getKeyValidator().getString(valueKey.key), cfi);
+         
+         indexCfs.apply(valueKey, cfi);
+     }
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysSearcher.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysSearcher.java
+index 35ab9148..a6a11795 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysSearcher.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/index/keys/KeysSearcher.java
+@@ -149,7 +149,7 @@ private static boolean isIdentityFilter(SliceQueryFilter filter)
+              * should be pretty close to `start_key`. */
+             if (logger.isDebugEnabled())
+                 logger.debug(String.format("Scanning index %s starting with %s",
+-                                           expressionString(primary), index.getUnderlyingCfs().getComparator().getString(startKey)));
++                                           expressionString(primary), index.getBaseCFStore().metadata.getKeyValidator().getString(startKey)));
+ 
+             // We shouldn't fetch only 1 row as this provides buggy paging in case the first row doesn't satisfy all clauses
+             int count = Math.max(clause.count, 2);
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/SchemaLoader.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/SchemaLoader.java
+index 9518f0f2..fc39b871 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/SchemaLoader.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/SchemaLoader.java
+@@ -276,6 +276,7 @@ private static CFMetaData superCFMD(String ksName, String cfName, AbstractType s
+     private static CFMetaData indexCFMD(String ksName, String cfName, final Boolean withIdxType) throws ConfigurationException
+     {
+         return standardCFMD(ksName, cfName)
++               .keyValidator(AsciiType.instance)
+                 .columnMetadata(new HashMap<ByteBuffer, ColumnDefinition>()
+                     {{
+                         ByteBuffer cName = ByteBuffer.wrap("birthdate".getBytes(Charsets.UTF_8));
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
+index 6678bfdb..adbbd010 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/streaming/StreamingTransferTest.java
+@@ -48,10 +48,15 @@
+ 
+ import org.junit.BeforeClass;
+ import org.junit.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ 
+ public class StreamingTransferTest extends CleanupHelper
+ {
++    private static final Logger logger = LoggerFactory.getLogger(StreamingTransferTest.class);
++
+     public static final InetAddress LOCAL = FBUtilities.getBroadcastAddress();
+ 
+     @BeforeClass
+@@ -67,6 +72,7 @@ public static void setup() throws Exception
+     private List<String> createAndTransfer(Table table, ColumnFamilyStore cfs, Mutator mutator) throws Exception
+     {
+         // write a temporary SSTable, and unregister it
++        logger.debug("Mutating " + cfs.columnFamily);
+         long timestamp = 1234;
+         for (int i = 1; i <= 3; i++)
+             mutator.mutate("key" + i, "col" + i, timestamp);
+@@ -79,6 +85,7 @@ public static void setup() throws Exception
+         cfs.removeAllSSTables();
+ 
+         // transfer the first and last key
++        logger.debug("Transferring " + cfs.columnFamily);
+         int[] offs = new int[]{1, 3};
+         IPartitioner p = StorageService.getPartitioner();
+         List<Range> ranges = new ArrayList<Range>();
+@@ -110,6 +117,8 @@ public static void setup() throws Exception
+         List<String> keys = new ArrayList<String>();
+         for (int off : offs)
+             keys.add("key" + off);
++
++        logger.debug("... everything looks good for " + cfs.columnFamily);
+         return keys;
+     }
+ 
+@@ -129,6 +138,7 @@ public void mutate(String key, String col, long timestamp) throws Exception
+                 cf.addColumn(column(col, "v", timestamp));
+                 cf.addColumn(new Column(ByteBufferUtil.bytes("birthdate"), ByteBufferUtil.bytes(val), timestamp));
+                 rm.add(cf);
++                logger.debug("Applying row to transfer " + rm);
+                 rm.apply();
+             }
+         });

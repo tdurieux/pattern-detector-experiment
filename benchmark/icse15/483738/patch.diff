@@ -1,0 +1,176 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
+index dd6d33ed..b15e042f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/JarUtil.java
+@@ -133,7 +133,7 @@ private long add(final InputStream is) throws StandardException
+             final String jarExternalName = JarDDL.mkExternalName(schemaName,
+                     sqlName, fr.getSeparatorChar());
+ 
+-            long generationId = setJar(jarExternalName, is);
++            long generationId = setJar(jarExternalName, is, true, 0L);
+ 
+             fid = ddg.newFileInfoDescriptor(/*DJD*/null, sd, sqlName, generationId);
+             dd.addDescriptor(fid, sd, DataDictionary.SYSFILES_CATALOG_NUM,
+@@ -284,9 +284,8 @@ private long replace(InputStream is) throws StandardException
+ 
+ 			//
+ 			//Replace the file.
+-			long generationId = 
+-				fr.replace(jarExternalName,
+-					fid.getGenerationId(), is);
++			long generationId = setJar(jarExternalName, is, false,
++					fid.getGenerationId());
+ 
+ 			//
+ 			//Re-add the descriptor to the data dictionary.
+@@ -359,16 +358,27 @@ public Object run() throws IOException {
+      * input stream into the database
+      * @param jarExternalName Name of jar with database structure.
+      * @param contents Contents of jar file.
++     * @param add true to add, false to replace
++     * @param currentGenerationId generation id of existing version, ignored when adding.
+      */
+-    private long setJar(final String jarExternalName, final InputStream contents)
++    private long setJar(final String jarExternalName,
++            final InputStream contents,
++            final boolean add,
++            final long currentGenerationId)
+             throws StandardException {
+         try {
+             return ((Long) AccessController
+                     .doPrivileged(new java.security.PrivilegedExceptionAction() {
+ 
+                         public Object run() throws StandardException {
+-                            long generatedId = fr.add(jarExternalName, contents);
+-                            return new Long(generatedId);
++                            long generationId;
++                            
++                            if (add)
++                                generationId = fr.add(jarExternalName, contents);
++                            else
++                                generationId =  fr.replace(jarExternalName,
++                                        currentGenerationId, contents);
++                            return new Long(generationId);
+                         }
+                     })).longValue();
+         } catch (PrivilegedActionException e) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
+index 58dbc14a..6e5c222c 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RFResource.java
+@@ -43,6 +43,10 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.io.OutputStream;
+ import java.io.FileNotFoundException;
+ import java.io.IOException;
++import java.security.AccessController;
++import java.security.PrivilegedAction;
++import java.security.PrivilegedActionException;
++import java.security.PrivilegedExceptionAction;
+ 
+ class RFResource implements FileResource {
+ 
+@@ -223,7 +227,7 @@ public char getSeparatorChar()
+ } // end of class RFResource
+ 
+ 
+-class RemoveFile implements Serviceable
++final class RemoveFile implements Serviceable, PrivilegedExceptionAction
+ {
+ 	private final StorageFile fileToGo;
+ 
+@@ -235,14 +239,10 @@ public char getSeparatorChar()
+ 	public int performWork(ContextManager context)
+         throws StandardException
+     {
+-        // SECURITY PERMISSION - MP1, OP5
+-        if (fileToGo.exists())
+-        {
+-            if (!fileToGo.delete())
+-            {
+-                throw StandardException.newException(
+-                    SQLState.FILE_CANNOT_REMOVE_FILE, fileToGo);
+-            }
++        try {
++            AccessController.doPrivileged(this);
++        } catch (PrivilegedActionException e) {
++            throw (StandardException) (e.getException());
+         }
+         return Serviceable.DONE;
+ 	}
+@@ -262,4 +262,15 @@ public boolean serviceImmediately()
+ 	{
+ 		return true;
+ 	}	
++
++    public Object run() throws StandardException {
++        // SECURITY PERMISSION - MP1, OP5
++        if (fileToGo.exists()) {
++            if (!fileToGo.delete()) {
++                throw StandardException.newException(
++                        SQLState.FILE_CANNOT_REMOVE_FILE, fileToGo);
++            }
++        }
++        return null;
++    }	
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DatabaseClassLoadingTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DatabaseClassLoadingTest.java
+index 7129a074..602aeecc 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DatabaseClassLoadingTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/DatabaseClassLoadingTest.java
+@@ -60,9 +60,11 @@ public static Test suite()
+         Test test = suite;
+         if (JDBC.vmSupportsJDBC3()) {
+         
++          suite.addTest(new DatabaseClassLoadingTest("testJarHandling"));
+         
+           suite.addTest(new DatabaseClassLoadingTest("testWithNoInstalledJars"));
+           suite.addTest(new DatabaseClassLoadingTest("testWithNoClasspath"));
++ 
+           suite.addTest(
+                 SecurityManagerSetup.noSecurityManager(
+                         new DatabaseClassLoadingTest("testSetClasspath")));
+@@ -172,6 +174,19 @@ public void testWithNoInstalledJars() throws SQLException {
+         }
+     }
+     
++    /**
++     * Test the sqlj procedures without setting any database
++     * classpath. This allows testing with the security manager
++     * without hitting the bugs that exist when the database class path
++     * is set with the security manager.
++     */
++    public void testJarHandling() throws SQLException, MalformedURLException
++    {       
++        installJar("dcl_emc1.jar", "EMC.MAIL_APP_JHT");
++        replaceJar("dcl_emc2.jar", "EMC.MAIL_APP_JHT");
++        removeJar("EMC.MAIL_APP_JHT");
++    }
++    
+     /**
+      * Install the jar, but don't set the classpath.
+      * @throws SQLException
+@@ -714,6 +729,14 @@ private void replaceJar(String resource, String jarName) throws SQLException, Ma
+         cs.close();
+     }
+     
++    private void removeJar(String jarName) throws SQLException
++    {
++        CallableStatement cs = prepareCall("CALL SQLJ.REMOVE_JAR(?, 0)");       
++        cs.setString(1, jarName);       
++        cs.executeUpdate();        
++        cs.close();
++    }
++    
+     private void setDBClasspath(String cp) throws SQLException
+     {
+         CallableStatement cs = prepareCall(
+@@ -724,6 +747,9 @@ private void setDBClasspath(String cp) throws SQLException
+         cs.close();
+     }
+     
++    
++    
++    
+     private void derby2035Workaround() throws SQLException
+     {
+         // DERBY-2035 Other connections, e.g. the next fixture

@@ -1,0 +1,198 @@
+diff --git a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/db/SystemTable.java b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/db/SystemTable.java
+index b70f50fa..0095f544 100644
+--- a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/db/SystemTable.java
++++ b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/db/SystemTable.java
+@@ -62,6 +62,7 @@
+     private static final ByteBuffer TOKEN = ByteBufferUtil.bytes("Token");
+     private static final ByteBuffer GENERATION = ByteBufferUtil.bytes("Generation");
+     private static final ByteBuffer CLUSTERNAME = ByteBufferUtil.bytes("ClusterName");
++    private static final ByteBuffer PARTITIONER = ByteBufferUtil.bytes("Partioner");
+     private static final ByteBuffer CURRENT_LOCAL_NODE_ID_KEY = ByteBufferUtil.bytes("CurrentLocal");
+     private static final ByteBuffer ALL_LOCAL_NODE_ID_KEY = ByteBufferUtil.bytes("Local");
+ 
+@@ -246,7 +247,7 @@ private static void forceBlockingFlush(String cfname)
+      * One of three things will happen if you try to read the system table:
+      * 1. files are present and you can read them: great
+      * 2. no files are there: great (new node is assumed)
+-     * 3. files are present but you can't read them: bad
++     * 3. files are present but you can't read them: bad (suspect that the partitioner was changed).
+      * @throws ConfigurationException
+      */
+     public static void checkHealth() throws ConfigurationException, IOException
+@@ -259,26 +260,28 @@ public static void checkHealth() throws ConfigurationException, IOException
+         catch (AssertionError err)
+         {
+             // this happens when a user switches from OPP to RP.
+-            ConfigurationException ex = new ConfigurationException("Could not read system table!");
++            ConfigurationException ex = new ConfigurationException("Could not read system table. Did you change partitioners?");
+             ex.initCause(err);
+             throw ex;
+         }
+         
+         SortedSet<ByteBuffer> cols = new TreeSet<ByteBuffer>(BytesType.instance);
++        cols.add(PARTITIONER);
+         cols.add(CLUSTERNAME);
+         QueryFilter filter = QueryFilter.getNamesFilter(decorate(LOCATION_KEY), new QueryPath(STATUS_CF), cols);
+         ColumnFamily cf = table.getColumnFamilyStore(STATUS_CF).getColumnFamily(filter);
+         
+         if (cf == null)
+         {
+-            // this is a brand new node
++            // this is either a brand new node (there will be no files), or the partitioner was changed from RP to OPP.
+             ColumnFamilyStore cfs = table.getColumnFamilyStore(STATUS_CF);
+             if (!cfs.getSSTables().isEmpty())
+-                throw new ConfigurationException("Found system table files, but they couldn't be loaded!");
++                throw new ConfigurationException("Found system table files, but they couldn't be loaded. Did you change the partitioner?");
+ 
+             // no system files.  this is a new node.
+             RowMutation rm = new RowMutation(Table.SYSTEM_TABLE, LOCATION_KEY);
+             cf = ColumnFamily.create(Table.SYSTEM_TABLE, SystemTable.STATUS_CF);
++            cf.addColumn(new Column(PARTITIONER, ByteBufferUtil.bytes(DatabaseDescriptor.getPartitioner().getClass().getName()), FBUtilities.timestampMicros()));
+             cf.addColumn(new Column(CLUSTERNAME, ByteBufferUtil.bytes(DatabaseDescriptor.getClusterName()), FBUtilities.timestampMicros()));
+             rm.add(cf);
+             rm.apply();
+@@ -287,8 +290,12 @@ public static void checkHealth() throws ConfigurationException, IOException
+         }
+         
+         
++        IColumn partitionerCol = cf.getColumn(PARTITIONER);
+         IColumn clusterCol = cf.getColumn(CLUSTERNAME);
++        assert partitionerCol != null;
+         assert clusterCol != null;
++        if (!DatabaseDescriptor.getPartitioner().getClass().getName().equals(ByteBufferUtil.string(partitionerCol.value())))
++            throw new ConfigurationException("Detected partitioner mismatch! Did you change the partitioner?");
+         String savedClusterName = ByteBufferUtil.string(clusterCol.value());
+         if (!DatabaseDescriptor.getClusterName().equals(savedClusterName))
+             throw new ConfigurationException("Saved cluster name " + savedClusterName + " != configured name " + DatabaseDescriptor.getClusterName());
+diff --git a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/Descriptor.java b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/Descriptor.java
+index f22fb3a9..809ad86d 100644
+--- a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/Descriptor.java
++++ b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/Descriptor.java
+@@ -56,9 +56,7 @@
+     // f (0.7.0): switched bloom filter implementations in data component
+     // g (0.8): tracks flushed-at context in metadata component
+     // h (1.0): tracks max client timestamp in metadata component
+-    // hb (1.0.3): records compression ration in metadata component
+-    // hc (1.0.4): records partitioner in metadata component
+-    public static final String CURRENT_VERSION = "hc";
++    public static final String CURRENT_VERSION = "hb";
+ 
+     public final File directory;
+     /** version has the following format: <code>[a-z]+</code> */
+@@ -77,7 +75,6 @@
+     public final boolean metadataIncludesReplayPosition;
+     public final boolean tracksMaxTimestamp;
+     public final boolean hasCompressionRatio;
+-    public final boolean hasPartitioner;
+ 
+     public enum TempState
+     {
+@@ -120,7 +117,6 @@ public Descriptor(String version, File directory, String ksname, String cfname,
+         metadataIncludesReplayPosition = version.compareTo("g") >= 0;
+         tracksMaxTimestamp = version.compareTo("h") >= 0;
+         hasCompressionRatio = version.compareTo("hb") >= 0;
+-        hasPartitioner = version.compareTo("hc") >= 0;
+         isLatestVersion = version.compareTo(CURRENT_VERSION) == 0;
+     }
+ 
+diff --git a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
+index 7a102f0a..46fd6193 100644
+--- a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
++++ b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableMetadata.java
+@@ -29,7 +29,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.commitlog.ReplayPosition;
+ import org.apache.cassandra.io.util.FileUtils;
+ import org.apache.cassandra.utils.EstimatedHistogram;
+@@ -41,8 +40,6 @@
+  *  - estimated column count histogram
+  *  - replay position
+  *  - max column timestamp
+- *  - compression ratio
+- *  - partitioner
+  *
+  * An SSTableMetadata should be instantiated via the Collector, openFromDescriptor()
+  * or createDefaultInstance()
+@@ -58,26 +55,19 @@
+     public final ReplayPosition replayPosition;
+     public final long maxTimestamp;
+     public final double compressionRatio;
+-    public final String partitioner;
+ 
+     private SSTableMetadata()
+     {
+-        this(defaultRowSizeHistogram(),
+-             defaultColumnCountHistogram(),
+-             ReplayPosition.NONE,
+-             Long.MIN_VALUE,
+-             Double.MIN_VALUE,
+-             DatabaseDescriptor.getPartitioner().getClass().getCanonicalName());
++        this(defaultRowSizeHistogram(), defaultColumnCountHistogram(), ReplayPosition.NONE, Long.MIN_VALUE, Double.MIN_VALUE);
+     }
+ 
+-    private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition, long maxTimestamp, double cr, String partitioner)
++    private SSTableMetadata(EstimatedHistogram rowSizes, EstimatedHistogram columnCounts, ReplayPosition replayPosition, long maxTimestamp, double cr)
+     {
+         this.estimatedRowSize = rowSizes;
+         this.estimatedColumnCount = columnCounts;
+         this.replayPosition = replayPosition;
+         this.maxTimestamp = maxTimestamp;
+         this.compressionRatio = cr;
+-        this.partitioner = partitioner;
+     }
+ 
+     public static SSTableMetadata createDefaultInstance()
+@@ -136,12 +126,7 @@ public void updateMaxTimestamp(long potentialMax)
+ 
+         public SSTableMetadata finalizeMetadata()
+         {
+-            return new SSTableMetadata(estimatedRowSize,
+-                                       estimatedColumnCount,
+-                                       replayPosition,
+-                                       maxTimestamp,
+-                                       compressionRatio,
+-                                       DatabaseDescriptor.getPartitioner().getClass().getCanonicalName());
++            return new SSTableMetadata(estimatedRowSize, estimatedColumnCount, replayPosition, maxTimestamp, compressionRatio);
+         }
+ 
+         public Collector estimatedRowSize(EstimatedHistogram estimatedRowSize)
+@@ -174,7 +159,6 @@ public void serialize(SSTableMetadata sstableStats, DataOutput dos) throws IOExc
+             ReplayPosition.serializer.serialize(sstableStats.replayPosition, dos);
+             dos.writeLong(sstableStats.maxTimestamp);
+             dos.writeDouble(sstableStats.compressionRatio);
+-            dos.writeUTF(sstableStats.partitioner);
+         }
+ 
+         public SSTableMetadata deserialize(Descriptor descriptor) throws IOException
+@@ -209,10 +193,7 @@ public SSTableMetadata deserialize(DataInputStream dis, Descriptor desc) throws
+             double compressionRatio = desc.hasCompressionRatio
+                                     ? dis.readDouble()
+                                     : Double.MIN_VALUE;
+-            String partitioner = desc.hasPartitioner
+-                               ? dis.readUTF()
+-                               : DatabaseDescriptor.getPartitioner().getClass().getCanonicalName();
+-            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, maxTimestamp, compressionRatio, partitioner);
++            return new SSTableMetadata(rowSizes, columnCounts, replayPosition, maxTimestamp, compressionRatio);
+         }
+     }
+ }
+diff --git a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableReader.java b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+index 75e5ffc5..1dc049b7 100644
+--- a/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
++++ b/cassandra/branches/cassandra-1.0.5/src/java/org/apache/cassandra/io/sstable/SSTableReader.java
+@@ -137,12 +137,6 @@ public static SSTableReader open(Descriptor descriptor, Set<Component> component
+                                         ? SSTableMetadata.serializer.deserialize(descriptor)
+                                         : SSTableMetadata.createDefaultInstance();
+ 
+-        // check if sstable is created using same partitioner as this node
+-        String partitionerName = partitioner.getClass().getCanonicalName();
+-        if (!partitionerName.equals(sstableMetadata.partitioner))
+-            throw new RuntimeException(String.format("Cannot open %s because partitioner does not match %s",
+-                                                     descriptor, partitionerName));
+-
+         SSTableReader sstable = new SSTableReader(descriptor,
+                                                   components,
+                                                   metadata,

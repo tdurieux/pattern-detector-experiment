@@ -1,0 +1,154 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index ae5e09b4..bbdf7d9b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -81,8 +81,6 @@
+     public final String name;
+     /* ColumnFamilyStore per column family */
+     private final Map<Integer, ColumnFamilyStore> columnFamilyStores = new HashMap<Integer, ColumnFamilyStore>();
+-    /* map to make it easier to look up cfs by name */
+-    private final Map<String, Integer> cfNameMap = new HashMap<String, Integer>();
+     // cache application CFs since Range queries ask for them a _lot_
+     private SortedSet<String> applicationColumnFamilies;
+     private final TimerTask flushTask;
+@@ -118,19 +116,23 @@ public static Table clear(String table) throws IOException
+         }
+     }
+     
+-    public Set<String> getColumnFamilies()
++    public Collection<ColumnFamilyStore> getColumnFamilyStores()
+     {
+-        return cfNameMap.keySet();
++        return Collections.unmodifiableCollection(columnFamilyStores.values());
+     }
+ 
+-    public Collection<ColumnFamilyStore> getColumnFamilyStores()
++    public ColumnFamilyStore getColumnFamilyStore(int cfId)
+     {
+-        return Collections.unmodifiableCollection(columnFamilyStores.values());
++        return columnFamilyStores.get(cfId);
+     }
+ 
++    /**
++     * @Deprecated Use getColumnFamilyStore(id) instead.
++     */
++    @Deprecated
+     public ColumnFamilyStore getColumnFamilyStore(String cfName)
+     {
+-        return columnFamilyStores.get(cfNameMap.get(cfName));
++        return columnFamilyStores.get(CFMetaData.getId(name, cfName));
+     }
+ 
+     /**
+@@ -261,7 +263,6 @@ private Table(String table)
+         for (CFMetaData cfm : DatabaseDescriptor.getTableDefinition(table).cfMetaData().values())
+         {
+             columnFamilyStores.put(cfm.cfId, ColumnFamilyStore.createColumnFamilyStore(table, cfm.cfName));
+-            cfNameMap.put(cfm.cfName, cfm.cfId);
+         }
+ 
+         // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+@@ -286,7 +287,6 @@ public void dropCf(int cfId) throws IOException
+         ColumnFamilyStore cfs = columnFamilyStores.remove(cfId);
+         if (cfs != null)
+         {
+-            cfNameMap.remove(cfs.getColumnFamilyName());
+             try
+             {
+                 cfs.forceBlockingFlush();
+@@ -307,7 +307,6 @@ public void initCf(int cfId, String cfName)
+     {
+         assert !columnFamilyStores.containsKey(cfId) : cfId;
+         columnFamilyStores.put(cfId, ColumnFamilyStore.createColumnFamilyStore(name, cfName));
+-        cfNameMap.put(cfName, cfId);
+     }
+     
+     /** basically a combined drop and add */
+@@ -319,7 +318,7 @@ public void renameCf(int cfId, String newName) throws IOException
+ 
+     public Row getRow(QueryFilter filter) throws IOException
+     {
+-        ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(filter.getColumnFamilyName()));
++        ColumnFamilyStore cfStore = getColumnFamilyStore(filter.getColumnFamilyName());
+         ColumnFamily columnFamily = cfStore.getColumnFamily(filter);
+         return new Row(filter.key, columnFamily);
+     }
+@@ -393,7 +392,7 @@ void load(RowMutation rowMutation) throws IOException
+             Collection<IColumn> columns = columnFamily.getSortedColumns();
+             for (IColumn column : columns)
+             {
+-                ColumnFamilyStore cfStore = columnFamilyStores.get(cfNameMap.get(new String(column.name(), "UTF-8")));
++                ColumnFamilyStore cfStore = getColumnFamilyStore(new String(column.name(), "UTF-8"));
+                 cfStore.applyBinary(key, column.value());
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 867ddebf..48bf077a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -924,12 +924,9 @@ public double getLoad()
+         for (String tableName : DatabaseDescriptor.getTables())
+         {
+             Table table = Table.open(tableName);
+-            for (String cfName : table.getColumnFamilies())
+-            {
+-                ColumnFamilyStore cfs = table.getColumnFamilyStore(cfName);
++            for (ColumnFamilyStore cfs : table.getColumnFamilyStores())
+                 bytes += cfs.getLiveDiskSpaceUsed();
+             }
+-        }
+         return bytes;
+     }
+ 
+@@ -1066,12 +1063,17 @@ public void clearSnapshot() throws IOException
+             logger_.debug("Cleared out all snapshot directories");
+     }
+ 
+-    public Iterable<ColumnFamilyStore> getValidColumnFamilies(String tableName, String... columnFamilies) throws IOException
++    public Iterable<ColumnFamilyStore> getValidColumnFamilies(String tableName, String... cfNames) throws IOException
+     {
+         Table table = getValidTable(tableName);
+-        Set<ColumnFamilyStore> valid = new HashSet<ColumnFamilyStore>();
+ 
+-        for (String cfName : columnFamilies.length == 0 ? table.getColumnFamilies() : Arrays.asList(columnFamilies))
++        if (cfNames.length == 0)
++            // all stores are interesting
++            return table.getColumnFamilyStores();
++
++        // filter out interesting stores
++        Set<ColumnFamilyStore> valid = new HashSet<ColumnFamilyStore>();
++        for (String cfName : cfNames)
+         {
+             ColumnFamilyStore cfStore = table.getColumnFamilyStore(cfName);
+             if (cfStore == null)
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+index 8d593113..bd2f8eaf 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+@@ -64,7 +64,7 @@ public static void prepareClass() throws Exception
+         StorageService.instance.initServer();
+         // generate a fake endpoint for which we can spoof receiving/sending trees
+         REMOTE = InetAddress.getByName("127.0.0.2");
+-        cfname = Table.open(tablename).getColumnFamilies().iterator().next();
++        cfname = Table.open(tablename).getColumnFamilyStores().iterator().next().columnFamily_;
+     }
+ 
+     @Before
+@@ -242,13 +242,13 @@ public void testGetNeighborsTimesTwo() throws Throwable
+     public void testDifferencer() throws Throwable
+     {
+         // generate a tree
+-        Validator validator = new Validator(new CFPair("Keyspace1", "lcf"));
++        Validator validator = new Validator(new CFPair(tablename, cfname));
+         validator.prepare();
+-
+-        // create a clone with no values filled
+         validator.complete();
+         MerkleTree ltree = validator.tree;
+-        validator = new Validator(new CFPair("Keyspace1", "rcf"));
++
++        // and a clone
++        validator = new Validator(new CFPair(tablename, cfname));
+         validator.prepare();
+         validator.complete();
+         MerkleTree rtree = validator.tree;

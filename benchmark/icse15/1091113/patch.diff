@@ -1,0 +1,212 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/Config.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/Config.java
+index d9e68951..8efdd465 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/Config.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/Config.java
+@@ -83,6 +83,7 @@
+     public Integer column_index_size_in_kb = 64;
+     public Integer in_memory_compaction_limit_in_mb = 256;
+     public Boolean compaction_multithreading = true;
++    public Integer compaction_throughput_mb_per_sec = 16;
+     
+     public String[] data_file_directories;
+ 
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index b837db9e..8a6167b2 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -344,6 +344,9 @@ else if (conf.memtable_flush_writers == null)
+             if (conf.compaction_multithreading == null)
+                 conf.compaction_multithreading = true;
+ 
++            if (conf.compaction_throughput_mb_per_sec == null)
++                conf.compaction_throughput_mb_per_sec = 16;
++
+             /* data file and commit log directories. they get created later, when they're needed. */
+             if (conf.commitlog_directory != null && conf.data_file_directories != null && conf.saved_caches_directory != null)
+             {
+@@ -731,6 +734,16 @@ public static boolean getCompactionMultithreading()
+         return conf.compaction_multithreading;
+     }
+ 
++    public static int getCompactionThroughputMbPerSec()
++    {
++        return conf.compaction_throughput_mb_per_sec;
++    }
++
++    public static void setCompactionThroughputMbPerSec(int value)
++    {
++        conf.compaction_throughput_mb_per_sec = value;
++    }
++
+     public static String[] getAllDataFileLocations()
+     {
+         return conf.data_file_directories;
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/CompactionManager.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/CompactionManager.java
+index 20b7711c..88f54fb4 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -1184,6 +1184,11 @@ public void run ()
+         }
+     }
+ 
++    public int getActiveCompactions()
++    {
++        return executor.getActiveCount();
++    }
++
+     private static class CompactionExecutor extends DebuggableThreadPoolExecutor
+     {
+         // a synchronized identity set of running tasks to their compaction info
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/CompactionIterator.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/CompactionIterator.java
+index 08047310..892295fd 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/CompactionIterator.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/io/CompactionIterator.java
+@@ -36,6 +36,7 @@
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.ColumnFamilyStore;
++import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.io.sstable.SSTableScanner;
+@@ -59,6 +60,14 @@
+     private long bytesRead;
+     private long row;
+ 
++    // the bytes that had been compacted the last time we delayed to throttle,
++    // and the time in milliseconds when we last throttled
++    private long bytesAtLastDelay;
++    private long timeAtLastDelay;
++
++    // current target bytes to compact per millisecond
++    private int targetBytesPerMS = -1;
++
+     public CompactionIterator(String type, Iterable<SSTableReader> sstables, CompactionController controller) throws IOException
+     {
+         this(type, getCollatingIterator(sstables), controller);
+@@ -140,6 +149,7 @@ protected AbstractCompactedRow getReduced()
+                 {
+                     bytesRead += scanner.getFilePointer();
+                 }
++                throttle();
+             }
+         }
+     }
+@@ -161,6 +171,42 @@ protected AbstractCompactedRow getCompactedRow()
+         return new PrecompactedRow(controller, rows);
+     }
+ 
++    private void throttle()
++    {
++        if (DatabaseDescriptor.getCompactionThroughputMbPerSec() < 1)
++            // throttling disabled
++            return;
++        int totalBytesPerMS = DatabaseDescriptor.getCompactionThroughputMbPerSec() * 1024 * 1024 / 1000;
++
++        // bytes compacted and time passed since last delay
++        long bytesSinceLast = bytesRead - bytesAtLastDelay;
++        long msSinceLast = System.currentTimeMillis() - timeAtLastDelay;
++
++        // determine the current target
++        int newTarget = totalBytesPerMS /
++            Math.max(1, CompactionManager.instance.getActiveCompactions());
++        if (newTarget != targetBytesPerMS)
++            logger.info(String.format("%s now compacting at %d bytes/ms.",
++                                      this,
++                                      newTarget));
++        targetBytesPerMS = newTarget;
++
++        // the excess bytes that were compacted in this period
++        long excessBytes = bytesSinceLast - msSinceLast * targetBytesPerMS;
++
++        // the time to delay to recap the deficit
++        long timeToDelay = excessBytes / Math.max(1, targetBytesPerMS);
++        if (timeToDelay > 0)
++        {
++            if (logger.isTraceEnabled())
++                logger.trace(String.format("Compacted %d bytes in %d ms: throttling for %d ms",
++                                           bytesSinceLast, msSinceLast, timeToDelay));
++            try { Thread.sleep(timeToDelay); } catch (InterruptedException e) { throw new AssertionError(e); }
++        }
++        bytesAtLastDelay = bytesRead;
++        timeAtLastDelay = System.currentTimeMillis();
++    }
++
+     public void close() throws IOException
+     {
+         FileUtils.close(getScanners());
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageService.java
+index 49e26ed5..e6bed6ab 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageService.java
+@@ -504,6 +504,10 @@ public boolean isJoined()
+         return joined;
+     }
+ 
++    public void setCompactionThroughputMbPerSec(int value) {
++        DatabaseDescriptor.setCompactionThroughputMbPerSec(value);
++    }
++
+     private void setMode(String m, boolean log)
+     {
+         operationMode = m;
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 9c59062d..036748fb 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -295,4 +295,6 @@
+     // allows a node that have been started without joining the ring to join it
+     public void joinRing() throws IOException, org.apache.cassandra.config.ConfigurationException;
+     public boolean isJoined();
++
++    public void setCompactionThroughputMbPerSec(int value);
+ }
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeCmd.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeCmd.java
+index 4610e61c..84f7baf4 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeCmd.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeCmd.java
+@@ -79,7 +79,7 @@ public NodeCmd(NodeProbe probe)
+         DECOMMISSION, MOVE, LOADBALANCE, REMOVETOKEN, REPAIR, CLEANUP, COMPACT, SCRUB,
+         SETCACHECAPACITY, GETCOMPACTIONTHRESHOLD, SETCOMPACTIONTHRESHOLD, NETSTATS, CFHISTOGRAMS,
+         COMPACTIONSTATS, DISABLEGOSSIP, ENABLEGOSSIP, INVALIDATEKEYCACHE, INVALIDATEROWCACHE,
+-        DISABLETHRIFT, ENABLETHRIFT, JOIN
++        DISABLETHRIFT, ENABLETHRIFT, JOIN, SETCOMPACTIONTHROUGHPUT
+     }
+ 
+     
+@@ -111,6 +111,7 @@ private static void printUsage()
+         addCmdHelp(header, "netstats [host]", "Print network information on provided host (connecting node by default)");
+         addCmdHelp(header, "move <new token>", "Move node on the token ring to a new token");
+         addCmdHelp(header, "removetoken status|force|<token>", "Show status of current token removal, force completion of pending removal or remove providen token");
++        addCmdHelp(header, "setcompactionthroughput <value_in_mb>", "Set the MB/s throughput cap for compaction in the system, or 0 to disable throttling.");
+ 
+         // Two args
+         addCmdHelp(header, "snapshot [keyspaces...] -t [snapshotName]", "Take a snapshot of the specified keyspaces using optional name snapshotName");
+@@ -592,6 +593,11 @@ public static void main(String[] args) throws IOException, InterruptedException,
+                 probe.joinRing();
+                 break;
+ 
++            case SETCOMPACTIONTHROUGHPUT :
++                if (arguments.length != 2) { badUse("Missing value argument."); }
++                probe.setCompactionThroughput(Integer.valueOf(arguments[1]));
++                break;
++
+             case REMOVETOKEN :
+                 if (arguments.length != 1) { badUse("Missing an argument for removetoken (either status, force, or a token)"); }
+                 else if (arguments[0].equals("status")) { nodeCmd.printRemovalStatus(System.out); }
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeProbe.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 9daa5338..f5998454 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -550,6 +550,11 @@ public boolean isInitialized()
+     {
+         return ssProxy.isInitialized();
+     }
++
++    public void setCompactionThroughput(int value)
++    {
++        ssProxy.setCompactionThroughputMbPerSec(value);
++    }
+ }
+ 
+ class ColumnFamilyStoreMBeanIterator implements Iterator<Map.Entry<String, ColumnFamilyStoreMBean>>

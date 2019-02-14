@@ -1,0 +1,121 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/FailureDetector.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/FailureDetector.java
+index 11e5cd96..0e8a763e 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/FailureDetector.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/FailureDetector.java
+@@ -125,14 +125,16 @@ public int getPhiConvictThreshold()
+     
+     public boolean isAlive(InetAddress ep)
+     {
+-       /* If the endpoint in question is the local endpoint return true. */
+-        InetAddress localHost = FBUtilities.getLocalAddress();
+-        if (localHost.equals(ep))
++        if (ep.equals(FBUtilities.getLocalAddress()))
+             return true;
+ 
+-    	/* Incoming port is assumed to be the Storage port. We need to change it to the control port */
+         EndPointState epState = Gossiper.instance.getEndPointStateForEndPoint(ep);
+-        return epState.isAlive();
++        // we could assert not-null, but having isAlive fail screws a node over so badly that
++        // it's worth being defensive here so minor bugs don't cause disproportionate
++        // badness.  (See CASSANDRA-1463 for an example).
++        if (epState == null)
++            logger_.error("unknown endpoint " + ep);
++        return epState != null && epState.isAlive();
+     }
+     
+     public void report(InetAddress ep)
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/Gossiper.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/Gossiper.java
+index 48ef835c..e8b93e97 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/Gossiper.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/Gossiper.java
+@@ -216,6 +216,10 @@ void evictFromMembership(InetAddress endpoint)
+      */
+     public void removeEndPoint(InetAddress endpoint)
+     {
++        // do subscribers first so anything in the subscriber that depends on gossiper state won't get confused
++        for (IEndPointStateChangeSubscriber subscriber : subscribers_)
++            subscriber.onRemove(endpoint);
++
+         liveEndpoints_.remove(endpoint);
+         unreachableEndpoints_.remove(endpoint);
+         endPointStateMap_.remove(endpoint);
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/IEndPointStateChangeSubscriber.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/IEndPointStateChangeSubscriber.java
+index 29699e20..83307d49 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/IEndPointStateChangeSubscriber.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/gms/IEndPointStateChangeSubscriber.java
+@@ -45,4 +45,6 @@
+     public void onAlive(InetAddress endpoint, EndPointState state);
+ 
+     public void onDead(InetAddress endpoint, EndPointState state);
++
++    public void onRemove(InetAddress endpoint);
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/locator/TokenMetadata.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/locator/TokenMetadata.java
+index c6c3b7aa..dfa48ba0 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/locator/TokenMetadata.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/locator/TokenMetadata.java
+@@ -172,24 +172,10 @@ public void addLeavingEndPoint(InetAddress endpoint)
+         }
+     }
+ 
+-    public void removeLeavingEndPoint(InetAddress endpoint)
++    public void removeEndpoint(InetAddress endpoint)
+     {
+         assert endpoint != null;
+ 
+-        lock.writeLock().lock();
+-        try
+-        {
+-            leavingEndPoints.remove(endpoint);
+-        }
+-        finally
+-        {
+-            lock.writeLock().unlock();
+-        }
+-    }
+-
+-    public void removeEndpoint(InetAddress endpoint)
+-    {
+-        assert tokenToEndPointMap.containsValue(endpoint);
+         lock.writeLock().lock();
+         try
+         {
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageLoadBalancer.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+index e8d74ca8..2e973c4c 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+@@ -223,6 +223,8 @@ public void onAlive(InetAddress endpoint, EndPointState state) {}
+ 
+     public void onDead(InetAddress endpoint, EndPointState state) {}
+ 
++    public void onRemove(InetAddress endpoint) {}
++
+ /*
+     private boolean isMoveable()
+     {
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+index a832ede2..bffb9acf 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+@@ -657,7 +657,7 @@ private void removeEndPointLocally(InetAddress endPoint)
+     {
+         restoreReplicaCount(endPoint);
+         Gossiper.instance.removeEndPoint(endPoint);
+-        tokenMetadata_.removeEndpoint(endPoint);
++        // gossiper onRemove will take care of TokenMetadata
+     }
+ 
+     /**
+@@ -874,6 +874,12 @@ public void onAlive(InetAddress endpoint, EndPointState state)
+             deliverHints(endpoint);
+     }
+ 
++    public void onRemove(InetAddress endpoint)
++    {
++        tokenMetadata_.removeEndpoint(endpoint);
++        calculatePendingRanges();
++    }
++
+     public void onDead(InetAddress endpoint, EndPointState state) 
+     {
+         MessagingService.instance.convict(endpoint);

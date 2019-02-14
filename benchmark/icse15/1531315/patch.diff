@@ -1,0 +1,339 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/Overseer.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/Overseer.java
+index 406f58a2..23ee973c 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/Overseer.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/Overseer.java
+@@ -56,9 +56,10 @@
+ 
+   private static final int STATE_UPDATE_DELAY = 1500;  // delay between cloud state updates
+ 
+-
+   private static Logger log = LoggerFactory.getLogger(Overseer.class);
+   
++  static enum LeaderStatus { DONT_KNOW, NO, YES };
++  
+   private class ClusterStateUpdater implements Runnable, ClosableThread {
+     
+     private final ZkStateReader reader;
+@@ -82,7 +83,12 @@ public ClusterStateUpdater(final ZkStateReader reader, final String myId) {
+     @Override
+     public void run() {
+         
+-      if (!this.isClosed && amILeader()) {
++      LeaderStatus isLeader = amILeader();
++      while (isLeader == LeaderStatus.DONT_KNOW) {
++        log.debug("am_i_leader unclear {}", isLeader);
++        isLeader = amILeader();  // not a no, not a yes, try ask again
++      }
++      if (!this.isClosed && LeaderStatus.YES == isLeader) {
+         // see if there's something left from the previous Overseer and re
+         // process all events that were not persisted into cloud state
+         synchronized (reader.getUpdateLock()) { // XXX this only protects
+@@ -96,14 +102,24 @@ public void run() {
+               ClusterState clusterState = reader.getClusterState();
+               log.info("Replaying operations from work queue.");
+               
+-              while (head != null && amILeader()) {
++              while (head != null) {
++                isLeader = amILeader();
++                if (LeaderStatus.NO == isLeader) {
++                  break;
++                }
++                else if (LeaderStatus.YES == isLeader) {
+                 final ZkNodeProps message = ZkNodeProps.load(head);
+                 final String operation = message.getStr(QUEUE_OPERATION);
+                 clusterState = processMessage(clusterState, message, operation);
+                 zkClient.setData(ZkStateReader.CLUSTER_STATE,
+                     ZkStateReader.toJSON(clusterState), true);
+                 
+-                workQueue.poll();
++                  workQueue.poll(); // poll-ing removes the element we got by peek-ing
++                }
++                else {
++                  log.info("am_i_leader unclear {}", isLeader);                  
++                  // re-peek below in case our 'head' value is out-of-date by now
++                }
+                 
+                 head = workQueue.peek();
+               }
+@@ -126,7 +142,15 @@ public void run() {
+       }
+       
+       log.info("Starting to work on the main queue");
+-      while (!this.isClosed && amILeader()) {
++      while (!this.isClosed) {
++        isLeader = amILeader();
++        if (LeaderStatus.NO == isLeader) {
++          break;
++        }
++        else if (LeaderStatus.YES != isLeader) {
++          log.debug("am_i_leader unclear {}", isLeader);                  
++          continue; // not a no, not a yes, try ask again
++        }
+         synchronized (reader.getUpdateLock()) {
+           try {
+             byte[] head = stateUpdateQueue.peek();
+@@ -272,19 +296,27 @@ private ClusterState createShard(ClusterState clusterState, ZkNodeProps message)
+       return clusterState;
+     }
+ 
+-      private boolean amILeader() {
++    private LeaderStatus amILeader() {
+         try {
+-          ZkNodeProps props = ZkNodeProps.load(zkClient.getData("/overseer_elect/leader", null, null, true));
+-          if(myId.equals(props.getStr("id"))) {
+-            return true;
++        ZkNodeProps props = ZkNodeProps.load(zkClient.getData(
++            "/overseer_elect/leader", null, null, true));
++        if (myId.equals(props.getStr("id"))) {
++          return LeaderStatus.YES;
+           }
+         } catch (KeeperException e) {
++        if (e.code() == KeeperException.Code.CONNECTIONLOSS) {
++          log.error("", e);
++          return LeaderStatus.DONT_KNOW;
++        } else if (e.code() == KeeperException.Code.SESSIONEXPIRED) {
++          log.info("", e);
++        } else {
+           log.warn("", e);
++        }
+         } catch (InterruptedException e) {
+           Thread.currentThread().interrupt();
+         }
+         log.info("According to ZK I (id=" + myId + ") am no longer a leader.");
+-        return false;
++      return LeaderStatus.NO;
+       }
+     
+       /**
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
+index 43b231f2..2c2edde5 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/OverseerCollectionProcessor.java
+@@ -25,6 +25,7 @@
+ import org.apache.solr.client.solrj.request.UpdateRequest;
+ import org.apache.solr.client.solrj.response.UpdateResponse;
+ import org.apache.solr.cloud.DistributedQueue.QueueEvent;
++import org.apache.solr.cloud.Overseer.LeaderStatus;
+ import org.apache.solr.common.SolrException;
+ import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.cloud.Aliases;
+@@ -140,8 +141,22 @@ protected OverseerCollectionProcessor(ZkStateReader zkStateReader, String myId,
+   @Override
+   public void run() {
+        log.info("Process current queue of collection creations");
+-       while (amILeader() && !isClosed) {
++       LeaderStatus isLeader = amILeader();
++       while (isLeader == LeaderStatus.DONT_KNOW) {
++         log.debug("am_i_leader unclear {}", isLeader);
++         isLeader = amILeader();  // not a no, not a yes, try ask again
++       }
++       while (!this.isClosed) {
+          try {
++           isLeader = amILeader();
++           if (LeaderStatus.NO == isLeader) {
++             break;
++           }
++           else if (LeaderStatus.YES != isLeader) {
++             log.debug("am_i_leader unclear {}", isLeader);                  
++             continue; // not a no, not a yes, try asking again
++           }
++           
+            QueueEvent head = workQueue.peek(true);
+            final ZkNodeProps message = ZkNodeProps.load(head.getBytes());
+            log.info("Overseer Collection Processor: Get the message id:" + head.getId() + " message:" + message.toString());
+@@ -172,20 +187,27 @@ public void close() {
+     isClosed = true;
+   }
+   
+-  protected boolean amILeader() {
++  protected LeaderStatus amILeader() {
+     try {
+       ZkNodeProps props = ZkNodeProps.load(zkStateReader.getZkClient().getData(
+           "/overseer_elect/leader", null, null, true));
+       if (myId.equals(props.getStr("id"))) {
+-        return true;
++        return LeaderStatus.YES;
+       }
+     } catch (KeeperException e) {
++      if (e.code() == KeeperException.Code.CONNECTIONLOSS) {
++        log.error("", e);
++        return LeaderStatus.DONT_KNOW;
++      } else if (e.code() == KeeperException.Code.SESSIONEXPIRED) {
++        log.info("", e);
++      } else {
+       log.warn("", e);
++      }
+     } catch (InterruptedException e) {
+       Thread.currentThread().interrupt();
+     }
+     log.info("According to ZK I (id=" + myId + ") am no longer a leader.");
+-    return false;
++    return LeaderStatus.NO;
+   }
+   
+   
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeyNothingIsSafeTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeyNothingIsSafeTest.java
+index 8558bc56..2889d9a8 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeyNothingIsSafeTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeyNothingIsSafeTest.java
+@@ -23,10 +23,10 @@
+ 
+ import org.apache.lucene.util.LuceneTestCase.BadApple;
+ import org.apache.lucene.util.LuceneTestCase.Slow;
+-
+ import org.apache.http.client.HttpClient;
+ import org.apache.solr.client.solrj.SolrQuery;
+ import org.apache.solr.client.solrj.SolrServer;
++import org.apache.solr.client.solrj.impl.CloudSolrServer;
+ import org.apache.solr.client.solrj.impl.ConcurrentUpdateSolrServer;
+ import org.apache.solr.client.solrj.impl.HttpClientUtil;
+ import org.apache.solr.client.solrj.impl.HttpSolrServer;
+@@ -205,6 +205,29 @@ public void doTest() throws Exception {
+       if (VERBOSE) System.out.println("control docs:"
+           + controlClient.query(new SolrQuery("*:*")).getResults()
+               .getNumFound() + "\n\n");
++      
++      // try and make a collection to make sure the overseer has survived the expiration and session loss
++
++      // sometimes we restart zookeeper as well
++      if (random().nextBoolean()) {
++        zkServer.shutdown();
++        zkServer = new ZkTestServer(zkServer.getZkDir(), zkServer.getPort());
++        zkServer.run();
++      }
++      
++      CloudSolrServer client = createCloudClient("collection1");
++      try {
++          createCollection(null, "testcollection",
++              1, 1, 1, client, null, "conf1");
++
++      } finally {
++        client.shutdown();
++      }
++      List<Integer> numShardsNumReplicas = new ArrayList<Integer>(2);
++      numShardsNumReplicas.add(1);
++      numShardsNumReplicas.add(1);
++      checkForCollection("testcollection",numShardsNumReplicas, null);
++      
+       testsSuccesful = true;
+     } finally {
+       if (!testsSuccesful) {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
+index 19375248..5ccd6225 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySafeLeaderTest.java
+@@ -22,6 +22,7 @@
+ 
+ import org.apache.lucene.util.LuceneTestCase.Slow;
+ import org.apache.solr.client.solrj.SolrQuery;
++import org.apache.solr.client.solrj.impl.CloudSolrServer;
+ import org.apache.solr.common.SolrInputDocument;
+ import org.apache.solr.core.Diagnostics;
+ import org.apache.solr.core.SolrCore;
+@@ -137,6 +138,28 @@ public void doTest() throws Exception {
+     checkShardConsistency(true, true);
+     
+     if (VERBOSE) System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
++    
++    // try and make a collection to make sure the overseer has survived the expiration and session loss
++
++    // sometimes we restart zookeeper as well
++    if (random().nextBoolean()) {
++      zkServer.shutdown();
++      zkServer = new ZkTestServer(zkServer.getZkDir(), zkServer.getPort());
++      zkServer.run();
++    }
++    
++    CloudSolrServer client = createCloudClient("collection1");
++    try {
++        createCollection(null, "testcollection",
++            1, 1, 1, client, null, "conf1");
++
++    } finally {
++      client.shutdown();
++    }
++    List<Integer> numShardsNumReplicas = new ArrayList<Integer>(2);
++    numShardsNumReplicas.add(1);
++    numShardsNumReplicas.add(1);
++    checkForCollection("testcollection",numShardsNumReplicas, null);
+   }
+ 
+   private void randomlyEnableAutoSoftCommit() {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/CollectionsAPIDistributedZkTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/CollectionsAPIDistributedZkTest.java
+index 90aedcad..432baf44 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/CollectionsAPIDistributedZkTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/CollectionsAPIDistributedZkTest.java
+@@ -605,6 +605,19 @@ private void testCollectionsAPI() throws Exception {
+       }
+     }
+ 
++    // sometimes we restart zookeeper
++    if (random().nextBoolean()) {
++      zkServer.shutdown();
++      zkServer = new ZkTestServer(zkServer.getZkDir(), zkServer.getPort());
++      zkServer.run();
++    }
++    
++    // sometimes we cause a connection loss - sometimes it will hit the overseer
++    if (random().nextBoolean()) {
++      JettySolrRunner jetty = jettys.get(random().nextInt(jettys.size()));
++      ChaosMonkey.causeConnectionLoss(jetty);
++    }
++    
+     ZkStateReader zkStateReader = getCommonCloudSolrServer().getZkStateReader();
+     for (int j = 0; j < cnt; j++) {
+       waitForRecoveriesToFinish("awholynewcollection_" + j, zkStateReader, false);
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/OverseerCollectionProcessorTest.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/OverseerCollectionProcessorTest.java
+index cead773a..6d1b30a7 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/OverseerCollectionProcessorTest.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/cloud/OverseerCollectionProcessorTest.java
+@@ -21,6 +21,7 @@
+ import org.apache.solr.client.solrj.SolrResponse;
+ import org.apache.solr.client.solrj.response.QueryResponse;
+ import org.apache.solr.cloud.DistributedQueue.QueueEvent;
++import org.apache.solr.cloud.Overseer.LeaderStatus;
+ import org.apache.solr.common.cloud.ClusterState;
+ import org.apache.solr.common.cloud.SolrZkClient;
+ import org.apache.solr.common.cloud.ZkNodeProps;
+@@ -101,8 +102,8 @@ protected SolrResponse processMessage(ZkNodeProps message, String operation) {
+     }
+     
+     @Override
+-    protected boolean amILeader() {
+-      return true;
++    protected LeaderStatus amILeader() {
++      return LeaderStatus.YES;
+     }
+     
+   }
+diff --git a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ChaosMonkey.java b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ChaosMonkey.java
+index d9ba1e90..8a842618 100644
+--- a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ChaosMonkey.java
++++ b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ChaosMonkey.java
+@@ -153,11 +153,11 @@ public void randomConnectionLoss() throws KeeperException, InterruptedException
+     }
+   }
+   
+-  private void causeConnectionLoss(JettySolrRunner jetty) {
++  public static void causeConnectionLoss(JettySolrRunner jetty) {
+     causeConnectionLoss(jetty, ZkTestServer.TICK_TIME * 2 + 200);
+   }
+   
+-  private void causeConnectionLoss(JettySolrRunner jetty, int pauseTime) {
++  public static void causeConnectionLoss(JettySolrRunner jetty, int pauseTime) {
+     SolrDispatchFilter solrDispatchFilter = (SolrDispatchFilter) jetty
+         .getDispatchFilter().getFilter();
+     if (solrDispatchFilter != null) {
+diff --git a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ZkTestServer.java b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ZkTestServer.java
+index 49910df1..61c86478 100644
+--- a/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ZkTestServer.java
++++ b/lucene/dev/branches/branch_4x/solr/test-framework/src/java/org/apache/solr/cloud/ZkTestServer.java
+@@ -351,4 +351,8 @@ public int getTheTickTime() {
+   public void setTheTickTime(int theTickTime) {
+     this.theTickTime = theTickTime;
+   }
++
++  public String getZkDir() {
++    return zkDir;
++  }
+ }

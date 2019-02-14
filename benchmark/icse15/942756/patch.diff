@@ -1,0 +1,152 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/IndexSummary.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/IndexSummary.java
+index b79596e8..8700588c 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/IndexSummary.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/IndexSummary.java
+@@ -40,11 +40,11 @@
+     private int keysWritten = 0;
+     private long lastIndexPosition;
+ 
+-    public void maybeAddEntry(DecoratedKey decoratedKey, long dataPosition, long dataSize, long indexPosition, long nextIndexPosition)
++    public void maybeAddEntry(DecoratedKey decoratedKey, long dataPosition, long rowSize, long indexPosition, long nextIndexPosition)
+     {
+         boolean spannedIndexEntry = DatabaseDescriptor.getIndexAccessMode() == DatabaseDescriptor.DiskAccessMode.mmap
+                                     && SSTableReader.bufferIndex(indexPosition) != SSTableReader.bufferIndex(nextIndexPosition);
+-        if (keysWritten++ % INDEX_INTERVAL == 0 || spannedIndexEntry)
++        if ((keysWritten++ % INDEX_INTERVAL == 0) || spannedIndexEntry)
+         {
+             if (indexPositions == null)
+             {
+@@ -60,13 +60,18 @@ public void maybeAddEntry(DecoratedKey decoratedKey, long dataPosition, long dat
+                     spannedIndexDataPositions = new HashMap<KeyPosition, SSTable.PositionSize>();
+                     spannedIndexPositions = new HashMap<Long, KeyPosition>();
+                 }
+-                spannedIndexDataPositions.put(info, new SSTable.PositionSize(dataPosition, dataSize));
++                spannedIndexDataPositions.put(info, new SSTable.PositionSize(dataPosition, rowSize));
+                 spannedIndexPositions.put(info.indexPosition, info);
+             }
+         }
+         lastIndexPosition = indexPosition;
+     }
+ 
++    public Map<KeyPosition, SSTable.PositionSize> getSpannedIndexDataPositions()
++    {
++        return spannedIndexDataPositions;
++    }
++
+     public List<KeyPosition> getIndexPositions()
+     {
+         return indexPositions;
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/SSTableWriter.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/SSTableWriter.java
+index ce6d89ac..5c2f2ce2 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/SSTableWriter.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/io/SSTableWriter.java
+@@ -42,7 +42,6 @@
+ {
+     private static Logger logger = Logger.getLogger(SSTableWriter.class);
+ 
+-    private long keysWritten;
+     private BufferedRandomAccessFile dataFile;
+     private BufferedRandomAccessFile indexFile;
+     private DecoratedKey lastWrittenKey;
+@@ -73,7 +72,7 @@ private long beforeAppend(DecoratedKey decoratedKey) throws IOException
+         return (lastWrittenKey == null) ? 0 : dataFile.getFilePointer();
+     }
+ 
+-    private void afterAppend(DecoratedKey decoratedKey, long dataPosition, int dataSize) throws IOException
++    private void afterAppend(DecoratedKey decoratedKey, long dataPosition) throws IOException
+     {
+         String diskKey = partitioner.convertToDiskFormat(decoratedKey);
+         bf.add(diskKey);
+@@ -86,7 +85,8 @@ private void afterAppend(DecoratedKey decoratedKey, long dataPosition, int dataS
+         if (logger.isTraceEnabled())
+             logger.trace("wrote index of " + decoratedKey + " at " + indexPosition);
+ 
+-        indexSummary.maybeAddEntry(decoratedKey, dataPosition, dataSize, indexPosition, indexFile.getFilePointer());
++        int rowSize = (int)(dataFile.getFilePointer() - dataPosition);
++        indexSummary.maybeAddEntry(decoratedKey, dataPosition, rowSize, indexPosition, indexFile.getFilePointer());
+     }
+ 
+     // TODO make this take a DataOutputStream and wrap the byte[] version to combine them
+@@ -98,7 +98,7 @@ public void append(DecoratedKey decoratedKey, DataOutputBuffer buffer) throws IO
+         assert length > 0;
+         dataFile.writeInt(length);
+         dataFile.write(buffer.getData(), 0, length);
+-        afterAppend(decoratedKey, currentPosition, length);
++        afterAppend(decoratedKey, currentPosition);
+     }
+ 
+     public void append(DecoratedKey decoratedKey, byte[] value) throws IOException
+@@ -108,7 +108,7 @@ public void append(DecoratedKey decoratedKey, byte[] value) throws IOException
+         assert value.length > 0;
+         dataFile.writeInt(value.length);
+         dataFile.write(value);
+-        afterAppend(decoratedKey, currentPosition, value.length);
++        afterAppend(decoratedKey, currentPosition);
+     }
+ 
+     /**
+diff --git a/cassandra/branches/cassandra-0.6/test/unit/org/apache/cassandra/io/SSTableReaderTest.java b/cassandra/branches/cassandra-0.6/test/unit/org/apache/cassandra/io/SSTableReaderTest.java
+index d340982a..0f16758b 100644
+--- a/cassandra/branches/cassandra-0.6/test/unit/org/apache/cassandra/io/SSTableReaderTest.java
++++ b/cassandra/branches/cassandra-0.6/test/unit/org/apache/cassandra/io/SSTableReaderTest.java
+@@ -22,8 +22,7 @@
+ 
+ 
+ import java.io.IOException;
+-import java.util.HashSet;
+-import java.util.Set;
++import java.util.*;
+ import java.util.concurrent.ExecutionException;
+ 
+ import org.junit.Test;
+@@ -32,8 +31,12 @@
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.io.util.BufferedRandomAccessFile;
+ import org.apache.cassandra.io.util.FileDataInput;
+ import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.FBUtilities;
++
++import static org.junit.Assert.assertEquals;
+ 
+ 
+ public class SSTableReaderTest extends CleanupHelper
+@@ -41,12 +44,12 @@
+     @Test
+     public void testSpannedIndexPositions() throws IOException, ExecutionException, InterruptedException
+     {
+-        SSTableReader.BUFFER_SIZE = 40;
++        SSTableReader.BUFFER_SIZE = 40; // each index entry is ~11 bytes, so this will generate lots of spanned entries
+ 
+         Table table = Table.open("Keyspace1");
+         ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
+ 
+-        // insert a bunch of data
++        // insert a bunch of data and compact to a single sstable
+         CompactionManager.instance.disableAutoCompaction();
+         for (int j = 0; j < 100; j += 2)
+         {
+@@ -76,5 +79,22 @@ public void testSpannedIndexPositions() throws IOException, ExecutionException,
+             DecoratedKey dk = StorageService.getPartitioner().decorateKey(key);
+             assert sstable.getPosition(dk) == null;
+         }
++
++        // check positionsize information
++        assert sstable.indexSummary.getSpannedIndexDataPositions().entrySet().size() > 0;
++        for (Map.Entry<IndexSummary.KeyPosition, SSTable.PositionSize> entry : sstable.indexSummary.getSpannedIndexDataPositions().entrySet())
++        {
++            IndexSummary.KeyPosition kp = entry.getKey();
++            SSTable.PositionSize info = entry.getValue();
++
++            long nextIndexPosition = kp.indexPosition + 2 + FBUtilities.encodedUTF8Length(StorageService.getPartitioner().convertToDiskFormat(kp.key)) + 8;
++            BufferedRandomAccessFile indexFile = new BufferedRandomAccessFile(sstable.indexFilename(), "r");
++            indexFile.seek(nextIndexPosition);
++            String nextKey = indexFile.readUTF();
++
++            BufferedRandomAccessFile file = new BufferedRandomAccessFile(sstable.getFilename(), "r");
++            file.seek(info.position + info.size);
++            assertEquals(nextKey, file.readUTF());
++        }
+     }
+ }

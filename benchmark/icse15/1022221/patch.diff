@@ -1,0 +1,119 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java b/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
+index 6a67ab26..4ec1410e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/Config.java
+@@ -97,6 +97,9 @@
+     
+     public String endpoint_snitch;
+     public Boolean dynamic_snitch = false;
++    public Integer dynamic_snitch_update_interval_in_ms = 100;
++    public Integer dynamic_snitch_reset_interval_in_ms = 600000;
++    public Double dynamic_snitch_badness_threshold = 0.0;
+     
+     public String request_scheduler;
+     public RequestSchedulerId request_scheduler_id;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index e824cb40..c188e11a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -561,6 +561,11 @@ else if (cf.compare_subcolumns_with != null)
+                     throw new ConfigurationException("read_repair_chance must be between 0.0 and 1.0 (0% and 100%)");
+                 }
+ 
++                if (conf.dynamic_snitch_badness_threshold < 0.0 || conf.dynamic_snitch_badness_threshold > 1.0)
++                {
++                    throw new ConfigurationException("dynamic_snitch_badness_threshold must be between 0.0 and 1.0 (0% and 100%)");
++                }
++                
+                 if (cf.min_compaction_threshold < 0 || cf.max_compaction_threshold < 0)
+                 {
+                     throw new ConfigurationException("min/max_compaction_thresholds must be non-negative integers.");
+@@ -1106,4 +1111,19 @@ public static File getSerializedKeyCachePath(String ksName, String cfName)
+     {
+         return new File(conf.saved_caches_directory + File.separator + ksName + "-" + cfName + "-KeyCache");
+     }
++
++    public static int getDynamicUpdateInterval()
++    {
++        return conf.dynamic_snitch_update_interval_in_ms;
++    }
++
++    public static int getDynamicResetInterval()
++    {
++        return conf.dynamic_snitch_reset_interval_in_ms;
++    }
++
++    public static double getDynamicBadnessThreshold()
++    {
++        return conf.dynamic_snitch_badness_threshold;
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
+index 86826d82..90c6031e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/locator/DynamicEndpointSnitch.java
+@@ -34,6 +34,7 @@
+ import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.AbstractStatsDeque;
+ import org.apache.cassandra.utils.FBUtilities;
++import org.apache.cassandra.config.DatabaseDescriptor;
+ 
+ /**
+  * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
+@@ -41,8 +42,9 @@
+ public class DynamicEndpointSnitch extends AbstractEndpointSnitch implements ILatencySubscriber, DynamicEndpointSnitchMBean
+ {
+     private static int UPDATES_PER_INTERVAL = 10000;
+-    private static int UPDATE_INTERVAL_IN_MS = 100;
+-    private static int RESET_INTERVAL_IN_MS = 60000 * 10;
++    private static int UPDATE_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicUpdateInterval();
++    private static int RESET_INTERVAL_IN_MS = DatabaseDescriptor.getDynamicResetInterval();
++    private static double BADNESS_THRESHOLD = DatabaseDescriptor.getDynamicBadnessThreshold();
+     private static int WINDOW_SIZE = 100;
+     private boolean registered = false;
+ 
+@@ -119,6 +121,18 @@ public String getDatacenter(InetAddress endpoint)
+     public List<InetAddress> sortByProximity(final InetAddress address, List<InetAddress> addresses)
+     {
+         assert address.equals(FBUtilities.getLocalAddress()); // we only know about ourself
++        if (BADNESS_THRESHOLD == 0)
++        {
++            return sortByProximityWithScore(address, addresses);
++        }
++        else
++        {
++            return sortByProximityWithBadness(address, addresses);
++        }
++    }
++
++    private List<InetAddress> sortByProximityWithScore(final InetAddress address, List<InetAddress> addresses)
++    {
+         Collections.sort(addresses, new Comparator<InetAddress>()
+         {
+             public int compare(InetAddress a1, InetAddress a2)
+@@ -129,6 +143,25 @@ public int compare(InetAddress a1, InetAddress a2)
+         return addresses;
+     }
+ 
++    private List<InetAddress> sortByProximityWithBadness(final InetAddress address, List<InetAddress> addresses)
++    {
++        if (addresses.size() < 2)
++            return addresses;
++        List<InetAddress> snitchordered = subsnitch.sortByProximity(address, addresses);
++        Double first = scores.get(snitchordered.get(0));
++        if (first == null)
++            return snitchordered;
++        for (InetAddress addr : addresses)
++        {
++            Double next = scores.get(addr);
++            if (next == null)
++                return snitchordered;
++            if ((first - next) / first > BADNESS_THRESHOLD)
++                return sortByProximityWithScore(address, addresses);
++        }
++        return snitchordered;
++    }
++
+     public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+     {
+         Double scored1 = scores.get(a1);

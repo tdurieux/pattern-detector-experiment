@@ -1,0 +1,74 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.db;
+
+import java.nio.ByteBuffer;
+
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+public class DeletedColumn extends Column
+{    
+    public DeletedColumn(ByteBuffer name, int localDeletionTime, long timestamp)
+    {
+        this(name, ByteBufferUtil.bytes(localDeletionTime), timestamp);
+    }
+
+    public DeletedColumn(ByteBuffer name, ByteBuffer value, long timestamp)
+    {
+        super(name, value, timestamp);
+    }
+
+    @Override
+    public boolean isMarkedForDelete()
+    {
+        return true;
+    }
+
+    @Override
+    public long getMarkedForDeleteAt()
+    {
+        return timestamp;
+    }
+
+    @Override
+    public int getLocalDeletionTime()
+    {
+       return value.getInt(value.position());
+    }
+
+    @Override
+    public IColumn reconcile(IColumn column)
+    {
+        if (column instanceof DeletedColumn)
+            return super.reconcile(column);
+        return column.reconcile(this);
+    }
+    
+    @Override
+    public IColumn localCopy(ColumnFamilyStore cfs)
+    {
+        return new DeletedColumn(cfs.internOrCopy(name), ByteBufferUtil.clone(value), timestamp);
+    }
+
+    @Override
+    public int serializationFlags()
+    {
+        return ColumnSerializer.DELETION_MASK;
+    }
+}

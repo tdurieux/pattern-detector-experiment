@@ -1,0 +1,280 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index 782e0c2e..fa38375e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -65,7 +65,7 @@
+ 
+     private final ICommitLogExecutorService executor;
+ 
+-    private final CommitLogAllocator allocator;
++    public final CommitLogAllocator allocator;
+ 
+     public static final int END_OF_SEGMENT_MARKER = 0;          // this is written out at the end of a segment
+     public static final int END_OF_SEGMENT_MARKER_SIZE = 4;     // number of bytes of ^^^
+@@ -388,7 +388,7 @@ public ReplayPosition call() throws Exception
+      */
+     public int activeSegments()
+     {
+-        return allocator.activeSegments.size();
++        return allocator.getActiveSegments().size();
+     }
+ 
+     /**
+@@ -427,7 +427,7 @@ public Object call() throws IOException
+                 // flushed CF as clean, until we reach the segment file containing the ReplayPosition passed
+                 // in the arguments. Any segments that become unused after they are marked clean will be
+                 // recycled or discarded.
+-                for (Iterator<CommitLogSegment> iter = allocator.activeSegments.iterator(); iter.hasNext(); )
++                for (Iterator<CommitLogSegment> iter = allocator.getActiveSegments().iterator(); iter.hasNext();)
+                 {
+                     CommitLogSegment segment = iter.next();
+                     segment.markClean(cfId, context);
+@@ -438,7 +438,6 @@ public Object call() throws IOException
+                     if (segment.isUnused() && iter.hasNext())
+                     {
+                         logger.debug("Commit log segment {} is unused", segment);
+-                        iter.remove();
+                         allocator.recycleSegment(segment);
+                     }
+                     else
+@@ -477,14 +476,11 @@ public Object call() throws IOException
+      */
+     public void sync() throws IOException
+     {
+-        for (CommitLogSegment segment : allocator.activeSegments)
+-        {
+-            if (segment.needsSync())
++        for (CommitLogSegment segment : allocator.getActiveSegments())
+             {
+                 segment.sync();
+             }
+         }
+-    }
+ 
+     /**
+      * @return the number of tasks completed by the commit log executor
+@@ -515,12 +511,15 @@ public long getTotalCommitlogSize()
+      */
+     public void forceNewSegment() throws ExecutionException, InterruptedException
+     {
++        logger.debug("Forcing new segment creation");
++
+         Callable<?> task = new Callable()
+         {
+             public Object call() throws IOException
+             {
+                 if (activeSegment.position() > 0)
+                     activateNextSegment();
++
+                 return null;
+             }
+         };
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogAllocator.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogAllocator.java
+index b0064c62..c5e6fc05 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogAllocator.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogAllocator.java
+@@ -22,6 +22,8 @@
+ 
+ import java.io.IOError;
+ import java.io.IOException;
++import java.util.Collection;
++import java.util.Collections;
+ import java.util.concurrent.BlockingQueue;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+@@ -58,7 +60,7 @@
+     private final BlockingQueue<Runnable> queue = new LinkedBlockingQueue<Runnable>();
+ 
+     /** Active segments, containing unflushed data */
+-    final ConcurrentLinkedQueue<CommitLogSegment> activeSegments = new ConcurrentLinkedQueue<CommitLogSegment>();
++    private final ConcurrentLinkedQueue<CommitLogSegment> activeSegments = new ConcurrentLinkedQueue<CommitLogSegment>();
+ 
+     /**
+      * Tracks commitlog size, in multiples of the segment size.  We need to do this so we can "promise" size
+@@ -113,7 +115,7 @@ public void runMayThrow() throws Exception
+     /**
+      * Fetches an empty segment file.
+      *
+-     * @return the next writeable segment
++     * @return the next writable segment
+      */
+     public CommitLogSegment fetchSegment()
+     {
+@@ -142,6 +144,8 @@ public CommitLogSegment fetchSegment()
+      */
+     public void recycleSegment(final CommitLogSegment segment)
+     {
++        activeSegments.remove(segment);
++
+         if (isCapExceeded())
+         {
+             discardSegment(segment);
+@@ -152,7 +156,8 @@ public void recycleSegment(final CommitLogSegment segment)
+         {
+             public void run()
+             {
+-                segment.recycle();
++                CommitLogSegment recycled = segment.recycle();
++                internalAddReadySegment(recycled);
+             }
+         });
+     }
+@@ -197,11 +202,11 @@ public void run()
+     private void discardSegment(final CommitLogSegment segment)
+     {
+         size.addAndGet(-CommitLog.SEGMENT_SIZE);
++
+         queue.add(new Runnable()
+         {
+             public void run()
+             {
+-                activeSegments.remove(segment);
+                 segment.discard();
+             }
+         });
+@@ -253,11 +258,20 @@ private CommitLogSegment internalAddReadySegment(CommitLogSegment segment)
+         return segment;
+     }
+ 
+-    public boolean isCapExceeded()
++    /**
++     * Check to see if the speculative current size exceeds the cap.
++     *
++     * @return true if cap is exceeded
++     */
++    private boolean isCapExceeded()
+     {
+         return size.get() > DatabaseDescriptor.getTotalCommitlogSpaceInMB() * 1024 * 1024;
+     }
+ 
++    /**
++     * Throws a flag that enables the behavior of keeping at least one spare segment
++     * available at all times.
++     */
+     public void enableReserveSegmentCreation()
+     {
+         createReserveSegments = true;
+@@ -323,5 +337,13 @@ public void awaitTermination() throws InterruptedException
+     {
+         allocationThread.join(); 
+     }
++
++    /**
++     * @return a read-only collection of the active commit log segments
++     */
++    public Collection<CommitLogSegment> getActiveSegments()
++    {
++        return Collections.unmodifiableCollection(activeSegments);
++    }
+ }
+ 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+index 620f594f..bfffbacf 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/commitlog/CommitLogSegment.java
+@@ -119,6 +119,8 @@ public static CommitLogSegment freshSegment()
+             buffer = logFileAccessor.getChannel().map(FileChannel.MapMode.READ_WRITE, (long) 0, (long) CommitLog.SEGMENT_SIZE);
+             buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
+             buffer.position(0);
++
++            needsSync = true;
+         }
+         catch (IOException e)
+         {
+@@ -178,13 +180,26 @@ public void discard()
+      * 
+      * @return a new CommitLogSegment representing the newly reusable segment.
+      */
+-    public void recycle()
++    public CommitLogSegment recycle()
+     {
+         // writes an end-of-segment marker at the very beginning of the file and closes it
+         buffer.position(0);
+         buffer.putInt(CommitLog.END_OF_SEGMENT_MARKER);
+         buffer.position(0);
+-        needsSync = true;
++
++        try
++        {
++            sync();
++        }
++        catch (IOException e)
++        {
++            // This is a best effort thing anyway
++            logger.warn("I/O error flushing " + this + " " + e);
++        }
++
++        close();
++
++        return new CommitLogSegment(getPath());
+     }
+ 
+     /**
+@@ -253,9 +268,12 @@ public ReplayPosition write(RowMutation rowMutation) throws IOException
+      */
+     public void sync() throws IOException
+     {
++        if (needsSync)
++        {
+         buffer.force();
+         needsSync = false;
+     }
++    }
+ 
+     /**
+      * @return the current ReplayPosition for this log segment
+@@ -345,14 +363,6 @@ public boolean isUnused()
+         return cfLastWrite.isEmpty();
+     }
+ 
+-    /**
+-     * @return true if this segment file has unflushed writes
+-     */
+-    public boolean needsSync()
+-    {
+-        return needsSync;
+-    }
+-
+     /**
+      * Check to see if a certain ReplayPosition is contained by this segment file.
+      *
+@@ -384,13 +394,6 @@ public String toString()
+ 
+     public int position()
+     {
+-        try
+-        {
+-            return (int) logFileAccessor.getFilePointer();
+-        }
+-        catch (IOException e)
+-        {
+-            throw new IOError(e);
+-        }
++        return buffer.position();
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java b/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
+index 606fe420..dcc9741c 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/SchemaLoader.java
+@@ -18,9 +18,11 @@
+ 
+ package org.apache.cassandra;
+ 
++import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.*;
+ 
++import org.apache.cassandra.db.commitlog.CommitLog;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ 
+ import com.google.common.base.Charsets;
+@@ -44,6 +46,8 @@
+     @BeforeClass
+     public static void loadSchema()
+     {
++        CommitLog.instance.allocator.enableReserveSegmentCreation();
++
+         Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler()
+         {
+             public void uncaughtException(Thread t, Throwable e)

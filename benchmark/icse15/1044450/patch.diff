@@ -1,0 +1,90 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index ef4838e6..c471616c 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -71,27 +71,27 @@
+      * For BinaryMemtable that's about all that happens.  For live Memtables there are two other things
+      * that switchMemtable does (which should be the only caller of submitFlush in this case).
+      * First, it puts the Memtable into memtablesPendingFlush, where it stays until the flush is complete
+-     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to commitLogUpdater
++     * and it's been added as an SSTableReader to ssTables_.  Second, it adds an entry to postFlushExecutor
+      * that waits for the flush to complete, then calls onMemtableFlush.  This allows multiple flushes
+      * to happen simultaneously on multicore systems, while still calling onMF in the correct order,
+      * which is necessary for replay in case of a restart since CommitLog assumes that when onMF is
+      * called, all data up to the given context has been persisted to SSTables.
+      */
+-    private static ExecutorService flushSorter_
++    private static final ExecutorService flushSorter
+             = new JMXEnabledThreadPoolExecutor(1,
+                                                Runtime.getRuntime().availableProcessors(),
+                                                Integer.MAX_VALUE,
+                                                TimeUnit.SECONDS,
+                                                new LinkedBlockingQueue<Runnable>(Runtime.getRuntime().availableProcessors()),
+                                                new NamedThreadFactory("FLUSH-SORTER-POOL"));
+-    private static ExecutorService flushWriter_
++    private static final ExecutorService flushWriter
+             = new JMXEnabledThreadPoolExecutor(1,
+                                                DatabaseDescriptor.getAllDataFileLocations().length,
+                                                Integer.MAX_VALUE,
+                                                TimeUnit.SECONDS,
+                                                new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getAllDataFileLocations().length),
+                                                new NamedThreadFactory("FLUSH-WRITER-POOL"));
+-    private static ExecutorService commitLogUpdater_ = new JMXEnabledThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
++    public static final ExecutorService postFlushExecutor = new JMXEnabledThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
+ 
+     private static final int KEY_RANGE_FILE_BUFFER_SIZE = 256 * 1024;
+ 
+@@ -480,7 +480,7 @@ public String getTempSSTableFileName()
+             memtable_ = new Memtable(this);
+             // a second executor that makes sure the onMemtableFlushes get called in the right order,
+             // while keeping the wait-for-flush (future.get) out of anything latency-sensitive.
+-            return commitLogUpdater_.submit(new WrappedRunnable()
++            return postFlushExecutor.submit(new WrappedRunnable()
+             {
+                 public void runMayThrow() throws InterruptedException, IOException
+                 {
+@@ -747,7 +747,7 @@ Condition submitFlush(IFlushable flushable)
+     {
+         logger_.info("Enqueuing flush of " + flushable);
+         final Condition condition = new SimpleCondition();
+-        flushable.flushAndSignal(condition, flushSorter_, flushWriter_);
++        flushable.flushAndSignal(condition, flushSorter, flushWriter);
+         return condition;
+     }
+ 
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+index d45a3f9b..5b9f471b 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+@@ -1607,6 +1607,10 @@ public synchronized void drain() throws IOException, InterruptedException, Execu
+         setMode("Draining: emptying MessageService pools", false);
+         MessagingService.waitFor();
+        
++        setMode("Draining: clearing mutation stage", false);
++        mutationStage.shutdown();
++        mutationStage.awaitTermination(3600, TimeUnit.SECONDS);
++       
+         // lets flush.
+         setMode("Draining: flushing column families", false);
+         for (String tableName : DatabaseDescriptor.getNonSystemTables())
+@@ -1614,18 +1618,11 @@ public synchronized void drain() throws IOException, InterruptedException, Execu
+                 f.get();
+        
+ 
+-        setMode("Draining: replaying commit log", false);
++        ColumnFamilyStore.postFlushExecutor.shutdown();
++        ColumnFamilyStore.postFlushExecutor.awaitTermination(60, TimeUnit.SECONDS);
+         CommitLog.instance().forceNewSegment();
+         // want to make sure that any segments deleted as a result of flushing are gone.
+         DeletionService.waitFor();
+-        CommitLog.recover();
+-       
+-        // commit log recovery just sends work to the mutation stage. (there could have already been work there anyway.  
+-        // Either way, we need to let this one drain naturally, and then we're finished.
+-        setMode("Draining: clearing mutation stage", false);
+-        mutationStage.shutdown();
+-        while (!mutationStage.isTerminated())
+-            mutationStage.awaitTermination(5, TimeUnit.SECONDS);
+        
+         setMode("Node is drained", true);
+     }

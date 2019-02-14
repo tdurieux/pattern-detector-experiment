@@ -1,0 +1,185 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
+index f69dfab7..20b7234d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeReply.java
+@@ -21,6 +21,8 @@
+ import java.util.*;
+ import java.io.IOException;
+ 
++import org.apache.commons.lang.StringUtils;
++
+ import org.apache.cassandra.io.DataInputBuffer;
+ import org.apache.cassandra.io.DataOutputBuffer;
+ import org.apache.cassandra.net.Message;
+@@ -50,6 +52,15 @@ public Message getReply(Message originalMessage) throws IOException
+         return originalMessage.getReply(StorageService.getLocalStorageEndPoint(), data);
+     }
+ 
++    @Override
++    public String toString()
++    {
++        return "RangeReply(" +
++               "keys=[" + StringUtils.join(keys, ", ") +
++               "], completed=" + rangeCompletedLocally +
++               ')';
++    }
++
+     public static RangeReply read(byte[] body) throws IOException
+     {
+         DataInputBuffer bufIn = new DataInputBuffer();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
+index fa48a173..458b4eae 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraServer.java
+@@ -550,8 +550,15 @@ else if (propertyName.equals("version"))
+             throw new InvalidRequestException("maxResults must be positive");
+         }
+ 
++        try
++        {
+         return StorageProxy.getKeyRange(new RangeCommand(tablename, columnFamily, startWith, stopAt, maxResults));
+     }
++        catch (IOException e)
++        {
++            throw new RuntimeException(e);
++        }
++    }
+ 
+     // main method moved to CassandraDaemon
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeVerbHandler.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeVerbHandler.java
+index 283c136e..852a0bba 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeVerbHandler.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeVerbHandler.java
+@@ -18,6 +18,8 @@
+ */
+ package org.apache.cassandra.service;
+ 
++import org.apache.log4j.Logger;
++
+ import org.apache.cassandra.db.RangeCommand;
+ import org.apache.cassandra.db.RangeReply;
+ import org.apache.cassandra.db.Table;
+@@ -27,16 +29,19 @@
+ 
+ public class RangeVerbHandler implements IVerbHandler
+ {
++    private static final Logger logger = Logger.getLogger(RangeVerbHandler.class);
++
+     public void doVerb(Message message)
+     {
+-        RangeReply rangeReply;
+         try
+         {
+             RangeCommand command = RangeCommand.read(message);
+             Table table = Table.open(command.table);
+ 
+-            rangeReply = table.getKeyRange(command.columnFamily, command.startWith, command.stopAt, command.maxResults);
++            RangeReply rangeReply = table.getKeyRange(command.columnFamily, command.startWith, command.stopAt, command.maxResults);
+             Message response = rangeReply.getReply(message);
++            if (logger.isDebugEnabled())
++                logger.debug("Sending " + rangeReply + " to " + message.getMessageId() + "@" + message.getFrom());
+             MessagingService.getMessagingInstance().sendOneWay(response, message.getFrom());
+         }
+         catch (Exception e)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index 85450cad..429b2dbe 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -359,14 +359,6 @@ public static Row readProtocol(ReadCommand command, int consistency_level)
+ 
+     /**
+      * This is a multiget version of the above method.
+-     * @param tablename
+-     * @param keys
+-     * @param columnFamily
+-     * @param start
+-     * @param count
+-     * @return
+-     * @throws IOException
+-     * @throws TimeoutException
+      */
+     public static Map<String, Row> strongReadProtocol(String[] keys, ReadCommand readCommand) throws IOException, TimeoutException
+     {       
+@@ -571,10 +563,6 @@ private static MultiQuorumResponseHandler dispatchMessages(Map<String, ReadComma
+      * This version is used when results for multiple keys needs to be
+      * retrieved.
+      * 
+-     * @param tablename name of the table that needs to be queried
+-     * @param keys keys whose values we are interested in 
+-     * @param columnFamily name of the "column" we are interested in
+-     * @param columns the columns we are interested in
+      * @return a mapping of key --> Row
+      * @throws Exception
+      */
+@@ -631,24 +619,33 @@ private static Row weakReadLocal(ReadCommand command) throws IOException
+         return row;
+     }
+ 
+-    static List<String> getKeyRange(RangeCommand command)
++    static List<String> getKeyRange(RangeCommand command) throws IOException
+     {
+         long startTime = System.currentTimeMillis();
+         int endpointOffset = 0;
+         List<String> allKeys = new ArrayList<String>();
+         int maxResults = command.maxResults;
+ 
+-        try
+-        {
+             EndPoint endPoint = StorageService.instance().findSuitableEndPoint(command.startWith, endpointOffset);
+             String firstEndpoint = endPoint.toString();
+ 
+             do
+             {
+-                IAsyncResult iar = MessagingService.getMessagingInstance().sendRR(command.getMessage(), endPoint);
++            Message message = command.getMessage();
++            if (logger.isDebugEnabled())
++                logger.debug("reading " + command + " from " + message.getMessageId() + "@" + endPoint);
++            IAsyncResult iar = MessagingService.getMessagingInstance().sendRR(message, endPoint);
+ 
+                 // read response
+-                byte[] responseBody = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
++            byte[] responseBody = new byte[0];
++            try
++            {
++                responseBody = iar.get(DatabaseDescriptor.getRpcTimeout(), TimeUnit.MILLISECONDS);
++            }
++            catch (TimeoutException e)
++            {
++                throw new RuntimeException(e);
++            }
+                 RangeReply rangeReply = RangeReply.read(responseBody);
+                 List<String> rangeKeys = rangeReply.keys;
+ 
+@@ -668,28 +665,16 @@ else if (rangeKeys != null && rangeKeys.size() > 0)
+                     break;
+                 }
+ 
+-                String newStartAt = (allKeys.size() > 0) ? allKeys.get(allKeys.size() - 1) : command.stopAt;
+-
+-                command = new RangeCommand(command.table, command.columnFamily,
+-                                           newStartAt, command.stopAt,
+-                                           command.maxResults - rangeKeys.size());
+-
++            String newStartWith = (allKeys.size() > 0) ? allKeys.get(allKeys.size() - 1) : command.startWith;
++            command = new RangeCommand(command.table, command.columnFamily, newStartWith, command.stopAt, command.maxResults - allKeys.size());
+                 endPoint = StorageService.instance().findSuitableEndPoint(command.startWith, ++endpointOffset);
+             } while (!endPoint.toString().equals(firstEndpoint));
+ 
++        rangeStats.add(System.currentTimeMillis() - startTime);
+             return (allKeys.size() > maxResults)
+                    ? allKeys.subList(0, maxResults)
+                    : allKeys;
+         }
+-        catch (Exception e)
+-        {
+-            throw new RuntimeException("error reading keyrange " + command, e);
+-        }
+-        finally
+-        {
+-            rangeStats.add(System.currentTimeMillis() - startTime);
+-        }
+-    }
+ 
+     public double getReadLatency()
+     {

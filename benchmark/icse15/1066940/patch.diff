@@ -1,0 +1,116 @@
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
+index 083c7101..ea05b093 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
+@@ -255,7 +255,7 @@ public void removeEndpoint(InetAddress endpoint)
+ 
+         liveEndpoints_.remove(endpoint);
+         unreachableEndpoints_.remove(endpoint);
+-        endpointStateMap_.remove(endpoint);
++        // do not remove endpointState until the quarantine expires
+         FailureDetector.instance.remove(endpoint);
+         justRemovedEndpoints_.put(endpoint, System.currentTimeMillis());
+     }
+@@ -326,8 +326,6 @@ Message makeGossipDigestAckMessage(GossipDigestAckMessage gDigestAckMessage) thr
+         ByteArrayOutputStream bos = new ByteArrayOutputStream();
+         DataOutputStream dos = new DataOutputStream(bos);
+         GossipDigestAckMessage.serializer().serialize(gDigestAckMessage, dos);
+-        if (logger_.isTraceEnabled())
+-            logger_.trace("@@@@ Size of GossipDigestAckMessage is " + bos.toByteArray().length);
+         return new Message(localEndpoint_, StorageService.Verb.GOSSIP_DIGEST_ACK, bos.toByteArray());
+     }
+ 
+@@ -436,7 +434,8 @@ void doStatusCheck()
+                     else
+                     {
+                         logger_.info("FatClient " + endpoint + " has been silent for " + FatClientTimeout_ + "ms, removing from gossip");
+-                        removeEndpoint(endpoint);
++                        if (!justRemovedEndpoints_.containsKey(endpoint)) // if the node was decommissioned, it will have been removed but still appear as a fat client
++                            removeEndpoint(endpoint); // after quarantine justRemoveEndpoints will remove the state
+                     }
+                 }
+ 
+@@ -457,6 +456,7 @@ void doStatusCheck()
+                     if (logger_.isDebugEnabled())
+                         logger_.debug(QUARANTINE_DELAY + " elapsed, " + entry.getKey() + " gossip quarantine over");
+                     justRemovedEndpoints_.remove(entry.getKey());
++                    endpointStateMap_.remove(entry.getKey());
+                 }
+             }
+         }
+@@ -469,8 +469,6 @@ public EndpointState getEndpointStateForEndpoint(InetAddress ep)
+ 
+     EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+     {
+-        if (logger_.isTraceEnabled())
+-            logger_.trace("Scanning for state greater than " + version + " for " + forEndpoint);
+         EndpointState epState = endpointStateMap_.get(forEndpoint);
+         EndpointState reqdEndpointState = null;
+ 
+@@ -488,6 +486,8 @@ EndpointState getStateForVersionBiggerThan(InetAddress forEndpoint, int version)
+             if ( localHbVersion > version )
+             {
+                 reqdEndpointState = new EndpointState(epState.getHeartBeatState());
++                if (logger_.isTraceEnabled())
++                    logger_.trace("local heartbeat version " + localHbVersion + " greater than " + version + " for " + forEndpoint);
+             }
+             /* Accumulate all application states whose versions are greater than "version" variable */
+             for (Entry<ApplicationState, VersionedValue> entry : epState.getApplicationStateMap().entrySet())
+@@ -668,6 +668,11 @@ else if ( remoteGeneration == localGeneration )
+ 	                    applyApplicationStateLocally(ep, localEpStatePtr, remoteState);
+ 	                }
+             	}
++                else
++                {
++                    if (logger_.isTraceEnabled())
++                        logger_.trace("Ignoring remote generation " + remoteGeneration + " < " + localGeneration);
++                }
+             }
+             else
+             {
+@@ -683,6 +688,8 @@ void applyHeartBeatStateLocally(InetAddress addr, EndpointState localState, Endp
+ 
+         if ( remoteHbState.getGeneration() > localHbState.getGeneration() )
+         {
++            if (logger_.isTraceEnabled())
++                logger_.trace("Updating heartbeat state generation to " + remoteHbState.getGeneration() + " from " + localHbState.getGeneration() + " for " + addr);
+             localState.setHeartBeatState(remoteHbState);
+         }
+         if ( localHbState.getGeneration() == remoteHbState.getGeneration() )
+@@ -694,6 +701,11 @@ void applyHeartBeatStateLocally(InetAddress addr, EndpointState localState, Endp
+                 if (logger_.isTraceEnabled())
+                     logger_.trace("Updating heartbeat state version to " + localState.getHeartBeatState().getHeartBeatVersion() + " from " + oldVersion + " for " + addr + " ...");
+             }
++            else
++            {
++                if (logger_.isTraceEnabled())
++                    logger_.trace("Ignoring lower version " + remoteHbState.getHeartBeatVersion() + " for " + addr + " which is lower than " + localHbState.getHeartBeatVersion());
++            }
+         }
+     }
+ 
+@@ -777,6 +789,8 @@ void requestAll(GossipDigest gDigest, List<GossipDigest> deltaGossipDigestList,
+     {
+         /* We are here since we have no data for this endpoint locally so request everthing. */
+         deltaGossipDigestList.add( new GossipDigest(gDigest.getEndpoint(), remoteGeneration, 0) );
++        if (logger_.isTraceEnabled())
++            logger_.trace("requestAll for " + gDigest.getEndpoint());
+     }
+ 
+     /* Send all the data with version greater than maxRemoteVersion */
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/StorageService.java
+index 234d73df..54450e37 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/StorageService.java
+@@ -1602,9 +1602,10 @@ private void leaveRing()
+         calculatePendingRanges();
+ 
+         Gossiper.instance.addLocalApplicationState(ApplicationState.STATUS, valueFactory.left(getLocalToken()));
++        logger_.info("Announcing that I have left the ring for " + RING_DELAY + "ms");
+         try
+         {
+-            Thread.sleep(2 * Gossiper.intervalInMillis_);
++            Thread.sleep(RING_DELAY);
+         }
+         catch (InterruptedException e)
+         {

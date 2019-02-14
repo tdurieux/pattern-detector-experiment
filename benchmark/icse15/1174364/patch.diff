@@ -1,0 +1,128 @@
+diff --git a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
+index 4fad837b..5eb1fde9 100644
+--- a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
++++ b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/AbstractCompactionStrategy.java
+@@ -92,4 +92,9 @@ public void shutdown() { }
+      * @return the number of background tasks estimated to still be needed for this columnfamilystore
+      */
+     public abstract int getEstimatedRemainingTasks();
++
++    /**
++     * @return size in bytes of the largest sstables for this strategy
++     */
++    public abstract long getMaxSSTableSize();
+ }
+diff --git a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/CompactionTask.java b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+index afb64789..3f12e044 100644
+--- a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
++++ b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/CompactionTask.java
+@@ -120,10 +120,11 @@ public int execute(CompactionExecutorStatsCollector collector) throws IOExceptio
+         long startTime = System.currentTimeMillis();
+         long totalkeysWritten = 0;
+ 
+-        // TODO the int cast here is potentially buggy
+-        int expectedBloomFilterSize = Math.max(DatabaseDescriptor.getIndexInterval(), (int)SSTableReader.getApproximateKeyCount(toCompact));
++        long estimatedTotalKeys = Math.max(DatabaseDescriptor.getIndexInterval(), SSTableReader.getApproximateKeyCount(toCompact));
++        long estimatedSSTables = Math.max(1, SSTable.getTotalBytes(toCompact) / cfs.getCompactionStrategy().getMaxSSTableSize());
++        long keysPerSSTable = (long) Math.ceil((double) estimatedTotalKeys / estimatedSSTables);
+         if (logger.isDebugEnabled())
+-            logger.debug("Expected bloom filter size : " + expectedBloomFilterSize);
++            logger.debug("Expected bloom filter size : " + keysPerSSTable);
+ 
+         AbstractCompactionIterable ci = DatabaseDescriptor.isMultithreadedCompaction()
+                                       ? new ParallelCompactionIterable(OperationType.COMPACTION, toCompact, controller)
+@@ -152,7 +153,7 @@ public int execute(CompactionExecutorStatsCollector collector) throws IOExceptio
+                 return 0;
+             }
+ 
+-            SSTableWriter writer = cfs.createCompactionWriter(expectedBloomFilterSize, compactionFileLocation, toCompact);
++            SSTableWriter writer = cfs.createCompactionWriter(keysPerSSTable, compactionFileLocation, toCompact);
+             writers.add(writer);
+             while (nni.hasNext())
+             {
+@@ -179,7 +180,7 @@ public int execute(CompactionExecutorStatsCollector collector) throws IOExceptio
+                     SSTableReader toIndex = writer.closeAndOpenReader(getMaxDataAge(toCompact));
+                     cachedKeyMap.put(toIndex, cachedKeys);
+                     sstables.add(toIndex);
+-                    writer = cfs.createCompactionWriter(expectedBloomFilterSize, compactionFileLocation, toCompact);
++                    writer = cfs.createCompactionWriter(keysPerSSTable, compactionFileLocation, toCompact);
+                     writers.add(writer);
+                     cachedKeys = new HashMap<DecoratedKey, Long>();
+                 }
+diff --git a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/LeveledCompactionStrategy.java b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/LeveledCompactionStrategy.java
+index f6713c73..1131e4b1 100644
+--- a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/LeveledCompactionStrategy.java
++++ b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/LeveledCompactionStrategy.java
+@@ -28,11 +28,9 @@
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+-import org.apache.commons.lang.StringUtils;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+ import org.apache.cassandra.db.ColumnFamilyStore;
+ import org.apache.cassandra.io.sstable.SSTableReader;
+ import org.apache.cassandra.notifications.INotification;
+@@ -47,7 +45,7 @@
+ 
+     private LeveledManifest manifest;
+     private final String SSTABLE_SIZE_OPTION = "sstable_size_in_mb";
+-    private final int maxSSTableSize;
++    private final int maxSSTableSizeInMB;
+     private final AtomicReference<LeveledCompactionTask> task = new AtomicReference<LeveledCompactionTask>();
+ 
+     public LeveledCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
+@@ -70,12 +68,12 @@ public LeveledCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> opti
+                 }
+             }
+         }
+-        maxSSTableSize = configuredMaxSSTableSize;
++        maxSSTableSizeInMB = configuredMaxSSTableSize;
+ 
+         cfs.getDataTracker().subscribe(this);
+         logger.info(this + " subscribed to the data tracker.");
+ 
+-        manifest = LeveledManifest.create(cfs, this.maxSSTableSize);
++        manifest = LeveledManifest.create(cfs, this.maxSSTableSizeInMB);
+         logger.debug("Created {}", manifest);
+         // override min/max for this strategy
+         cfs.setMaximumCompactionThreshold(Integer.MAX_VALUE);
+@@ -119,7 +117,7 @@ public int getLevelSize(int i)
+             return Collections.emptyList();
+         }
+ 
+-        LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, sstables, gcBefore, this.maxSSTableSize);
++        LeveledCompactionTask newTask = new LeveledCompactionTask(cfs, sstables, gcBefore, this.maxSSTableSizeInMB);
+         return task.compareAndSet(currentTask, newTask)
+                ? Collections.<AbstractCompactionTask>singletonList(newTask)
+                : Collections.<AbstractCompactionTask>emptyList();
+@@ -156,6 +154,11 @@ else if (notification instanceof SSTableListChangedNotification)
+         }
+     }
+ 
++    public long getMaxSSTableSize()
++    {
++        return maxSSTableSizeInMB * 1024 * 1024;
++    }
++
+     @Override
+     public String toString()
+     {
+diff --git a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/SizeTieredCompactionStrategy.java b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/SizeTieredCompactionStrategy.java
+index 2acfd675..884c7597 100644
+--- a/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/SizeTieredCompactionStrategy.java
++++ b/cassandra/branches/cassandra-1.0.0/src/java/org/apache/cassandra/db/compaction/SizeTieredCompactionStrategy.java
+@@ -176,6 +176,11 @@ public long getMinSSTableSize()
+         return minSSTableSize;
+     }
+ 
++    public long getMaxSSTableSize()
++    {
++        return Long.MAX_VALUE;
++    }
++
+     public String toString()
+     {
+         return String.format("SizeTieredCompactionStrategy[%s/%s]",

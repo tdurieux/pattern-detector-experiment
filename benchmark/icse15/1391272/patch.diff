@@ -1,0 +1,503 @@
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/BtJob.java b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/BtJob.java
+index dd7068c7..50572fe6 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/BtJob.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/BtJob.java
+@@ -49,6 +49,7 @@
+ import org.apache.mahout.common.iterator.sequencefile.SequenceFileDirValueIterator;
+ import org.apache.mahout.common.iterator.sequencefile.SequenceFileValueIterator;
+ import org.apache.mahout.math.DenseVector;
++import org.apache.mahout.math.NamedVector;
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.VectorWritable;
+ import org.apache.mahout.math.function.Functions;
+@@ -91,8 +92,8 @@
+   public static final String PROP_OUTER_PROD_BLOCK_HEIGHT =
+     "ssvd.outerProdBlockHeight";
+   public static final String PROP_RHAT_BROADCAST = "ssvd.rhat.broadcast";
+-
+   public static final String PROP_XI_PATH = "ssvdpca.xi.path";
++  public static final String PROP_NV = "ssvd.nv";
+ 
+   static final double SPARSE_ZEROS_PCT_THRESHOLD = 0.1;
+ 
+@@ -111,6 +112,7 @@ private BtJob() {
+     private Vector btRow;
+     private SparseRowBlockAccumulator btCollector;
+     private Context mapContext;
++    private boolean nv;
+ 
+     // pca stuff
+     private Vector sqAccum;
+@@ -131,10 +133,9 @@ protected void map(Writable key, VectorWritable value, Context context)
+ 
+       Vector qRow = qr.next();
+       int kp = qRow.size();
+-      qRowValue.set(qRow);
+ 
+       // make sure Qs are inheriting A row labels.
+-      outputQRow(key, qRowValue);
++      outputQRow(key, qRow, aRow);
+ 
+       // MAHOUT-817
+       if (computeSq) {
+@@ -273,6 +274,9 @@ public void collect(LongWritable blockKey,
+       // MAHOUT-817
+       computeSq = (conf.get(PROP_XI_PATH) != null);
+ 
++      // MAHOUT-1067
++      nv = conf.getBoolean(PROP_NV, false);
++
+     }
+ 
+     @Override
+@@ -294,8 +298,13 @@ protected void cleanup(Context context) throws IOException,
+     }
+ 
+     @SuppressWarnings("unchecked")
+-    private void outputQRow(Writable key, Writable value) throws IOException {
+-      outputs.getCollector(OUTPUT_Q, null).collect(key, value);
++    private void outputQRow(Writable key, Vector qRow, Vector aRow ) throws IOException {
++      if (nv && (aRow instanceof NamedVector)) {
++        qRowValue.set(new NamedVector(qRow, ((NamedVector) aRow).getName()));
++      } else {
++        qRowValue.set(qRow);
++      }
++      outputs.getCollector(OUTPUT_Q, null).collect(key, qRowValue);
+     }
+   }
+ 
+@@ -512,6 +521,12 @@ public static void run(Configuration conf,
+                                      org.apache.hadoop.mapred.SequenceFileOutputFormat.class,
+                                      IntWritable.class,
+                                      VectorWritable.class);
++      /*
++       * MAHOUT-1067: if we are asked to output BBT products then named vector
++       * names should be propagated to Q too so that UJob could pick them up
++       * from there.
++       */
++      oldApiJob.setBoolean(PROP_NV, true);
+     }
+     if (xiPath != null) {
+       // compute pca -related stuff as well
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDCli.java b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDCli.java
+index 198e44c7..b9064db4 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDCli.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDCli.java
+@@ -57,12 +57,16 @@ public int run(String[] args) throws Exception {
+     addOption("computeU", "U", "compute U (true/false)", String.valueOf(true));
+     addOption("uHalfSigma",
+               "uhs",
+-              "Compute U as UHat=U x pow(Sigma,0.5)",
++              "Compute U * Sigma^0.5",
++              String.valueOf(false));
++    addOption("uSigma",
++              "us",
++              "Compute U * Sigma",
+               String.valueOf(false));
+     addOption("computeV", "V", "compute V (true/false)", String.valueOf(true));
+     addOption("vHalfSigma",
+               "vhs",
+-              "compute V as VHat= V x pow(Sigma,0.5)",
++              "compute V * Sigma^0.5",
+               String.valueOf(false));
+     addOption("reduceTasks",
+               "t",
+@@ -100,6 +104,7 @@ public int run(String[] args) throws Exception {
+     boolean computeU = Boolean.parseBoolean(getOption("computeU"));
+     boolean computeV = Boolean.parseBoolean(getOption("computeV"));
+     boolean cUHalfSigma = Boolean.parseBoolean(getOption("uHalfSigma"));
++    boolean cUSigma = Boolean.parseBoolean(getOption("uSigma"));
+     boolean cVHalfSigma = Boolean.parseBoolean(getOption("vHalfSigma"));
+     int reduceTasks = Integer.parseInt(getOption("reduceTasks"));
+     boolean broadcast = Boolean.parseBoolean(getOption("broadcast"));
+@@ -131,6 +136,7 @@ public int run(String[] args) throws Exception {
+     solver.setComputeV(computeV);
+     solver.setcUHalfSigma(cUHalfSigma);
+     solver.setcVHalfSigma(cVHalfSigma);
++    solver.setcUSigma(cUSigma);
+     solver.setOuterBlockHeight(h);
+     solver.setAbtBlockHeight(abh);
+     solver.setQ(q);
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDSolver.java b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDSolver.java
+index 30aac7fb..ce15f714 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDSolver.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/SSVDSolver.java
+@@ -92,6 +92,10 @@
+   private boolean computeV = true;
+   private String uPath;
+   private String vPath;
++  private String uSigmaPath;
++  private String uHalfSigmaPath;
++  private String vSigmaPath;
++  private String vHalfSigmaPath;
+   private int outerBlockHeight = 30000;
+   private int abtBlockHeight = 200000;
+ 
+@@ -106,7 +110,9 @@
+   private final int reduceTasks;
+   private int minSplitSize = -1;
+   private boolean cUHalfSigma;
++  private boolean cUSigma;
+   private boolean cVHalfSigma;
++  private boolean cVSigma;
+   private boolean overwrite;
+   private boolean broadcast = true;
+   private Path pcaMeanPath;
+@@ -151,14 +157,6 @@ public SSVDSolver(Configuration conf,
+     this.reduceTasks = reduceTasks;
+   }
+ 
+-  public void setcUHalfSigma(boolean cUHat) {
+-    this.cUHalfSigma = cUHat;
+-  }
+-
+-  public void setcVHalfSigma(boolean cVHat) {
+-    this.cVHalfSigma = cVHat;
+-  }
+-
+   public int getQ() {
+     return q;
+   }
+@@ -175,6 +173,7 @@ public void setQ(int q) {
+ 
+   /**
+    * The setting controlling whether to compute U matrix of low rank SSVD.
++   * Default true.
+    * 
+    */
+   public void setComputeU(boolean val) {
+@@ -191,6 +190,37 @@ public void setComputeV(boolean val) {
+     computeV = val;
+   }
+ 
++  /**
++   * 
++   * @param cUHat whether produce U*Sigma^0.5 as well (default false)
++   */
++  public void setcUHalfSigma(boolean cUHat) {
++    this.cUHalfSigma = cUHat;
++  }
++
++  /**
++   * 
++   * @param cVHat whether produce V*Sigma^0.5 as well (default false)
++   */
++  public void setcVHalfSigma(boolean cVHat) {
++    this.cVHalfSigma = cVHat;
++  }
++
++  /**
++   * 
++   * @param cUSigma whether produce U*Sigma output as well (default false)
++   */
++  public void setcUSigma(boolean cUSigma) {
++    this.cUSigma = cUSigma;
++  }
++
++  /**
++   * @param cVSigma whether produce V*Sigma output as well (default false)
++   */
++  public void setcVSigma(boolean cVSigma) {
++    this.cVSigma = cVSigma;
++  }
++
+   /**
+    * Sometimes, if requested A blocks become larger than a split, we may need to
+    * use that to ensure at least k+p rows of A get into a split. This is
+@@ -232,6 +262,22 @@ public String getVPath() {
+     return vPath;
+   }
+ 
++  public String getuSigmaPath() {
++    return uSigmaPath;
++  }
++
++  public String getuHalfSigmaPath() {
++    return uHalfSigmaPath;
++  }
++
++  public String getvSigmaPath() {
++    return vSigmaPath;
++  }
++
++  public String getvHalfSigmaPath() {
++    return vHalfSigmaPath;
++  }
++
+   public boolean isOverwrite() {
+     return overwrite;
+   }
+@@ -334,7 +380,11 @@ public void run() throws IOException {
+       Path uHatPath = new Path(outputPath, "UHat");
+       Path svPath = new Path(outputPath, "Sigma");
+       Path uPath = new Path(outputPath, "U");
++      Path uSigmaPath = new Path(outputPath, "USigma");
++      Path uHalfSigmaPath = new Path(outputPath, "UHalfSigma");
+       Path vPath = new Path(outputPath, "V");
++      Path vHalfSigmaPath = new Path(outputPath, "VHalfSigma");
++      Path vSigmaPath = new Path(outputPath, "VSigma");
+ 
+       Path pcaBasePath = new Path(outputPath, "pca");
+ 
+@@ -391,9 +441,6 @@ public void run() throws IOException {
+        * bit too many (I would be happy i that were ever the case though).
+        */
+ 
+-      //sbPath = new Path(pcaBasePath, "sb0");
+-      //sqPath = new Path(pcaBasePath, "sq0");
+-
+       BtJob.run(conf,
+                 inputPath,
+                 qPath,
+@@ -514,10 +561,38 @@ public void run() throws IOException {
+                  k,
+                  reduceTasks,
+                  labelType,
+-                 cUHalfSigma);
++                 OutputScalingEnum.NOSCALING);
+         // actually this is map-only job anyway
+       }
+ 
++      UJob uhsjob = null;
++      if (cUHalfSigma) {
++        uhsjob = new UJob();
++        uhsjob.run(conf,
++                 new Path(btPath, BtJob.OUTPUT_Q + "-*"),
++                 uHatPath,
++                 svPath,
++                 uHalfSigmaPath,
++                 k,
++                 reduceTasks,
++                 labelType,
++                 OutputScalingEnum.HALFSIGMA);
++      }
++
++      UJob usjob = null;
++      if (cUSigma) {
++        usjob = new UJob();
++        usjob.run(conf,
++                 new Path(btPath, BtJob.OUTPUT_Q + "-*"),
++                 uHatPath,
++                 svPath,
++                 uSigmaPath,
++                 k,
++                 reduceTasks,
++                 labelType,
++                 OutputScalingEnum.SIGMA);
++      }
++
+       VJob vjob = null;
+       if (computeV) {
+         vjob = new VJob();
+@@ -530,17 +605,63 @@ public void run() throws IOException {
+                  vPath,
+                  k,
+                  reduceTasks,
+-                 cVHalfSigma);
++                 OutputScalingEnum.NOSCALING);
++      }
++
++      VJob vhsjob = null;
++      if (cVHalfSigma) {
++        vhsjob = new VJob();
++        vhsjob.run(conf,
++                   new Path(btPath, BtJob.OUTPUT_BT + "-*"),
++                   pcaMeanPath,
++                   sqPath,
++                   uHatPath,
++                   svPath,
++                   vHalfSigmaPath,
++                   k,
++                   reduceTasks,
++                   OutputScalingEnum.HALFSIGMA);
++      }
++
++      VJob vsjob = null;
++      if (cVSigma) {
++        vsjob = new VJob();
++        vsjob.run(conf,
++                  new Path(btPath, BtJob.OUTPUT_BT + "-*"),
++                  pcaMeanPath,
++                  sqPath,
++                  uHatPath,
++                  svPath,
++                  vSigmaPath,
++                  k,
++                  reduceTasks,
++                  OutputScalingEnum.SIGMA);
+       }
+ 
+       if (ujob != null) {
+         ujob.waitForCompletion();
+         this.uPath = uPath.toString();
+       }
++      if (uhsjob != null) {
++        uhsjob.waitForCompletion();
++        this.uHalfSigmaPath = uHalfSigmaPath.toString();
++      }
++      if (usjob != null) {
++        usjob.waitForCompletion();
++        this.uSigmaPath = uSigmaPath.toString();
++      }
+       if (vjob != null) {
+         vjob.waitForCompletion();
+         this.vPath = vPath.toString();
+       }
++      if (vhsjob != null) {
++        vhsjob.waitForCompletion();
++        this.vHalfSigmaPath = vHalfSigmaPath.toString();
++      }
++      if (vsjob != null) {
++        vsjob.waitForCompletion();
++        this.vSigmaPath = vSigmaPath.toString();
++      }
+ 
+     } catch (InterruptedException exc) {
+       throw new IOException("Interrupted", exc);
+@@ -550,6 +671,9 @@ public void run() throws IOException {
+     } finally {
+       IOUtils.close(closeables);
+     }
++  }
+ 
++  static enum OutputScalingEnum {
++    NOSCALING, SIGMA, HALFSIGMA
+   }
+ }
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/UJob.java b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/UJob.java
+index 151084e7..9b0e490d 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/UJob.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/UJob.java
+@@ -35,6 +35,7 @@
+ import org.apache.mahout.math.DenseMatrix;
+ import org.apache.mahout.math.DenseVector;
+ import org.apache.mahout.math.Matrix;
++import org.apache.mahout.math.NamedVector;
+ import org.apache.mahout.math.Vector;
+ import org.apache.mahout.math.VectorWritable;
+ import org.apache.mahout.math.function.Functions;
+@@ -47,14 +48,14 @@
+   private static final String OUTPUT_U = "u";
+   private static final String PROP_UHAT_PATH = "ssvd.uhat.path";
+   private static final String PROP_SIGMA_PATH = "ssvd.sigma.path";
+-  private static final String PROP_U_HALFSIGMA = "ssvd.u.halfsigma";
++  private static final String PROP_OUTPUT_SCALING = "ssvd.u.output.scaling";
+   private static final String PROP_K = "ssvd.k";
+ 
+   private Job job;
+ 
+   public void run(Configuration conf, Path inputPathQ, Path inputUHatPath,
+       Path sigmaPath, Path outputPath, int k, int numReduceTasks,
+-      Class<? extends Writable> labelClass, boolean uHalfSigma)
++      Class<? extends Writable> labelClass, SSVDSolver.OutputScalingEnum outputScaling)
+     throws ClassNotFoundException, InterruptedException, IOException {
+ 
+     job = new Job(conf);
+@@ -81,9 +82,7 @@ public void run(Configuration conf, Path inputPathQ, Path inputUHatPath,
+ 
+     job.getConfiguration().set(PROP_UHAT_PATH, inputUHatPath.toString());
+     job.getConfiguration().set(PROP_SIGMA_PATH, sigmaPath.toString());
+-    if (uHalfSigma) {
+-      job.getConfiguration().set(PROP_U_HALFSIGMA, "y");
+-    }
++    job.getConfiguration().set(PROP_OUTPUT_SCALING, outputScaling.name());
+     job.getConfiguration().setInt(PROP_K, k);
+     job.setNumReduceTasks(0);
+     job.submit();
+@@ -125,6 +124,14 @@ protected void map(Writable key, VectorWritable value, Context context)
+         }
+       }
+ 
++      /*
++       * MAHOUT-1067: inherit A names too.
++       */
++      if (qRow instanceof NamedVector) {
++        uRowWritable.set(new NamedVector(uRow, ((NamedVector) qRow).getName()));
++      } else
++        uRowWritable.set(uRow);
++
+       context.write(key, uRowWritable); // U inherits original A row labels.
+     }
+ 
+@@ -144,11 +151,18 @@ protected void setup(Context context) throws IOException,
+       uRow = new DenseVector(k);
+       uRowWritable = new VectorWritable(uRow);
+ 
+-      if (context.getConfiguration().get(PROP_U_HALFSIGMA) != null) {
++      SSVDSolver.OutputScalingEnum outputScaling =
++        SSVDSolver.OutputScalingEnum.valueOf(context.getConfiguration()
++                                                    .get(PROP_OUTPUT_SCALING));
++      switch (outputScaling) {
++      case SIGMA:
++        sValues = SSVDHelper.loadVector(sigmaPath, context.getConfiguration());
++        break;
++      case HALFSIGMA:
+         sValues = SSVDHelper.loadVector(sigmaPath, context.getConfiguration());
+         sValues.assign(Functions.SQRT);
++        break;
+       }
+-
+     }
+ 
+   }
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/VJob.java b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/VJob.java
+index 71bd3c31..ffbc4af4 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/VJob.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/math/hadoop/stochasticsvd/VJob.java
+@@ -43,7 +43,7 @@
+   private static final String OUTPUT_V = "v";
+   private static final String PROP_UHAT_PATH = "ssvd.uhat.path";
+   private static final String PROP_SIGMA_PATH = "ssvd.sigma.path";
+-  private static final String PROP_V_HALFSIGMA = "ssvd.v.halfsigma";
++  private static final String PROP_OUTPUT_SCALING = "ssvd.v.output.scaling";
+   private static final String PROP_K = "ssvd.k";
+   public static final String PROP_SQ_PATH = "ssvdpca.sq.path";
+   public static final String PROP_XI_PATH = "ssvdpca.xi.path";
+@@ -110,8 +110,17 @@ protected void setup(Context context) throws IOException,
+       vRowWritable = new VectorWritable(vRow);
+ 
+       sValues = SSVDHelper.loadVector(sigmaPath, conf);
+-      if (conf.get(PROP_V_HALFSIGMA) != null) {
++      SSVDSolver.OutputScalingEnum outputScaling =
++        SSVDSolver.OutputScalingEnum.valueOf(context.getConfiguration()
++                                                    .get(PROP_OUTPUT_SCALING));
++      switch (outputScaling) {
++      case SIGMA:
++        sValues.assign(1.0);
++        break;
++      case HALFSIGMA:
++        sValues = SSVDHelper.loadVector(sigmaPath, context.getConfiguration());
+         sValues.assign(Functions.SQRT);
++        break;
+       }
+ 
+       /*
+@@ -141,7 +150,7 @@ protected void setup(Context context) throws IOException,
+    * @param outputPath
+    * @param k
+    * @param numReduceTasks
+-   * @param vHalfSigma
++   * @param outputScaling output scaling: apply Sigma, or Sigma^0.5, or none
+    * @throws ClassNotFoundException
+    * @throws InterruptedException
+    * @throws IOException
+@@ -157,7 +166,7 @@ public void run(Configuration conf,
+                   Path outputPath,
+                   int k,
+                   int numReduceTasks,
+-                  boolean vHalfSigma) throws ClassNotFoundException,
++                  SSVDSolver.OutputScalingEnum outputScaling ) throws ClassNotFoundException,
+     InterruptedException, IOException {
+ 
+     job = new Job(conf);
+@@ -186,9 +195,7 @@ public void run(Configuration conf,
+ 
+     job.getConfiguration().set(PROP_UHAT_PATH, inputUHatPath.toString());
+     job.getConfiguration().set(PROP_SIGMA_PATH, inputSigmaPath.toString());
+-    if (vHalfSigma) {
+-      job.getConfiguration().set(PROP_V_HALFSIGMA, "y");
+-    }
++    job.getConfiguration().set(PROP_OUTPUT_SCALING, outputScaling.name());
+     job.getConfiguration().setInt(PROP_K, k);
+     job.setNumReduceTasks(0);
+ 

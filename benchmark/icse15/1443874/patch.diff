@@ -1,0 +1,271 @@
+diff --git a/db/derby/code/branches/10.9/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java b/db/derby/code/branches/10.9/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+index 38085a7a..d21724af 100644
+--- a/db/derby/code/branches/10.9/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
++++ b/db/derby/code/branches/10.9/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+@@ -896,6 +896,20 @@ public int convertAbsoluteToRelativeColumnPosition(int absolutePosition)
+ 	}
+ 
+ 	/**
++     * <p>
++     * Estimate the cost of scanning this {@code FromBaseTable} using the
++     * given predicate list with the given conglomerate.
++     * </p>
++     *
++     * <p>
++     * If the table contains little data, the cost estimate might be adjusted
++     * to make it more likely that an index scan will be preferred to a table
++     * scan, and a unique index will be preferred to a non-unique index. Even
++     * though such a plan may be slightly suboptimal when seen in isolation,
++     * using indexes, unique indexes in particular, needs fewer locks and
++     * allows more concurrency.
++     * </p>
++     *
+ 	 * @see Optimizable#estimateCost
+ 	 *
+ 	 * @exception StandardException		Thrown on error
+@@ -1060,6 +1074,24 @@ public CostEstimate estimateCost(OptimizablePredicateList predList,
+ 						getBaseCostController().getFetchFromRowLocationCost(
+ 																(FormatableBitSet) null,
+ 																0);
++
++                // The estimated row count is always 1 here, although the
++                // index scan may actually return 0 rows, depending on whether
++                // or not the predicates match a key. It is assumed that a
++                // match is more likely than a miss, hence the row count is 1.
++
++                // Note (DERBY-6011): Alternative (non-unique) indexes may come
++                // up with row counts lower than 1 because they multiply with
++                // the selectivity, especially if the table is almost empty.
++                // This makes the optimizer prefer non-unique indexes if there
++                // are not so many rows in the table. We still want to use the
++                // unique index in that case, as the performance difference
++                // between the different scans on a small table is small, and
++                // the unique index is likely to lock fewer rows and reduce
++                // the chance of deadlocks. Therefore, we compensate by
++                // making the row count at least 1 for the non-unique index.
++                // See reference to DERBY-6011 further down in this method.
++
+ 				cost = singleFetchCost * costEstimate.rowCount();
+ 
+ 				costEstimate.setEstimatedCost(
+@@ -1693,7 +1725,28 @@ public CostEstimate estimateCost(OptimizablePredicateList predList,
+ 																(FormatableBitSet) null,
+ 																0);
+ 
+-				cost = singleFetchCost * costEstimate.rowCount();
++                // The number of rows we expect to fetch from the base table.
++                double rowsToFetch = costEstimate.rowCount();
++
++                if (oneRowResultSetForSomeConglom) {
++                    // DERBY-6011: We know that there is a unique index, and
++                    // that there are predicates that guarantee that at most
++                    // one row will be fetched from the unique index. The
++                    // unique alternative always has 1 as estimated row count
++                    // (see reference to DERBY-6011 further up in this method),
++                    // even though it could actually return 0 rows.
++                    //
++                    // If the alternative that's being considered here has
++                    // expected row count less than 1, it is going to have
++                    // lower estimated cost for fetching base rows. We prefer
++                    // unique indexes, as they lock fewer rows and allow more
++                    // concurrency. Therefore, make sure the cost estimate for
++                    // this alternative includes at least fetching one row from
++                    // the base table.
++                    rowsToFetch = Math.max(1.0d, rowsToFetch);
++                }
++
++                cost = singleFetchCost * rowsToFetch;
+ 
+ 				costEstimate.setEstimatedCost(
+ 								costEstimate.getEstimatedCost() + cost);
+diff --git a/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/QueryPlanTest.java b/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/QueryPlanTest.java
+index e69de29b..50d62ce6 100644
+--- a/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/QueryPlanTest.java
++++ b/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/QueryPlanTest.java
+@@ -0,0 +1,174 @@
++/*
++ * Derby - Class org.apache.derbyTesting.functionTests.tests.lang.QueryPlanTest
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.derbyTesting.functionTests.tests.lang;
++
++import java.sql.PreparedStatement;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.util.Properties;
++import junit.framework.Test;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.RuntimeStatisticsParser;
++import org.apache.derbyTesting.junit.SQLUtilities;
++import org.apache.derbyTesting.junit.SystemPropertyTestSetup;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++/**
++ * Test that the optimizer chooses the expected query plans for specific
++ * queries.
++ */
++public class QueryPlanTest extends BaseJDBCTestCase {
++    public QueryPlanTest(String name) {
++        super(name);
++    }
++
++    public static Test suite() {
++        // Set derby.optimizer.noTimeout to prevent the optimizer from
++        // timing out and returning an unexpected plan on slower machines.
++        // Run in embedded mode only, since we're only interested in testing
++        // functionality in the engine.
++        Properties sysprops = new Properties();
++        sysprops.setProperty("derby.optimizer.noTimeout", "true");
++        return new CleanDatabaseTestSetup(new SystemPropertyTestSetup(
++                TestConfiguration.embeddedSuite(QueryPlanTest.class),
++                sysprops, true));
++    }
++
++    /**
++     * Test that we prefer unique indexes if we have equality predicates for
++     * the full key, even when the table is empty or almost empty. Although
++     * it doesn't matter much for performance when the table is almost empty,
++     * using a unique index will most likely need fewer locks and allow more
++     * concurrency.
++     */
++    public void testDerby6011PreferUniqueIndex() throws SQLException {
++        setAutoCommit(false);
++        Statement s = createStatement();
++
++        // Create tables/indexes like the ones used by the Apache ManifoldCF
++        // test that had concurrency problems (deadlocks).
++        s.execute("CREATE TABLE jobs(id BIGINT PRIMARY KEY)");
++        s.execute("CREATE TABLE jobqueue(docpriority FLOAT, "
++                + "id BIGINT PRIMARY KEY, priorityset BIGINT, "
++                + "docid CLOB NOT NULL, failcount BIGINT, "
++                + "status CHAR(1) NOT NULL, dochash VARCHAR(40) NOT NULL, "
++                + "isseed CHAR(1), checktime BIGINT, checkaction CHAR(1), "
++                + "jobid BIGINT NOT NULL CONSTRAINT jobs_fk REFERENCES jobs, "
++                + "failtime BIGINT)");
++        s.execute("CREATE UNIQUE INDEX DOCHASH_JOBID_IDX ON "
++                + "jobqueue(dochash, jobid)");
++
++        // Enable collection of runtime statistics.
++        s.execute("call SYSCS_UTIL.SYSCS_SET_RUNTIMESTATISTICS(1)");
++
++        // Execute the query that caused problems and verify that it used
++        // the unique index. It used to pick a plan that used the JOBS_FK
++        // foreign key constraint.
++        PreparedStatement ps = prepareStatement(
++                "SELECT id,status,checktime FROM jobqueue "
++                + "WHERE dochash=? AND jobid=? FOR UPDATE");
++        ps.setString(1, "");
++        ps.setInt(2, 0);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("JOBQUEUE", "DOCHASH_JOBID_IDX");
++
++        // Check that the optimizer picks the unique index if there is a
++        // column that has both a unique and a non-unique index. It used to
++        // pick the non-unique index.
++        s.execute("create table t1(a int not null, b int not null, " +
++                  "c int not null, d int not null, e blob)");
++        s.execute("create index idx_t1_a on t1(a)");
++        s.execute("create unique index uidx_t1_a on t1(a)");
++        ps = prepareStatement("select * from t1 where a = ?");
++        ps.setInt(1, 1);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("T1", "UIDX_T1_A");
++
++        // Check that a unique index is preferred also for indexes with
++        // two and three columns. Used to pick a non-unique index.
++        s.execute("drop index uidx_t1_a");
++        s.execute("create index idx_t1_ab on t1(a,b)");
++        s.execute("create unique index uidx_t1_ab on t1(a,b)");
++        ps = prepareStatement("select * from t1 where a = ? and b = ?");
++        ps.setInt(1, 1);
++        ps.setInt(2, 2);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("T1", "UIDX_T1_AB");
++
++        s.execute("drop index uidx_t1_ab");
++        s.execute("create index idx_t1_abc on t1(a,b,c)");
++        s.execute("create unique index uidx_t1_abc on t1(a,b,c)");
++        ps = prepareStatement(
++                "select * from t1 where a = ? and b = ? and c = ?");
++        ps.setInt(1, 1);
++        ps.setInt(2, 2);
++        ps.setInt(3, 3);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("T1", "UIDX_T1_ABC");
++
++        // The optimizer should prefer a four-column unique to a three-column
++        // non-unique index for the query below. Used to pick the three-column
++        // non-unique index.
++        s.execute("drop index uidx_t1_abc");
++        s.execute("create unique index uidx_t1_abcd on t1(a,b,c,d)");
++        ps = prepareStatement(
++                "select * from t1 where a = ? and b = ? and c = ? and d = ?");
++        ps.setInt(1, 1);
++        ps.setInt(2, 2);
++        ps.setInt(3, 3);
++        ps.setInt(4, 4);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("T1", "UIDX_T1_ABCD");
++
++        // Given a covering non-unique index and a non-covering unique index,
++        // we want the covering index to be picked. The optimizer used to pick
++        // the covering index before the fix. Verify that it still does.
++        s.execute("create table t2(a varchar(200) not null, "
++                + "b varchar(200) not null, c varchar(200) not null)");
++        s.execute("create unique index uidx_t2_ab on t1(a,b)");
++        s.execute("create index idx_t2_abc on t2(a,b,c)");
++        ps = prepareStatement(
++                "select * from t2 where a = ? and b = ? and c = ?");
++        ps.setInt(1, 1);
++        ps.setInt(2, 2);
++        ps.setInt(3, 3);
++        JDBC.assertEmpty(ps.executeQuery());
++        assertIndex("T2", "IDX_T2_ABC");
++    }
++
++    /**
++     * Assert that a specific index was used for accessing a table.
++     * @param table the table being accessed
++     * @param index the index that should be used
++     */
++    private void assertIndex(String table, String index)
++            throws SQLException {
++        RuntimeStatisticsParser parser =
++                SQLUtilities.getRuntimeStatisticsParser(createStatement());
++        if (!parser.usedSpecificIndexForIndexScan(table, index)) {
++            fail("Should have used index " + index + " when accessing table " +
++                 table + ". Actual plan:\n" + parser);
++        }
++    }
++}
+diff --git a/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java b/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+index cb7b51bb..1c48038f 100644
+--- a/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
++++ b/db/derby/code/branches/10.9/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+@@ -222,6 +222,7 @@ public static Test suite() {
+         suite.addTest(HalfCreatedDatabaseTest.suite());
+         suite.addTest(NativeAuthenticationServiceTest.suite());
+         suite.addTest(Derby5652.suite());
++        suite.addTest(QueryPlanTest.suite());
+         return suite;
+ 	}
+ }

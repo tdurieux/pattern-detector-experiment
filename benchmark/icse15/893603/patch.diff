@@ -1,0 +1,168 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index d82a76d0..02510aee 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -170,6 +170,22 @@ public static ColumnFamilyStore getColumnFamilyStore(String table, String column
+         return cfs;
+     }
+ 
++    private Set<File> files()
++    {
++        Set<File> fileSet = new HashSet<File>(3 * ssTables_.size() + 6); // 6 is fudge factor so we don't have to double if there's a couple uncompacted ones around
++        for (String directory : DatabaseDescriptor.getAllDataFileLocationsForTable(table_))
++        {
++            File[] files = new File(directory).listFiles();
++            for (File file : files)
++            {
++                String cfName = getColumnFamilyFromFileName(file.getName());
++                if (cfName.equals(columnFamily_))
++                    fileSet.add(file);
++            }
++        }
++        return fileSet;
++    }
++
+     void onStart() throws IOException
+     {
+         if (logger_.isDebugEnabled())
+@@ -177,19 +193,9 @@ void onStart() throws IOException
+         // scan for data files corresponding to this CF
+         List<File> sstableFiles = new ArrayList<File>();
+         Pattern auxFilePattern = Pattern.compile("(.*)(-Filter\\.db$|-Index\\.db$)");
+-        String[] dataFileDirectories = DatabaseDescriptor.getAllDataFileLocationsForTable(table_);
+-        for (String directory : dataFileDirectories)
+-        {
+-            File fileDir = new File(directory);
+-            File[] files = fileDir.listFiles();
+-            for (File file : files)
++        for (File file : files())
+             {
+                 String filename = file.getName();
+-                String cfName = getColumnFamilyFromFileName(filename);
+-
+-                // skip files that are not from this column family
+-                if (!cfName.equals(columnFamily_))
+-                    continue;
+ 
+                 /* look for and remove orphans. An orphan is a -Filter.db or -Index.db with no corresponding -Data.db. */
+                 Matcher matcher = auxFilePattern.matcher(file.getAbsolutePath());
+@@ -215,7 +221,6 @@ void onStart() throws IOException
+                     sstableFiles.add(file.getAbsoluteFile());
+                 }
+             }
+-        }
+         Collections.sort(sstableFiles, new FileUtils.FileComparator());
+ 
+         /* Load the index files and the Bloom Filters associated with them. */
+@@ -1211,6 +1216,31 @@ public void snapshot(String snapshotName) throws IOException
+         }
+     }
+ 
++    public long getTotalDiskSpaceUsed()
++    {
++        long n = 0;
++        for (File file : files())
++        {
++            n += file.length();
++        }
++        return n;
++    }
++
++    public long getLiveDiskSpaceUsed()
++    {
++        long n = 0;
++        for (SSTableReader sstable : ssTables_)
++        {
++            n += sstable.bytesOnDisk();
++        }
++        return n;
++    }
++
++    public int getLiveSSTableCount()
++    {
++        return ssTables_.size();
++    }
++
+     /**
+      * for testing.  no effort is made to clear historical memtables.
+      */
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStoreMBean.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStoreMBean.java
+index a8b9893d..2ce8741c 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStoreMBean.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStoreMBean.java
+@@ -80,9 +80,22 @@
+     public double getWriteLatency();
+     
+     /**
+-     * 
+      * @return the estimated number of tasks pending for this column family
+      */
+     public int getPendingTasks();
+     
++    /**
++     * @return the number of SSTables on disk for this CF
++     */
++    public int getLiveSSTableCount();
++
++    /**
++     * @return disk space used by SSTables belonging to this CF
++     */
++    public long getLiveDiskSpaceUsed();
++
++    /**
++     * @return total disk space used by SSTables belonging to this CF, including obsolete ones waiting to be GC'd
++     */
++    public long getTotalDiskSpaceUsed();
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
+index e5b0690a..2c137ef2 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/io/SSTable.java
+@@ -198,6 +198,11 @@ public String toString()
+         }
+     }
+ 
++    public long dataBytesOnDisk()
++    {
++        return new File(path).length();
++    }
++
+     public long bytesOnDisk()
+     {
+         long bytes = 0;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 3b942d3d..8f4b5428 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -781,10 +781,7 @@ public double getLoad()
+             for (String cfName : table.getColumnFamilies())
+             {
+                 ColumnFamilyStore cfs = table.getColumnFamilyStore(cfName);
+-                for (SSTableReader sstable : cfs.getSSTables())
+-                {
+-                    bytes += sstable.bytesOnDisk();
+-                }
++                bytes += cfs.getLiveDiskSpaceUsed();
+             }
+         }
+         return bytes;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+index 5f64b5f2..e1aa7204 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -322,10 +322,14 @@ public void printColumnFamilyStats(PrintStream outs)
+                 outs.println("\tWrite Count: " + tableWriteCount);
+                 outs.println("\tWrite Latency: " + String.format("%01.3f", tableWriteLatency) + " ms.");
+                 outs.println("\tPending Tasks: " + tablePendingTasks);
+-                // print out column family statistic for this table
++
++                // print out column family statistics for this table
+                 for (ColumnFamilyStoreMBean cfstore : columnFamilies)
+                 {
+                     outs.println("\t\tColumn Family: " + cfstore.getColumnFamilyName());
++                    outs.println("\t\tSSTable count: " + cfstore.getLiveSSTableCount());
++                    outs.println("\t\tSpace used (live): " + cfstore.getLiveDiskSpaceUsed());
++                    outs.println("\t\tSpace used (total): " + cfstore.getTotalDiskSpaceUsed());
+                     outs.println("\t\tMemtable Columns Count: " + cfstore.getMemtableColumnsCount());
+                     outs.println("\t\tMemtable Data Size: " + cfstore.getMemtableDataSize());
+                     outs.println("\t\tMemtable Switch Count: " + cfstore.getMemtableSwitchCount());

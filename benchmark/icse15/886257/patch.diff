@@ -1,0 +1,271 @@
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
+index 97c0575b..bf528050 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -3378,10 +3378,15 @@ public final void prepareCommit(Map<String,String> commitUserData) throws Corrup
+     startCommit(0, commitUserData);
+   }
+ 
++  // Used only by commit, below; lock order is commitLock -> IW
++  private final Object commitLock = new Object();
++
+   private void commit(long sizeInBytes) throws IOException {
++    synchronized(commitLock) {
+     startCommit(sizeInBytes, null);
+     finishCommit();
+   }
++  }
+ 
+   /**
+    * <p>Commits all pending changes (added & deleted
+@@ -3430,18 +3435,27 @@ public final void commit(Map<String,String> commitUserData) throws CorruptIndexE
+ 
+     ensureOpen();
+ 
+-    if (infoStream != null)
++    if (infoStream != null) {
+       message("commit: start");
++    }
++
++    synchronized(commitLock) {
++      if (infoStream != null) {
++        message("commit: enter lock");
++      }
+ 
+     if (pendingCommit == null) {
+-      if (infoStream != null)
++        if (infoStream != null) {
+         message("commit: now prepare");
++        }
+       prepareCommit(commitUserData);
+-    } else if (infoStream != null)
++      } else if (infoStream != null) {
+       message("commit: already prepared");
++      }
+ 
+     finishCommit();
+   }
++  }
+ 
+   private synchronized final void finishCommit() throws CorruptIndexException, IOException {
+ 
+@@ -4554,6 +4568,9 @@ private void startCommit(long sizeInBytes, Map<String,String> commitUserData) th
+ 
+     assert testPoint("startStartCommit");
+ 
++    // TODO: as of LUCENE-2095, we can simplify this method,
++    // since only 1 thread can be in here at once
++
+     if (hitOOM) {
+       throw new IllegalStateException("this writer hit an OutOfMemoryError; cannot commit");
+     }
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/store/RAMDirectory.java b/lucene/java/trunk/src/java/org/apache/lucene/store/RAMDirectory.java
+index 8edc43b2..a1dcb67f 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/store/RAMDirectory.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/store/RAMDirectory.java
+@@ -22,6 +22,7 @@
+ import java.io.Serializable;
+ import java.util.HashMap;
+ import java.util.Set;
++import java.util.concurrent.atomic.AtomicLong;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ 
+ /**
+@@ -34,7 +35,7 @@
+   private static final long serialVersionUID = 1l;
+ 
+   HashMap<String,RAMFile> fileMap = new HashMap<String,RAMFile>();
+-  long sizeInBytes = 0;
++  final AtomicLong sizeInBytes = new AtomicLong();
+   
+   // *****
+   // Lock acquisition sequence:  RAMDirectory, then RAMFile
+@@ -153,7 +154,7 @@ public final long fileLength(String name) throws IOException {
+    * RAMOutputStream.BUFFER_SIZE. */
+   public synchronized final long sizeInBytes() {
+     ensureOpen();
+-    return sizeInBytes;
++    return sizeInBytes.get();
+   }
+   
+   /** Removes an existing file in the directory.
+@@ -166,7 +167,7 @@ public synchronized void deleteFile(String name) throws IOException {
+     if (file!=null) {
+         fileMap.remove(name);
+         file.directory = null;
+-        sizeInBytes -= file.sizeInBytes;       // updates to RAMFile.sizeInBytes synchronized on directory
++        sizeInBytes.addAndGet(-file.sizeInBytes);
+     } else
+       throw new FileNotFoundException(name);
+   }
+@@ -179,7 +180,7 @@ public IndexOutput createOutput(String name) throws IOException {
+     synchronized (this) {
+       RAMFile existing = fileMap.get(name);
+       if (existing!=null) {
+-        sizeInBytes -= existing.sizeInBytes;
++        sizeInBytes.addAndGet(existing.sizeInBytes);
+         existing.directory = null;
+       }
+       fileMap.put(name, file);
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/store/RAMFile.java b/lucene/java/trunk/src/java/org/apache/lucene/store/RAMFile.java
+index 5e8a5b47..efb50226 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/store/RAMFile.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/store/RAMFile.java
+@@ -27,7 +27,7 @@
+   private ArrayList<byte[]> buffers = new ArrayList<byte[]>();
+   long length;
+   RAMDirectory directory;
+-  long sizeInBytes;                  // Only maintained if in a directory; updates synchronized on directory
++  long sizeInBytes;
+ 
+   // This is publicly modifiable via Directory.touchFile(), so direct access not supported
+   private long lastModified = System.currentTimeMillis();
+@@ -57,16 +57,16 @@ synchronized void setLastModified(long lastModified) {
+     this.lastModified = lastModified;
+   }
+ 
+-  final synchronized byte[] addBuffer(int size) {
++  final byte[] addBuffer(int size) {
+     byte[] buffer = newBuffer(size);
+-    if (directory!=null)
+-      synchronized (directory) {             // Ensure addition of buffer and adjustment to directory size are atomic wrt directory
++    synchronized(this) {
+         buffers.add(buffer);
+-        directory.sizeInBytes += size;
+         sizeInBytes += size;
+       }
+-    else
+-      buffers.add(buffer);
++
++    if (directory != null) {
++      directory.sizeInBytes.getAndAdd(size);
++    }
+     return buffer;
+   }
+ 
+@@ -88,11 +88,8 @@ final synchronized int numBuffers() {
+     return new byte[size];
+   }
+ 
+-  // Only valid if in a directory
+-  long getSizeInBytes() {
+-    synchronized (directory) {
++  synchronized long getSizeInBytes() {
+       return sizeInBytes;
+     }
+-  }
+   
+ }
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
+index 4a6e7554..d2965f10 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -30,6 +30,7 @@
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Random;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.analysis.Analyzer;
+@@ -4610,4 +4611,56 @@ public void testNoDocsIndex() throws Throwable {
+     _TestUtil.checkIndex(dir);
+     dir.close();
+   }
++
++  // LUCENE-2095: make sure with multiple threads commit
++  // doesn't return until all changes are in fact in the
++  // index
++  public void testCommitThreadSafety() throws Throwable {
++    final int NUM_THREADS = 5;
++    final double RUN_SEC = 0.5;
++    final Directory dir = new MockRAMDirectory();
++    final IndexWriter w = new IndexWriter(dir, new SimpleAnalyzer(), IndexWriter.MaxFieldLength.UNLIMITED);
++    w.commit();
++    final AtomicBoolean failed = new AtomicBoolean();
++    Thread[] threads = new Thread[NUM_THREADS];
++    final long endTime = System.currentTimeMillis()+((long) (RUN_SEC*1000));
++    for(int i=0;i<NUM_THREADS;i++) {
++      final int finalI = i;
++      threads[i] = new Thread() {
++          public void run() {
++            try {
++              final Document doc = new Document();
++              IndexReader r = IndexReader.open(dir);
++              Field f = new Field("f", "", Field.Store.NO, Field.Index.NOT_ANALYZED);
++              doc.add(f);
++              int count = 0;
++              while(System.currentTimeMillis() < endTime && !failed.get()) {
++                for(int j=0;j<10;j++) {
++                  final String s = finalI + "_" + String.valueOf(count++);
++                  f.setValue(s);
++                  w.addDocument(doc);
++                  w.commit();
++                  IndexReader r2 = r.reopen();
++                  assertTrue(r2 != r);
++                  r.close();
++                  r = r2;
++                  assertEquals("term=f:" + s, 1, r.docFreq(new Term("f", s)));
++                }
++              }
++              r.close();
++            } catch (Throwable t) {
++              failed.set(true);
++              throw new RuntimeException(t);
++            }
++          }
++        };
++      threads[i].start();
++    }
++    for(int i=0;i<NUM_THREADS;i++) {
++      threads[i].join();
++    }
++    w.close();
++    dir.close();
++    assertFalse(failed.get());
++  }
+ }
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/store/MockRAMDirectory.java b/lucene/java/trunk/src/test/org/apache/lucene/store/MockRAMDirectory.java
+index eb7eaaef..65ba8686 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/store/MockRAMDirectory.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/store/MockRAMDirectory.java
+@@ -18,7 +18,6 @@
+  */
+ 
+ import java.io.IOException;
+-import java.io.File;
+ import java.io.FileNotFoundException;
+ import java.util.Iterator;
+ import java.util.Random;
+@@ -213,7 +212,7 @@ public synchronized IndexOutput createOutput(String name) throws IOException {
+       throw new IOException("file " + name + " already exists");
+     else {
+       if (existing!=null) {
+-        sizeInBytes -= existing.sizeInBytes;
++        sizeInBytes.getAndAdd(-existing.sizeInBytes);
+         existing.directory = null;
+       }
+ 
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/store/TestRAMDirectory.java b/lucene/java/trunk/src/test/org/apache/lucene/store/TestRAMDirectory.java
+index a6ae9e4b..b8a71d22 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/store/TestRAMDirectory.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/store/TestRAMDirectory.java
+@@ -97,7 +97,7 @@ public void testRAMDirectory () throws IOException {
+     searcher.close();
+   }
+   
+-  private final int numThreads = 50;
++  private final int numThreads = 10;
+   private final int docsPerThread = 40;
+   
+   public void testRAMDirectorySize() throws IOException, InterruptedException {
+@@ -125,9 +125,6 @@ public void run() {
+             } catch (IOException e) {
+               throw new RuntimeException(e);
+             }
+-            synchronized (ramDir) {
+-              assertEquals(ramDir.sizeInBytes(), ramDir.getRecomputedSizeInBytes());
+-            }
+           }
+         }
+       };

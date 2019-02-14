@@ -1,0 +1,241 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/TransactionController.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/TransactionController.java
+index 9dd14fc2..ffc8d511 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/TransactionController.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/store/access/TransactionController.java
+@@ -719,6 +719,33 @@ long findContainerid(long conglomid)
+      * Once the first write of a non-readOnly nested transaction is done,
+      * then the nested user transaction must be committed or aborted before
+      * any write operation is attempted in the parent transaction.  
++     * (p>
++     * fix for DERBY-5493 introduced a behavior change for commits executed
++     * against an updatable nested user transaction.  Prior to this change
++     * commits would execute a "lazy" commit where commit log record would only
++     * be written to the stream, not guaranteed to disk.  After this change
++     * commits on these transactions will always be forced to disk.  To get
++     * the previous behavior one must call commitNoSync() instead.
++     * <p>
++     * examples of current usage of nested updatable transactions in Derby
++     * include:
++     * o recompile and saving of stored prepared statements, changed with
++     *   DERBY-5493 to do synchronous commit.  Code in SPSDescriptor.java.
++     * o sequence updater reserves new "range" of values in sequence 
++     *   catalog, changed with DERBY-5493 to do synchronous commit.  Without
++     *   this change crash of system might lose the updat of the range and
++     *   then return same value on reboot.  Code in SequenceUpdater.java
++     * o in place compress defragment phase committing units of work in
++     *   moving tuples around in heap and indexes.  changed with DERBY-5493 
++     *   to do synchronous commit. code in AlterTableConstantAction.java.
++     * o used for creation of users initial default schema in SYSSCHEMAS.
++     *   moving tuples around in heap and indexes.  changed with DERBY-5493 
++     *   to do synchronous commit. code in DDLConstantAction.java.
++     * o autoincrement/generated key case.  Kept behavior previous to 
++     *   DERBY-5493 by changing to use commitNoSync.  Changing every 
++     *   key allocation to be a synchronous commit would be a huge performance
++     *   problem for existing applications depending on current performance.
++     *   code in InsertResultSet.java
+      *
+      * @param readOnly  Is transaction readonly?  Only 1 non-readonly nested
+      *                  transaction is allowed per transaction.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+index c0ccd41c..b153194d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/SequenceUpdater.java
+@@ -477,6 +477,10 @@ public boolean updateCurrentValueOnDisk( Long oldValue, Long newValue ) throws S
+             }
+             finally
+             {
++                // DERBY-5494, if this commit does not flush log then an
++                // unorderly shutdown could lose the update.  Do not use
++                // commitNoSync(), and store needs to flush user nested update
++                // transaction commits by default.
+                 nestedTransaction.commit();
+                 nestedTransaction.destroy();
+             }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+index a4260de5..65e81fa7 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+@@ -1886,8 +1886,19 @@ public void beginNestedTransaction(boolean readOnly) throws StandardException
+         // method support read-write nested transactions as well
+         // instead of callers using the startNestedUserTransaction
+         // directly on tran.
++        if (SanityManager.DEBUG)
++        {
++            // if called for update transactions, compile would start using
++            // non-readonly xacts for compile.  For now, throw an error if
++            // someone tries to use this call to make non readonly transaction.
++            SanityManager.ASSERT(
++                readOnly, 
++                "Routine not yet coded to support non-readonly transactions.");
++        }
++
+         if (readOnlyNestedTransaction == null)
+             readOnlyNestedTransaction = tran.startNestedUserTransaction(readOnly);
++
+         queryNestingDepth++;
+     }
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
+index 05edce2a..49c93d43 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/execute/InsertResultSet.java
+@@ -786,7 +786,6 @@ public ResultSet getAutoGeneratedKeysResultset()
+ 											 cd.getColumnName());
+ 			aiCache[columnPosition - 1].setValue(ret);
+ 		}	
+-
+ 		else
+ 		{
+ 			NumberDataValue newValue;
+@@ -797,7 +796,6 @@ public ResultSet getAutoGeneratedKeysResultset()
+ 				nestedTC = tc.startNestedUserTransaction(false);
+ 				tcToUse = nestedTC;
+ 			}
+-
+ 			catch (StandardException se)
+ 			{
+ 				// If I cannot start a Nested User Transaction use the parent
+@@ -815,7 +813,6 @@ public ResultSet getAutoGeneratedKeysResultset()
+ 						   constants.autoincRowLocation[index],
+ 						   tcToUse, true, aiCache[index], (tcToUse == tc));
+ 			}
+-
+ 			catch (StandardException se)
+ 			{
+ 				if (tcToUse == tc)
+@@ -851,9 +848,21 @@ else if (se.getMessageId().equals(SQLState.LANG_OUTSIDE_RANGE_FOR_DATATYPE))
+ 				// no matter what, commit the nested transaction; if something
+ 				// bad happened in the child xaction lets not abort the parent
+ 				// here.
++                
+ 				if (nestedTC != null)
+ 				{
+-					nestedTC.commit();
++                    // DERBY-5493 - prior to fix all nested user update 
++                    // transactions did a nosync commit when commit() was 
++                    // called, this default has been changed to do synced 
++                    // commit.  Changed this commit to be commitNoSync to
++                    // not introduce performce degredation for autoincrement
++                    // keys.  As before, if server crashes the changes 
++                    // made in the nested transaction may be lost.  If any
++                    // subsequent user transaction is commited, including any
++                    // inserts that would depend on the autoincrement value
++                    // change then the nested tranaction is guaranteed on
++                    // system crash.
++					nestedTC.commitNoSync(TransactionController.RELEASE_LOCKS);
+ 					nestedTC.destroy();
+ 				}
+ 			}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/XactFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/XactFactory.java
+index e2addef7..fb7e3622 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/XactFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/XactFactory.java
+@@ -943,12 +943,18 @@ public UUID makeNewUUID()
+ 	public boolean flushLogOnCommit(String contextName)
+ 	{
+ 		//
+-		// if this is a user transaction, flush the log
++		// if this is a user transaction, flush the log by default.
++        // if this is a nested user update transaction, flush log by default.
+ 		// if this is an internal or nested top transaction, do not
+ 		// flush, let it age out.
+ 		//
++        // In all cases log will not be flushsed by Xact.prepareCommit() 
++        // if commitNoSync() has been called rather than commit.
++		//
+ 		return (contextName == USER_CONTEXT_ID || 
+-				contextName.equals(USER_CONTEXT_ID));
++				contextName.equals(USER_CONTEXT_ID)          ||
++                contextName == NESTED_UPDATE_USER_CONTEXT_ID ||
++                contextName.equals(NESTED_UPDATE_USER_CONTEXT_ID));
+ 	}
+ 
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+index c9acee23..6595b12f 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SequenceGeneratorTest.java
+@@ -681,6 +681,56 @@ public void test_10_5398() throws Exception
+         vetBumping( conn, TEST_DBO, "SEQ_10", seq_10_value++, seq_10_upperBound );
+     }
+     
++    /**
++     * <p>
++     * Verify that system crash does not rollback changes to SYSSEQUENCES.CURRENTVALUE.
++     * See DERBY-5494.
++     * </p>
++     */
++    public void test_13_5494() throws Exception
++    {
++        String  dbName = "DB_5494";
++        
++        // create a sequence and get the first value from it, then crash
++        assertLaunchedJUnitTestMethod( getClass().getName() + ".preCrashActions", dbName );
++
++        // now check that the sequence state was correctly recovered
++        assertLaunchedJUnitTestMethod( getClass().getName() + ".postCrashActions", dbName );
++    }
++    // actions to perform just before a crash
++    public void    preCrashActions()   throws Exception
++    {
++        Connection  dboConn = openUserConnection( TEST_DBO );
++        Connection  ruthConn = openUserConnection( "RUTH" );
++        int initialValue = Integer.MIN_VALUE;
++
++        goodStatement( dboConn, "create sequence s_5494\n" );
++        
++        assertNextValue( dboConn, TEST_DBO, "S_5494", initialValue );
++
++        assertEquals( (long) (initialValue + ALLOCATION_COUNT), getCurrentValue( ruthConn, TEST_DBO, "S_5494" ) );
++    }
++    // actions to perform after the crash
++    public void    postCrashActions()   throws Exception
++    {
++        int initialValue = (int) (Integer.MIN_VALUE + ALLOCATION_COUNT);
++        
++        // now verify that, after the crash, SYSSEQUENCES has still been advanced
++        Connection  dboConn = openUserConnection( TEST_DBO );
++        assertEquals( (long) initialValue, getCurrentValue( dboConn, TEST_DBO, "S_5494" ) );
++
++        assertNextValue( dboConn, TEST_DBO, "S_5494", initialValue );
++
++        goodStatement( dboConn, "drop sequence s_5494 restrict\n" );
++    }
++    private void    assertNextValue( Connection conn, String schema, String sequenceName, int expectedValue )
++        throws Exception
++    {
++        PreparedStatement ps = chattyPrepare( conn, "values( next value for " + schema + "." + sequenceName + " )\n" );
++
++        assertEquals( expectedValue, getScalarInteger( ps ) );
++    }
++    
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // MINIONS
+@@ -706,6 +756,26 @@ private long getCurrentValue( String schemaName, String sequenceName )
+         return retval;
+     }
+     
++    /** Get the current value from a sequence */
++    private long getCurrentValue(
++    Connection  conn, 
++    String      schemaName, 
++    String      sequenceName )
++        throws Exception
++    {
++        PreparedStatement ps = chattyPrepare
++            ( conn,
++              "select currentvalue from sys.syssequences seq, sys.sysschemas s where s.schemaname = ? and seq.sequencename = ? and s.schemaid = seq.schemaid" );
++        ps.setString( 1, schemaName );
++        ps.setString( 2, sequenceName );
++
++        long retval = getScalarLong( ps );
++
++        conn.commit();
++        
++        return retval;
++    }
++    
+     /** Get a scalar integer result from a query */
+     private int getScalarInteger( PreparedStatement ps ) throws Exception
+     {

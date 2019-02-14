@@ -1,0 +1,317 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseDataFileFactory.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseDataFileFactory.java
+index b9f276a2..44ca8ed3 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseDataFileFactory.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/BaseDataFileFactory.java
+@@ -2418,9 +2418,11 @@ public void backupDataFiles(Transaction rt, File backupDir) throws StandardExcep
+ 
+ 	/**
+      * get all the names of the files in seg 0.
++     * MT - This method needs to be synchronized to avoid conflicts 
++     * with other privileged actions execution in this class.
+ 	 * @return An array of all the file names in seg0.
+      **/
+-	private String[] getContainerNames()
++	private synchronized String[] getContainerNames()
+ 	{
+         actionCode = GET_CONTAINER_NAMES_ACTION;
+         try{
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+index d976f4a7..dd8a62ef 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/log/LogToFile.java
+@@ -1576,8 +1576,12 @@ protected boolean checkpointWithTran(RawTransaction cptran,
+ 				truncateLog(currentCheckpoint);
+ 			}
+ 
+-			//delete the committted container drop stubs that are no longer
+-			//required during recovery.
++			// delete the committted container drop stubs 
++            // that are no longer required during recovery. 
++            // If a backup is in progress don't delete the stubs until 
++            // it is done. Backup needs to copy all the stubs that 
++            // are needed to recover from the backup checkpoint on restore.
++            if(!backupInProgress)
+ 			df.removeDroppedContainerFileStubs(redoLWM);
+ 		
+ 		}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
+index 7d4fe471..87f3656b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/xact/Xact.java
+@@ -1911,10 +1911,6 @@ protected void postComplete(int commitflag, Integer commitOrAbort) throws Standa
+ 
+ 		setIdleState();
+ 
+-		// any backup blocking operations (like unlogged ops) in this 
+-		// transaction are done with post commit/abort work by now, 
+-		// unblock the backup.
+-		unblockBackup();
+ 		inComplete = null;
+ 	}
+ 
+@@ -2095,6 +2091,11 @@ private final void postTermination() throws StandardException
+ 			postCommitWorks.clear();
+ 
+ 		}
++
++        // any backup blocking operations (like unlogged ops) in this 
++        // transaction are done with post commit/abort work that needs be
++        // done in the same trasaction,  unblock the backup.
++        unblockBackup();
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackup.java
+index 6f7c871f..8dcbb777 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackup.java
+@@ -37,14 +37,16 @@
+ 
+ public class OnlineBackup implements Runnable{
+ 
+-	private static final String backupPath = "extinout/onlinebackuptest";
+-	
+ 	private String dbName; // name of the database to backup
+ 	private boolean beginBackup = false;
+ 	private boolean endBackup = false;
++    private boolean backupFailed = false;
++    private Throwable backupError = null;
++    private String backupPath;
+ 
+-	OnlineBackup(String dbName) {
++	OnlineBackup(String dbName, String backupPath) {
+ 		this.dbName = dbName;
++        this.backupPath = backupPath;
+ 	}
+ 
+ 	/**
+@@ -55,11 +57,19 @@
+ 	 * 
+ 	 */
+ 	public void run()	{
++        backupFailed = false;
+ 		try {
+ 			performBackup();
+-		} catch (SQLException sqle) {
+-			org.apache.derby.tools.JDBCDisplayUtil.ShowSQLException(System.out, sqle);
+-			sqle.printStackTrace(System.out);
++		} catch (Throwable error) {
++            synchronized(this) {
++                // inform threads that may be waiting for backup to 
++                // start/end that it failed. 
++                backupFailed = true;
++                backupError = error;
++                notifyAll();
++            }
++			org.apache.derby.tools.JDBCDisplayUtil.ShowException(System.out, error);
++			error.printStackTrace(System.out);
+ 		}
+ 	}
+ 
+@@ -93,10 +103,16 @@ void performBackup() throws SQLException {
+ 	 * Wait for the backup to start.
+ 	 */
+ 
+-	public void waitForBackupToBegin() throws InterruptedException{
++	public void waitForBackupToBegin() throws Exception{
+ 		synchronized(this) {
+ 			//wait for backup to begin
+-			while(!beginBackup) {
++			while (!beginBackup) {
++                // if the backup failed for some reason throw error, don't go
++                // into wait state.
++                if (backupFailed)
++                    throw new Exception("BACKUP FAILED:" + 
++                                        backupError.getMessage());
++                else
+ 					wait();
+ 			}
+ 		}
+@@ -105,7 +121,7 @@ public void waitForBackupToBegin() throws InterruptedException{
+ 	/*
+ 	 * Wait for the backup to finish.
+ 	 */
+-	public void waitForBackupToEnd() throws InterruptedException{
++	public void waitForBackupToEnd() throws Exception{
+ 		synchronized(this) {
+ 			if (!endBackup) {
+ 				// check if a backup has actually started by the test
+@@ -114,7 +130,14 @@ public void waitForBackupToEnd() throws InterruptedException{
+ 				} else {
+ 
+ 					//wait for backup to finish
+-					while(!endBackup) {
++					while (!endBackup) 
++                    {
++                        // if the backup failed for some reason throw error, don't go
++                        // into wait state.
++                        if (backupFailed)
++                            throw new Exception("BACKUP FAILED:" + 
++                                                backupError.getMessage());
++                        else
+ 						wait();
+ 					}
+ 				}
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
+index 7e4b56e1..8d33d6dc 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
+@@ -43,6 +43,7 @@
+ 	private static final String TEST_TABLE_NAME   =    "emp";
+     private static final String TEST_TABLE_NAME_1 =    "emp_1";
+     private static final String TEST_TABLE_NAME_2 =    "emp_2";
++    private static final String BACKUP_PATH = "extinout/onlinebackuptest1";
+ 
+ 	public static void main(String[] argv) throws Throwable {
+ 		
+@@ -64,7 +65,7 @@ public static void main(String[] argv) throws Throwable {
+ 	 * the database from the backup and performs consistency checks on the
+ 	 * database to make sure backup was good one.  
+ 	 */
+-	private void runTest() throws SQLException, Exception {
++	private void runTest() throws Exception {
+ 		logMessage("Begin Online Backup Test1");
+ 		Connection conn = ij.startJBMS();
+ 		conn.setAutoCommit(false);
+@@ -86,21 +87,16 @@ private void runTest() throws SQLException, Exception {
+ 		dbActions1.startUnloggedAction(TEST_TABLE_NAME_2);
+ 		logMessage("Second Transaction with Unlogged Operation Started");
+         
+-
++        // setup threads.
+ 		// start a  thread to perform online backup
+-		OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME);
++		OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME, BACKUP_PATH);
+ 		Thread backupThread = new Thread(backup, "BACKUP");
+-		backupThread.start();	
+-		// wait for the backup to start
+-		backup.waitForBackupToBegin();
+-		logMessage("BACKUP STARTED");
+ 
+         // run some dml actions in another thread
+         Connection dmlConn = getConnection();
+         DatabaseActions dmlActions = 
+             new DatabaseActions(DatabaseActions.DMLACTIONS, dmlConn);
+ 		Thread dmlThread = new Thread(dmlActions, "DML_THREAD");
+-		dmlThread.start();
+ 
+         // run some DDL create/drop tables in another thread
+         Connection ddlConn = getConnection();
+@@ -108,6 +104,18 @@ private void runTest() throws SQLException, Exception {
+         DatabaseActions ddlActions = 
+             new DatabaseActions(DatabaseActions.CREATEDROPS, ddlConn);
+         Thread ddlThread = new Thread(ddlActions, "DDL_THREAD");
++
++        try {
++            // start a  thread to perform online backup
++            backupThread.start();	
++            // wait for the backup to start
++            backup.waitForBackupToBegin();
++            logMessage("BACKUP STARTED");
++
++            // run some dml actions in another thread
++            dmlThread.start();
++
++            // run some DDL create/drop tables in another thread
+         ddlThread.start();
+ 
+         // sleep for few seconds just to make sure backup thread is actually
+@@ -126,18 +134,22 @@ private void runTest() throws SQLException, Exception {
+ 		dbActions1.endUnloggedAction(TEST_TABLE_NAME_2);
+         
+ 		backup.waitForBackupToEnd();
++
++        }finally {
++            //stop all threads activities.
+ 		backupThread.join();
+ 		dmlActions.stopActivity();
+         ddlActions.stopActivity(); 
+ 		dmlThread.join();
+         ddlThread.join(); 
+-        
++        }        
+         // close the connections.
+         conn.close();
+         conn1.close();
+         dmlConn.close();
+         ddlConn.close() ;
+ 
++
+ 		//shutdown the test db 
+ 		shutdown(TEST_DATABASE_NAME);
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest3.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest3.java
+index 59153227..7796d577 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest3.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest3.java
+@@ -40,6 +40,7 @@
+ public class OnlineBackupTest3 {
+ 
+     private static final String TEST_DATABASE_NAME = "wombat" ;
++    private static final String BACKUP_PATH = "extinout/onlinebackuptest3";
+ 
+     public static void main(String[] argv) throws Throwable {
+ 
+@@ -58,7 +59,7 @@ public static void main(String[] argv) throws Throwable {
+     /*
+      * Test online backup with unlogged jar operations running in parallel. 
+      */
+-    private void runTest() throws SQLException, Exception {
++    private void runTest() throws Exception{
+         logMessage("Begin Online Backup Test3");
+         Connection conn = ij.startJBMS();
+         conn.setAutoCommit(false);
+@@ -168,7 +169,7 @@ private int countRows(Connection conn,
+     /*
+      * Test install jar running in parallel to backup and vice versa. 
+      */
+-    void installJarTest() throws SQLException, Exception{
++    void installJarTest() throws Exception{
+         logMessage("Begin Install Jar Test");
+         Connection conn1 = getConnection();
+         conn1.setAutoCommit(false);
+@@ -194,7 +195,7 @@ void installJarTest() throws SQLException, Exception{
+         // operation to install  'brtestjar.jar to commit.
+         
+         // start a  thread to perform online backup
+-        OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME);
++        OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME, BACKUP_PATH);
+         Thread backupThread = new Thread(backup, "BACKUP1");
+         backupThread.start();
+         // wait for the backup to start
+@@ -236,7 +237,7 @@ void installJarTest() throws SQLException, Exception{
+         conn1_stmt.execute("insert into t1 values(6)");
+         
+         // start a  thread to perform online backup
+-        backup = new OnlineBackup(TEST_DATABASE_NAME);
++        backup = new OnlineBackup(TEST_DATABASE_NAME, BACKUP_PATH);
+         backupThread = new Thread(backup, "BACKUP2");
+         backupThread.start();
+         // wait for the backup to start
+@@ -343,7 +344,7 @@ void installJarTest() throws SQLException, Exception{
+     /*
+      * Test remove jar running in parallel to backup and vice versa. 
+      */
+-    void removeJarTest() throws SQLException, Exception{
++    void removeJarTest() throws Exception{
+         logMessage("Begin Remove Jar Test");
+         Connection conn1 = getConnection();
+         conn1.setAutoCommit(false);
+@@ -390,7 +391,7 @@ void removeJarTest() throws SQLException, Exception{
+         // the above remove jar  to commit.
+         
+         // start a  thread to perform online backup
+-        OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME);
++        OnlineBackup backup = new OnlineBackup(TEST_DATABASE_NAME, BACKUP_PATH);
+         Thread backupThread = new Thread(backup, "BACKUP3");
+         backupThread.start();
+         // wait for the backup to start
+@@ -427,7 +428,7 @@ void removeJarTest() throws SQLException, Exception{
+         conn1_stmt.execute("insert into t1 values(12)");
+         
+         // start a  thread to perform online backup
+-        backup = new OnlineBackup(TEST_DATABASE_NAME);
++        backup = new OnlineBackup(TEST_DATABASE_NAME, BACKUP_PATH);
+         backupThread = new Thread(backup, "BACKUP4");
+         backupThread.start();
+         // wait for the backup to start

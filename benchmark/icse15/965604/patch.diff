@@ -1,0 +1,130 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 5b0b8856..ce07215e 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -895,7 +895,7 @@ private ColumnFamily getTopLevelColumns(QueryFilter filter, int gcBefore) throws
+        range_slice.  still opens one randomaccessfile per key, which sucks.  something like compactioniterator
+        would be better.
+      */
+-    private boolean getKeyRange(List<String> keys, final AbstractBounds range, int maxResults)
++    private void getKeyRange(List<String> keys, final AbstractBounds range, int maxResults)
+     throws IOException, ExecutionException, InterruptedException
+     {
+         final DecoratedKey startWith = new DecoratedKey(range.left, null);
+@@ -974,21 +974,22 @@ protected DecoratedKey getReduced()
+             {
+                 if (!stopAt.isEmpty() && stopAt.compareTo(current) < 0)
+                 {
+-                    return true;
++                    return;
+                 }
+ 
+                 if (range instanceof Bounds || !first || !current.equals(startWith))
+                 {
++                    if (logger_.isDebugEnabled())
++                        logger_.debug("scanned " + current.key + " with token of " + StorageService.getPartitioner().getToken(current.key));
+                     keys.add(current.key);
+                 }
+                 first = false;
+ 
+                 if (keys.size() >= maxResults)
+                 {
+-                    return true;
++                    return;
+                 }
+             }
+-            return false;
+         }
+         finally
+         {
+@@ -1017,23 +1018,10 @@ public RangeSliceReply getRangeSlice(byte[] super_column, final AbstractBounds r
+     throws IOException, ExecutionException, InterruptedException
+     {
+         List<String> keys = new ArrayList<String>();
+-        boolean completed;
+-        if ((range instanceof Bounds || !((Range)range).isWrapAround()))
+-        {
+-            completed = getKeyRange(keys, range, keyMax);
+-        }
+-        else
+-        {
+-            // wrapped range
+-            Token min = StorageService.getPartitioner().getMinimumToken();
+-            Range first = new Range(range.left, min);
+-            completed = getKeyRange(keys, first, keyMax);
+-            if (!completed && min.compareTo(range.right) < 0)
+-            {
+-                Range second = new Range(min, range.right);
+-                getKeyRange(keys, second, keyMax);
+-            }
+-        }
++        assert range instanceof Bounds
++               || (!((Range)range).isWrapAround() || range.right.equals(StorageService.getPartitioner().getMinimumToken()))
++               : range;
++        getKeyRange(keys, range, keyMax);
+         List<Row> rows = new ArrayList<Row>(keys.size());
+         final QueryPath queryPath =  new QueryPath(columnFamily_, super_column, null);
+         final SortedSet<byte[]> columnNameSet = new TreeSet<byte[]>(getComparator());
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/Range.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/Range.java
+index c6428a73..f5d83263 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/Range.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/Range.java
+@@ -131,10 +131,10 @@ public boolean intersects(Range that)
+      */
+     public Set<Range> intersectionWith(Range that)
+     {
+-        if (this.contains(that))
+-            return rangeSet(that);
+         if (that.contains(this))
+             return rangeSet(this);
++        if (this.contains(that))
++            return rangeSet(that);
+ 
+         boolean thiswraps = isWrapAround(left, right);
+         boolean thatwraps = isWrapAround(that.left, that.right);
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
+index 16c4c353..75bd3ea6 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -659,10 +659,13 @@ protected AbstractBounds computeNext()
+      *     D, but we don't want any other results from it until after the (D, T] range.  Unwrapping so that
+      *     the ranges we consider are (D, T], (T, MIN], (MIN, D] fixes this.
+      */
+-    private static List<AbstractBounds> getRestrictedRanges(AbstractBounds queryRange)
++    private static List<AbstractBounds> getRestrictedRanges(final AbstractBounds queryRange)
+     {
+         TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();
+ 
++        if (logger.isDebugEnabled())
++            logger.debug("computing restricted ranges for query " + queryRange);
++
+         List<AbstractBounds> ranges = new ArrayList<AbstractBounds>();
+         // for each node, compute its intersection with the query range, and add its unwrapped components to our list
+         for (Token nodeToken : tokenMetadata.sortedTokens())
+@@ -682,14 +685,23 @@ protected AbstractBounds computeNext()
+         // re-sort ranges in ring order, post-unwrapping
+         Comparator<AbstractBounds> comparator = new Comparator<AbstractBounds>()
+         {
+-            public int compare(AbstractBounds o1, AbstractBounds o2)
+-            {
+                 // no restricted ranges will overlap so we don't need to worry about inclusive vs exclusive left,
+                 // just sort by raw token position.
+-                return o1.left.compareTo(o2.left);
++            public int compare(AbstractBounds o1, AbstractBounds o2)
++            {
++                // sort in order that the original query range would see them.
++                int queryOrder1 = queryRange.left.compareTo(o1.left);
++                int queryOrder2 = queryRange.left.compareTo(o2.left);
++                if (queryOrder1 < queryOrder2)
++                    return -1; // o1 comes after query start, o2 wraps to after
++                if (queryOrder1 > queryOrder2)
++                    return 1; // o2 comes after query start, o1 wraps to after
++                return o1.left.compareTo(o2.left); // o1 and o2 are on the same side of query start
+             }
+         };
+         Collections.sort(ranges, comparator);
++        if (logger.isDebugEnabled())
++            logger.debug("Sorted ranges are [" + StringUtils.join(ranges, ", ") + "]");
+ 
+         return ranges;
+     }

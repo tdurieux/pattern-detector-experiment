@@ -1,0 +1,520 @@
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/client/solrj/embedded/JettySolrRunner.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/client/solrj/embedded/JettySolrRunner.java
+index e2cd75af..f5bfdec4 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/client/solrj/embedded/JettySolrRunner.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/client/solrj/embedded/JettySolrRunner.java
+@@ -156,14 +156,12 @@ public void start() throws Exception {
+   public void start(boolean waitForSolr) throws Exception {
+     // if started before, make a new server
+     if (startedBefore) {
+-
++      waitOnSolr = false;
+       init(solrHome, context, lastPort, stopAtShutdown);
+     } else {
+       startedBefore = true;
+     }
+     
+-    System.out.println("starting up on port " + lastPort);
+-    
+     if( dataDir != null) {
+       System.setProperty("solr.data.dir", dataDir);
+     }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/RecoveryStrat.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/RecoveryStrat.java
+index 509e2a36..68f7a052 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/RecoveryStrat.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/cloud/RecoveryStrat.java
+@@ -21,9 +21,6 @@
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.atomic.AtomicInteger;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantLock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.lucene.search.MatchAllDocsQuery;
+ import org.apache.solr.client.solrj.SolrServerException;
+@@ -41,7 +38,6 @@
+ import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.update.UpdateLog;
+ import org.apache.solr.update.UpdateLog.RecoveryInfo;
+-import org.apache.solr.update.UpdateLog.State;
+ import org.apache.solr.util.RefCounted;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -60,7 +56,6 @@
+   private final AtomicInteger recoveryAttempts = new AtomicInteger();
+   private final AtomicInteger recoverySuccesses = new AtomicInteger();
+   
+-  private static final Lock RECOVERY_LOCK = new ReentrantLock();
+   
+   // for now, just for tests
+   public interface RecoveryListener {
+@@ -98,8 +93,8 @@ public void recover(final SolrCore core) {
+       
+       @Override
+       public void run() {
+-        RECOVERY_LOCK.lock();
+-        try {
++        synchronized (core.getUpdateHandler().getSolrCoreState().getRecoveryLock()) {
++          
+           UpdateLog ulog = core.getUpdateHandler().getUpdateLog();
+           // TODO: consider any races issues here - if we failed though, an
+           // assert
+@@ -183,8 +178,6 @@ public void run() {
+           }
+           log.info("Finished recovery process");
+           System.out.println("recovery done: " + succesfulRecovery);
+-        } finally {
+-          RECOVERY_LOCK.unlock();
+         }
+       }
+       
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+index 08c2396f..f29c4c1f 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/DirectUpdateHandler2.java
+@@ -55,7 +55,7 @@
+  * directly to the main Lucene index as opposed to adding to a separate smaller index.
+  */
+ public class DirectUpdateHandler2 extends UpdateHandler implements SolrCoreState.IndexWriterCloser {
+-  protected SolrCoreState solrCoreState;
++  protected final SolrCoreState solrCoreState;
+   protected final Lock commitLock = new ReentrantLock();
+ 
+   // stats
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/FSUpdateLog.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/FSUpdateLog.java
+index 8fa644da..412421c6 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/FSUpdateLog.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/FSUpdateLog.java
+@@ -770,6 +770,11 @@ public void run() {
+               default:
+                 throw new SolrException(SolrException.ErrorCode.SERVER_ERROR,  "Unknown Operation! " + oper);
+             }
++            
++            // nocommit: do we want to at least log it?
++            if (rsp.getException() != null) {
++              throw rsp.getException();
++            }
+           } catch (IOException ex) {
+             recoveryInfo.errors++;
+             log.warn("IOException reading log", ex);
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+index ca81aae2..580ede41 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCmdDistributor.java
+@@ -71,8 +71,6 @@
+   private List<AddUpdateCommand> alist;
+   private ArrayList<DeleteUpdateCommand> dlist;
+ 
+-  Response response = new Response();
+-  
+   public static class ShardInfo {
+     public String url;
+     public RetryUrl retryUrl;
+@@ -241,9 +239,8 @@ private DeleteUpdateCommand clone(DeleteUpdateCommand cmd) {
+     UpdateRequestExt ureq;
+     NamedList<Object> ursp;
+     int rspCode;
+-    Exception exception;
++    public Exception exception;
+     String url;
+-    int retries = 0;
+   }
+   
+   void submit(UpdateRequestExt ureq, List<String> urls) {
+@@ -271,8 +268,10 @@ public Request call() throws Exception {
+           Request clonedRequest = new Request();
+           clonedRequest.urls = sreq.urls;
+           clonedRequest.ureq = sreq.ureq;
++          
++          // TODO: yeah, this is a little odd...
+           clonedRequest.url = url;
+-          clonedRequest.retries = sreq.retries;
++
+           
+           try {
+             // TODO: what about https?
+@@ -306,8 +305,9 @@ public Request call() throws Exception {
+     }
+   }
+   
++  // TODO: need to consider those that call this with block=false now...
+   Response checkResponses(boolean block, List<String> urls) {
+-
++    Response response = new Response();
+ 
+     while (pending != null && pending.size() > 0) {
+       try {
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCoreState.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+index 0ad1f524..38bc65a2 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+@@ -30,6 +30,9 @@
+  */
+ public abstract class SolrCoreState {
+   
++  // need a per core lock over reloads...
++  private Object recoveryLock = new Object();
++  
+   /**
+    * Force the creation of a new IndexWriter using the settings from the given
+    * SolrCore.
+@@ -79,4 +82,9 @@
+   public interface IndexWriterCloser {
+     public void closeWriter(IndexWriter writer) throws IOException;
+   }
++
++
++  public Object getRecoveryLock() {
++    return recoveryLock;
++  }
+ }
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+index 5fb39803..0ff3d29a 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+@@ -29,7 +29,6 @@
+ import org.apache.lucene.util.CharsRef;
+ import org.apache.solr.client.solrj.SolrServerException;
+ import org.apache.solr.client.solrj.impl.CommonsHttpSolrServer;
+-import org.apache.solr.client.solrj.request.CoreAdminRequest.PrepRecovery;
+ import org.apache.solr.client.solrj.request.CoreAdminRequest.RequestRecovery;
+ import org.apache.solr.cloud.CloudDescriptor;
+ import org.apache.solr.cloud.ZkController;
+@@ -264,24 +263,44 @@ private void finish(ModifiableSolrParams params) {
+     Response response;
+     do {
+       retry = false;
++      // TODO: realtime timeout strat
++      int timeout = 200;
+       response = cmdDistrib.finish(urls, params);
+       // nocommit - we may need to tell about more than one error...
+       if (response.errors.size() > 0) { 
+         if (urls.size() == 1 && forwardToLeader) {
+           // we should retry a failed forward...
+           retry = true;
+-          retries++;
+-          if (retries > 10) {
++
++          if (retries++ > 15) {
++            timeout = timeout * 2;
+             // nocommit
+-            log.error("we totally failed");
++            log.error("we totally failed: set exception to:" + response.errors.get(0).e);
+             retry = false;
+-            rsp.setException(response.errors.get(0).e);
++            
++            Exception e = response.errors.get(0).e;
++            String newMsg = "shard update error (" + response.sreq.urls + "):"
++                + e.getMessage();
++            if (e instanceof SolrException) {
++              SolrException se = (SolrException) e;
++              e = new SolrException(ErrorCode.getErrorCode(se.code()),
++                  newMsg, se.getCause());
++            } else {
++              e = new SolrException(SolrException.ErrorCode.SERVER_ERROR,
++                  newMsg, e);
++            }
++            
++            rsp.setException(e);
+           } else {
+             try {
+               response.sreq.urls = Collections.singletonList(zkController
+                   .getZkStateReader().getLeaderUrl(collection, shardId));
++              response.sreq.exception = null;
++              
+               System.out.println("FORWARD FAILED:" + urls + " retry with "
+                   + response.sreq.urls);
++              response.errors.get(0).e.printStackTrace();
++              urls = response.sreq.urls;
+             } catch (InterruptedException e2) {
+               Thread.currentThread().interrupt();
+               throw new SolrException(ErrorCode.SERVER_ERROR, e2);
+@@ -291,7 +310,7 @@ private void finish(ModifiableSolrParams params) {
+             cmdDistrib.submit(response.sreq);
+             
+             try {
+-              Thread.sleep(100);
++              Thread.sleep(timeout);
+             } catch (InterruptedException e1) {
+               Thread.currentThread().interrupt();
+               throw new SolrException(ErrorCode.SERVER_ERROR, "");
+@@ -299,7 +318,6 @@ private void finish(ModifiableSolrParams params) {
+           }
+         }
+       } else {
+-        // System.out.println("success:" + urls);
+         rsp.setException(null);
+       }
+     } while(retry);
+@@ -664,10 +682,7 @@ public void processCommit(CommitUpdateCommand cmd) throws IOException {
+ 
+     if (zkEnabled) {
+       ModifiableSolrParams params = new ModifiableSolrParams(req.getParams());
+-      System.out.println("end point:" + params.getBool(COMMIT_END_POINT, false));
+-      System.out.println("commit params:" + params);  
+       if (!params.getBool(COMMIT_END_POINT, false)) {
+-        System.out.println("distrib commit");
+         params.set(COMMIT_END_POINT, true);
+ 
+         String nodeName = req.getCore().getCoreDescriptor().getCoreContainer()
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkey.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkey.java
+index 54e6b83a..56237d72 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkey.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkey.java
+@@ -105,6 +105,14 @@ public static void stop(JettySolrRunner jetty) throws Exception {
+   
+   public static void kill(JettySolrRunner jetty) throws Exception {
+     jetty.stop();
++    
++    FilterHolder fh = jetty.getDispatchFilter();
++    if (fh != null) {
++      SolrDispatchFilter sdf = (SolrDispatchFilter) fh.getFilter();
++      if (sdf != null) {
++        sdf.destroy();
++      }
++    }
+   }
+   
+   public void stopShard(String slice) throws Exception {
+@@ -156,7 +164,7 @@ public JettySolrRunner killRandomShard() throws Exception {
+     sliceKeyList.addAll(slices.keySet());
+     String sliceName = sliceKeyList.get(random.nextInt(sliceKeyList.size()));
+     
+-    return stopRandomShard(sliceName);
++    return killRandomShard(sliceName);
+   }
+   
+   public JettySolrRunner killRandomShard(String slice) throws Exception {
+@@ -218,6 +226,8 @@ public JettySolrRunner getRandomSacraficialShard(String slice) throws KeeperExce
+     List<CloudJettyRunner> jetties = shardToJetty.get(slice);
+     int index = random.nextInt(jetties.size() - 1);
+     JettySolrRunner jetty = jetties.get(index).jetty;
++    System.out.println("sac shard "+ jetty.getLocalPort());
++    
+     return jetty;
+   }
+   
+@@ -254,14 +264,8 @@ public void run() {
+             JettySolrRunner jetty;
+             if (random.nextBoolean()) {
+               jetty = stopRandomShard();
+-              if (jetty != null) {
+-                System.out.println("looking to stop " + jetty.getLocalPort());
+-              }
+             } else {
+               jetty = killRandomShard();
+-              if (jetty != null) {
+-                System.out.println("looking to kill " + jetty.getLocalPort());
+-              }
+             }
+             if (jetty == null) {
+               System.out.println("we cannot kill");
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySolrCloudTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySolrCloudTest.java
+index e4041d36..e3085625 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySolrCloudTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/ChaosMonkeySolrCloudTest.java
+@@ -25,11 +25,7 @@
+ import org.junit.BeforeClass;
+ import org.junit.Ignore;
+ 
+-/**
+- * TODO: sometimes the shards are off by a doc or two, even with the
+- * retries on index failure...perhaps because of leader dying mid update?
+- */
+-@Ignore
++@Ignore("almost ready to not ignore this...")
+ public class ChaosMonkeySolrCloudTest extends FullSolrCloudTest {
+   
+   @BeforeClass
+@@ -39,7 +35,7 @@ public static void beforeSuperClass() throws Exception {
+   
+   public ChaosMonkeySolrCloudTest() {
+     super();
+-    shardCount = 12;
++    shardCount = 16;
+     sliceCount = 3;
+   }
+   
+@@ -59,7 +55,7 @@ public void doTest() throws Exception {
+     
+     chaosMonkey.startTheMonkey();
+     
+-    Thread.sleep(12000);
++    Thread.sleep(18000);
+     
+     chaosMonkey.stopTheMonkey();
+     
+@@ -72,8 +68,6 @@ public void doTest() throws Exception {
+       indexThread.join();
+     }
+     
+-    Thread.sleep(2000);
+-       
+     for (StopableIndexingThread indexThread : threads) {
+       assertEquals(0, indexThread.getFails());
+     }
+@@ -97,11 +91,13 @@ public void doTest() throws Exception {
+     
+     System.out.println("control docs:" + controlClient.query(new SolrQuery("*:*")).getResults().getNumFound() + "\n\n");
+     
+-    //printLayout();
+   }
+   
+   @Override
+   public void tearDown() throws Exception {
++    
++    //printLayout();
++
+     super.tearDown();
+   }
+   
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullSolrCloudTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullSolrCloudTest.java
+index 2f96d73c..ee343bf7 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullSolrCloudTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/FullSolrCloudTest.java
+@@ -207,6 +207,8 @@ protected void initCloud() throws Exception {
+         try {
+           CloudSolrServer server = new CloudSolrServer(zkServer.getZkAddress());
+           server.setDefaultCollection(DEFAULT_COLLECTION);
++          server.getLbServer().getHttpClient().getParams().setConnectionManagerTimeout(5000);
++          server.getLbServer().getHttpClient().getParams().setSoTimeout(5000);
+           cloudClient = server;
+         } catch (MalformedURLException e) {
+           throw new RuntimeException(e);
+@@ -1020,9 +1022,9 @@ protected QueryResponse queryServer(ModifiableSolrParams params) throws SolrServ
+   // TODO: also do some deletes
+   class StopableIndexingThread extends Thread {
+     private volatile boolean stop = false;
+-    private int startI;
+-    private List<Integer> deletes = new ArrayList<Integer>();
+-    private int fails;
++    private final int startI;
++    private final List<Integer> deletes = new ArrayList<Integer>();
++    private final AtomicInteger fails = new AtomicInteger();
+     private boolean doDeletes;  
+     
+     public StopableIndexingThread(int startI, boolean doDeletes) {
+@@ -1040,7 +1042,6 @@ public void run() {
+       while (true && !stop) {
+         ++i;
+         
+-        
+         if (doDeletes && random.nextBoolean() && deletes.size() > 0) {
+           Integer delete = deletes.remove(0);
+           try {
+@@ -1050,9 +1051,8 @@ public void run() {
+           } catch (Exception e) {
+             System.err.println("REQUEST FAILED:");
+             e.printStackTrace();
+-            fails++;
++            fails.incrementAndGet();
+           }
+-
+         }
+         
+         try {
+@@ -1062,7 +1062,7 @@ public void run() {
+         } catch (Exception e) {
+           System.err.println("REQUEST FAILED:");
+           e.printStackTrace();
+-          fails++;
++          fails.incrementAndGet();
+         }
+         
+         if (doDeletes && random.nextBoolean()) {
+@@ -1079,7 +1079,7 @@ public void safeStop() {
+     }
+ 
+     public int getFails() {
+-      return fails;
++      return fails.get();
+     }
+     
+   };
+diff --git a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/LeaderElectionIntegrationTest.java b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/LeaderElectionIntegrationTest.java
+index 2162688a..8250dfb9 100644
+--- a/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/LeaderElectionIntegrationTest.java
++++ b/lucene/dev/branches/solrcloud/solr/core/src/test/org/apache/solr/cloud/LeaderElectionIntegrationTest.java
+@@ -141,7 +141,7 @@ public void testSimpleSliceLeaderElection() throws Exception {
+       //printLayout(zkServer.getZkAddress());
+       
+       // wait a sec for new leader to register
+-      Thread.sleep(1000);
++      Thread.sleep(2000);
+       
+       leader = getLeader();
+       int newLeaderPort = getLeaderPort(leader);
+@@ -225,7 +225,9 @@ public void tearDown() throws Exception {
+     if (VERBOSE) {
+       printLayout(zkServer.getZkHost());
+     }
++    if (zkClient != null) {
+     zkClient.close();
++    }
+     
+     for (CoreContainer cc : containerMap.values()) {
+       if (!cc.isShutDown()) {
+diff --git a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/CloudSolrServer.java b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/CloudSolrServer.java
+index 21fd627f..f4245553 100644
+--- a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/CloudSolrServer.java
++++ b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/CloudSolrServer.java
+@@ -182,4 +182,8 @@ public void close() {
+       }
+     }
+   }
++
++  public LBHttpSolrServer getLbServer() {
++    return lbServer;
++  }
+ }
+diff --git a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrServer.java b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrServer.java
+index 2ca520c4..603137e1 100644
+--- a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrServer.java
++++ b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/client/solrj/impl/LBHttpSolrServer.java
+@@ -250,16 +250,18 @@ public Rsp request(Req req) throws SolrServerException, IOException {
+         rsp.rsp = server.request(req.getRequest());
+         return rsp; // SUCCESS
+       } catch (SolrException e) {
+-        System.out
+-            .println("root: " + new SolrServerException(e).getRootCause());
+-        if (e.code() == 404 || e.code() == 503
+-            || e.getMessage().contains("java.net.SocketException")
+-            || e.getMessage().contains("java.net.ConnectException")) {
+-          ex = addZombie(server, e);
+-        } else {
++        // nocommit: we would like to try with another server on connection problems - but
++        // we don't want to ignore true failures due to forwarding with distrib...
++//        System.out
++//            .println("root: " + new SolrServerException(e).getRootCause());
++//        if (e.code() == 404 || e.code() == 503
++//            || e.getMessage().contains("java.net.SocketException")
++//            || e.getMessage().contains("java.net.ConnectException")) {
++//          ex = addZombie(server, e);
++//        } else {
+           // Server is alive but the request was malformed or invalid
+           throw e;
+-        }
++//        }
+       } catch (SocketException e) {
+         ex = addZombie(server, e);
+       } catch (SolrServerException e) {
+diff --git a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/CoreState.java b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/CoreState.java
+index 750de52c..51a7a1ab 100644
+--- a/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/CoreState.java
++++ b/lucene/dev/branches/solrcloud/solr/solrj/src/java/org/apache/solr/common/cloud/CoreState.java
+@@ -17,10 +17,12 @@
+  * the License.
+  */
+ 
+-import org.apache.noggit.JSONWriter;
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
+ 
+-import java.io.IOException;
+-import java.util.*;
++import org.apache.noggit.JSONWriter;
+ 
+ public class CoreState implements JSONWriter.Writable {
+   private static String COLLECTION="collection";

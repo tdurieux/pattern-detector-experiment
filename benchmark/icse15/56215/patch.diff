@@ -1,0 +1,192 @@
+diff --git a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DDMWriter.java b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DDMWriter.java
+index cb3b96ca..6b8bbb62 100644
+--- a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DDMWriter.java
++++ b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DDMWriter.java
+@@ -91,6 +91,12 @@
+ 	// Whether or not the current DSS is a continuation DSS.
+ 	private boolean isContinuationDss;
+ 	
++	// In situations where we want to "mark" a buffer location so that
++	// we can "back-out" of a write to handle errors, this holds the
++	// location within the "bytes" array of the start of the header
++	// that immediately precedes the mark.
++	private int lastDSSBeforeMark;
++
+ 	// Constructors
+ 	DDMWriter (int minSize, CcsidManager ccsidManager, DRDAConnThread agent, DssTrace dssTrace)
+ 	{
+@@ -101,6 +107,7 @@
+ 		this.previousCorrId = DssConstants.CORRELATION_ID_UNKNOWN;
+ 		this.previousChainByte = DssConstants.DSS_NOCHAIN;
+ 		this.isContinuationDss = false;
++		this.lastDSSBeforeMark = -1;
+ 		reset(dssTrace);
+ 	}
+ 
+@@ -113,6 +120,7 @@
+ 		this.previousCorrId = DssConstants.CORRELATION_ID_UNKNOWN;
+ 		this.previousChainByte = DssConstants.DSS_NOCHAIN;
+ 		this.isContinuationDss = false;
++		this.lastDSSBeforeMark = -1;
+ 		reset(dssTrace);
+ 	}
+ 
+@@ -1812,5 +1820,58 @@ protected void finalizeChain(byte currChainByte,
+ 
+ 	}
+ 
++	/**
++	 * Takes note of the location of the most recently completed
++	 * DSS in the buffer, and then returns the current offset.
++	 * This method is used in conjunction with "clearDSSesBackToMark"
++	 * to allow for DRDAConnThread to "back-out" DSSes in the
++	 * event of errors.
++	 */
++	protected int markDSSClearPoint()
++	{
++
++		lastDSSBeforeMark = prevHdrLocation;
++		return getOffset();
++
++	}
++
++	/**
++	 * Does a logical "clear" of everything written to the buffer after
++	 * the received mark.  It's assumed that this method will be used
++	 * in error cases when we've started writing one or more DSSes,
++	 * but then hit an error and need to back out.  After backing out,
++	 * we'll always need to write _something_ back to the client to
++	 * indicate an error (typically, we just write an SQLCARD) but what
++	 * exactly gets written is handled in DRDAConnThread.  Here, we
++	 * just do the necessary prep so that whatever comes next will
++	 * succeed.
++	 */
++	protected void clearDSSesBackToMark(int mark)
++	{
++
++		// Logical clear.
++		setOffset(mark);
++
++		// Because we've just cleared out the most recently-
++		// written DSSes, we have to make sure the next thing
++		// we write will have the correct correlation id.  We
++		// do this by setting the value of 'nextCorrelationID'
++		// based on the chaining byte from the last remaining
++		// DSS (where "remaining" means that it still exists
++		// in the buffer after the clear).
++		if (lastDSSBeforeMark == -1)
++		// we cleared out the entire buffer; reset corr id.
++			nextCorrelationID = 1;
++		else {
++		// last remaining DSS had chaining, so we set "nextCorrelationID"
++		// to be 1 greater than whatever the last remaining DSS had as
++		// its correlation id.
++ 			nextCorrelationID = 1 + (int)
++				(((bytes[lastDSSBeforeMark + 4] & 0xff) << 8) +
++				(bytes[lastDSSBeforeMark + 5] & 0xff));
++		}
++
++	}
++
+ }
+ 
+diff --git a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+index 1091bbc3..0b726a2d 100644
+--- a/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
++++ b/incubator/derby/code/trunk/java/drda/org/apache/derby/impl/drda/DRDAConnThread.java
+@@ -558,6 +558,7 @@ private void processCommands() throws DRDAProtocolException
+ 		{
+ 			correlationID = reader.readDssHeader();
+ 			int codePoint = reader.readLengthAndCodePoint();
++			int writerMark = writer.markDSSClearPoint();
+ 			switch(codePoint)
+ 			{
+ 				case CodePoint.CNTQRY:
+@@ -581,7 +582,7 @@ private void processCommands() throws DRDAProtocolException
+  						{
+ 							// if we got a SQLException we need to clean up and
+  							// close the statement Beetle 4758
+-							writer.clearBuffer();
++							writer.clearDSSesBackToMark(writerMark);
+  							if (! stmt.rsIsClosed())
+  							{
+  								try {
+@@ -626,6 +627,7 @@ private void processCommands() throws DRDAProtocolException
+ 							null, updateCount, true, true);
+ 					} catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						writeSQLCARDs(e, 0);
+ 						errorInChain(e);
+ 					}
+@@ -643,6 +645,7 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						writeSQLCARDs(e, 0);
+ 						errorInChain(e);
+ 					}
+@@ -663,6 +666,7 @@ private void processCommands() throws DRDAProtocolException
+ 
+ 					} catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						writeSQLCARDs(e, 0, true);
+ 						PRPSQLSTTfailed = true;
+ 						errorInChain(e);
+@@ -702,13 +706,9 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						try {
+ 							// Try to cleanup if we hit an error.
+-							// We me have written all or part of
+-							// OPNQRYRM and/or QRYDSC before hitting
+-							// the error, so we have to clear the write
+-							// buffer and ONLY write the OPNQLFRM.
+-							writer.clearBuffer();
+ 							if (ps != null)
+ 								ps.close();
+ 							writeOPNQFLRM(e);
+@@ -735,6 +735,7 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						// Even in case of error, we have to write the ENDUOWRM.
+ 						writeENDUOWRM(COMMIT);
+ 						writeSQLCARDs(e, 0);
+@@ -756,6 +757,7 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						// Even in case of error, we have to write the ENDUOWRM.
+ 						writeENDUOWRM(ROLLBACK);
+ 						writeSQLCARDs(e, 0);
+@@ -770,6 +772,7 @@ private void processCommands() throws DRDAProtocolException
+ 					}
+ 					catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						writeSQLCARDs(e, 0);
+ 						errorInChain(e);
+ 					}
+@@ -811,6 +814,7 @@ private void processCommands() throws DRDAProtocolException
+ 						
+ 					} catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						server.consoleExceptionPrint(e);
+ 						try {
+ 							writeSQLDARD(database.getCurrentStatement(), true, e);
+@@ -835,6 +839,7 @@ private void processCommands() throws DRDAProtocolException
+ 							curStmt.rsSuspend();
+ 					} catch (SQLException e)
+ 					{
++						writer.clearDSSesBackToMark(writerMark);
+ 						if (SanityManager.DEBUG) 
+ 						{
+ 							server.consoleExceptionPrint(e);

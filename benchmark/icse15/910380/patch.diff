@@ -1,0 +1,1126 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 8ef0b0ee..ce3204dc 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -44,6 +44,7 @@
+ import org.apache.cassandra.dht.AbstractBounds;
+ import org.apache.cassandra.dht.Bounds;
+ import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.io.*;
+ import org.apache.cassandra.io.util.FileUtils;
+ 
+@@ -1062,12 +1063,13 @@ public RangeSliceReply getRangeSlice(byte[] super_column, final AbstractBounds r
+         else
+         {
+             // wrapped range
+-            Range first = new Range(range.left, StorageService.getPartitioner().getMinimumToken());
++            Token min = StorageService.getPartitioner().getMinimumToken();
++            Range first = new Range(range.left, min);
+             completed = getKeyRange(keys, first, keyMax);
+-            if (!completed)
++            if (!completed && min.compareTo(range.right) < 0)
+             {
+-                Range second = new Range(StorageService.getPartitioner().getMinimumToken(), range.right);
+-                completed = getKeyRange(keys, second, keyMax);
++                Range second = new Range(min, range.right);
++                getKeyRange(keys, second, keyMax);
+             }
+         }
+         List<Row> rows = new ArrayList<Row>(keys.size());
+@@ -1081,7 +1083,7 @@ public RangeSliceReply getRangeSlice(byte[] super_column, final AbstractBounds r
+             rows.add(new Row(key, getColumnFamily(filter)));
+         }
+ 
+-        return new RangeSliceReply(rows, completed);
++        return new RangeSliceReply(rows);
+     }
+ 
+     public AbstractType getComparator()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeSliceReply.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeSliceReply.java
+index 4848cd5f..05ecde52 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeSliceReply.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RangeSliceReply.java
+@@ -31,18 +31,15 @@
+ public class RangeSliceReply
+ {
+     public final List<Row> rows;
+-    public final boolean rangeCompletedLocally;
+ 
+-    public RangeSliceReply(List<Row> rows, boolean rangeCompletedLocally)
++    public RangeSliceReply(List<Row> rows)
+     {
+         this.rows = rows;
+-        this.rangeCompletedLocally = rangeCompletedLocally;
+     }
+ 
+     public Message getReply(Message originalMessage) throws IOException
+     {
+         DataOutputBuffer dob = new DataOutputBuffer();
+-        dob.writeBoolean(rangeCompletedLocally);
+         dob.writeInt(rows.size());
+         for (Row row : rows)
+         {
+@@ -57,7 +54,6 @@ public String toString()
+     {
+         return "RangeSliceReply{" +
+                "rows=" + StringUtils.join(rows, ",") +
+-               ", rangeCompletedLocally=" + rangeCompletedLocally +
+                '}';
+     }
+ 
+@@ -65,13 +61,12 @@ public static RangeSliceReply read(byte[] body) throws IOException
+     {
+         ByteArrayInputStream bufIn = new ByteArrayInputStream(body);
+         DataInputStream dis = new DataInputStream(bufIn);
+-        boolean completed = dis.readBoolean();
+         int rowCount = dis.readInt();
+         List<Row> rows = new ArrayList<Row>(rowCount);
+         for (int i = 0; i < rowCount; i++)
+         {
+             rows.add(Row.serializer().deserialize(dis));
+         }
+-        return new RangeSliceReply(rows, completed);
++        return new RangeSliceReply(rows);
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/AbstractBounds.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/AbstractBounds.java
+index f6fb0f4b..54e3530a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/AbstractBounds.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/AbstractBounds.java
+@@ -1,7 +1,11 @@
+ package org.apache.cassandra.dht;
+ 
+-import java.io.*;
++import java.io.DataInput;
++import java.io.DataOutput;
++import java.io.IOException;
++import java.io.Serializable;
+ import java.util.List;
++import java.util.Set;
+ 
+ import org.apache.cassandra.io.ICompactSerializer2;
+ 
+@@ -23,13 +27,29 @@
+     public final Token left;
+     public final Token right;
+ 
+-    public AbstractBounds(Token left, Token right)
++    protected transient final IPartitioner partitioner;
++
++    public AbstractBounds(Token left, Token right, IPartitioner partitioner)
+     {
+         this.left = left;
+         this.right = right;
++        this.partitioner = partitioner;
++    }
++
++    @Override
++    public int hashCode()
++    {
++        return toString().hashCode();
+     }
+ 
+-    public abstract List<AbstractBounds> restrictTo(Range range);
++    @Override
++    public abstract boolean equals(Object obj);
++
++    public abstract boolean contains(Token start);
++
++    public abstract Set<AbstractBounds> restrictTo(Range range);
++
++    public abstract List<AbstractBounds> unwrap();
+ 
+     private static class AbstractBoundsSerializer implements ICompactSerializer2<AbstractBounds>
+     {
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Bounds.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Bounds.java
+index 97fede3e..39222f7b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Bounds.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Bounds.java
+@@ -1,9 +1,6 @@
+ package org.apache.cassandra.dht;
+ 
+-import java.util.Arrays;
+-import java.util.List;
+-
+-import org.apache.commons.lang.ObjectUtils;
++import java.util.*;
+ 
+ import org.apache.cassandra.service.StorageService;
+ 
+@@ -11,27 +8,62 @@
+ {
+     public Bounds(Token left, Token right)
+     {
+-        super(left, right);
+-        // unlike a Range, a Bounds may not wrap
+-        assert left.compareTo(right) <= 0 || right.equals(StorageService.getPartitioner().getMinimumToken());
++        this(left, right, StorageService.getPartitioner());
+     }
+ 
+-    public List<AbstractBounds> restrictTo(Range range)
++    Bounds(Token left, Token right, IPartitioner partitioner)
+     {
+-        Token left, right;
+-        if (range.left.equals(range.right))
++        super(left, right, partitioner);
++        // unlike a Range, a Bounds may not wrap
++        assert left.compareTo(right) <= 0 || right.equals(partitioner.getMinimumToken()) : "[" + left + "," + right + "]";
++    }
++
++    @Override
++    public boolean contains(Token token)
+         {
+-            left = this.left;
+-            right = this.right;
++        return Range.contains(left, right, token) || left.equals(token);
+         }
++
++    public Set<AbstractBounds> restrictTo(Range range)
++    {
++        Token min = partitioner.getMinimumToken();
++
++        // special case Bounds where left=right (single Token)
++        if (this.left.equals(this.right) && !this.right.equals(min))
++            return range.contains(this.left)
++                   ? Collections.unmodifiableSet(new HashSet<AbstractBounds>(Arrays.asList(this)))
++                   : Collections.<AbstractBounds>emptySet();
++
++        // get the intersection of a Range w/ same left & right
++        Set<Range> ranges = range.intersectionWith(new Range(this.left, this.right));
++        // if range doesn't contain left token anyway, that's the correct answer
++        if (!range.contains(this.left))
++            return (Set) ranges;
++        // otherwise, add back in the left token
++        Set<AbstractBounds> S = new HashSet<AbstractBounds>(ranges.size());
++        for (Range restricted : ranges)
++        {
++            if (restricted.left.equals(this.left))
++                S.add(new Bounds(restricted.left, restricted.right));
+         else
++                S.add(restricted);
++        }
++        return Collections.unmodifiableSet(S);
++    }
++
++    public List<AbstractBounds> unwrap()
+         {
+-            left = (Token) ObjectUtils.max(this.left, range.left);
+-            right = this.right.equals(StorageService.getPartitioner().getMinimumToken())
+-                    ? range.right
+-                    : (Token) ObjectUtils.min(this.right, range.right);
++        // Bounds objects never wrap
++        return (List)Arrays.asList(this);
+         }
+-        return (List) Arrays.asList(new Bounds(left, right));
++
++    @Override
++    public boolean equals(Object o)
++    {
++        if (!(o instanceof Bounds))
++            return false;
++        Bounds rhs = (Bounds)o;
++        return left.equals(rhs.left) && right.equals(rhs.right);
+     }
+ 
+     public String toString()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Range.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Range.java
+index 1d325a30..157d0907 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Range.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/dht/Range.java
+@@ -19,13 +19,12 @@
+ package org.apache.cassandra.dht;
+ 
+ import java.io.Serializable;
+-import java.util.ArrayList;
+-import java.util.Arrays;
+-import java.util.Collections;
+-import java.util.List;
++import java.util.*;
+ 
+ import org.apache.commons.lang.ObjectUtils;
+ 
++import org.apache.cassandra.service.StorageService;
++
+ 
+ /**
+  * A representation of the range that a node is responsible for on the DHT ring.
+@@ -38,7 +37,12 @@
+     
+     public Range(Token left, Token right)
+     {
+-        super(left, right);
++        this(left, right, StorageService.getPartitioner());
++    }
++
++    public Range(Token left, Token right, IPartitioner partitioner)
++    {
++        super(left, right, partitioner);
+     }
+ 
+     public static boolean contains(Token left, Token right, Token bi)
+@@ -68,19 +72,31 @@ public static boolean contains(Token left, Token right, Token bi)
+ 
+     public boolean contains(Range that)
+     {
++        if (this.left.equals(this.right))
++        {
++            // full ring always contains all other ranges
++            return true;
++        }
++
+         boolean thiswraps = isWrapAround(left, right);
+         boolean thatwraps = isWrapAround(that.left, that.right);
+         if (thiswraps == thatwraps)
+-            return left.compareTo(that.left) <= 0 &&
+-                that.right.compareTo(right) <= 0;
++        {
++            return left.compareTo(that.left) <= 0 && that.right.compareTo(right) <= 0;
++        }
+         else if (thiswraps)
++        {
+             // wrapping might contain non-wrapping
+-            return left.compareTo(that.left) <= 0 ||
+-                that.right.compareTo(right) <= 0;
+-        else // (thatwraps)
++            // that is contained if both its tokens are in one of our wrap segments
++            return left.compareTo(that.left) <= 0 || that.right.compareTo(right) <= 0;
++        }
++        else
++        {
++            // (thatwraps)
+             // non-wrapping cannot contain wrapping
+             return false;
+     }
++    }
+ 
+     /**
+      * Helps determine if a given point on the DHT ring is contained
+@@ -102,46 +118,89 @@ public boolean intersects(Range that)
+         return intersectionWith(that).size() > 0;
+     }
+ 
+-    public List<Range> intersectionWith(Range that)
++    public static Set<Range> rangeSet(Range ... ranges)
++    {
++        return Collections.unmodifiableSet(new HashSet<Range>(Arrays.asList(ranges)));
++    }
++
++    /**
++     * @param that
++     * @return the intersection of the two Ranges.  this can be two disjoint Ranges if one is wrapping and one is not.
++     * say you have nodes G and M, with query range (D,T]; the intersection is (M-T] and (D-G].
++     * If there is no intersection, an empty list is returned.
++     */
++    public Set<Range> intersectionWith(Range that)
+     {
++        if (this.contains(that))
++            return rangeSet(that);
++        if (that.contains(this))
++            return rangeSet(this);
++
+         boolean thiswraps = isWrapAround(left, right);
+         boolean thatwraps = isWrapAround(that.left, that.right);
+-        if (thiswraps && thatwraps)
+-        {
+-            // there is always an intersection when both wrap
+-            return Arrays.asList(new Range((Token)ObjectUtils.max(this.left, that.left),
+-                                           (Token)ObjectUtils.min(this.right, that.right)));
+-        }
+         if (!thiswraps && !thatwraps)
+         {
++            // neither wraps.  the straightforward case.
+             if (!(left.compareTo(that.right) < 0 && that.left.compareTo(right) < 0))
+-                return Collections.emptyList();
+-            return Arrays.asList(new Range((Token)ObjectUtils.max(this.left, that.left),
++                return Collections.emptySet();
++            return rangeSet(new Range((Token)ObjectUtils.max(this.left, that.left),
+                                            (Token)ObjectUtils.min(this.right, that.right)));
+         }
++        if (thiswraps && thatwraps)
++        {
++            // if the starts are the same, one contains the other, which we have already ruled out.
++            assert !this.left.equals(that.left);
++            // two wrapping ranges always intersect.
++            // since we have already determined that neither this nor that contains the other, we have 2 cases,
++            // and mirror images of those case.
++            // (1) both of that's (1, 2] endpoints lie in this's (A, B] right segment:
++            //  ---------B--------A--1----2------>
++            // (2) only that's start endpoint lies in this's right segment:
++            //  ---------B----1---A-------2------>
++            // or, we have the same cases on the left segement, which we can handle by swapping this and that.
++            return this.left.compareTo(that.left) < 0
++                   ? intersectionBothWrapping(this, that)
++                   : intersectionBothWrapping(that, this);
++        }
+         if (thiswraps && !thatwraps)
+             return intersectionOneWrapping(this, that);
+         assert (!thiswraps && thatwraps);
+         return intersectionOneWrapping(that, this);
+     }
+ 
+-    public List<AbstractBounds> restrictTo(Range range)
++    private static Set<Range> intersectionBothWrapping(Range first, Range that)
+     {
+-        return (List) intersectionWith(range);
++        Set<Range> intersection = new HashSet<Range>(2);
++        if (that.right.compareTo(first.left) > 0)
++            intersection.add(new Range(first.left, that.right));
++        intersection.add(new Range(that.left, first.right));
++        return Collections.unmodifiableSet(intersection);
+     }
+ 
+-    private static List<Range> intersectionOneWrapping(Range wrapping, Range other)
++    private static Set<Range> intersectionOneWrapping(Range wrapping, Range other)
+     {
+-        List<Range> intersection = new ArrayList<Range>(2);
+-        if (wrapping.contains(other))
+-        {
+-            return Arrays.asList(other);
+-        }
+-        if (other.contains(wrapping.right) || other.left.equals(wrapping.left))
++        Set<Range> intersection = new HashSet<Range>(2);
++        if (other.contains(wrapping.right))
+             intersection.add(new Range(other.left, wrapping.right));
++        // need the extra compareto here because ranges are asymmetrical; wrapping.left _is not_ contained by the wrapping range
+         if (other.contains(wrapping.left) && wrapping.left.compareTo(other.right) < 0)
+             intersection.add(new Range(wrapping.left, other.right));
+-        return Collections.unmodifiableList(intersection);
++        return Collections.unmodifiableSet(intersection);
++    }
++
++    public Set<AbstractBounds> restrictTo(Range range)
++    {
++        return (Set) intersectionWith(range);
++    }
++
++    public List<AbstractBounds> unwrap()
++    {
++        if (!isWrapAround() || right.equals(partitioner.getMinimumToken()))
++            return (List)Arrays.asList(this);
++        List<AbstractBounds> unwrapped = new ArrayList<AbstractBounds>(2);
++        unwrapped.add(new Range(left, partitioner.getMinimumToken()));
++        unwrapped.add(new Range(partitioner.getMinimumToken(), right));
++        return unwrapped;
+     }
+ 
+     /**
+@@ -190,12 +249,6 @@ public boolean equals(Object o)
+         return left.equals(rhs.left) && right.equals(rhs.right);
+     }
+     
+-    @Override
+-    public int hashCode()
+-    {
+-        return toString().hashCode();
+-    }
+-
+     public String toString()
+     {
+         return "(" + left + "," + right + "]";
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+index d8c5013c..abeccee5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/RangeSliceResponseResolver.java
+@@ -24,63 +24,78 @@
+ 
+ import org.apache.log4j.Logger;
+ 
++import org.apache.commons.collections.iterators.CollatingIterator;
++
++import com.google.common.collect.AbstractIterator;
+ import org.apache.cassandra.db.ColumnFamily;
+ import org.apache.cassandra.db.RangeSliceReply;
+ import org.apache.cassandra.db.Row;
+-import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.net.Message;
++import org.apache.cassandra.utils.Pair;
++import org.apache.cassandra.utils.ReducingIterator;
+ 
+ /**
+  * Turns RangeSliceReply objects into row (string -> CF) maps, resolving
+  * to the most recent ColumnFamily and setting up read repairs as necessary.
+  */
+-public class RangeSliceResponseResolver implements IResponseResolver<Map<String, ColumnFamily>>
++public class RangeSliceResponseResolver implements IResponseResolver<List<Row>>
+ {
+     private static final Logger logger_ = Logger.getLogger(RangeSliceResponseResolver.class);
+     private final String table;
+-    private final Range range;
+     private final List<InetAddress> sources;
+-    private boolean isCompleted;
+ 
+-    public RangeSliceResponseResolver(String table, Range range, List<InetAddress> sources)
++    public RangeSliceResponseResolver(String table, List<InetAddress> sources)
+     {
+         assert sources.size() > 0;
+         this.sources = sources;
+-        this.range = range;
+         this.table = table;
+     }
+ 
+-    public Map<String, ColumnFamily> resolve(List<Message> responses) throws DigestMismatchException, IOException
++    public List<Row> resolve(List<Message> responses) throws DigestMismatchException, IOException
+     {
+-        Map<InetAddress, Map<String, ColumnFamily>> replies = new HashMap<InetAddress, Map<String, ColumnFamily>>(responses.size());
+-        Set<String> allKeys = new HashSet<String>();
+-        for (Message response : responses)
++        CollatingIterator collator = new CollatingIterator(new Comparator<Pair<Row,InetAddress>>()
+         {
+-            RangeSliceReply reply = RangeSliceReply.read(response.getMessageBody());
+-            isCompleted &= reply.rangeCompletedLocally;
+-            Map<String, ColumnFamily> rows = new HashMap<String, ColumnFamily>(reply.rows.size());
+-            for (Row row : reply.rows)
++            public int compare(Pair<Row,InetAddress> o1, Pair<Row,InetAddress> o2)
+             {
+-                rows.put(row.key, row.cf);
+-                allKeys.add(row.key);
++                return o1.left.key.compareTo(o2.left.key);
+             }
+-            replies.put(response.getFrom(), rows);
++        });
++        
++        int n = 0;
++        for (Message response : responses)
++        {
++            RangeSliceReply reply = RangeSliceReply.read(response.getMessageBody());
++            n = Math.max(n, reply.rows.size());
++            collator.addIterator(new RowIterator(reply.rows.iterator(), response.getFrom()));
+         }
+ 
+         // for each row, compute the combination of all different versions seen, and repair incomplete versions
+-        // TODO since the rows all arrive in sorted order, we should be able to do this more efficiently w/o all the Map conversion
+-        Map<String, ColumnFamily> resolvedRows = new HashMap<String, ColumnFamily>(allKeys.size());
+-        for (String key : allKeys)
++        ReducingIterator<Pair<Row,InetAddress>, Row> iter = new ReducingIterator<Pair<Row,InetAddress>, Row>(collator)
+         {
+             List<ColumnFamily> versions = new ArrayList<ColumnFamily>(sources.size());
+-            for (InetAddress endpoint : sources)
++            List<InetAddress> versionSources = new ArrayList<InetAddress>(sources.size());
++            String key;
++
++            public void reduce(Pair<Row,InetAddress> current)
+             {
+-                versions.add(replies.get(endpoint).get(key));
++                key = current.left.key;
++                versions.add(current.left.cf);
++                versionSources.add(current.right);
+             }
++
++            protected Row getReduced()
++            {
+             ColumnFamily resolved = ReadResponseResolver.resolveSuperset(versions);
+-            ReadResponseResolver.maybeScheduleRepairs(resolved, table, key, versions, sources);
+-            resolvedRows.put(key, resolved);
+-        }
++                ReadResponseResolver.maybeScheduleRepairs(resolved, table, key, versions, versionSources);
++                versions.clear();
++                return new Row(key, resolved);
++            }
++        };
++
++        List<Row> resolvedRows = new ArrayList<Row>(n);
++        while (iter.hasNext())
++            resolvedRows.add(iter.next());
++
+         return resolvedRows;
+     }
+ 
+@@ -89,11 +104,21 @@ public boolean isDataPresent(List<Message> responses)
+         return responses.size() >= sources.size();
+     }
+ 
+-    /**
+-     * only valid after resolve has been called (typically via QRH.get)
+-     */
+-    public boolean completed()
++    private static class RowIterator extends AbstractIterator<Pair<Row,InetAddress>>
++    {
++        private final Iterator<Row> iter;
++        private final InetAddress source;
++
++        private RowIterator(Iterator<Row> iter, InetAddress source)
+     {
+-        return isCompleted;
++            this.iter = iter;
++            this.source = source;
++        }
++
++        @Override
++        protected Pair<Row,InetAddress> computeNext()
++        {
++            return iter.hasNext() ? new Pair<Row, InetAddress>(iter.next(), source) : endOfData();
++        }
+     }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+index 4a0a98b5..32920ca1 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageProxy.java
+@@ -29,6 +29,9 @@
+ 
+ import org.apache.commons.lang.StringUtils;
+ 
++import com.google.common.collect.AbstractIterator;
++import com.google.common.collect.Iterables;
++import com.google.common.collect.Iterators;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import java.net.InetAddress;
+@@ -530,81 +533,154 @@ else if (consistency_level == ConsistencyLevel.ANY)
+         return rows;
+     }
+ 
+-    public static List<Pair<String, ColumnFamily>> getRangeSlice(RangeSliceCommand command, ConsistencyLevel consistency_level)
++    public static List<Row> getRangeSlice(RangeSliceCommand command, ConsistencyLevel consistency_level)
+     throws IOException, UnavailableException, TimeoutException
+     {
++        if (logger.isDebugEnabled())
++            logger.debug(command);
+         long startTime = System.nanoTime();
+-        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();
+-        Iterator<Token> iter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), command.range.left);
+ 
+         final String table = command.keyspace;
+         int responseCount = determineBlockFor(DatabaseDescriptor.getReplicationFactor(table), DatabaseDescriptor.getReplicationFactor(table), consistency_level);
+ 
+-        // starting with the range containing the start key, scan until either we have enough results,
+-        // or the node scan reports that it was done (i.e., encountered a key outside the desired range).
+-        Map<String, ColumnFamily> rows = new HashMap<String, ColumnFamily>(command.max_keys);
+-        outer:
+-        while (iter.hasNext())
+-        {
+-            Token currentToken = iter.next();
+-            Range currentRange = new Range(tokenMetadata.getPredecessor(currentToken), currentToken);
+-            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(command.keyspace, currentToken);
+-            if (endpoints.size() < responseCount)
+-                throw new UnavailableException();
+-            DatabaseDescriptor.getEndPointSnitch(command.keyspace).sortByProximity(FBUtilities.getLocalAddress(), endpoints);
+-
+-            // make sure we only get keys from the current range (and not other replicas that might be on the nodes).
+-            // usually this will be only one range, but sometimes the intersection of a wrapping Range with a non-wrapping
+-            // is two disjoint, non-wrapping Ranges separated by a gap.
+-            List<AbstractBounds> restricted = command.range.restrictTo(currentRange);
++        List<Pair<AbstractBounds, List<InetAddress>>> ranges = getRestrictedRanges(command.range, command.keyspace, responseCount);
+ 
+-            for (AbstractBounds range : restricted)
++        // now scan until we have enough results
++        List<Row> rows = new ArrayList<Row>(command.max_keys);
++        for (Pair<AbstractBounds, List<InetAddress>> pair : getRangeIterator(ranges, command.range.left))
+             {
++            AbstractBounds range = pair.left;
++            List<InetAddress> endpoints = pair.right;
+                 RangeSliceCommand c2 = new RangeSliceCommand(command.keyspace, command.column_family, command.super_column, command.predicate, range, command.max_keys);
+                 Message message = c2.getMessage();
+ 
+                 // collect replies and resolve according to consistency level
+-                List<InetAddress> endpointsforCL = endpoints.subList(0, responseCount);
+-                RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(command.keyspace, currentRange, endpointsforCL);
+-                QuorumResponseHandler<Map<String, ColumnFamily>> handler = new QuorumResponseHandler<Map<String, ColumnFamily>>(responseCount, resolver);
++            RangeSliceResponseResolver resolver = new RangeSliceResponseResolver(command.keyspace, endpoints);
++            QuorumResponseHandler<List<Row>> handler = new QuorumResponseHandler<List<Row>>(responseCount, resolver);
+ 
+-                for (InetAddress endpoint : endpointsforCL)
++            for (InetAddress endpoint : endpoints)
+                 {
+                     MessagingService.instance.sendRR(message, endpoint, handler);
+                     if (logger.isDebugEnabled())
+-                        logger.debug("reading " + c2 + " for " + range + " from " + message.getMessageId() + "@" + endpoint);
++                    logger.debug("reading " + c2 + " from " + message.getMessageId() + "@" + endpoint);
+                 }
+                 // TODO read repair on remaining replicas?
+ 
+                 // if we're done, great, otherwise, move to the next range
+                 try
+                 {
+-                    rows.putAll(handler.get());
++                if (logger.isDebugEnabled())
++                {
++                    for (Row row : handler.get())
++                    {
++                        logger.debug("range slices read " + row.key);
++                    }
++                }
++                rows.addAll(handler.get());
+                 }
+                 catch (DigestMismatchException e)
+                 {
+                     throw new AssertionError(e); // no digests in range slices yet
+                 }
+-                if (rows.size() >= command.max_keys || resolver.completed())
+-                    break outer;
++            if (rows.size() >= command.max_keys)
++                break;
+             }
++
++        rangeStats.addNano(System.nanoTime() - startTime);
++        return rows.size() > command.max_keys ? rows.subList(0, command.max_keys) : rows;
++    }
++
++    /**
++     * returns an iterator that will return ranges in ring order, starting with the one that contains the start token
++     */
++    private static Iterable<Pair<AbstractBounds, List<InetAddress>>> getRangeIterator(final List<Pair<AbstractBounds, List<InetAddress>>> ranges, Token start)
++    {
++        // sort ranges in ring order
++        Comparator<Pair<AbstractBounds, List<InetAddress>>> comparator = new Comparator<Pair<AbstractBounds, List<InetAddress>>>()
++        {
++            public int compare(Pair<AbstractBounds, List<InetAddress>> o1, Pair<AbstractBounds, List<InetAddress>> o2)
++            {
++                // no restricted ranges will overlap so we don't need to worry about inclusive vs exclusive left,
++                // just sort by raw token position.
++                return o1.left.left.compareTo(o2.left.left);
+         }
++        };
++        Collections.sort(ranges, comparator);
+ 
+-        List<Pair<String, ColumnFamily>> results = new ArrayList<Pair<String, ColumnFamily>>(rows.size());
+-        for (Map.Entry<String, ColumnFamily> entry : rows.entrySet())
++        // find the one to start with
++        int i;
++        for (i = 0; i < ranges.size(); i++)
+         {
+-            ColumnFamily cf = entry.getValue();
+-            results.add(new Pair<String, ColumnFamily>(entry.getKey(), cf));
++            AbstractBounds range = ranges.get(i).left;
++            if (range.contains(start) || range.left.equals(start))
++                break;
+         }
+-        Collections.sort(results, new Comparator<Pair<String, ColumnFamily>>()
++        AbstractBounds range = ranges.get(i).left;
++        assert range.contains(start) || range.left.equals(start); // make sure the loop didn't just end b/c ranges were exhausted
++
++        // return an iterable that starts w/ the correct range and iterates the rest in ring order
++        final int begin = i;
++        return new Iterable<Pair<AbstractBounds, List<InetAddress>>>()
+         {
+-            public int compare(Pair<String, ColumnFamily> o1, Pair<String, ColumnFamily> o2)
++            public Iterator<Pair<AbstractBounds, List<InetAddress>>> iterator()
++        {
++                return new AbstractIterator<Pair<AbstractBounds, List<InetAddress>>>()
+             {
+-                return keyComparator.compare(o1.left, o2.left);                
++                    int n = 0;
++
++                    protected Pair<AbstractBounds, List<InetAddress>> computeNext()
++                    {
++                        if (n == ranges.size())
++                            return endOfData();
++                        return ranges.get((begin + n++) % ranges.size());
+             }
+-        });
+-        rangeStats.addNano(System.nanoTime() - startTime);
+-        return results;
++                };
++            }
++        };
++    }
++
++    /**
++     * compute all ranges we're going to query, in sorted order, so that we get the correct results back.
++     *  1) computing range intersections is necessary because nodes can be replica destinations for many ranges,
++     *     so if we do not restrict each scan to the specific range we want we will get duplicate results.
++     *  2) sorting the intersection ranges is necessary because wraparound node ranges can be discontiguous.
++     *     Consider a 2-node ring, (D, T] and (T, D]. A query for [A, Z] will intersect the 2nd node twice,
++     *     at [A, D] and (T, Z]. We need to scan the (D, T] range in between those, or we will skip those
++     *     results entirely if the limit is low enough.
++     *  3) we unwrap the intersection ranges because otherwise we get results in the wrong order.
++     *     Consider a 2-node ring, (D, T] and (T, D].  A query for [D, Z] will get results in the wrong
++     *     order if we use (T, D] directly -- we need to start with that range, because our query starts with
++     *     D, but we don't want any other results from it until after the (D, T] range.  Unwrapping so that
++     *     the ranges we consider are (D, T], (T, MIN], (MIN, D] fixes this.
++     */
++    private static List<Pair<AbstractBounds, List<InetAddress>>> getRestrictedRanges(AbstractBounds queryRange, String keyspace, int responseCount)
++    throws UnavailableException
++    {
++        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();
++        Iterator<Token> iter = TokenMetadata.ringIterator(tokenMetadata.sortedTokens(), queryRange.left);
++        List<Pair<AbstractBounds, List<InetAddress>>> ranges = new ArrayList<Pair<AbstractBounds, List<InetAddress>>>();
++        while (iter.hasNext())
++        {
++            Token nodeToken = iter.next();
++            Range nodeRange = new Range(tokenMetadata.getPredecessor(nodeToken), nodeToken);
++            List<InetAddress> endpoints = StorageService.instance.getLiveNaturalEndpoints(keyspace, nodeToken);
++            if (endpoints.size() < responseCount)
++                throw new UnavailableException();
++
++            DatabaseDescriptor.getEndPointSnitch(keyspace).sortByProximity(FBUtilities.getLocalAddress(), endpoints);
++            List<InetAddress> endpointsForCL = endpoints.subList(0, responseCount);
++            Set<AbstractBounds> restrictedRanges = queryRange.restrictTo(nodeRange);
++            for (AbstractBounds range : restrictedRanges)
++            {
++                for (AbstractBounds unwrapped : range.unwrap())
++                {
++                    if (logger.isDebugEnabled())
++                        logger.debug("Adding to restricted ranges " + unwrapped + " for " + nodeRange);
++                    ranges.add(new Pair<AbstractBounds, List<InetAddress>>(unwrapped, endpointsForCL));
++                }
++            }
++        }
++        return ranges;
+     }
+ 
+     public long getReadOperations()
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+index 9a10628c..c87ec9cb 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraServer.java
+@@ -35,6 +35,7 @@
+ import org.apache.cassandra.db.marshal.MarshalException;
+ import org.apache.cassandra.dht.AbstractBounds;
+ import org.apache.cassandra.dht.Bounds;
++import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.service.StorageProxy;
+@@ -543,7 +544,7 @@ else if (propertyName.equals("version"))
+     throws InvalidRequestException, UnavailableException, TException, TimedOutException
+     {
+         if (logger.isDebugEnabled())
+-            logger.debug("range_slice");
++            logger.debug("get_range_slice " + start_key + " to " + finish_key);
+ 
+         KeyRange range = new KeyRange().setStart_key(start_key).setEnd_key(finish_key).setCount(maxRows);
+         return getRangeSlicesInternal(keyspace, column_parent, predicate, range, consistency_level);
+@@ -567,21 +568,21 @@ else if (propertyName.equals("version"))
+         ThriftValidation.validatePredicate(keyspace, column_parent, predicate);
+         ThriftValidation.validateKeyRange(range);
+ 
+-        List<Pair<String, ColumnFamily>> rows;
++        List<Row> rows;
+         try
+         {
++            IPartitioner p = StorageService.getPartitioner();
+             AbstractBounds bounds;
+             if (range.start_key == null)
+             {
+-                Token.TokenFactory tokenFactory = StorageService.getPartitioner().getTokenFactory();
++                Token.TokenFactory tokenFactory = p.getTokenFactory();
+                 Token left = tokenFactory.fromString(range.start_token);
+                 Token right = tokenFactory.fromString(range.end_token);
+                 bounds = new Range(left, right);
+             }
+             else
+             {
+-                bounds = new Bounds(StorageService.getPartitioner().decorateKey(range.start_key).token,
+-                                    StorageService.getPartitioner().decorateKey(range.end_key).token);
++                bounds = new Bounds(p.decorateKey(range.start_key).token, p.decorateKey(range.end_key).token);
+             }
+             rows = StorageProxy.getRangeSlice(new RangeSliceCommand(keyspace, column_parent, predicate, bounds, range.count), consistency_level);
+             assert rows != null;
+@@ -597,10 +598,10 @@ else if (propertyName.equals("version"))
+ 
+         List<KeySlice> keySlices = new ArrayList<KeySlice>(rows.size());
+         boolean reversed = predicate.slice_range != null && predicate.slice_range.reversed;
+-        for (Pair<String, ColumnFamily> row : rows)
++        for (Row row : rows)
+         {
+-            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(row.right, column_parent.super_column != null, reversed);
+-            keySlices.add(new KeySlice(row.left, thriftifiedColumns));
++            List<ColumnOrSuperColumn> thriftifiedColumns = thriftifyColumnFamily(row.cf, column_parent.super_column != null, reversed);
++            keySlices.add(new KeySlice(row.key, thriftifiedColumns));
+         }
+ 
+         return keySlices;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+index c4009073..3349dcba 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/thrift/ThriftValidation.java
+@@ -314,6 +314,12 @@ public static void validateKeyRange(KeyRange range) throws InvalidRequestExcepti
+             throw new InvalidRequestException("exactly one of {start key, end key} or {start token, end token} must be specified");
+         }
+ 
++        if (range.start_key != null)
++        {
++            if (range.start_key.compareTo(range.end_key) > 0 && !range.end_key.isEmpty())
++                throw new InvalidRequestException("start key must sort before (or equal to) finish key in your partitioner!");
++        }
++
+         if (range.count <= 0)
+         {
+             throw new InvalidRequestException("maxRows must be positive");
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BoundsTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BoundsTest.java
+index 3f24d583..c51f9d02 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BoundsTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/BoundsTest.java
+@@ -1 +1,74 @@
+   + native
++package org.apache.cassandra.dht;
++
++import java.util.*;
++
++import junit.framework.TestCase;
++import org.apache.cassandra.utils.FBUtilities;
++
++public class BoundsTest extends TestCase
++{
++    public void testRestrictTo() throws Exception
++    {
++        IPartitioner p = new OrderPreservingPartitioner();
++        Token min = p.getMinimumToken();
++        Range wraps = new Range(new StringToken("m"), new StringToken("e"));
++        Range normal = new Range(wraps.right, wraps.left);
++        Bounds all = new Bounds(min, min, p);
++        Bounds almostAll = new Bounds(new StringToken("a"), min, p);
++
++        Set<AbstractBounds> S;
++        Set<AbstractBounds> S2;
++
++        S = all.restrictTo(wraps);
++        assert S.equals(new HashSet<AbstractBounds>(Arrays.asList(wraps)));
++
++        S = almostAll.restrictTo(wraps);
++        S2 = new HashSet<AbstractBounds>(Arrays.asList(new Bounds(new StringToken("a"), new StringToken("e"), p),
++                                                       new Range(new StringToken("m"), min)));
++        assert S.equals(S2);
++
++        S = all.restrictTo(normal);
++        assert S.equals(new HashSet<AbstractBounds>(Arrays.asList(normal)));
++    }
++
++    public void testNoIntersectionWrapped()
++    {
++        IPartitioner p = new OrderPreservingPartitioner();
++        Range node = new Range(new StringToken("z"), new StringToken("a"));
++        Bounds bounds;
++
++        bounds = new Bounds(new StringToken("m"), new StringToken("n"), p);
++        assert bounds.restrictTo(node).equals(Collections.<AbstractBounds>emptySet());
++
++        bounds = new Bounds(new StringToken("b"), node.left, p);
++        assert bounds.restrictTo(node).equals(Collections.<AbstractBounds>emptySet());
++    }
++
++    public void testSmallBoundsFullRange()
++    {
++        IPartitioner p = new OrderPreservingPartitioner();
++        Range node;
++        Bounds bounds = new Bounds(new StringToken("b"), new StringToken("c"), p);
++
++        node = new Range(new StringToken("d"), new StringToken("d"));
++        assert bounds.restrictTo(node).equals(new HashSet(Arrays.asList(bounds)));
++    }
++
++    public void testNoIntersectionUnwrapped()
++    {
++        IPartitioner p = new OrderPreservingPartitioner();
++        Token min = p.getMinimumToken();
++        Range node = new Range(new StringToken("m"), new StringToken("n"));
++        Bounds bounds;
++
++        bounds = new Bounds(new StringToken("z"), min, p);
++        assert bounds.restrictTo(node).equals(Collections.<AbstractBounds>emptySet());
++
++        bounds = new Bounds(new StringToken("a"), node.left, p);
++        assert bounds.restrictTo(node).equals(Collections.<AbstractBounds>emptySet());
++
++        bounds = new Bounds(min, new StringToken("b"), p);
++        assert bounds.restrictTo(node).equals(Collections.<AbstractBounds>emptySet());
++    }
++}
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeIntersectionTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeIntersectionTest.java
+index e69de29b..e918d708 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeIntersectionTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeIntersectionTest.java
+@@ -0,0 +1,131 @@
++package org.apache.cassandra.dht;
++
++import java.util.Arrays;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.commons.lang.StringUtils;
++import org.junit.Test;
++
++public class RangeIntersectionTest
++{
++    static void assertIntersection(Range one, Range two, Range ... ranges)
++    {
++        Set<Range> correct = Range.rangeSet(ranges);
++        Set<Range> result1 = one.intersectionWith(two);
++        assert result1.equals(correct) : String.format("%s != %s",
++                                                       StringUtils.join(result1, ","),
++                                                       StringUtils.join(correct, ","));
++        Set<Range> result2 = two.intersectionWith(one);
++        assert result2.equals(correct) : String.format("%s != %s",
++                                                       StringUtils.join(result2, ","),
++                                                       StringUtils.join(correct, ","));
++    }
++
++    private void assertNoIntersection(Range wraps1, Range nowrap3)
++    {
++        assertIntersection(wraps1, nowrap3);
++    }
++
++    @Test
++    public void testIntersectionWithAll()
++    {
++        Range all0 = new Range(new BigIntegerToken("0"), new BigIntegerToken("0"));
++        Range all10 = new Range(new BigIntegerToken("10"), new BigIntegerToken("10"));
++        Range all100 = new Range(new BigIntegerToken("100"), new BigIntegerToken("100"));
++        Range all1000 = new Range(new BigIntegerToken("1000"), new BigIntegerToken("1000"));
++        Range wraps = new Range(new BigIntegerToken("100"), new BigIntegerToken("10"));
++
++        assertIntersection(all0, wraps, wraps);
++        assertIntersection(all10, wraps, wraps);
++        assertIntersection(all100, wraps, wraps);
++        assertIntersection(all1000, wraps, wraps);
++    }
++
++    @Test
++    public void testIntersectionContains()
++    {
++        Range wraps1 = new Range(new BigIntegerToken("100"), new BigIntegerToken("10"));
++        Range wraps2 = new Range(new BigIntegerToken("90"), new BigIntegerToken("20"));
++        Range wraps3 = new Range(new BigIntegerToken("90"), new BigIntegerToken("0"));
++        Range nowrap1 = new Range(new BigIntegerToken("100"), new BigIntegerToken("110"));
++        Range nowrap2 = new Range(new BigIntegerToken("0"), new BigIntegerToken("10"));
++        Range nowrap3 = new Range(new BigIntegerToken("0"), new BigIntegerToken("9"));
++
++        assertIntersection(wraps1, wraps2, wraps1);
++        assertIntersection(wraps3, wraps2, wraps3);
++
++        assertIntersection(wraps1, nowrap1, nowrap1);
++        assertIntersection(wraps1, nowrap2, nowrap2);
++        assertIntersection(nowrap2, nowrap3, nowrap3);
++
++        assertIntersection(wraps1, wraps1, wraps1);
++        assertIntersection(nowrap1, nowrap1, nowrap1);
++        assertIntersection(nowrap2, nowrap2, nowrap2);
++        assertIntersection(wraps3, wraps3, wraps3);
++    }
++
++    @Test
++    public void testNoIntersection()
++    {
++        Range wraps1 = new Range(new BigIntegerToken("100"), new BigIntegerToken("10"));
++        Range wraps2 = new Range(new BigIntegerToken("100"), new BigIntegerToken("0"));
++        Range nowrap1 = new Range(new BigIntegerToken("0"), new BigIntegerToken("100"));
++        Range nowrap2 = new Range(new BigIntegerToken("100"), new BigIntegerToken("200"));
++        Range nowrap3 = new Range(new BigIntegerToken("10"), new BigIntegerToken("100"));
++
++        assertNoIntersection(wraps1, nowrap3);
++        assertNoIntersection(wraps2, nowrap1);
++        assertNoIntersection(nowrap1, nowrap2);
++    }
++
++    @Test
++    public void testIntersectionOneWraps()
++    {
++        Range wraps1 = new Range(new BigIntegerToken("100"), new BigIntegerToken("10"));
++        Range wraps2 = new Range(new BigIntegerToken("100"), new BigIntegerToken("0"));
++        Range nowrap1 = new Range(new BigIntegerToken("0"), new BigIntegerToken("200"));
++        Range nowrap2 = new Range(new BigIntegerToken("0"), new BigIntegerToken("100"));
++
++        assertIntersection(wraps1,
++                           nowrap1,
++                           new Range(new BigIntegerToken("0"), new BigIntegerToken("10")),
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("200")));
++        assertIntersection(wraps2,
++                           nowrap1,
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("200")));
++        assertIntersection(wraps1,
++                           nowrap2,
++                           new Range(new BigIntegerToken("0"), new BigIntegerToken("10")));
++    }
++
++    @Test
++    public void testIntersectionTwoWraps()
++    {
++        Range wraps1 = new Range(new BigIntegerToken("100"), new BigIntegerToken("20"));
++        Range wraps2 = new Range(new BigIntegerToken("120"), new BigIntegerToken("90"));
++        Range wraps3 = new Range(new BigIntegerToken("120"), new BigIntegerToken("110"));
++        Range wraps4 = new Range(new BigIntegerToken("10"), new BigIntegerToken("0"));
++        Range wraps5 = new Range(new BigIntegerToken("10"), new BigIntegerToken("1"));
++        Range wraps6 = new Range(new BigIntegerToken("30"), new BigIntegerToken("10"));
++
++        assertIntersection(wraps1,
++                           wraps2,
++                           new Range(new BigIntegerToken("120"), new BigIntegerToken("20")));
++        assertIntersection(wraps1,
++                           wraps3,
++                           new Range(new BigIntegerToken("120"), new BigIntegerToken("20")),
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("110")));
++        assertIntersection(wraps1,
++                           wraps4,
++                           new Range(new BigIntegerToken("10"), new BigIntegerToken("20")),
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("0")));
++        assertIntersection(wraps1,
++                           wraps5,
++                           new Range(new BigIntegerToken("10"), new BigIntegerToken("20")),
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("1")));
++        assertIntersection(wraps1,
++                           wraps6,
++                           new Range(new BigIntegerToken("100"), new BigIntegerToken("10")));
++    }
++}
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeTest.java
+index 3962f1cd..41464a49 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/dht/RangeTest.java
+@@ -19,6 +19,9 @@
+ */
+ package org.apache.cassandra.dht;
+ 
++import java.util.Arrays;
++import java.util.List;
++
+ import org.junit.Test;
+ 
+ public class RangeTest
+@@ -81,6 +84,7 @@ public void testContainsRangeWrapping()
+         Range two = new Range(new BigIntegerToken("5"), new BigIntegerToken("3"));
+         Range thr = new Range(new BigIntegerToken("10"), new BigIntegerToken("12"));
+         Range fou = new Range(new BigIntegerToken("2"), new BigIntegerToken("6"));
++        Range fiv = new Range(new BigIntegerToken("0"), new BigIntegerToken("0"));
+ 
+         assert !one.contains(two);
+         assert one.contains(thr);
+@@ -97,6 +101,30 @@ public void testContainsRangeWrapping()
+         assert !fou.contains(one);
+         assert !fou.contains(two);
+         assert !fou.contains(thr);
++
++        assert fiv.contains(one);
++        assert fiv.contains(two);
++        assert fiv.contains(thr);
++        assert fiv.contains(fou);
++    }
++
++    @Test
++    public void testContainsRangeOneWrapping()
++    {
++        Range wrap1 = new Range(new BigIntegerToken("0"), new BigIntegerToken("0"));
++        Range wrap2 = new Range(new BigIntegerToken("10"), new BigIntegerToken("2"));
++
++        Range nowrap1 = new Range(new BigIntegerToken("0"), new BigIntegerToken("2"));
++        Range nowrap2 = new Range(new BigIntegerToken("2"), new BigIntegerToken("10"));
++        Range nowrap3 = new Range(new BigIntegerToken("10"), new BigIntegerToken("100"));
++
++        assert wrap1.contains(nowrap1);
++        assert wrap1.contains(nowrap2);
++        assert wrap1.contains(nowrap3);
++
++        assert wrap2.contains(nowrap1);
++        assert !wrap2.contains(nowrap2);
++        assert wrap2.contains(nowrap3);
+     }
+ 
+     @Test
+@@ -125,12 +153,14 @@ public void testIntersectsWrapping()
+     {
+         Range onewrap = new Range(new BigIntegerToken("10"), new BigIntegerToken("2"));
+         Range onecomplement = new Range(onewrap.right, onewrap.left);
+-        Range oneadjoins = new Range(onewrap.left, new BigIntegerToken("12"));
++        Range onestartswith = new Range(onewrap.left, new BigIntegerToken("12"));
++        Range oneendswith = new Range(new BigIntegerToken("1"), onewrap.right);
+         Range twowrap = new Range(new BigIntegerToken("5"), new BigIntegerToken("3"));
+         Range not = new Range(new BigIntegerToken("2"), new BigIntegerToken("6"));
+ 
+         assert !onewrap.intersects(onecomplement);
+-        assert onewrap.intersects(oneadjoins);
++        assert onewrap.intersects(onestartswith);
++        assert onewrap.intersects(oneendswith);
+ 
+         assert onewrap.intersects(twowrap);
+         assert twowrap.intersects(onewrap);

@@ -1,0 +1,333 @@
+diff --git a/incubator/aries/trunk/jndi/jndi-url/src/main/java/org/apache/aries/jndi/services/ServiceHelper.java b/incubator/aries/trunk/jndi/jndi-url/src/main/java/org/apache/aries/jndi/services/ServiceHelper.java
+index a5d9fb00..7de5a3e3 100644
+--- a/incubator/aries/trunk/jndi/jndi-url/src/main/java/org/apache/aries/jndi/services/ServiceHelper.java
++++ b/incubator/aries/trunk/jndi/jndi-url/src/main/java/org/apache/aries/jndi/services/ServiceHelper.java
+@@ -18,15 +18,21 @@
+  */
+ package org.apache.aries.jndi.services;
+ 
++import java.lang.ref.WeakReference;
+ import java.lang.reflect.InvocationHandler;
+ import java.lang.reflect.InvocationTargetException;
+ import java.lang.reflect.Method;
+ import java.lang.reflect.Proxy;
++import java.security.AccessController;
++import java.security.PrivilegedAction;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Comparator;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ 
+ import javax.naming.NamingException;
+ 
+@@ -34,9 +40,13 @@
+ import org.apache.aries.util.BundleToClassLoaderAdapter;
+ import org.osgi.framework.Bundle;
+ import org.osgi.framework.BundleContext;
++import org.osgi.framework.BundleEvent;
++import org.osgi.framework.BundleListener;
+ import org.osgi.framework.Constants;
+ import org.osgi.framework.InvalidSyntaxException;
++import org.osgi.framework.ServiceEvent;
+ import org.osgi.framework.ServiceException;
++import org.osgi.framework.ServiceListener;
+ import org.osgi.framework.ServiceReference;
+ import org.osgi.service.jndi.JNDIConstants;
+ 
+@@ -53,24 +63,107 @@
+  *   the BundleContext for the bundle should be used to obtain the service.
+  * </p>
+  */
+-public final class ServiceHelper {
++public final class ServiceHelper
++{
++  public static final class CacheClearoutListener implements BundleListener, ServiceListener
++  {
++    /** The cache to purge */
++    private final ConcurrentMap<ServiceKey, WeakReference<Object>> cache;
++
++    public CacheClearoutListener(ConcurrentMap<ServiceKey, WeakReference<Object>> pc)
++    {
++      cache = pc;
++    }
++
++    public void bundleChanged(BundleEvent event)
++    {
++      if (event.getType() == BundleEvent.STOPPED) {
++        Bundle b = event.getBundle();
++        Iterator<ServiceKey> keys = cache.keySet().iterator();
++        while (keys.hasNext()) {
++          ServiceKey key = keys.next();
++          if (key.requesting == b) keys.remove();
++        }
++      }
++    }
+     
+-    private static class JNDIServiceDamper implements InvocationHandler {
+-        private BundleContext ctx;
++    public void serviceChanged(ServiceEvent event)
++    {
++      if (event.getType() == ServiceEvent.UNREGISTERING) {
++        ServiceReference ref = event.getServiceReference();
++        Long serviceId = (Long) ref.getProperty(Constants.SERVICE_ID);
++        Bundle registeringBundle = ref.getBundle();
++        Iterator<ServiceKey> keys = cache.keySet().iterator();
++        while (keys.hasNext()) {
++          ServiceKey key = keys.next();
++          if (key.registering == registeringBundle && serviceId.equals(key.serviceId)) {
++            keys.remove();
++            break;
++          }
++        }
++      }
++    }
++
++    public void add(final BundleContext ctx, ServiceKey k)
++    {
++      // try to use the system bundle for our listener, if that fails we fall back to the calling context
++      BundleContext systemBundle = AccessController.doPrivileged(new PrivilegedAction<BundleContext>() {
++        public BundleContext run()
++        {
++          return ctx.getBundle(0).getBundleContext();
++        }
++      });
++      if (systemBundle == null) systemBundle = ctx;
++      systemBundle.addBundleListener(cacheClearoutListener);
++      systemBundle.addServiceListener(cacheClearoutListener);
++    }
++  }
++
++  private static final class ServiceKey
++  {
++    private final Bundle requesting;
++    private final Bundle registering;
++    private final Long serviceId;
++    private final int hash;
++
++    public ServiceKey(Bundle owningBundle, Bundle registeringBundle, Long property)
++    {
++      requesting = owningBundle;
++      registering = registeringBundle;
++      serviceId = property;
++      hash = serviceId.intValue() * 100003 + System.identityHashCode(requesting);
++    }
+ 
+-        private ServicePair pair;
++    public int hashCode()
++    {
++      return hash;
++    }
+ 
+-        private String interfaceName;
++    public boolean equals(Object other)
++    {
++      if (other == this) return true;
++      if (other == null) return false;
+ 
+-        private String filter;
++      if (other instanceof ServiceKey) {
++        ServiceKey otherKey = (ServiceKey) other;
++        return (otherKey.requesting == requesting && otherKey.serviceId.equals(serviceId));
++      }
+ 
++      return false;
++    }
++  }
++
++  private static class JNDIServiceDamper implements InvocationHandler
++  {
++    private BundleContext ctx;
++    private ServicePair pair;
++    private String interfaceName;
++    private String filter;
+         private boolean dynamic;
+ 
+-        public JNDIServiceDamper(BundleContext context,
+-                                 String i,
+-                                 String f,
+-                                 ServicePair service,
+-                                 boolean d) {
++    public JNDIServiceDamper(BundleContext context, String i, String f, ServicePair service,
++        boolean d)
++    {
+             ctx = context;
+             pair = service;
+             interfaceName = i;
+@@ -78,7 +171,8 @@ public JNDIServiceDamper(BundleContext context,
+             dynamic = d;
+         }
+ 
+-        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
++    public Object invoke(Object proxy, Method method, Object[] args) throws Throwable
++    {
+             if (pair == null || pair.ref.getBundle() == null) {
+                 if (dynamic) {
+                     pair = findService(ctx, interfaceName, filter);
+@@ -99,16 +193,20 @@ public Object invoke(Object proxy, Method method, Object[] args) throws Throwabl
+         }
+     }
+ 
+-    private static class ServicePair {
++  private static class ServicePair
++  {
+         private ServiceReference ref;
+         private Object service;
+     }
+ 
+-    public static Object getService(BundleContext ctx,
+-                                    OsgiName lookupName,
+-                                    String id,
+-                                    boolean dynamicRebind,
+-                                    Map<String, Object> env) throws NamingException {
++  /** A cache of proxies returned to the client */
++  private static final ConcurrentMap<ServiceKey, WeakReference<Object>> proxyCache = new ConcurrentHashMap<ServiceKey, WeakReference<Object>>();
++  private static final CacheClearoutListener cacheClearoutListener = new CacheClearoutListener(
++      proxyCache);
++
++  public static Object getService(BundleContext ctx, OsgiName lookupName, String id,
++      boolean dynamicRebind, Map<String, Object> env) throws NamingException
++  {
+         Object result = null;
+ 
+         String interfaceName = lookupName.getInterface();
+@@ -134,7 +232,8 @@ public static Object getService(BundleContext ctx,
+             if (id == null) {
+                 filter = "(" + JNDIConstants.JNDI_SERVICENAME + "=" + serviceName + ')';
+             } else {
+-                filter = "(&(" + Constants.SERVICE_ID + '=' + id + ")(" + JNDIConstants.JNDI_SERVICENAME + "=" + serviceName + "))";
++        filter = "(&(" + Constants.SERVICE_ID + '=' + id + ")(" + JNDIConstants.JNDI_SERVICENAME
++            + "=" + serviceName + "))";
+             }
+             pair = findService(ctx, interfaceName, filter);
+         }
+@@ -146,14 +245,47 @@ public static Object getService(BundleContext ctx,
+         return result;
+     }
+ 
+-    private static Object proxy(String interface1,
+-                                String filter,
+-                                boolean dynamicRebind,
+-                                BundleContext ctx,
+-                                ServicePair pair) {
++  private static Object proxy(final String interface1, final String filter, final boolean rebind,
++      final BundleContext ctx, final ServicePair pair)
++  {
++    Object result = null;
++    Bundle owningBundle = ctx.getBundle();
++    ServiceKey k = new ServiceKey(owningBundle, pair.ref.getBundle(), (Long) pair.ref
++        .getProperty(Constants.SERVICE_ID));
++
++    WeakReference<Object> proxyRef = proxyCache.get(k);
++
++    if (proxyRef != null) {
++      result = proxyRef.get();
++      if (result == null) {
++        proxyCache.remove(k, proxyRef);
++      }
++    }
++
++    if (result == null) {
++      result = AccessController.doPrivileged(new PrivilegedAction<Object>() {
++        public Object run()
++        {
++          return proxyPriviledged(interface1, filter, rebind, ctx, pair);
++        }
++      });
++
++      proxyRef = new WeakReference<Object>(result);
++      // if we have two threads doing a put and then clashing we ignore it. The code to ensure only
++      // one wins is quite complex to save a few bytes of memory and millis of execution time.
++      proxyCache.putIfAbsent(k, proxyRef);
++      cacheClearoutListener.add(ctx, k);
++    }
++
++    return result;
++  }
++
++  private static Object proxyPriviledged(String interface1, String filter, boolean dynamicRebind,
++      BundleContext ctx, ServicePair pair)
++  {
+         String[] interfaces = null;   
+         if (interface1 != null) {
+-            interfaces = new String [] { interface1 };
++      interfaces = new String[] { interface1 };
+         } else {
+             interfaces = (String[]) pair.ref.getProperty(Constants.OBJECTCLASS);
+         }
+@@ -207,13 +339,13 @@ private static Object proxy(String interface1,
+         // wrapping the service provider bundle. The class is actually defined
+         // on this adapter.
+ 
+-        return Proxy.newProxyInstance(new BundleToClassLoaderAdapter(serviceProviderBundle),
+-                                      clazz.toArray(new Class<?>[clazz.size()]), 
+-                                      ih);
++    return Proxy.newProxyInstance(new BundleToClassLoaderAdapter(serviceProviderBundle), clazz
++        .toArray(new Class<?>[clazz.size()]), ih);
+     }
+ 
+     private static ServicePair findService(BundleContext ctx, String interface1, String filter)
+-            throws NamingException {
++      throws NamingException
++  {
+         ServicePair p = null;
+ 
+         try {
+@@ -222,7 +354,8 @@ private static ServicePair findService(BundleContext ctx, String interface1, Str
+             if (refs != null) {
+                 // natural order is the exact opposite of the order we desire.
+                 Arrays.sort(refs, new Comparator<ServiceReference>() {
+-                    public int compare(ServiceReference o1, ServiceReference o2) {
++          public int compare(ServiceReference o1, ServiceReference o2)
++          {
+                         return o2.compareTo(o1);
+                     }
+                 });
+@@ -249,19 +382,17 @@ public int compare(ServiceReference o1, ServiceReference o2) {
+         return p;
+     }
+ 
+-    public static ServiceReference[] getServiceReferences(BundleContext ctx,
+-                                                          String interface1,
+-                                                          String filter,
+-                                                          String serviceName,
+-                                                          Map<String, Object> env)
+-            throws NamingException {
++  public static ServiceReference[] getServiceReferences(BundleContext ctx, String interface1,
++      String filter, String serviceName, Map<String, Object> env) throws NamingException
++  {
+         ServiceReference[] refs = null;
+ 
+         try {
+             refs = ctx.getServiceReferences(interface1, filter);
+ 
+             if (refs == null || refs.length == 0) {
+-                refs = ctx.getServiceReferences(null, "(" + JNDIConstants.JNDI_SERVICENAME + "=" + serviceName + ')');
++        refs = ctx.getServiceReferences(null, "(" + JNDIConstants.JNDI_SERVICENAME + "="
++            + serviceName + ')');
+             }
+         } catch (InvalidSyntaxException e) {
+             throw (NamingException) new NamingException(e.getFilter()).initCause(e);
+@@ -270,7 +401,8 @@ public int compare(ServiceReference o1, ServiceReference o2) {
+         if (refs != null) {
+             // natural order is the exact opposite of the order we desire.
+             Arrays.sort(refs, new Comparator<ServiceReference>() {
+-                public int compare(ServiceReference o1, ServiceReference o2) {
++        public int compare(ServiceReference o1, ServiceReference o2)
++        {
+                     return o2.compareTo(o1);
+                 }
+             });
+@@ -279,7 +411,8 @@ public int compare(ServiceReference o1, ServiceReference o2) {
+         return refs;
+     }
+ 
+-    public static Object getService(BundleContext ctx, ServiceReference ref) {
++  public static Object getService(BundleContext ctx, ServiceReference ref)
++  {
+         Object service = ctx.getService(ref);
+ 
+         Object result = null;

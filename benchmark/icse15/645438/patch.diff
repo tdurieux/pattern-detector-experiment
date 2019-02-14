@@ -1,0 +1,877 @@
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Connection.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Connection.java
+index 45bec72b..20ffcb9f 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Connection.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Connection.java
+@@ -1000,6 +1000,13 @@ private void setTransactionIsolationX(int level)
+      */
+     protected abstract boolean supportsSessionDataCaching();
+ 
++    /**
++     * Checks whether the server supports locators for large objects.
++     *
++     * @return {@code true} if LOB locators are supported.
++     */
++    protected abstract boolean serverSupportsLocators();
++
+     public int getTransactionIsolation() throws SQLException {
+     	
+     	// Store the current auto-commit value and use it to restore 
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Cursor.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Cursor.java
+index 02533cf4..35fbe579 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Cursor.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Cursor.java
+@@ -663,6 +663,29 @@ private final String getStringFromTIMESTAMP(int column) throws SqlException {
+         return recyclableCalendar_;
+     }
+ 
++    /**
++     * Returns a reference to the locator procedures.
++     * <p>
++     * These procedures are used to operate on large objects referenced on the
++     * server by locators.
++     *
++     * @return The locator procedures object.
++     */
++    CallableLocatorProcedures getLocatorProcedures() {
++        return agent_.connection_.locatorProcedureCall();
++    }
++
++    /**
++     * Obtains the locator for the specified LOB column.
++     * <p>
++     * Note that this method cannot be invoked on a LOB column that is NULL.
++     *
++     * @param column 1-based column index
++     * @return A positive integer locator if valid, {@link Lob#INVALID_LOCATOR}
++     *      otherwise.
++     */
++    protected abstract int locator(int column);
++
+     abstract public Blob getBlobColumn_(int column, Agent agent) throws SqlException;
+ 
+     abstract public Clob getClobColumn_(int column, Agent agent) throws SqlException;
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/LOBStateTracker.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/LOBStateTracker.java
+index e69de29b..00f31926 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/LOBStateTracker.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/LOBStateTracker.java
+@@ -0,0 +1,150 @@
++/*
++
++   Derby - Class org.apache.derby.client.am.LOBStateTracker
++
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++*/
++package org.apache.derby.client.am;
++
++import java.util.Arrays;
++
++/**
++ * An object that tracks the state of large objects (LOBs) in a result set.
++ * <p>
++ * This object covers two types of functionality regarding LOBs;
++ * <ul>
++ *      <li>Keep track of whether a LOB column has been accessed.</li>
++ *      <li>Release LOB locators on the server.</li>
++ * </ul>
++ * The former functionality is always present in a tracker object. The latter
++ * functionality may or may not be available. This is decided by whether
++ * locators are supported by the server or not.
++ * <p>
++ * The tracker has a notion of current row. The current row is changed by
++ * calling {@link #checkCurrentRow checkCurrentRow}. The owner of the tracker
++ * is repsonsible for invoking the method at the correct time, and only when
++ * the cursor is positioned on a valid data row. The method must be invoked
++ * before the cursor changes the position. Note that calling the method
++ * {@link #discardState discardState} makes {@code checkCurrentRow} ignore all
++ * LOBs on the subsequent call.
++ */
++class LOBStateTracker {
++
++    /** Instance to use when there are no LOBs in the result set. */
++    public static final LOBStateTracker NO_OP_TRACKER =
++            new LOBStateTracker(new int[0], new boolean[0], false);
++
++    /** 1-based column indexes for the LOBs to track. */
++    private final int[] columns;
++    /** Tells whether a LOB is Blob or a Clob. */
++    private final boolean[] isBlob;
++    /** Tells whether a LOB colum has been accessed in the current row.  */
++    private final boolean[] accessed;
++    /**
++     * Tells whether locators shall be released. This will be {@code false} if
++     * locators are not supported by the server.
++     */
++    private final boolean release;
++    /**
++     * The last locator values seen when releasing. These values are used to
++     * detect if {@linkplain #checkCurrentRow} is being executed more than once
++     * on the same row.
++     */
++    private final int[] lastLocatorSeen;
++
++    /**
++     * Creates a LOB state tracker for the specified configuration.
++     *
++     * @param lobIndexes the 1-based indexes of the LOB columns
++     * @param isBlob whether the LOB is a Blob or a Clob
++     * @param release whether locators shall be released
++     * @see #NO_OP_TRACKER
++     */
++    LOBStateTracker(int[] lobIndexes, boolean[] isBlob, boolean release) {
++        this.columns = lobIndexes;
++        this.isBlob = isBlob;
++        this.accessed = new boolean[columns.length];
++        this.release = release;
++        // Zero is an invalid locator, so don't fill with different value.
++        this.lastLocatorSeen = new int[columns.length];
++    }
++
++    /**
++     * Checks the current row, updating state and releasing locators on the
++     * server as required.
++     * <p>
++     * This method should only be called once per valid row in the result set.
++     *
++     * @param cursor the cursor object to use for releasing the locators
++     * @throws SqlException if releasing the locators on the server fails
++     */
++    void checkCurrentRow(Cursor cursor)
++            throws SqlException {
++        if (this.release) {
++            CallableLocatorProcedures procs = cursor.getLocatorProcedures();
++            for (int i=0; i < this.columns.length; i++) {
++                // Note the conversion from 1-based to 0-based index when
++                // checking if the column has a NULL value.
++                if (!this.accessed[i] && !cursor.isNull_[this.columns[i] -1]) {
++                    // Fetch the locator so we can free it.
++                    int locator = cursor.locator(this.columns[i]);
++                    if (locator == this.lastLocatorSeen[i]) {
++                        // We are being called on the same row twice...
++                        return;
++                    }
++                    this.lastLocatorSeen[i] = locator;
++                    if (this.isBlob[i]) {
++                        procs.blobReleaseLocator(locator);
++                    } else {
++                        procs.clobReleaseLocator(locator);
++                    }
++                }
++            }
++        }
++        // Reset state for the next row.
++        Arrays.fill(this.accessed, false);
++    }
++
++    /**
++     * Discards all recorded dynamic state about LOBs.
++     * <p>
++     * Typically called after connection commit or rollback, as those operations
++     * will release all locators on the server automatically. There is no need
++     * to release them from the client side in this case.
++     */
++    void discardState() {
++        // Force the internal state to accessed for all LOB columns.
++        // This will cause checkCurrentRow to ignore all LOBs on the next
++        // invocation. The method markAccessed cannot be called before after
++        // checkCurrentRow has been called again.
++        Arrays.fill(this.accessed, true);
++    }
++
++    /**
++     * Marks the specified column of the current row as accessed, which implies
++     * that the tracker should not release the associated locator.
++     * <p>
++     * Columns must be marked as accessed when a LOB object is created on
++     * the client, to avoid releasing the corresponding locator too early.
++     *
++     * @param index 1-based column index
++     */
++    void markAccessed(int index) {
++        int internalIndex = Arrays.binarySearch(this.columns, index);
++        this.accessed[internalIndex] = true;
++    }
++}
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/ResultSet.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/ResultSet.java
+index 4f7131dd..2da84c7b 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/ResultSet.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/ResultSet.java
+@@ -29,6 +29,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.client.am.SQLExceptionFactory;
+ import org.apache.derby.shared.common.reference.SQLState;
+ import org.apache.derby.shared.common.i18n.MessageUtil;
++import org.apache.derby.shared.common.sanity.SanityManager;
+ 
+ public abstract class ResultSet implements java.sql.ResultSet,
+         ResultSetCallbackInterface {
+@@ -38,6 +39,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     public ColumnMetaData resultSetMetaData_; // As obtained from the SQLDA
+     private SqlWarning warnings_;
+     public Cursor cursor_;
++    /** Tracker object for LOB state, used to free locators on the server. */
++    private LOBStateTracker lobState = null;
+     protected Agent agent_;
+ 
+     public Section generatedSection_ = null;
+@@ -428,6 +431,12 @@ public final void closeX() throws SqlException {
+             return;
+         }
+         closeCloseFilterInputStream();
++        // See if there are open locators on the current row, if valid.
++        if (isValidCursorPosition_ && !isOnInsertRow_) {
++            lobState.checkCurrentRow(cursor_);
++        }
++        // NOTE: The preClose_ method must also check for locators if
++        //       prefetching of data is enabled for result sets containing LOBs.
+         preClose_();
+         try {
+             if (openOnServer_) {
+@@ -3759,6 +3768,12 @@ public void moveToCurrentRow() throws SQLException {
+         }
+     }
+     
++    /**
++     * Moves off the insert row if positioned there, and checks the current row
++     * for releasable LOB locators if positioned on a valid data row.
++     *
++     * @throws SqlException if releasing a LOB locator fails
++     */
+     private void moveToCurrentRowX() throws SqlException {
+         if (isOnInsertRow_) {
+             resetUpdatedColumns();
+@@ -3769,6 +3784,14 @@ private void moveToCurrentRowX() throws SqlException {
+             }
+             isValidCursorPosition_ = true;
+         }
++        if (isValidCursorPosition_) {
++            // isOnInsertRow must be false here.
++            if (SanityManager.DEBUG) {
++                SanityManager.ASSERT(!isOnInsertRow_,
++                        "Cannot check current row if positioned on insert row");
++            }
++            lobState.checkCurrentRow(cursor_);
++        }
+     }
+ 
+     /**
+@@ -4340,6 +4363,7 @@ public void listenToUnitOfWork() {
+ 
+     public void completeLocalCommit(java.util.Iterator listenerIterator) {
+         cursorUnpositionedOnServer_ = true;
++        lobState.discardState(); // Locators released on server side.
+         markAutoCommitted();
+         if (!cursorHold_) {
+             // only non-held cursors need to be closed at commit
+@@ -4352,6 +4376,7 @@ public void completeLocalCommit(java.util.Iterator listenerIterator) {
+     }
+ 
+     public void completeLocalRollback(java.util.Iterator listenerIterator) {
++        lobState.discardState(); // Locators released on server side.
+         markAutoCommitted();
+         // all cursors need to be closed at rollback
+         markClosed();
+@@ -6175,4 +6200,52 @@ public void updateClob(String columnLabel, java.sql.Clob x)
+             throw se.getSQLException();
+         }
+     }
++
++    /**
++     * Marks the LOB at the specified column as accessed.
++     * <p>
++     * When a LOB is marked as accessed, the release mechanism will not be
++     * invoked by the result set. It is expected that the code accessing the
++     * LOB releases the locator when it is done with the LOB.
++     *
++     * @param index 1-based column index
++     */
++    public final void markLOBAsAccessed(int index) {
++        this.lobState.markAccessed(index);
++    }
++
++    /**
++     * Initializes the LOB state tracker.
++     * <p>
++     * The state tracker is used to free LOB locators on the server.
++     */
++    final void createLOBColumnTracker() {
++        if (SanityManager.DEBUG) {
++            SanityManager.ASSERT(this.lobState == null,
++                    "LOB state tracker already initialized.");
++        }
++        if (this.resultSetMetaData_.hasLobColumns()) {
++            final int columnCount = this.resultSetMetaData_.columns_;
++            int lobCount = 0;
++            int[] tmpIndexes = new int[columnCount];
++            boolean[] tmpIsBlob = new boolean[columnCount];
++            for (int i=0; i < columnCount; i++) {
++                int type = this.resultSetMetaData_.types_[i];
++                if (type == Types.BLOB || type == Types.CLOB) {
++                    tmpIndexes[lobCount] = i +1; // Convert to 1-based index.
++                    tmpIsBlob[lobCount++] = (type == Types.BLOB);
++                }
++            }
++            // Create a tracker for the LOB columns found.
++            int[] lobIndexes = new int[lobCount];
++            boolean[] isBlob = new boolean[lobCount];
++            System.arraycopy(tmpIndexes, 0, lobIndexes, 0, lobCount);
++            System.arraycopy(tmpIsBlob, 0, isBlob, 0, lobCount);
++            this.lobState = new LOBStateTracker(lobIndexes, isBlob,
++                    this.connection_.serverSupportsLocators());
++        } else {
++            // Use a no-op state tracker to simplify code expecting a tracker.
++            this.lobState = LOBStateTracker.NO_OP_TRACKER;
++        }
++    }
+ }
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Statement.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Statement.java
+index 70615b19..402f9366 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Statement.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/am/Statement.java
+@@ -1489,6 +1489,8 @@ public void completeOpenQuery(Sqlca sqlca, ResultSet resultSet) {
+         }
+         resultSet.resultSetMetaData_ = resultSetMetaData_;
+         resultSet.resultSetMetaData_.resultSetConcurrency_ = resultSet.resultSetConcurrency_;
++        // Create tracker for LOB locator columns.
++        resultSet.createLOBColumnTracker();
+ 
+         // only cache the Cursor object for a PreparedStatement and if a Cursor object is
+         // not already cached.
+@@ -1521,6 +1523,8 @@ public void completeExecuteCallOpenQuery(Sqlca sqlca, ResultSet resultSet, Colum
+         resultSet.completeSqlca(sqlca);
+         // For CallableStatements we can't just clobber the resultSet_ here, must use setResultSetEvent() separately
+         resultSet.resultSetMetaData_ = resultSetMetaData;
++        // Create tracker for LOB locator columns.
++        resultSet.createLOBColumnTracker();
+ 
+         // The following two assignments should have already happened via prepareEvent(),
+         // but are included here for safety for the time being.
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetConnection.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetConnection.java
+index 38ed61a6..8f105f07 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetConnection.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetConnection.java
+@@ -1731,6 +1731,17 @@ protected final boolean supportsSessionDataCaching() {
+         return metadata.serverSupportsSessionDataCaching();
+     }
+ 
++    /**
++     * Checks whether the server supports locators for large objects.
++     *
++     * @return {@code true} if LOB locators are supported.
++     */
++    protected final boolean serverSupportsLocators() {
++        // Support for locators was added in the same version as layer B
++        // streaming.
++        return serverSupportsLayerBStreaming();
++    }
++
+     /**
+      * Returns if a transaction is in process
+      * @return open
+diff --git a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetCursor.java b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetCursor.java
+index bd2bc336..6b92ae62 100644
+--- a/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetCursor.java
++++ b/db/derby/code/branches/10.4/java/client/org/apache/derby/client/net/NetCursor.java
+@@ -1054,11 +1054,14 @@ void setBlocking(int queryProtocolType) {
+     
+     /**
+      * Get locator for LOB of the designated column
++     * <p>
++     * Note that this method cannot be invoked on a LOB column that is NULL.
++     *
+      * @param column column number, starts at 1
+      * @return locator value, <code>Lob.INVALID_LOCATOR</code> if LOB
+      *         value was sent instead of locator
+      */
+-    private int locator(int column)
++    protected int locator(int column)
+     {
+         int locator = get_INTEGER(column);
+         // If Lob value was sent instead of locator, the value will be
+@@ -1075,6 +1078,7 @@ private int locator(int column)
+ 
+     public Blob getBlobColumn_(int column, Agent agent) throws SqlException 
+     {
++        netResultSet_.markLOBAsAccessed(column);
+         // Check for locator
+         int locator = locator(column);
+         if (locator > 0) { // Create locator-based LOB object
+@@ -1109,6 +1113,7 @@ public Blob getBlobColumn_(int column, Agent agent) throws SqlException
+ 
+ 
+     public Clob getClobColumn_(int column, Agent agent) throws SqlException {
++        netResultSet_.markLOBAsAccessed(column);
+         // Check for locator
+         int locator = locator(column);
+         if (locator > 0) { // Create locator-based LOB object
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/LOBLocatorReleaseTest.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/LOBLocatorReleaseTest.java
+index e69de29b..9d2532a5 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/LOBLocatorReleaseTest.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/LOBLocatorReleaseTest.java
+@@ -0,0 +1,442 @@
++/*
++
++   Derby - Class org.apache.derbyTesting.functionTests.tests.derbynet.LOBLocatorReleaseTest
++
++   Licensed to the Apache Software Foundation (ASF) under one or more
++   contributor license agreements.  See the NOTICE file distributed with
++   this work for additional information regarding copyright ownership.
++   The ASF licenses this file to You under the Apache License, Version 2.0
++   (the "License"); you may not use this file except in compliance with
++   the License.  You may obtain a copy of the License at
++
++      http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++*/
++
++package org.apache.derbyTesting.functionTests.tests.derbynet;
++
++import java.io.UnsupportedEncodingException;
++import java.sql.Blob;
++import java.sql.Clob;
++import java.sql.Connection;
++import java.sql.PreparedStatement;
++import java.sql.ResultSet;
++import java.sql.SQLException;
++import java.sql.Statement;
++import java.sql.Types;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++
++import junit.framework.Test;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++/**
++ * Tests of accessing large objects (LOBs) with locators.
++ */
++public class LOBLocatorReleaseTest
++        extends BaseJDBCTestCase {
++
++    public LOBLocatorReleaseTest(String name) {
++        super(name);
++    }
++
++    /**
++     * Tests that the code path for LOB locator release works fine for result
++     * sets without LOBs.
++     *
++     * @throws SQLException if the test fails for some reason
++     */
++    public void testNoLOBs()
++            throws SQLException {
++        // Test a forward only result set, with autocommit.
++        Statement stmt = createStatement();
++        ResultSet rs = stmt.executeQuery("select * from sys.systables");
++        while (rs.next()) {
++            // Do nothing, just iterate through.
++        }
++        rs.close();
++
++        // Basic test checking that the scrollable result code path works.
++        stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                               ResultSet.CONCUR_READ_ONLY);
++        getConnection().setAutoCommit(false);
++        rs = stmt.executeQuery("select * from sys.systables");
++        rs.absolute(3);
++        while (rs.next()) {
++            // Do nothing, just iterate through.
++        }
++        // Just navigate randomly.
++        rs.previous();
++        rs.absolute(2);
++        rs.relative(2);
++        rs.afterLast();
++        rs.first();
++        rs.next();
++        rs.last();
++        rs.beforeFirst();
++        // Close the statement instead of the result set first.
++        stmt.close();
++        rs.close();
++        rollback();
++    }
++
++    /**
++     * Test basic operations on forward only result sets.
++     *
++     * @throws SQLException if something causes the test to fail
++     */
++    public void testForwardOnlyWithNoNulls()
++            throws SQLException {
++        forwardOnlyTest("LOBLOC_NO_NULLS");
++    }
++
++    /**
++     * Test basic operations on forward only result sets containing NULL LOBs.
++     * <p>
++     * This requires some special care because NUL LOBs don't have a locator.
++     *
++     * @throws SQLException if something causes the test to fail
++     */
++    public void testForwardOnlyWithNulls()
++            throws SQLException {
++        forwardOnlyTest("LOBLOC_WITH_NULLS");
++    }
++
++    private void forwardOnlyTest(String table)
++            throws SQLException {
++        final String sql = "select dBlob, dClob from " + table;
++        getConnection().setAutoCommit(false);
++        // Just loop through.
++        Statement stmt = createStatement();
++        ResultSet rs = stmt.executeQuery(sql);
++        while (rs.next()) {
++            // Just iterate through.
++        }
++        rs.close();
++
++        // Loop through and get references to some of the LOBs.
++        // When you get a LOB reference, the locator shuold only be freed on
++        // explicit calls to free (requires Java SE 6) or commit/rollback.
++        rs = stmt.executeQuery(sql);
++        int index = 0;
++        while (rs.next()) {
++            if (index % 2 == 0) {
++                Blob b = rs.getBlob(1);
++                if (!rs.wasNull()) {
++                    b.length();
++                }
++            }
++            if (index % 3 == 0) {
++                Clob c = rs.getClob(2);
++                if (!rs.wasNull()) {
++                    c.length();
++                }
++            }
++            // Clear all LOB mappings after 10 rows.
++            if (index == 9) {
++                commit();
++            }
++            index++;
++        }
++        rs.close();
++        stmt.close();
++
++        // Close the statement after a few rows.
++        stmt = createStatement();
++        rs = stmt.executeQuery(sql);
++        rs.next();
++        rs.next();
++        stmt.close();
++        // The LOB mapping is cleared on a commit.
++        commit();
++
++        // Close the result set after a few rows and a rollback.
++        stmt = createStatement();
++        rs = stmt.executeQuery(sql);
++        rs.next();
++        rs.next();
++        rollback();
++        rs.close();
++    }
++
++    /**
++     * Tests that the LOB objects are not closed when closing the result set.
++     *
++     * @throws SQLException if something causes the test to fail
++     */
++    public void testBlobClobStateForwardOnlyWithNoNulls()
++            throws SQLException {
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement();
++        ResultSet rs = stmt.executeQuery(
++                "select dBlob, dClob from LOBLOC_NO_NULLS");
++        rs.next();
++        Blob b = rs.getBlob(1);
++        final long blobLength = b.length();
++        rs.next();
++        Clob c = rs.getClob(2);
++        final long clobLength = c.length();
++        rs.next();
++        rs.close();
++        // The LOB objects should still be usable.
++        assertEquals(blobLength, b.length());
++        assertEquals(clobLength, c.length());
++        commit();
++        try {
++            // This should fail because the locator has been released.
++            c.getSubString(1, 9);
++            fail("Locator should have been released, causing the call to fail");
++        } catch (SQLException sqle) {
++            assertSQLState("XJ215", sqle);
++        }
++    }
++
++    /**
++     * Tests that the LOB objects are not closed when closing the result set.
++     *
++     * @throws SQLException if something causes the test to fail
++     */
++    public void testBlobClobStateAfterCloseOnScrollable()
++            throws SQLException {
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                         ResultSet.CONCUR_READ_ONLY);
++        ResultSet rs = stmt.executeQuery(
++                "select dBlob, dClob from LOBLOC_NO_NULLS");
++        rs.next();
++        rs.relative(5);
++        Blob b = rs.getBlob(1);
++        final long blobLength = b.length();
++        rs.next();
++        Clob c = rs.getClob(2);
++        final long clobLength = c.length();
++        rs.first();
++        rs.close();
++        // The LOB objects should still be usable.
++        assertEquals(blobLength, b.length());
++        assertEquals(clobLength, c.length());
++        commit();
++        try {
++            // This should fail because the locator has been released.
++            c.getSubString(1, 9);
++            fail("Locator should have been released, causing the call to fail");
++        } catch (SQLException sqle) {
++            assertSQLState("XJ215", sqle);
++        }
++    }
++    /**
++     * Test navigation on a scrollable result set with LOB columns.
++     */
++    public void testScrollableWithNoNulls()
++            throws SQLException {
++        scrollableTest("LOBLOC_NO_NULLS", ResultSet.CONCUR_READ_ONLY);
++        scrollableTest("LOBLOC_NO_NULLS", ResultSet.CONCUR_UPDATABLE);
++    }
++
++    /**
++     * Test navigation on a scrollable result set with LOB columns containing
++     * some NULL values.
++     */
++    public void testScrollableWithNulls()
++            throws SQLException {
++        scrollableTest("LOBLOC_WITH_NULLS", ResultSet.CONCUR_READ_ONLY);
++        scrollableTest("LOBLOC_WITH_NULLS", ResultSet.CONCUR_UPDATABLE);
++    }
++
++    /**
++     * Tests a sequence of operations on a scrollable result set.
++     *
++     * @param table the table to query
++     * @param rsConcurrency the result set concurrency
++     */
++    private void scrollableTest(String table, int rsConcurrency)
++            throws SQLException {
++        final String sql = "select dBlob, dClob from " + table;
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                         rsConcurrency);
++        ResultSet rs = stmt.executeQuery(sql);
++        // Just iterate through and close.
++        while (rs.next()) {}
++        rs.close();
++
++        // Do some random navigation.
++        rs = stmt.executeQuery(sql);
++        rs.next();
++        rs.beforeFirst();
++        rs.first();
++        rs.relative(3);
++        rs.previous();
++        rs.last();
++        rs.absolute(5);
++        rs.afterLast();
++        rs.next();
++    }
++
++    /**
++     * Tests that the cursor can be positioned on the current row multiple
++     * times on a scrollable resultset.
++     * <p>
++     * The motivation for the test is that the locators assoicated with the
++     * current row must not be released multiple times.
++     */
++    public void testScrollableMoveToCurrentRow()
++            throws SQLException {
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                         ResultSet.CONCUR_UPDATABLE);
++        ResultSet rs = stmt.executeQuery(
++                "select dBlob, dClob from LOBLOC_NO_NULLS");
++        rs.next();
++        rs.moveToCurrentRow();
++        rs.moveToCurrentRow();
++    }
++
++    /**
++     * Tests that absolute positioning can be called for the same row multiple
++     * times on a scrollable resultset.
++     */
++    public void testScrollableAbsoluteRow()
++            throws SQLException {
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                         ResultSet.CONCUR_UPDATABLE);
++        ResultSet rs = stmt.executeQuery(
++                "select dBlob, dClob from LOBLOC_NO_NULLS");
++        rs.next();
++        rs.absolute(4);
++        rs.absolute(4);
++        rs.absolute(4);
++    }
++
++    /**
++     * Tests a sequence of operations on a scrollable, updatable resultset.
++     *
++     * @throws SQLException if the test fails
++     */
++    public void testScrollableUpdateWithLocators()
++            throws SQLException {
++        getConnection().setAutoCommit(false);
++        Statement stmt = createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
++                                         ResultSet.CONCUR_UPDATABLE);
++        ResultSet rs = stmt.executeQuery(
++                "select dBlob, dClob from LOBLOC_NO_NULLS");
++        rs.absolute(3);
++        Clob c1 = rs.getClob(2);
++        final int origLength = (int)c1.length();
++        final String origContent = c1.getSubString(1, origLength);
++        // Do a change
++        c1.setString(origLength, "FIRSTPASS");
++        rs.absolute(7);
++        rs.next();
++        // Move back to row 3
++        rs.absolute(3);
++        Clob c2 = rs.getClob(2);
++        assertEquals(origContent, c2.getSubString(1, (int)c2.length()));
++        rs.updateRow(); // Should be a no-op
++        rs.absolute(3);
++        // Expect this to fail if the restriction that LOB columns cannot be
++        // accessed more than once is enforced.
++        Clob c3 = rs.getClob(2);
++        assertEquals(origContent, c3.getSubString(1, (int)c3.length()));
++        rs.previous();
++        rs.next();
++        Clob c4 = rs.getClob(2);
++        final String newContent = "THIS IS THE NEW VALUE!";
++        c4.setString(1, newContent);
++        rs.updateClob(2, c4);
++        rs.updateRow();
++        c4.setString(1, "THIS IS NOT NOT NOT THE NEW VALUE!");
++        rs.updateRow();
++        rs.next();
++        rs.absolute(3);
++        Clob c5 = rs.getClob(2);
++        assertEquals(newContent, c5.getSubString(1, (int)c5.length()));
++        rollback();
++        assertInvalid(c1);
++        assertInvalid(c2);
++        assertInvalid(c3);
++        assertInvalid(c4);
++        assertInvalid(c5);
++    }
++
++    /**
++     * Asserts that the Clob is invalid by invoking a method on it (that is
++     * supposed to fail) and catching the exception. Fails if no exception is
++     * thrown, or the wrong exception is thrown.
++     *
++     * @param clob the Clob to check
++     */
++    private void assertInvalid(Clob clob) {
++        try {
++            clob.getSubString(1, (int)clob.length());
++            fail("Clob should have been invalidated");
++        } catch (SQLException sqle) {
++            assertSQLState("XJ215", sqle);
++        }
++    }
++
++    /**
++     * Returns a default suite running in a client-server environment.
++     * <p>
++     * The tests in this class is only meant to be run with client-server.
++     *
++     * @return A test suite.
++     */
++    public static Test suite() {
++        return new CleanDatabaseTestSetup(
++                TestConfiguration.clientServerSuite(
++                                                LOBLocatorReleaseTest.class)) {
++            /**
++             * Populates two tables with LOB data.
++             */
++            protected void decorateSQL(Statement s) throws SQLException {
++                s.executeUpdate("create table LOBLOC_NO_NULLS " +
++                        "(dBlob BLOB not null, dClob CLOB not null)");
++                Connection con = s.getConnection();
++                PreparedStatement ps = con.prepareStatement(
++                        "insert into LOBLOC_NO_NULLS values (?,?)");
++                String cContent = "A little test Clob";
++                byte[] bContent;
++                try {
++                    bContent = cContent.getBytes("US-ASCII");
++                } catch (UnsupportedEncodingException uee) {
++                    SQLException sqle = new SQLException();
++                    sqle.initCause(uee);
++                    throw sqle;
++                }
++                for (int i=0; i < 25; i++) {
++                    ps.setBytes(1, bContent);
++                    ps.setString(2, cContent);
++                    ps.executeUpdate();
++                }
++                ps.close();
++                s.executeUpdate("create table LOBLOC_WITH_NULLS " +
++                        "(dBlob BLOB, dClob CLOB)");
++                ps = con.prepareStatement(
++                        "insert into LOBLOC_WITH_NULLS values (?,?)");
++                for (int i=0; i < 25; i++) {
++                    if (i % 3 == 0) {
++                        ps.setNull(1, Types.BLOB);
++                    } else {
++                        ps.setBytes(1, bContent);
++                    }
++                    if (i % 4 == 0) {
++                        ps.setNull(2, Types.CLOB);
++                    } else {
++                        ps.setString(2, cContent);
++                    }
++                    ps.executeUpdate();
++                }
++                ps.close();
++                con.commit();
++            }
++        };
++    }
++}
+diff --git a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/_Suite.java b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/_Suite.java
+index c7f9f6e3..ffe2e338 100644
+--- a/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/_Suite.java
++++ b/db/derby/code/branches/10.4/java/testing/org/apache/derbyTesting/functionTests/tests/derbynet/_Suite.java
+@@ -58,6 +58,7 @@ public static Test suite() {
+         suite.addTest(NSinSameJVMTest.suite());
+         suite.addTest(NetworkServerControlClientCommandTest.suite());
+         suite.addTest(ServerPropertiesTest.suite());
++        suite.addTest(LOBLocatorReleaseTest.suite());
+         
+         
+         // Disabled due to "java.sql.SQLSyntaxErrorException: The class

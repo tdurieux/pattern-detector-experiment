@@ -1,0 +1,259 @@
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/CollationController.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/CollationController.java
+index 38d6bd18..b59e5261 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/CollationController.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/CollationController.java
+@@ -59,7 +59,9 @@ public CollationController(ColumnFamilyStore cfs, boolean mutableColumns, QueryF
+ 
+     public ColumnFamily getTopLevelColumns()
+     {
+-        return filter.filter instanceof NamesQueryFilter && cfs.metadata.getDefaultValidator() != CounterColumnType.instance
++        return filter.filter instanceof NamesQueryFilter
++               && (cfs.metadata.cfType == ColumnFamilyType.Standard || filter.path.superColumnName != null)
++               && cfs.metadata.getDefaultValidator() != CounterColumnType.instance
+                ? collectTimeOrderedData()
+                : collectAllData();
+     }
+@@ -95,8 +97,7 @@ private ColumnFamily collectTimeOrderedData()
+ 
+             // avoid changing the filter columns of the original filter
+             // (reduceNameFilter removes columns that are known to be irrelevant)
+-            TreeSet<ByteBuffer> filterColumns = new TreeSet<ByteBuffer>(cfs.metadata.comparator);
+-            filterColumns.addAll(((NamesQueryFilter) filter.filter).columns);
++            TreeSet<ByteBuffer> filterColumns = new TreeSet<ByteBuffer>(((NamesQueryFilter) filter.filter).columns);
+             QueryFilter reducedFilter = new QueryFilter(filter.key, filter.path, new NamesQueryFilter(filterColumns));
+ 
+             /* add the SSTables on disk */
+@@ -181,9 +182,9 @@ public DecoratedKey getKey()
+      */
+     private void reduceNameFilter(QueryFilter filter, ColumnFamily returnCF, long sstableTimestamp)
+     {
+-        AbstractColumnContainer container = filter.path.superColumnName != null
+-                                          ? (SuperColumn) returnCF.getColumn(filter.path.superColumnName)
+-                                          : returnCF;
++        AbstractColumnContainer container = filter.path.superColumnName == null
++                                          ? returnCF
++                                          : (SuperColumn) returnCF.getColumn(filter.path.superColumnName);
+         if (container == null)
+             return;
+ 
+@@ -191,7 +192,7 @@ private void reduceNameFilter(QueryFilter filter, ColumnFamily returnCF, long ss
+         {
+             ByteBuffer filterColumn = iterator.next();
+             IColumn column = container.getColumn(filterColumn);
+-            if (column != null && column.minTimestamp() > sstableTimestamp)
++            if (column != null && column.timestamp() > sstableTimestamp)
+                 iterator.remove();
+         }
+     }
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Column.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Column.java
+index 2af53964..112f5b42 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Column.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/Column.java
+@@ -104,11 +104,6 @@ public long maxTimestamp()
+         return timestamp;
+     }
+ 
+-    public long minTimestamp()
+-    {
+-        return timestamp;
+-    }
+-
+     public boolean isMarkedForDelete()
+     {
+         return false;
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/IColumn.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/IColumn.java
+index 40b99e4f..ade55f65 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/IColumn.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/IColumn.java
+@@ -81,10 +81,4 @@
+      * For a super column, this is the max column timestamp of the sub columns.
+      */
+     public long maxTimestamp();
+-
+-    /**
+-     * For a standard column, this is the same as timestamp().
+-     * For a super column, this is the min column timestamp of the sub columns.
+-     */
+-    public long minTimestamp();
+ }
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/SuperColumn.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/SuperColumn.java
+index ed43e570..45aa7e74 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/SuperColumn.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/SuperColumn.java
+@@ -138,14 +138,6 @@ public long maxTimestamp()
+         return maxTimestamp;
+     }
+ 
+-    public long minTimestamp()
+-    {
+-        long minTimestamp = getMarkedForDeleteAt();
+-        for (IColumn subColumn : getSubColumns())
+-            minTimestamp = Math.min(minTimestamp, subColumn.maxTimestamp());
+-        return minTimestamp;
+-    }
+-
+     public long mostRecentLiveChangeAt()
+     {
+         long max = Long.MIN_VALUE;
+diff --git a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/TreeMapBackedSortedColumns.java b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/TreeMapBackedSortedColumns.java
+index f14436de..238ca27d 100644
+--- a/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/TreeMapBackedSortedColumns.java
++++ b/cassandra/branches/cassandra-1.0/src/java/org/apache/cassandra/db/TreeMapBackedSortedColumns.java
+@@ -84,13 +84,21 @@ public boolean isInsertReversed()
+     public void addColumn(IColumn column, Allocator allocator)
+     {
+         ByteBuffer name = column.name();
++        // this is a slightly unusual way to structure this; a more natural way is shown in ThreadSafeSortedColumns,
++        // but TreeMap lacks putAbsent.  Rather than split it into a "get, then put" check, we do it as follows,
++        // which saves the extra "get" in the no-conflict case [for both normal and super columns],
++        // in exchange for a re-put in the SuperColumn case.
+         IColumn oldColumn = put(name, column);
+         if (oldColumn != null)
+         {
+             if (oldColumn instanceof SuperColumn)
+             {
+                 assert column instanceof SuperColumn;
++                // since oldColumn is where we've been accumulating results, it's usually going to be faster to
++                // add the new one to the old, then place old back in the Map, rather than copy the old contents
++                // into the new Map entry.
+                 ((SuperColumn) oldColumn).putColumn((SuperColumn)column, allocator);
++                put(name,  oldColumn);
+             }
+             else
+             {
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+index f13b823a..03ada875 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyStoreTest.java
+@@ -51,6 +51,7 @@
+ import static junit.framework.Assert.assertTrue;
+ import static org.apache.cassandra.Util.column;
+ import static org.apache.cassandra.Util.getBytes;
++import static org.apache.cassandra.db.TableTest.assertColumns;
+ import static org.junit.Assert.assertNull;
+ 
+ import org.junit.Test;
+@@ -575,7 +576,7 @@ private static void putColsSuper(ColumnFamilyStore cfs, DecoratedKey key, ByteBu
+     {
+         RowMutation rm = new RowMutation(cfs.table.name, key.key);
+         ColumnFamily cf = ColumnFamily.create(cfs.table.name, cfs.getColumnFamilyName());
+-        SuperColumn sc = new SuperColumn(scfName, LongType.instance);
++        SuperColumn sc = new SuperColumn(scfName, cfs.metadata.subcolumnComparator);
+         for (Column col : cols)
+             sc.addColumn(col);
+         cf.addColumn(sc);
+@@ -679,4 +680,28 @@ public void testBackupAfterFlush() throws Throwable
+                 assertTrue("can not find backedup file:" + desc.filenameFor(c), new File(desc.filenameFor(c)).exists());
+         }
+     }
++    
++    @Test
++    public void testSuperSliceByNamesCommandOn() throws Throwable
++    {
++        String tableName = "Keyspace1";
++        String cfName= "Super4";
++        ByteBuffer superColName = ByteBufferUtil.bytes("HerpDerp");
++        DecoratedKey key = Util.dk("multiget-slice-resurrection");
++        Table table = Table.open(tableName);
++        ColumnFamilyStore cfs = table.getColumnFamilyStore(cfName);
++
++        // Initially create a SC with 1 subcolumn
++        putColsSuper(cfs, key, superColName, new Column(ByteBufferUtil.bytes("c1"), ByteBufferUtil.bytes("a"), 1));
++        cfs.forceBlockingFlush();
++
++        // Add another column
++        putColsSuper(cfs, key, superColName, new Column(ByteBufferUtil.bytes("c2"), ByteBufferUtil.bytes("b"), 2));
++
++        // Test fetching the supercolumn by name
++        SliceByNamesReadCommand cmd = new SliceByNamesReadCommand(tableName, key.key, new QueryPath(cfName), Collections.singletonList(superColName));
++        ColumnFamily cf = cmd.getRow(table).cf;
++        SuperColumn superColumn = (SuperColumn) cf.getColumn(superColName);
++        assertColumns(superColumn, "c1", "c2");
++    }
+ }
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
+index 08149c7e..2d2658fc 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/ColumnFamilyTest.java
+@@ -30,13 +30,15 @@
+ import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.db.filter.QueryPath;
+ import static org.apache.cassandra.Util.column;
++import static org.junit.Assert.assertEquals;
++
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.HeapAllocator;
+ 
+ 
+ public class ColumnFamilyTest extends SchemaLoader
+ {
+-    // TODO test SuperColumns
++    // TODO test SuperColumns more
+ 
+     @Test
+     public void testSingleColumn() throws IOException
+@@ -146,4 +148,34 @@ public void testMergeAndAdd()
+         cf_result.addColumn(QueryPath.column(ByteBufferUtil.bytes("col3")), ByteBufferUtil.bytes("z"), 2);
+         assert cf_result.getColumn(ByteBufferUtil.bytes("col3")).value().equals(ByteBufferUtil.bytes("z"));
+     }
++
++    private void testSuperColumnResolution(ISortedColumns.Factory factory)
++    {
++        ColumnFamilyStore cfs = Table.open("Keyspace1").getColumnFamilyStore("Super1");
++        ColumnFamily cf = ColumnFamily.create(cfs.metadata, factory);
++        ByteBuffer superColumnName = ByteBufferUtil.bytes("sc");
++        ByteBuffer subColumnName = ByteBufferUtil.bytes(1L);
++
++        Column first = new Column(subColumnName, ByteBufferUtil.bytes("one"), 1L);
++        Column second = new Column(subColumnName, ByteBufferUtil.bytes("two"), 2L);
++
++        cf.addColumn(superColumnName, first);
++
++        // resolve older + new
++        cf.addColumn(superColumnName, second);
++        assertEquals(second, cf.getColumn(superColumnName).getSubColumn(subColumnName));
++
++        // resolve new + older
++        cf.addColumn(superColumnName, first);
++        assertEquals(second, cf.getColumn(superColumnName).getSubColumn(subColumnName));
++    }
++
++    @Test
++    public void testSuperColumnResolution()
++    {
++        testSuperColumnResolution(TreeMapBackedSortedColumns.factory());
++        testSuperColumnResolution(ThreadSafeSortedColumns.factory());
++        // array-sorted does allow conflict resolution IF it is the last column.  Bit of an edge case.
++        testSuperColumnResolution(ArrayBackedSortedColumns.factory());
++    }
+ }
+diff --git a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/TableTest.java b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/TableTest.java
+index 3460adbc..62ae97a6 100644
+--- a/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/TableTest.java
++++ b/cassandra/branches/cassandra-1.0/test/unit/org/apache/cassandra/db/TableTest.java
+@@ -542,17 +542,10 @@ public static void assertColumns(IColumnContainer container, String... columnNam
+ 
+         String[] columnNames1 = names.toArray(new String[0]);
+         String[] la = L.toArray(new String[columns.size()]);
+-        StringBuffer lasb = new StringBuffer();
+-        for (String l: la)
+-        {
+-            lasb.append(l);
+-            lasb.append(", ");
+-        }
+ 
+         assert Arrays.equals(la, columnNames1)
+-                : String.format("Columns [%s(as string: %s)])] is not expected [%s]",
++                : String.format("Columns [%s])] is not expected [%s]",
+                                 ((container == null) ? "" : container.getComparator().getColumnsString(columns)),
+-                                lasb.toString(),
+                                 StringUtils.join(columnNames1, ","));
+     }
+ 
+@@ -573,6 +566,4 @@ public static void assertColumn(IColumn column, String value, long timestamp)
+         assertEquals(0, ByteBufferUtil.compareUnsigned(column.value(), ByteBufferUtil.bytes(value)));
+         assertEquals(timestamp, column.timestamp());
+     }
+-
+-
+ }

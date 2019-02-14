@@ -1,0 +1,125 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CreateViewNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CreateViewNode.java
+index d66a1ec8..a4aa2314 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CreateViewNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/CreateViewNode.java
+@@ -220,7 +220,8 @@ public void bindStatement() throws StandardException
+ 		}
+ 
+ 		// for each column, stuff system.column
+-		colInfos = new ColumnInfo[queryExpression.getResultColumns().size()];
++		// System columns should only include visible columns DERBY-4230
++		colInfos = new ColumnInfo[queryExpression.getResultColumns().visibleSize()];
+ 		genColumnInfos(colInfos);
+ 	}
+ 
+@@ -344,12 +345,19 @@ public ConstantAction	makeConstantAction() throws StandardException
+ 	private void genColumnInfos(ColumnInfo[] colInfos)
+ 	{
+ 		ResultColumnList rcl = 	queryExpression.getResultColumns();
+-		int			 	 rclSize = rcl.size();
+ 
+-		for (int index = 0; index < rclSize; index++)
++		for (int index = 0; index < colInfos.length; index++)
+ 		{
+ 			ResultColumn rc = (ResultColumn) rcl.elementAt(index);
+-
++			// The colInfo array has been initialized to be of length 
++			// visibleSize() (DERBY-4230).  This code assumes that all the visible
++			// columns are at the beginning of the rcl. Throw an assertion 
++			// if we hit a generated column in what we think is the visible
++			// range.
++			if (SanityManager.DEBUG) {
++				if (rc.isGenerated)
++					SanityManager.THROWASSERT("Encountered generated column in expected visible range at rcl[" + index +"]");
++			}
+ 			//RESOLVEAUTOINCREMENT
+ 			colInfos[index] = new ColumnInfo(rc.getName(),
+ 											 rc.getType(),
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+index 7595ac68..c781b28d 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+@@ -4082,12 +4082,21 @@ private int numGeneratedColumns()
+ 	{
+ 		int numGenerated = 0;
+ 		int sz = size();
++		boolean inVisibleRange = false;
+ 		for (int i = sz - 1; i >= 0; i--) 
+ 		{
+ 			ResultColumn rc = (ResultColumn) elementAt(i);
+ 			if (rc.isGenerated()) 
+ 			{
++				if (SanityManager.DEBUG) {
++					// We expect the generated columns to always be at the end of the list.
++					if (inVisibleRange)
++						SanityManager.THROWASSERT("Encountered generated column in expected visible range at rcl[" + i +"]");
++				}	
+ 				numGenerated++;
++			} else {
++				// We are counting down, so as soon as we see one visible column, the rest should be th same
++				inVisibleRange = true;
+ 			}
+ 		}
+ 		return numGenerated;
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
+index 0f4f435d..9e78b8cc 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
+@@ -1,7 +1,9 @@
+ package org.apache.derbyTesting.functionTests.tests.lang;
+ 
++import java.sql.DatabaseMetaData;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
++import java.sql.ResultSetMetaData;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ 
+@@ -11,6 +13,7 @@
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
+ import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.TestConfiguration;
++import org.apache.derbyTesting.junit.Utilities;
+ 
+ 
+ public final class ViewsTest extends BaseJDBCTestCase {
+@@ -756,4 +759,39 @@ public void test_views() throws Exception
+         getConnection().rollback();
+         st.close();
+     }
++    /**
++     * Make sure DatabaseMetaData.getColumns is correct when we have a view
++     * created when there is an expression in the select list.
++     * Also check the ResultSetMetaData
++     * @throws SQLException
++     */
++    public void testViewMetaDataWithGeneratedColumnsDerby4230() throws SQLException {
++        Statement s = createStatement();
++        s.executeUpdate("create table A (id integer, data varchar(20), data2 integer)");
++        s.executeUpdate("insert into A values (3, 'G', 5), (23, 'G', 4), (5, 'F', 1), (2, 'H', 4), (1, 'F', 5)");
++        //DERBY-4230. Make sure DatabaseMetaData.getColumns does not include generated columns.
++        // You need an expression in the select list.
++        s.executeUpdate("create view V (data, num) as select data, data2 + 2 from A group by data, data2");
++        DatabaseMetaData dmd = getConnection().getMetaData();
++        ResultSet columns = dmd.getColumns(null, null, "V", null);
++        String[][] expectedDBMetaRows = new String[][] {{"","APP","V","DATA","12","VARCHAR","20",null,null,null,"1","",null,null,null
++            ,"40","1","YES",null,null,null,null,"NO"},
++            {"","APP","V","NUM","4","INTEGER","10",null,"0","10","1","",null,null,null,null,"2","YES",null,null,null,null,"NO"}};  
++        JDBC.assertFullResultSet(columns,expectedDBMetaRows);
++        // Make sure ResultSetMetaData is right when selecting from view.
++        // This wasn't a problem with DERBY-4230, but checking for good measure.
++        ResultSet rs = s.executeQuery("SELECT * FROM V");        
++        JDBC.assertColumnNames(rs, new String[] {"DATA","NUM"});
++        JDBC.assertColumnTypes(rs, new int[] {java.sql.Types.VARCHAR, java.sql.Types.INTEGER});
++        JDBC.assertNullability(rs,new boolean[] {true,true});
++        // Finally check the results.
++        String [][] expectedRows = new String[][] {{"F","3"},
++            {"F","7"},
++            {"G","6"},
++            {"G","7"},
++            {"H","6"}};
++        JDBC.assertFullResultSet(rs, expectedRows);
++        s.executeUpdate("DROP VIEW V");
++        s.executeUpdate("DROP TABLE A");        
++    }
+ }

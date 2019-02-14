@@ -1,0 +1,121 @@
+diff --git a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
+index 82e6126b..b168a4ae 100644
+--- a/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
++++ b/cassandra/branches/cassandra-0.8/src/java/org/apache/cassandra/db/compaction/PrecompactedRow.java
+@@ -45,16 +45,20 @@
+     private static Logger logger = LoggerFactory.getLogger(PrecompactedRow.class);
+ 
+     private final ColumnFamily compactedCf;
++    private final int gcBefore;
+ 
++    // For testing purposes
+     public PrecompactedRow(DecoratedKey key, ColumnFamily compacted)
+     {
+         super(key);
+         this.compactedCf = compacted;
++        this.gcBefore = Integer.MAX_VALUE;
+     }
+ 
+     public PrecompactedRow(CompactionController controller, List<SSTableIdentityIterator> rows)
+     {
+         super(rows.get(0).getKey());
++        this.gcBefore = controller.gcBefore;
+ 
+         ColumnFamily cf = null;
+         for (SSTableIdentityIterator row : rows)
+@@ -120,7 +124,7 @@ public void update(MessageDigest digest)
+ 
+     public boolean isEmpty()
+     {
+-        return compactedCf == null || compactedCf.getColumnCount() == 0;
++        return compactedCf == null || ColumnFamilyStore.removeDeletedCF(compactedCf, gcBefore) == null;
+     }
+ 
+     public int columnCount()
+diff --git a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
+index bb3fe863..62218109 100644
+--- a/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
++++ b/cassandra/branches/cassandra-0.8/test/unit/org/apache/cassandra/db/compaction/CompactionsTest.java
+@@ -23,6 +23,7 @@
+ import java.nio.ByteBuffer;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
++import java.util.Collection;
+ import java.util.List;
+ import java.util.ArrayList;
+ import java.util.Set;
+@@ -34,11 +35,10 @@
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.CleanupHelper;
+-import org.apache.cassandra.db.Table;
+-import org.apache.cassandra.db.ColumnFamilyStore;
+-import org.apache.cassandra.db.DecoratedKey;
+-import org.apache.cassandra.db.RowMutation;
++import org.apache.cassandra.db.*;
++import org.apache.cassandra.db.filter.QueryFilter;
+ import org.apache.cassandra.db.filter.QueryPath;
++import org.apache.cassandra.io.sstable.*;
+ import org.apache.cassandra.utils.ByteBufferUtil;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.Pair;
+@@ -157,6 +157,7 @@ public void testGetBuckets()
+         buckets = CompactionManager.getBuckets(pairs, 10); // notice the min is 10
+         assertEquals(1, buckets.size());
+     }
++
+     @Test
+     public void testEchoedRow() throws IOException, ExecutionException, InterruptedException
+     {
+@@ -187,4 +188,51 @@ public void testEchoedRow() throws IOException, ExecutionException, InterruptedE
+         // Now assert we do have the two keys
+         assertEquals(4, Util.getRangeSlice(store).size());
+     }
++
++    @Test
++    public void testDontPurgeAccidentaly() throws IOException, ExecutionException, InterruptedException
++    {
++        // This test catches the regression of CASSANDRA-2786
++        Table table = Table.open(TABLE1);
++        String cfname = "Super5";
++        ColumnFamilyStore store = table.getColumnFamilyStore(cfname);
++
++        // disable compaction while flushing
++        store.disableAutoCompaction();
++
++        // Add test row
++        DecoratedKey key = Util.dk("test");
++        RowMutation rm = new RowMutation(TABLE1, key.key);
++        rm.add(new QueryPath(cfname, ByteBufferUtil.bytes("sc"), ByteBufferUtil.bytes("c")), ByteBufferUtil.EMPTY_BYTE_BUFFER, 0);
++        rm.apply();
++
++        store.forceBlockingFlush();
++
++        Collection<SSTableReader> sstablesBefore = store.getSSTables();
++
++        QueryFilter filter = QueryFilter.getIdentityFilter(Util.dk("test"), new QueryPath(cfname, null, null));
++        assert !store.getColumnFamily(filter).isEmpty();
++
++        // Remove key
++        key = Util.dk("test");
++        rm = new RowMutation(TABLE1, key.key);
++        rm.delete(new QueryPath(cfname, null, null), 2);
++        rm.apply();
++
++        ColumnFamily cf = store.getColumnFamily(filter);
++        assert cf.isEmpty() : "should be empty: " + cf;
++
++        store.forceBlockingFlush();
++
++        Collection<SSTableReader> sstablesAfter = store.getSSTables();
++        Collection<Descriptor> toCompact = new ArrayList<Descriptor>();
++        for (SSTableReader sstable : sstablesAfter)
++            if (!sstablesBefore.contains(sstable))
++                toCompact.add(sstable.descriptor);
++
++        CompactionManager.instance.submitUserDefined(store, toCompact, (int) (System.currentTimeMillis() / 1000) - store.metadata.getGcGraceSeconds()).get();
++
++        cf = store.getColumnFamily(filter);
++        assert cf.isEmpty() : "should be empty: " + cf;
++    }
+ }

@@ -1,0 +1,434 @@
+diff --git a/cassandra/trunk/contrib/javautils/src/test/java/org/apache/cassandra/contrib/utils/service/CassandraServiceTest.java b/cassandra/trunk/contrib/javautils/src/test/java/org/apache/cassandra/contrib/utils/service/CassandraServiceTest.java
+index 171ee0c2..c3973be9 100644
+--- a/cassandra/trunk/contrib/javautils/src/test/java/org/apache/cassandra/contrib/utils/service/CassandraServiceTest.java
++++ b/cassandra/trunk/contrib/javautils/src/test/java/org/apache/cassandra/contrib/utils/service/CassandraServiceTest.java
+@@ -68,7 +68,6 @@
+ public class CassandraServiceTest {
+ 
+     private static EmbeddedCassandraService cassandra;
+-    private static Thread cassandraRunner;
+     private static CassandraServiceDataCleaner cleaner;
+ 
+     /**
+@@ -95,13 +94,7 @@ private static void initCleaner() throws IOException, TTransportException, Confi
+         cleaner.prepare();
+         
+         cassandra = new EmbeddedCassandraService();
+-        cassandra.init();
+-        
+-        if ( cassandraRunner == null ) {
+-            cassandraRunner = new Thread(cassandra);
+-            cassandraRunner.setDaemon(true);
+-            cassandraRunner.start();
+-        }
++        cassandra.start();
+     }
+     
+ 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java b/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java
+index 0563a7af..3c83067e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/AbstractCassandraDaemon.java
+@@ -56,6 +56,10 @@
+  */
+ public abstract class AbstractCassandraDaemon implements CassandraDaemon
+ {
++    public AbstractCassandraDaemon()
++    {
++        StorageService.instance.registerDaemon(this);
++    }
+ 
+     //Initialize logging in such a way that it checks for config changes every 10 seconds.
+     static
+@@ -82,6 +86,7 @@
+     
+     protected InetAddress listenAddr;
+     protected int listenPort;
++    protected volatile boolean isRunning = false;
+     
+     public static final int MIN_WORKER_THREADS = 64;
+ 
+@@ -212,14 +217,81 @@ public void init(String[] arguments) throws IOException
+      * initialized, via either {@link #init(String[])} or
+      * {@link #load(String[])}.
+      * 
++     * Hook for JSVC
++     *
+      * @throws IOException
+      */
+-    public abstract void start() throws IOException;
++    public void start()
++    {
++        if (Boolean.parseBoolean(System.getProperty("cassandra.start_rpc", "true")))
++        {
++            startRPCServer();
++        }
++        else
++        {
++            logger.info("Not starting RPC server as requested. Use JMX (StorageService->startRPCServer()) to start it");
++        }
++    }
+     
+     /**
+      * Stop the daemon, ideally in an idempotent manner.
++     *
++     * Hook for JSVC
++     */
++    public void stop()
++    {
++        // this doesn't entirely shut down Cassandra, just the RPC server.
++        // jsvc takes care of taking the rest down
++        logger.info("Cassandra shutting down...");
++        stopRPCServer();
++    }
++
++    /**
++     * Start the underlying RPC server in idempotent manner.
++     */
++    public void startRPCServer()
++    {
++        if (!isRunning)
++        {
++            startServer();
++            isRunning = true;
++        }
++    }
++
++    /**
++     * Stop the underlying RPC server in idempotent manner.
++     */
++    public void stopRPCServer()
++    {
++        if (isRunning)
++        {
++            stopServer();
++            isRunning = false;
++        }
++    }
++
++    /**
++     * Returns whether the underlying RPC server is running or not.
+      */
+-    public abstract void stop();
++    public boolean isRPCServerRunning()
++    {
++        return isRunning;
++    }
++
++    /**
++     * Start the underlying RPC server.
++     * This method shoud be able to restart a server stopped through stopServer().
++     * Should throw a RuntimeException if the server cannot be started
++     */
++    protected abstract void startServer();
++
++    /**
++     * Stop the underlying RPC server.
++     * This method should be able to stop server started through startServer().
++     * Should throw a RuntimeException if the server cannot be stopped
++     */
++    protected abstract void stopServer();
++
+     
+     /**
+      * Clean up all resources obtained during the lifetime of the daemon. This
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraDaemon.java b/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraDaemon.java
+index c26e646d..09fa07fd 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraDaemon.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/CassandraDaemon.java
+@@ -61,6 +61,10 @@
+      */
+     public void destroy();
+     
++    public void startRPCServer();
++    public void stopRPCServer();
++    public boolean isRPCServerRunning();
++    
+     /**
+      * A convenience method to initialize and start the daemon in one shot.
+      */
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/EmbeddedCassandraService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/EmbeddedCassandraService.java
+index 25d31ae2..6ccf3e46 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/EmbeddedCassandraService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/EmbeddedCassandraService.java
+@@ -37,35 +37,26 @@
+  * This is the implementation of https://issues.apache.org/jira/browse/CASSANDRA-740
+  * <p>
+  * How to use:
+- * In the client code create a new thread and spawn it with its {@link Thread#start()} method.
++ * In the client code simply create a new EmbeddedCassandraService and start it.
+  * Example:
+  * <pre>
+ 
+         cassandra = new EmbeddedCassandraService();
+-        cassandra.init();
+-
+-        // spawn cassandra in a new thread
+-        Thread t = new Thread(cassandra);
+-        t.setDaemon(true);
+-        t.start();
++        cassandra.start();
+ 
+  * </pre>
+  * @author Ran Tavory (rantav@gmail.com)
+  *
+  */
+-public class EmbeddedCassandraService implements Runnable
++public class EmbeddedCassandraService
+ {
+ 
+     CassandraDaemon cassandraDaemon;
+ 
+-    public void init() throws TTransportException, IOException
++    public void start() throws IOException
+     {
+         cassandraDaemon = new CassandraDaemon();
+         cassandraDaemon.init(null);
+-    }
+-
+-    public void run()
+-    {
+         cassandraDaemon.start();
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+index 8f7c1822..56ffbbf2 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageService.java
+@@ -172,6 +172,8 @@ public Range getLocalPrimaryRange()
+     private TokenMetadata tokenMetadata_ = new TokenMetadata();
+ 
+     private Set<InetAddress> replicatingNodes = Collections.synchronizedSet(new HashSet<InetAddress>());
++    private CassandraDaemon daemon;
++
+     private InetAddress removingNode;
+ 
+     /* Are we starting this node in bootstrap mode? */
+@@ -248,6 +250,11 @@ public StorageService()
+             throw new RuntimeException("Streaming service is unavailable.");
+     }
+ 
++    public void registerDaemon(CassandraDaemon daemon)
++    {
++        this.daemon = daemon;
++    }
++
+     // should only be called via JMX
+     public void stopGossiping()
+     {
+@@ -270,6 +277,35 @@ public void startGossiping()
+         }
+     }
+ 
++    // should only be called via JMX
++    public void startRPCServer()
++    {
++        if (daemon == null)
++        {
++            throw new IllegalStateException("No configured RPC daemon");
++        }
++        daemon.startRPCServer();
++    }
++
++    // should only be called via JMX
++    public void stopRPCServer()
++    {
++        if (daemon == null)
++        {
++            throw new IllegalStateException("No configured RPC daemon");
++        }
++        daemon.stopRPCServer();
++    }
++
++    public boolean isRPCServerRunning()
++    {
++        if (daemon == null)
++        {
++            throw new IllegalStateException("No configured RPC daemon");
++        }
++        return daemon.isRPCServerRunning();
++    }
++
+     public void stopClient()
+     {
+         Gossiper.instance.unregister(migrationManager);
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 55293d0d..2a8c9b84 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -281,6 +281,15 @@
+     // to determine if gossip is disabled
+     public boolean isInitialized();
+ 
++    // allows a user to disable thrift
++    public void stopRPCServer();
++
++    // allows a user to reenable thrift
++    public void startRPCServer();
++
++    // to determine if thrift is running
++    public boolean isRPCServerRunning();
++
+     public void invalidateKeyCaches(String ks, String... cfs) throws IOException;
+     public void invalidateRowCaches(String ks, String... cfs) throws IOException;
+ 
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
+index 42ce6c64..cabc29bf 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/thrift/CassandraDaemon.java
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.thrift;
+ 
+ import java.io.IOException;
++import java.net.InetAddress;
+ import java.net.InetSocketAddress;
+ import java.util.concurrent.ExecutorService;
+ 
+@@ -47,12 +48,49 @@
+ public class CassandraDaemon extends org.apache.cassandra.service.AbstractCassandraDaemon
+ {
+     private static Logger logger = LoggerFactory.getLogger(CassandraDaemon.class);
+-    private TServer serverEngine;
++    private ThriftServer server;
+ 
+-    protected void setup() throws IOException
++    protected void startServer()
+     {
+-        super.setup();
++        if (server == null)
++        {
++            server = new ThriftServer(listenAddr, listenPort);
++            server.start();
++        }
++    }
++
++    protected void stopServer()
++    {
++        if (server != null)
++        {
++            server.stopServer();
++            try
++            {
++                server.join();
++            }
++            catch (InterruptedException e)
++            {
++                logger.error("Interrupted while waiting thrift server to stop", e);
++            }
++            server = null;
++        }
++    }
+ 
++    public static void main(String[] args)
++    {
++        new CassandraDaemon().activate();
++    }
++
++    /**
++     * Simple class to run the thrift connection accepting code in separate
++     * thread of control.
++     */
++    private static class ThriftServer extends Thread
++    {
++        private TServer serverEngine;
++
++        public ThriftServer(InetAddress listenAddr, int listenPort)
++        {
+         // now we start listening for clients
+         final CassandraServer cassandraServer = new CassandraServer();
+         Cassandra.Processor processor = new Cassandra.Processor(cassandraServer);
+@@ -69,7 +107,7 @@ protected void setup() throws IOException
+         }
+         catch (TTransportException e)
+         {
+-            throw new IOException(String.format("Unable to create thrift socket to %s:%s",
++                throw new RuntimeException(String.format("Unable to create thrift socket to %s:%s",
+                                                 listenAddr, listenPort), e);
+         }
+         
+@@ -112,24 +150,16 @@ protected void setup() throws IOException
+                                              executorService);
+     }
+ 
+-    /** hook for JSVC */
+-    public void start()
++        public void run()
+     {
+         logger.info("Listening for thrift clients...");
+         serverEngine.serve();
+     }
+ 
+-    /** hook for JSVC */
+-    public void stop()
++        public void stopServer()
+     {
+-        // this doesn't entirely shut down Cassandra, just the Thrift server.
+-        // jsvc takes care of taking the rest down
+-        logger.info("Cassandra shutting down...");
++            logger.info("Stop listening to thrift clients");
+         serverEngine.stop();
+     }
+-    
+-    public static void main(String[] args)
+-    {
+-        new CassandraDaemon().activate();
+     }
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/cli/CliTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/cli/CliTest.java
+index a34feac3..580b127a 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/cli/CliTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/cli/CliTest.java
+@@ -146,7 +146,7 @@
+     @Test
+     public void testCli() throws IOException, TTransportException, ConfigurationException
+     {
+-        setup();
++        new EmbeddedCassandraService().start();
+ 
+         // new error/output streams for CliSessionState
+         ByteArrayOutputStream errStream = new ByteArrayOutputStream();
+@@ -204,24 +204,4 @@ else if (statement.startsWith("assume "))
+             errStream.reset(); // no errors to the end user.
+         }
+     }
+-
+-    /**
+-     * Setup embedded cassandra instance using test config.
+-     * @throws TTransportException - when trying to bind address
+-     * @throws IOException - when reading config file
+-     * @throws ConfigurationException - when can set up configuration
+-     */
+-    private void setup() throws TTransportException, IOException, ConfigurationException
+-    {
+-        EmbeddedCassandraService cassandra;
+-
+-        cassandra = new EmbeddedCassandraService();
+-        cassandra.init();
+-
+-        // spawn cassandra in a new thread
+-        Thread t = new Thread(cassandra);
+-        t.setDaemon(true);
+-        t.start();
+-    }
+-
+ }
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
+index e02432fa..efd2e115 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/EmbeddedCassandraServiceTest.java
+@@ -64,14 +64,8 @@
+     @BeforeClass
+     public static void setup() throws TTransportException, IOException, InterruptedException, ConfigurationException
+     {
+-
+         cassandra = new EmbeddedCassandraService();
+-        cassandra.init();
+-
+-        // spawn cassandra in a new thread
+-        Thread t = new Thread(cassandra);
+-        t.setDaemon(true);
+-        t.start();
++        cassandra.start();
+     }
+ 
+     @Test

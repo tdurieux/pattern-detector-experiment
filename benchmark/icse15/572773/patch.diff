@@ -1,0 +1,134 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ConditionalNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ConditionalNode.java
+index eb43c403..eee631fe 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ConditionalNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/ConditionalNode.java
+@@ -282,16 +282,22 @@ private DataTypeDescriptor findType(ValueNodeList thenElseList,
+ 	 *
+ 	 * @param thenElseList    The thenElseList to update.
+ 	 * @param castType        The type to cast SQL parsed NULL's too.
++	 * @param fromList        FromList to pass on to bindExpression if recast is performed
++	 * @param subqueryList    SubqueryList to pass on to bindExpression if recast is performed
++	 * @param aggregateVector AggregateVector to pass on to bindExpression if recast is performed
+ 	 *
+ 	 * @exception             StandardException Thrown on error.
+ 	 */
+ 	private void recastNullNodes(ValueNodeList thenElseList,
+-	                           DataTypeDescriptor castType)
++	                           DataTypeDescriptor castType, FromList fromList,
++	                           SubqueryList subqueryList, Vector aggregateVector)
+ 	 throws StandardException {
+ 
+ 		// Don't do anything if we couldn't find a castType.
+ 		if (castType == null) return;
+ 
++		// need to have nullNodes nullable
++		castType.setNullability(true);
+ 		ValueNode thenNode = (ValueNode)thenElseList.elementAt(0);
+ 		ValueNode elseNode = (ValueNode)thenElseList.elementAt(1);
+ 
+@@ -299,22 +305,29 @@ private void recastNullNodes(ValueNodeList thenElseList,
+ 		if (isNullNode(thenNode) &&
+ 		    shouldCast(castType, thenNode.getTypeServices()))
+ 		{
++			// recast and rebind. findTypes would have bound as SQL CHAR.
++			// need to rebind here. (DERBY-3032)
+ 			thenElseList.setElementAt(recastNullNode(thenNode, castType), 0);
++			((ValueNode) thenElseList.elementAt(0)).bindExpression(fromList, subqueryList, aggregateVector);
++			
+ 		// otherwise recurse on thenNode, but only if it's a conditional
+ 		} else if (isConditionalNode(thenNode)) {
+ 			recastNullNodes(((ConditionalNode)thenNode).thenElseList,
+-			                castType);
++			                castType,fromList, subqueryList, aggregateVector);
+ 		}
+ 
+ 		// lastly, check if the "else" node is NULL
+ 		if (isNullNode(elseNode) &&
+ 		    shouldCast(castType, elseNode.getTypeServices()))
+ 		{
++			// recast and rebind. findTypes would have bound as SQL CHAR.
++			// need to rebind here. (DERBY-3032)
+ 			thenElseList.setElementAt(recastNullNode(elseNode, castType), 1);
++			((ValueNode) thenElseList.elementAt(1)).bindExpression(fromList, subqueryList, aggregateVector);
+ 		// otherwise recurse on elseNode, but only if it's a conditional
+ 		} else if (isConditionalNode(elseNode)) {
+ 			recastNullNodes(((ConditionalNode)elseNode).thenElseList,
+-			                castType);
++			                castType,fromList,subqueryList,aggregateVector);
+ 		}
+ 	}
+ 
+@@ -396,16 +409,21 @@ public ValueNode bindExpression(FromList fromList, SubqueryList subqueryList,
+ 				aggregateVector);
+ 
+ 		} else {
+-			/* Following call to "findType()" will indirectly bind the
++			/* Following call to "findType()"  and "recastNullNodes" will indirectly bind the
+ 			 * expressions in the thenElseList, so no need to call
+ 			 * "thenElseList.bindExpression(...)" after we do this.
+ 			 * DERBY-2986.
+ 			 */
+ 			recastNullNodes(thenElseList,
+-				findType(thenElseList, fromList, subqueryList, aggregateVector));
++				findType(thenElseList, fromList, subqueryList, aggregateVector),fromList,
++					subqueryList,
++					aggregateVector);
++			
+  		}
+ 
++		
+ 		// Can't get the then and else expressions until after they've been bound
++		// expressions have been bound by findType and rebound by recastNullNodes if needed.
+ 		ValueNode thenExpression = (ValueNode) thenElseList.elementAt(0);
+ 		ValueNode elseExpression = (ValueNode) thenElseList.elementAt(1);
+ 
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CaseExpressionTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CaseExpressionTest.java
+index 85627c6b..6aafe96f 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CaseExpressionTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CaseExpressionTest.java
+@@ -22,6 +22,7 @@
+ package org.apache.derbyTesting.functionTests.tests.lang;
+ 
+ import java.sql.Connection;
++import java.sql.ResultSetMetaData;
+ import java.sql.SQLException;
+ import java.sql.Statement;
+ import java.sql.ResultSet;
+@@ -275,4 +276,37 @@ private void testCaseExpressionQuery(Statement st,
+             rs.close();
+         }
+     }
++
++    
++    /**
++     * Test fix for DERBY-3032. Fix ClassCastException if SQL NULL is returned from conditional.
++     * 
++     * @throws SQLException
++     */
++    public void testDerby3032() throws SQLException 
++    {
++        Statement s = createStatement();
++        
++
++        s.executeUpdate("create table t (d date, vc varchar(30))");
++        s.executeUpdate("insert into t values(CURRENT_DATE, 'hello')");
++        ResultSet rs = s.executeQuery("SELECT d from t where d = (SELECT CASE WHEN 1 = 1 THEN CURRENT_DATE ELSE NULL END from t)");
++        JDBC.assertDrainResults(rs,1);
++        
++        // Make sure null gets cast properly to date type to avoid cast exception. DERBY-3032
++        rs = s.executeQuery("SELECT d from t where d = (SELECT CASE WHEN 1 = 1 THEN NULL  ELSE CURRENT_DATE  END from t)");
++        JDBC.assertEmpty(rs);
++        
++        rs = s.executeQuery("SELECT d from t where d = (SELECT CASE WHEN 1 = 0 THEN CURRENT_DATE  ELSE NULL END from t)");
++        JDBC.assertEmpty(rs);
++        
++        // Make sure metadata has correct type
++        rs = s.executeQuery("SELECT CASE WHEN 1 = 1 THEN NULL  ELSE CURRENT_DATE  END from t");
++        ResultSetMetaData rsmd = rs.getMetaData();
++        assertEquals(java.sql.Types.DATE, rsmd.getColumnType(1));
++        // should be nullable since it returns NULL #:)
++        assertTrue(rsmd.isNullable(1) == ResultSetMetaData.columnNullable);
++        JDBC.assertSingleValueResultSet(rs, null);        
++    }
++    
+ }

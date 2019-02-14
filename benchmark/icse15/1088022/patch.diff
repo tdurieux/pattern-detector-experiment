@@ -1,0 +1,727 @@
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintRepository.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintRepository.java
+index 065f843c..e95b8884 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintRepository.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/BlueprintRepository.java
+@@ -30,7 +30,10 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+ import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
+ 
+ import org.apache.aries.blueprint.ExtendedBlueprintContainer;
+ import org.apache.aries.blueprint.di.CircularDependencyException;
+@@ -43,16 +46,12 @@
+ import org.osgi.service.blueprint.container.ReifiedType;
+ import org.osgi.service.blueprint.container.ComponentDefinitionException;
+ import org.osgi.service.blueprint.container.NoSuchComponentException;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+ 
+ /**
+  * The default repository implementation
+  */
+ public class BlueprintRepository implements Repository, ExecutionContext {
+ 
+-    private static final Logger LOGGER = LoggerFactory.getLogger(BlueprintRepository.class);
+-
+     /**
+      * The blueprint container
+      */
+@@ -64,37 +63,45 @@
+     private final Map<String, Recipe> recipes = new ConcurrentHashMap<String, Recipe>();
+ 
+     /**
+-     * Contains object instances
++     * Contains object instances. Objects are stored as futures by the first task that wants to create it.
++     * All other listeners should call get on the future.
+      */
+-    private final Map<String, Object> instances = new ConcurrentHashMap<String, Object>();
++    private final ConcurrentMap<String, Future<Object>> instances = new ConcurrentHashMap<String, Future<Object>>();
+ 
+     /**
+      * Keep track of creation order
+      */
+     private final List<String> creationOrder = new CopyOnWriteArrayList<String>();
+ 
+-    /**
+-     * Lock for object instance creation
+-     */
+-    private final Object instanceLock = new Object();
+-
+     /**
+      * Contains partial objects.
+      */
+-    private final Map<String, Object> partialObjects = new ConcurrentHashMap<String, Object>();
++    private final ThreadLocal<Map<String, Object>> partialObjects = new ThreadLocal<Map<String,Object>>();
+ 
+     /**
+      * Before each recipe is executed it is pushed on the stack.  The
+      * stack is used to detect circular dependencies.
+      */
+-    private final LinkedList<Recipe> stack = new LinkedList<Recipe>();
++    private final ThreadLocal<LinkedList<Recipe>> stack = new ThreadLocal<LinkedList<Recipe>>();
+     
+     public BlueprintRepository(ExtendedBlueprintContainer container) {
+         blueprintContainer = container;
+     }
+     
+     public Object getInstance(String name) {
+-        return instances.get(name);
++        Future<Object> future = instances.get(name);
++        if (future != null && future.isDone()) {
++            try {
++                return future.get();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return null;
++            } catch (ExecutionException e) {
++                return null;
++            }
++        } else {
++            return null;
++        }
+     }
+ 
+     public Recipe getRecipe(String name) {
+@@ -109,15 +116,15 @@ public Recipe getRecipe(String name) {
+     }
+ 
+     public void putRecipe(String name, Recipe recipe) {
+-        if (instances.get(name) != null) {
+-            throw new ComponentDefinitionException("Name " + name + " is already registered to instance " + instances.get(name));
++        if (instances.containsKey(name)) {
++            throw new ComponentDefinitionException("Name " + name + " is already registered to instance " + getInstance(name));
+         }
+         recipes.put(name, recipe);
+     }
+     
+     public void removeRecipe(String name) {
+-        if (instances.get(name) != null)
+-            throw new ComponentDefinitionException("Name " + name + " is already instanciated as " + instances.get(name) + " and cannot be removed.");
++        if (instances.containsKey(name))
++            throw new ComponentDefinitionException("Name " + name + " is already instanciated as " + getInstance(name) + " and cannot be removed.");
+ 
+         recipes.remove(name);
+     }
+@@ -205,24 +212,17 @@ private Object createInstance(String name) {
+     }
+ 
+     private Map<String, Object> createInstances(Collection<String> names) {
+-        // We need to synchronize recipe creation on the repository
+-        // so that we don't end up with multiple threads creating the
+-        // same instance at the same time.
+-        synchronized (instanceLock) {
++        // Instance creation is synchronized inside each create method (via the use of futures), so that 
++        // a recipe will only created once where appropriate
+             DependencyGraph graph = new DependencyGraph(this);
+             HashMap<String, Object> objects = new LinkedHashMap<String, Object>();
+             for (Map.Entry<String, Recipe> entry : graph.getSortedRecipes(names).entrySet()) {
+-                String name = entry.getKey();
+-                Object object = instances.get(name);
+-                if (object == null) {
+-                    Recipe recipe = entry.getValue();
+-                    object = recipe.create();
+-                }
+-                objects.put(name, object);
++            objects.put(
++                    entry.getKey(), 
++                    entry.getValue().create());
+             }
+             return objects;
+         }
+-    }
+         
+     public void validate() {
+         for (Recipe recipe : getAllRecipes()) {
+@@ -292,20 +292,16 @@ public void destroy() {
+         for (String name : order) {
+             Recipe recipe = recipes.get(name);
+             if (recipe != null) {
+-                recipe.destroy(instances.get(name));
++                recipe.destroy(getInstance(name));
+             }
+         }
+         instances.clear();
+         creationOrder.clear();
+     }
+ 
+-    public Object getInstanceLock() {
+-        return instanceLock;
+-    }
+-
+     public void push(Recipe recipe) {
+-        if (stack.contains(recipe)) {
+-            ArrayList<Recipe> circularity = new ArrayList<Recipe>(stack.subList(stack.indexOf(recipe), stack.size()));
++        if (stack.get() != null && stack.get().contains(recipe)) {
++            ArrayList<Recipe> circularity = new ArrayList<Recipe>(stack.get().subList(stack.get().indexOf(recipe), stack.get().size()));
+ 
+             // remove anonymous nodes from circularity list
+             for (Iterator<Recipe> iterator = circularity.iterator(); iterator.hasNext();) {
+@@ -320,53 +316,58 @@ public void push(Recipe recipe) {
+ 
+             throw new CircularDependencyException(circularity);
+         }
+-        stack.add(recipe);
++        if (stack.get() == null) {
++            stack.set(new LinkedList<Recipe>());
+     }
+-
+-    public Recipe pop() {
+-        return stack.removeLast();
++        stack.get().add(recipe);
+     }
+ 
+-    public LinkedList<Recipe> getStack() {
+-        return new LinkedList<Recipe>(stack);
++    public Recipe pop() {
++        return stack.get().removeLast();
+     }
+ 
+     public boolean containsObject(String name) {
+-        return getInstance(name) != null
+-                || getRecipe(name) != null;
++        return instances.containsKey(name) || getRecipe(name) != null;
+     }
+ 
+     public Object getObject(String name) {
+-        Object object = getInstance(name);
+-        if (object == null) {
+-            object = getRecipe(name);
++        Future<Object> future = instances.get(name);
++        Object result = null;
++        if (future != null && future.isDone()) {
++            try {
++                result = future.get();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                result = getRecipe(name);
++            } catch (ExecutionException e) {
++                result = getRecipe(name);
+         }
+-        return object;
++        } else {
++            result = getRecipe(name);
+     }
+ 
+-    public void addFullObject(String name, Object object) {
+-        if (instances.get(name) != null) {
+-            throw new ComponentDefinitionException("Name " + name + " is already registered to instance " + instances.get(name));
++        return result;
+         }
+-        instances.put(name, object);
+-        creationOrder.add(name); 
+-        partialObjects.remove(name);
++
++    public Future<Object> addFullObject(String name, Future<Object> object) {
++        return instances.putIfAbsent(name, object);
+     }
+     
+     public void addPartialObject(String name, Object object) {
+-        partialObjects.put(name, object);
+-    }
++        if (partialObjects.get() == null)
++            partialObjects.set(new HashMap<String, Object>());
+     
+-    public Object removePartialObject(String name) {
+-        return partialObjects.remove(name);
++        partialObjects.get().put(name, object);
+     }
+     
+     public Object getPartialObject(String name) {
+-        Object obj = partialObjects.get(name);
+-        if (obj == null) {
+-            obj = getInstance(name);
++        return (partialObjects.get() != null) ? partialObjects.get().get(name) : null;
+         }
+-        return obj;
++    
++    public void removePartialObject(String name) {
++        creationOrder.add(name); 
++        if (partialObjects.get() != null) 
++            partialObjects.get().remove(name);
+     }
+ 
+     public Object convert(Object value, ReifiedType type) throws Exception {
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
+index ba188939..1e2c5d5f 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/container/ServiceRecipe.java
+@@ -230,10 +230,6 @@ protected Object internalGetService() {
+ 
+     /**
+      * Create the service object.
+-     * We need to synchronize the access to the repository,
+-     * but not on this ServiceRecipe instance to avoid deadlock.
+-     * When using internalCreate(), no other lock but the on the repository
+-     * should be held.
+      *
+      * @param bundle
+      * @param registration
+@@ -242,12 +238,8 @@ protected Object internalGetService() {
+     private Object internalGetService(Bundle bundle, ServiceRegistration registration) {
+         LOGGER.debug("Retrieving service for bundle {} and service registration {}", bundle, registration);
+         if (this.service == null) {
+-            synchronized (blueprintContainer.getRepository().getInstanceLock()) {
+-                if (this.service == null) {
+                     createService();
+                 }
+-            }
+-        }
+         
+         Object service = this.service;
+         // We need the real service ...
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/AbstractRecipe.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/AbstractRecipe.java
+index 3662dc75..9d819f2d 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/AbstractRecipe.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/AbstractRecipe.java
+@@ -20,6 +20,10 @@
+ import java.lang.reflect.Type;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.Future;
++import java.util.concurrent.FutureTask;
+ 
+ import org.apache.aries.blueprint.container.GenericType;
+ import org.osgi.service.blueprint.container.ReifiedType;
+@@ -51,22 +55,51 @@ public final Object create() throws ComponentDefinitionException {
+         // Ensure a container has been set
+         ExecutionContext context = ExecutionContext.Holder.getContext();
+ 
+-        synchronized (context.getInstanceLock()) {
+-            // if this recipe has already been executed in this container, return the currently registered value
+-            Object obj = context.getPartialObject(name);
+-            if (obj != null) {
+-                return obj;
++        // if this recipe has already been executed in this context, return the currently registered value
++        Object result = context.getPartialObject(name);
++        if (result != null) {
++            return result;
+             }
+ 
+             // execute the recipe
+             context.push(this);
++        boolean didCreate = false;
+             try {
+-                obj = internalCreate();
+                 if (!prototype) {
+-                    context.addFullObject(name, obj);
++                FutureTask<Object> objectCreation = new FutureTask<Object>(new Callable<Object>() {
++                    public Object call() throws ComponentDefinitionException {
++                        return internalCreate();
++                    }                
++                });
++                Future<Object> resultFuture = context.addFullObject(name, objectCreation);
++
++                // are we the first to try to create it
++                if (resultFuture == null) {
++                    didCreate = true;
++                    objectCreation.run();
++                    resultFuture = objectCreation;
++                }
++                
++                
++                try {
++                    result = resultFuture.get();
++                } catch (InterruptedException ie) {
++                    Thread.currentThread().interrupt();
++                } catch (ExecutionException ee) {
++                    if (ee.getCause() instanceof ComponentDefinitionException)
++                        throw (ComponentDefinitionException) ee.getCause();
++                    else if (ee.getCause() instanceof RuntimeException)
++                        throw (RuntimeException) ee.getCause();
++                    else 
++                        throw (Error) ee.getCause();
++                }
++                
++            } else {
++                result = internalCreate();
+                 }
+-                return obj;
+             } finally {
++            if (didCreate) context.removePartialObject(name);
++            
+                 Recipe popped = context.pop();
+                 if (popped != this) {
+                     //noinspection ThrowFromFinallyBlock
+@@ -74,7 +107,8 @@ public final Object create() throws ComponentDefinitionException {
+                             " Expected " + this + " to be popped of the stack but was " + popped);
+                 }
+             }
+-        }
++        
++        return result;
+     }
+ 
+     protected abstract Object internalCreate() throws ComponentDefinitionException;
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/ExecutionContext.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/ExecutionContext.java
+index a40a464e..6f01099c 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/ExecutionContext.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/ExecutionContext.java
+@@ -17,6 +17,8 @@
+  */
+ package org.apache.aries.blueprint.di;
+ 
++import java.util.concurrent.Future;
++
+ import org.osgi.service.blueprint.container.ReifiedType;
+ 
+ public interface ExecutionContext {
+@@ -44,26 +46,19 @@ public static ExecutionContext setContext(ExecutionContext newContext) {
+ 
+     }
+ 
+-    /**
+-     * Lock that should be used to synchronized creation of singletons
+-     * 
+-     * @return
+-     */
+-    public Object getInstanceLock();
+-
+     /**
+      * Adds a recipe to the top of the execution stack.  If the recipe is already on
+      * the stack, a CircularDependencyException is thrown.
+      * @param recipe the recipe to add to the stack
+      * @throws CircularDependencyException if the recipe is already on the stack
+      */
+-    public abstract void push(Recipe recipe) throws CircularDependencyException;
++    public void push(Recipe recipe) throws CircularDependencyException;
+ 
+     /**
+      * Removes the top recipe from the execution stack.
+      * @return the top recipe on the stack
+      */
+-    public abstract Recipe pop();
++    public Recipe pop();
+ 
+     /**
+      * Does this context contain a object with the specified name.
+@@ -71,7 +66,7 @@ public static ExecutionContext setContext(ExecutionContext newContext) {
+      * @param name the unique name of the object instance
+      * @return true if this context contain a object with the specified name
+      */
+-    public abstract boolean containsObject(String name);
++    public boolean containsObject(String name);
+ 
+     /**
+      * Gets the object or recipe with the specified name from the repository.
+@@ -79,23 +74,29 @@ public static ExecutionContext setContext(ExecutionContext newContext) {
+      * @param name the unique name of the object instance
+      * @return the object instance, a recipe to build the object or null
+      */
+-    public abstract Object getObject(String name);
++    public Object getObject(String name);
+ 
+-    public abstract void addFullObject(String name, Object object);
++    /**
++     * Try to add a full object and return the already registered future if available
++     * @param name
++     * @param object
++     * @return
++     */
++    public Future<Object> addFullObject(String name, Future<Object> object);
+     
+-    public abstract void addPartialObject(String name, Object object);
++    public void addPartialObject(String name, Object object);
+     
+-    public abstract Object removePartialObject(String name);
++    public Object getPartialObject(String name);
+     
+-    public abstract Object getPartialObject(String name);
++    public void removePartialObject(String name);
+ 
+-    public abstract Object convert(Object value, ReifiedType type) throws Exception;
++    public Object convert(Object value, ReifiedType type) throws Exception;
+     
+-    public abstract boolean canConvert(Object value, ReifiedType type);
++    public boolean canConvert(Object value, ReifiedType type);
+ 
+-    public abstract Class loadClass(String className) throws ClassNotFoundException;
++    public Class loadClass(String className) throws ClassNotFoundException;
+ 
+-    public abstract Recipe getRecipe(String name);
++    public Recipe getRecipe(String name);
+     
+ }
+ 
+diff --git a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/Repository.java b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/Repository.java
+index 2d94879b..542d358b 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/Repository.java
++++ b/aries/trunk/blueprint/blueprint-core/src/main/java/org/apache/aries/blueprint/di/Repository.java
+@@ -34,7 +34,7 @@
+ 
+     /**
+      * Return the singleton instance for the given name.
+-     * This method will not create the object if it has been created yet.
++     * This method will not create the object if it has not been created yet.
+      *
+      * @param name
+      * @return the instance or <code>null</code>
+@@ -67,11 +67,4 @@
+     Set<Recipe> getAllRecipes(String... names);
+ 
+     void destroy();
+-
+-    /**
+-     * Lock that should be used to synchronized creation of singletons
+-     *
+-     * @return
+-     */
+-    public Object getInstanceLock();
+ }
+diff --git a/aries/trunk/blueprint/blueprint-core/src/test/java/org/apache/aries/blueprint/utils/ReflectionUtilsTest.java b/aries/trunk/blueprint/blueprint-core/src/test/java/org/apache/aries/blueprint/utils/ReflectionUtilsTest.java
+index 93ec712e..29341cf1 100644
+--- a/aries/trunk/blueprint/blueprint-core/src/test/java/org/apache/aries/blueprint/utils/ReflectionUtilsTest.java
++++ b/aries/trunk/blueprint/blueprint-core/src/test/java/org/apache/aries/blueprint/utils/ReflectionUtilsTest.java
+@@ -27,6 +27,7 @@
+ import java.util.LinkedList;
+ import java.util.List;
+ import java.util.Queue;
++import java.util.concurrent.Future;
+ 
+ import org.apache.aries.blueprint.ExtendedBlueprintContainer;
+ import org.apache.aries.blueprint.di.CircularDependencyException;
+@@ -61,7 +62,6 @@
+     public static void before()
+     {
+         ExecutionContext.Holder.setContext(new ExecutionContext() {
+-            public void addFullObject(String name, Object object) {}
+             public void addPartialObject(String name, Object object) {}
+             public boolean containsObject(String name) { return false; }
+ 
+@@ -84,14 +84,14 @@ public boolean canConvert(Object value, ReifiedType type) {
+                 else return false;
+             }
+ 
+-            public Object getInstanceLock() { return null; }
+             public Object getObject(String name) { return null; }
+             public Object getPartialObject(String name) { return null; }
+             public Recipe getRecipe(String name) { return null; }
+             public Class loadClass(String className) throws ClassNotFoundException { return null; }
+             public Recipe pop() { return null; }
+             public void push(Recipe recipe) throws CircularDependencyException {}
+-            public Object removePartialObject(String name) { return null; }            
++            public void removePartialObject(String name) {}
++            public Future<Object> addFullObject(String name, Future<Object> object) { return null; }            
+         });
+     }
+     
+diff --git a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/AbstractIntegrationTest.java b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/AbstractIntegrationTest.java
+index 5f0c1030..cfc47bc0 100644
+--- a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/AbstractIntegrationTest.java
++++ b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/AbstractIntegrationTest.java
+@@ -117,8 +117,12 @@ protected BlueprintContainer getBlueprintContainerForBundle(BundleContext bc, St
+             
+             // add tracker to the list of trackers we close at tear down
+             srs.add(tracker);
++            System.out.println("Started waiting for service: "+filter+", timeout=" + timeout+ ", time="+System.currentTimeMillis());
+             Object svc = type.cast(tracker.waitForService(timeout));
+             if (svc == null) {
++                System.out.println("Could not obtain a service in time, service-ref="+ 
++                  tracker.getServiceReference()+
++                  ", time="+System.currentTimeMillis());
+                 throw new RuntimeException("Gave up waiting for service " + flt);
+             }
+             return type.cast(svc);
+diff --git a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/BlueprintContainerTest.java b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/BlueprintContainerTest.java
+index 3c09aec6..e99d1349 100644
+--- a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/BlueprintContainerTest.java
++++ b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/BlueprintContainerTest.java
+@@ -18,29 +18,26 @@
+  */
+ package org.apache.aries.blueprint.itests;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+-import static org.junit.Assert.assertSame;
+-import static org.junit.Assert.assertTrue;
+-import static org.junit.Assert.fail;
+ import static org.ops4j.pax.exam.CoreOptions.equinox;
+ import static org.ops4j.pax.exam.CoreOptions.options;
+ import static org.ops4j.pax.exam.CoreOptions.systemProperty;
+ 
+-import java.text.SimpleDateFormat;
+-import java.util.Currency;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.InputStream;
++import java.util.ArrayList;
+ import java.util.Hashtable;
+ import java.util.HashSet;
++import java.util.List;
+ 
+-import org.apache.aries.blueprint.sample.Bar;
+-import org.apache.aries.blueprint.sample.Foo;
++import org.apache.aries.unittest.fixture.ArchiveFixture;
++import org.apache.aries.unittest.fixture.ArchiveFixture.Fixture;
+ import org.junit.Test;
+ import org.junit.runner.RunWith;
+ import org.ops4j.pax.exam.Option;
+ import org.ops4j.pax.exam.junit.JUnit4TestRunner;
+ import org.osgi.framework.Bundle;
+-import org.osgi.service.blueprint.container.BlueprintContainer;
+ import org.osgi.service.cm.Configuration;
+ import org.osgi.service.cm.ConfigurationAdmin;
+ 
+@@ -65,6 +62,66 @@ public void test() throws Exception {
+         testBlueprintContainer(bundle);
+     }
+     
++    @Test
++    public void testReferenceListenerDeadlock() throws Exception {
++        List<Bundle> bundles = new ArrayList<Bundle>();
++        int total = 10;
++        for (int i=0; i<total; i++) {
++            bundles.add(bundleContext.installBundle("sample"+i, getTestBundle(i, total)));
++        }
++        
++        for (Bundle b : bundles) b.start();
++        
++        // every blueprint container should be up
++        for (Bundle b : bundles) {
++          assertNotNull(getBlueprintContainerForBundle(b.getSymbolicName()));
++        }
++    }
++    
++    private InputStream getTestBundle(int no, int total) throws Exception {
++        StringBuilder blueprint = new StringBuilder();
++        blueprint.append("<blueprint xmlns=\"http://www.osgi.org/xmlns/blueprint/v1.0.0\">");
++        blueprint.append("<bean id=\"listener\" class=\"org.apache.aries.blueprint.itests.comp.Listener\" />");
++        
++        for (int i=0; i<total; i++) {
++            if (i==no) {
++                blueprint.append("<service interface=\"java.util.List\">");
++                blueprint.append("<service-properties><entry key=\"no\" value=\""+i+"\" /></service-properties>");
++                blueprint.append("<bean class=\"org.apache.aries.blueprint.itests.comp.ListFactory\" factory-method=\"create\">");
++                blueprint.append("<argument value=\""+i+"\" />");
++                blueprint.append("</bean>");
++                blueprint.append("</service>");
++            } else {
++                blueprint.append("<reference availability=\"optional\" id=\"ref"+i+"\" interface=\"java.util.List\" filter=\"(no="+i+")\">");
++                blueprint.append("<reference-listener ref=\"listener\" bind-method=\"bind\" unbind-method=\"unbind\" />");
++                blueprint.append("</reference>");
++            }
++        }
++        blueprint.append("</blueprint>");
++        
++        Fixture jar = ArchiveFixture.newJar()
++            .manifest().symbolicName("sample"+no)
++                .attribute("Import-Package", "org.osgi.framework")
++            .end()
++            .binary("org/apache/aries/blueprint/itests/comp/Component.class", 
++                    getClass().getClassLoader().getResourceAsStream(
++                            "org/apache/aries/blueprint/itests/comp/Component.class"))
++            .binary("org/apache/aries/blueprint/itests/comp/Listener.class",
++                    getClass().getClassLoader().getResourceAsStream(
++                            "org/apache/aries/blueprint/itests/comp/Listener.class"))
++            .binary("org/apache/aries/blueprint/itests/comp/ListFactory.class",
++                    getClass().getClassLoader().getResourceAsStream(
++                            "org/apache/aries/blueprint/itests/comp/ListFactory.class"))
++                            
++            .file("OSGI-INF/blueprint/blueprint.xml", blueprint.toString())
++            .end();
++        
++        ByteArrayOutputStream bout = new ByteArrayOutputStream();
++        jar.writeOut(bout);
++        
++        return new ByteArrayInputStream(bout.toByteArray());
++    }
++    
+     @Test
+     public void testDeadlock() throws Exception {
+       bundleContext.registerService("java.util.Set",new HashSet<Object>(), null);
+@@ -101,6 +158,7 @@ public void testDeadlock() throws Exception {
+             mavenBundle("org.apache.aries.blueprint", "org.apache.aries.blueprint"),
+             mavenBundle("org.apache.aries.blueprint", "org.apache.aries.blueprint.sample").noStart(),
+             mavenBundle("org.osgi", "org.osgi.compendium"),
++            mavenBundle("org.apache.aries.testsupport", "org.apache.aries.testsupport.unit"),
+             //org.ops4j.pax.exam.container.def.PaxRunnerOptions.vmOption("-Xdebug -Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5005"),
+ 
+             equinox().version("3.5.0")
+diff --git a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/ListFactory.java b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/ListFactory.java
+index e69de29b..c5fe79ff 100644
+--- a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/ListFactory.java
++++ b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/ListFactory.java
+@@ -0,0 +1,35 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.blueprint.itests.comp;
++
++import java.util.Arrays;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Random;
++
++public class ListFactory {
++    public static List<Integer> create(int no) {
++        System.out.println(Thread.currentThread().getId()+": creating list");
++        try {
++            Thread.sleep(new Random().nextInt(100));
++        } catch (InterruptedException ie) {}
++        System.out.println(Thread.currentThread().getId()+": created");
++        return new ArrayList<Integer>(Arrays.asList(no));
++    }
++}
+diff --git a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/Listener.java b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/Listener.java
+index e69de29b..f24a18df 100644
+--- a/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/Listener.java
++++ b/aries/trunk/blueprint/blueprint-itests/src/test/java/org/apache/aries/blueprint/itests/comp/Listener.java
+@@ -0,0 +1,37 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.aries.blueprint.itests.comp;
++
++import java.util.Random;
++
++public class Listener {
++    public void bind(Object service) {
++        try {
++            Thread.sleep(new Random().nextInt(20));
++        } catch (InterruptedException ie) {}
++        System.out.println(Thread.currentThread().getId()+": bind "+service);
++    }
++    
++    public void unbind(Object service) {
++        try {
++            Thread.sleep(new Random().nextInt(20));
++        } catch (InterruptedException ie) {}
++        System.out.println(Thread.currentThread().getId()+": unbind "+service);
++    }
++}

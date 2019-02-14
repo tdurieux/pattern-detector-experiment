@@ -1,0 +1,432 @@
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCache.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCache.java
+index b928176f..af538679 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCache.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCache.java
+@@ -310,6 +310,14 @@ public String toString() {
+     }
+   };
+   
++  /** Checks the internal cache for an appropriate entry, and if none is found,
++   * reads the terms in <code>field</code> and returns a bit set at the size of
++   * <code>reader.maxDoc()</code>, with turned on bits for each docid that 
++   * does not have a value for this field.
++   */
++  public DocIdSet getUnValuedDocs (IndexReader reader, String field) 
++  throws IOException;
++  
+   /** Checks the internal cache for an appropriate entry, and if none is
+    * found, reads the terms in <code>field</code> as a single byte and returns an array
+    * of size <code>reader.maxDoc()</code> of the value each document
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCacheImpl.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCacheImpl.java
+index c076a45a..f15a8000 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCacheImpl.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldCacheImpl.java
+@@ -20,6 +20,7 @@
+ import java.io.IOException;
+ import java.io.PrintStream;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -29,6 +30,9 @@
+ import org.apache.lucene.index.Term;
+ import org.apache.lucene.index.TermDocs;
+ import org.apache.lucene.index.TermEnum;
++import org.apache.lucene.util.BitVector;
++import org.apache.lucene.util.DocIdBitSet;
++import org.apache.lucene.util.OpenBitSet;
+ import org.apache.lucene.util.StringHelper;
+ import org.apache.lucene.util.FieldCacheSanityChecker;
+ 
+@@ -47,7 +51,7 @@
+     init();
+   }
+   private synchronized void init() {
+-    caches = new HashMap<Class<?>,Cache>(7);
++    caches = new HashMap<Class<?>,Cache>(9);
+     caches.put(Byte.TYPE, new ByteCache(this));
+     caches.put(Short.TYPE, new ShortCache(this));
+     caches.put(Integer.TYPE, new IntCache(this));
+@@ -56,6 +60,7 @@ private synchronized void init() {
+     caches.put(Double.TYPE, new DoubleCache(this));
+     caches.put(String.class, new StringCache(this));
+     caches.put(StringIndex.class, new StringIndexCache(this));
++    caches.put(UnValuedDocsCache.class, new UnValuedDocsCache(this));
+   }
+ 
+   public synchronized void purgeAllCaches() {
+@@ -409,6 +414,42 @@ protected Object createValue(IndexReader reader, Entry entryKey)
+     }
+   }
+ 
++  static final class UnValuedDocsCache extends Cache {
++    UnValuedDocsCache(FieldCache wrapper) {
++      super(wrapper);
++    }
++    
++    @Override
++    protected Object createValue(IndexReader reader, Entry entryKey)
++    throws IOException {
++      Entry entry = entryKey;
++      String field = entry.field;
++      
++      if (reader.maxDoc() == reader.docFreq(new Term(field))) {
++        return DocIdSet.EMPTY_DOCIDSET;
++      }
++      
++      OpenBitSet res = new OpenBitSet(reader.maxDoc());
++      TermDocs termDocs = reader.termDocs();
++      TermEnum termEnum = reader.terms (new Term (field));
++      try {
++        do {
++          Term term = termEnum.term();
++          if (term==null || term.field() != field) break;
++          termDocs.seek (termEnum);
++          while (termDocs.next()) {
++            res.fastSet(termDocs.doc());
++          }
++        } while (termEnum.next());
++      } finally {
++        termDocs.close();
++        termEnum.close();
++      }
++      res.flip(0, reader.maxDoc());
++      return res;
++    }
++  }
++  
+ 
+   // inherit javadocs
+   public float[] getFloats (IndexReader reader, String field)
+@@ -695,5 +736,10 @@ public void setInfoStream(PrintStream stream) {
+   public PrintStream getInfoStream() {
+     return infoStream;
+   }
++  
++  public DocIdSet getUnValuedDocs(IndexReader reader, String field)
++      throws IOException {
++    return (DocIdSet) caches.get(UnValuedDocsCache.class).get(reader, new Entry(field, null));  
++  }
+ }
+ 
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldComparator.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldComparator.java
+index ac0969ba..eb7cffaa 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldComparator.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/FieldComparator.java
+@@ -29,6 +29,7 @@
+ import org.apache.lucene.search.FieldCache.IntParser;
+ import org.apache.lucene.search.FieldCache.ShortParser;
+ import org.apache.lucene.search.FieldCache.StringIndex;
++import org.apache.lucene.util.OpenBitSet;
+ 
+ /**
+  * Expert: a FieldComparator compares hits so as to determine their
+@@ -83,6 +84,14 @@
+  */
+ public abstract class FieldComparator<T> {
+ 
++  protected T missingValue = null;
++  
++  /** Set a default sorting value for documents which lacks one */
++  public FieldComparator<T> setMissingValue(T missingValue) {
++    this.missingValue = missingValue;
++    return this;
++  }
++  
+   /**
+    * Compare hit at slot1 with hit at slot2.
+    * 
+@@ -205,6 +214,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getBytes(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final byte byteValue = missingValue.byteValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = byteValue;
++        }
++      }
+     }
+     
+     @Override
+@@ -312,6 +328,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getDoubles(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final double doubleValue = missingValue.doubleValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = doubleValue;
++        }
++      }
+     }
+     
+     @Override
+@@ -377,6 +400,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getFloats(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final float floatValue = missingValue.floatValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = floatValue;
++        }
++      }
+     }
+     
+     @Override
+@@ -446,6 +476,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getInts(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final int intValue = missingValue.intValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = intValue;
++        }
++      }
+     }
+     
+     @Override
+@@ -511,6 +548,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getLongs(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final long longValue = missingValue.longValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = longValue;
++        }
++      }
+     }
+     
+     @Override
+@@ -625,6 +669,13 @@ public void copy(int slot, int doc) {
+     @Override
+     public void setNextReader(IndexReader reader, int docBase) throws IOException {
+       currentReaderValues = FieldCache.DEFAULT.getShorts(reader, field, parser);
++      if (missingValue != null) {
++        DocIdSetIterator iterator = FieldCache.DEFAULT.getUnValuedDocs(reader, field).iterator();
++        final short shortValue = missingValue.shortValue();
++        for (int doc=iterator.nextDoc(); doc!=DocIdSetIterator.NO_MORE_DOCS; doc=iterator.nextDoc()) {
++          currentReaderValues[doc] = shortValue;
++        }
++      }
+     }
+     
+     @Override
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/SortField.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/SortField.java
+index 96ec3c00..eb9d1206 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/SortField.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/search/SortField.java
+@@ -102,6 +102,8 @@
+   // Used for CUSTOM sort
+   private FieldComparatorSource comparatorSource;
+ 
++  private Object missingValue;
++
+   /** Creates a sort by terms in the given field with the type of term
+    * values explicitly given.
+    * @param field  Name of field to sort by.  Can be <code>null</code> if
+@@ -204,6 +206,16 @@ public SortField(String field, FieldComparatorSource comparator, boolean reverse
+     this.comparatorSource = comparator;
+   }
+ 
++  /** Set a default sorting value for documents which lacks one */
++  public SortField setMissingValue(Object missingValue) {
++    if (type != BYTE && type != SHORT && type != INT && type != FLOAT && type != LONG && type != DOUBLE) {
++      throw new IllegalArgumentException( "Missing value only works for numeric types" );
++    }
++    this.missingValue = missingValue;
++    
++    return this;
++  }
++  
+   // Sets field & type, and ensures field is not NULL unless
+   // type is SCORE or DOC
+   private void initFieldType(String field, int type) {
+@@ -391,22 +403,22 @@ public FieldComparator getComparator(final int numHits, final int sortPos) throw
+       return new FieldComparator.DocComparator(numHits);
+ 
+     case SortField.INT:
+-      return new FieldComparator.IntComparator(numHits, field, parser);
++      return new FieldComparator.IntComparator(numHits, field, parser).setMissingValue((Integer) missingValue);
+ 
+     case SortField.FLOAT:
+-      return new FieldComparator.FloatComparator(numHits, field, parser);
++      return new FieldComparator.FloatComparator(numHits, field, parser).setMissingValue((Float) missingValue);
+ 
+     case SortField.LONG:
+-      return new FieldComparator.LongComparator(numHits, field, parser);
++      return new FieldComparator.LongComparator(numHits, field, parser).setMissingValue((Long) missingValue);
+ 
+     case SortField.DOUBLE:
+-      return new FieldComparator.DoubleComparator(numHits, field, parser);
++      return new FieldComparator.DoubleComparator(numHits, field, parser).setMissingValue((Double) missingValue);
+ 
+     case SortField.BYTE:
+-      return new FieldComparator.ByteComparator(numHits, field, parser);
++      return new FieldComparator.ByteComparator(numHits, field, parser).setMissingValue((Byte) missingValue);
+ 
+     case SortField.SHORT:
+-      return new FieldComparator.ShortComparator(numHits, field, parser);
++      return new FieldComparator.ShortComparator(numHits, field, parser).setMissingValue((Short) missingValue);
+ 
+     case SortField.CUSTOM:
+       assert comparatorSource != null;
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/search/TestSort.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/search/TestSort.java
+index dab4bc41..2902e0d3 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/search/TestSort.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/search/TestSort.java
+@@ -68,6 +68,7 @@
+   private Query queryE;
+   private Query queryF;
+   private Query queryG;
++  private Query queryM;
+   private Sort sort;
+ 
+   @BeforeClass
+@@ -82,12 +83,12 @@ public static void beforeClass() throws Exception {
+   // the string field to sort by string
+     // the i18n field includes accented characters for testing locale-specific sorting
+   private String[][] data = new String[][] {
+-  // tracer  contents         int            float           string   custom   i18n               long            double, 'short', byte, 'custom parser encoding'
++  // tracer  contents         int            float           string   custom   i18n               long            double,          short,     byte, 'custom parser encoding'
+   {   "A",   "x a",           "5",           "4f",           "c",     "A-3",   "p\u00EAche",      "10",           "-4.0", "3", "126", "J"},//A, x
+   {   "B",   "y a",           "5",           "3.4028235E38", "i",     "B-10",  "HAT",             "1000000000", "40.0", "24", "1", "I"},//B, y
+-  {   "C",   "x a b c",       "2147483647",  "1.0",          "j",     "A-2",   "p\u00E9ch\u00E9", "99999999",   "40.00002343", "125", "15", "H"},//C, x
+-  {   "D",   "y a b c",       "-1",          "0.0f",         "a",     "C-0",   "HUT",             String.valueOf(Long.MAX_VALUE),           String.valueOf(Double.MIN_VALUE), String.valueOf(Short.MIN_VALUE), String.valueOf(Byte.MIN_VALUE), "G"},//D, y
+-  {   "E",   "x a b c d",     "5",           "2f",           "h",     "B-8",   "peach",           String.valueOf(Long.MIN_VALUE),           String.valueOf(Double.MAX_VALUE), String.valueOf(Short.MAX_VALUE),           String.valueOf(Byte.MAX_VALUE), "F"},//E,x
++  {   "C",   "x a b c",       "2147483647",  "1.0",          "j",     "A-2",   "p\u00E9ch\u00E9", "99999999","40.00002343",        "125",     "15", "H"},//C, x
++  {   "D",   "y a b c",       "-1",          "0.0f",         "a",     "C-0",   "HUT",   String.valueOf(Long.MAX_VALUE),String.valueOf(Double.MIN_VALUE), String.valueOf(Short.MIN_VALUE), String.valueOf(Byte.MIN_VALUE), "G"},//D, y
++  {   "E",   "x a b c d",     "5",           "2f",           "h",     "B-8",   "peach", String.valueOf(Long.MIN_VALUE),String.valueOf(Double.MAX_VALUE), String.valueOf(Short.MAX_VALUE),           String.valueOf(Byte.MAX_VALUE), "F"},//E,x
+   {   "F",   "y a b c d",     "2",           "3.14159f",     "g",     "B-1",   "H\u00C5T",        "-44",           "343.034435444", "-3", "0", "E"},//F,y
+   {   "G",   "x a b c d",     "3",           "-1.0",         "f",     "C-100", "sin",             "323254543543", "4.043544", "5", "100", "D"},//G,x
+   {   "H",   "y a b c d",     "0",           "1.4E-45",      "e",     "C-88",  "H\u00D8T",        "1023423423005","4.043545", "10", "-50", "C"},//H,y
+@@ -96,7 +97,13 @@ public static void beforeClass() throws Exception {
+   {   "W",   "g",             "1",           null,           null,    null,    null,              null,           null, null, null, null},
+   {   "X",   "g",             "1",           "0.1",          null,    null,    null,              null,           null, null, null, null},
+   {   "Y",   "g",             "1",           "0.2",          null,    null,    null,              null,           null, null, null, null},
+-  {   "Z",   "f g",           null,          null,           null,    null,    null,              null,           null, null, null, null}
++  {   "Z",   "f g",           null,          null,           null,    null,    null,              null,           null, null, null, null},
++  
++  // Sort Missing first/last
++  {   "a",   "m",            null,          null,           null,    null,    null,              null,           null, null, null, null},
++  {   "b",   "m",            "4",           "4.0",           "4",    null,    null,              "4",           "4", "4", "4", null},
++  {   "c",   "m",            "5",           "5.0",           "5",    null,    null,              "5",           "5", "5", "5", null},
++  {   "d",   "m",            null,          null,           null,    null,    null,              null,           null, null, null, null}
+   };
+   
+   // the sort order of Ø versus U depends on the version of the rules being used
+@@ -224,6 +231,7 @@ public void setUp() throws Exception {
+     queryE = new TermQuery (new Term ("contents", "e"));
+     queryF = new TermQuery (new Term ("contents", "f"));
+     queryG = new TermQuery (new Term ("contents", "g"));
++    queryM = new TermQuery (new Term ("contents", "m"));
+     sort = new Sort();
+   }
+   
+@@ -284,6 +292,68 @@ public void testTypedSort() throws Exception {
+     assertMatches (full, queryY, sort, "DJHFB");
+   }
+   
++  private static class SortMissingLastTestHelper {
++    final SortField sortField;
++    final Object min;
++    final Object max;
++    
++    SortMissingLastTestHelper( SortField sortField, Object min, Object max ) {
++      this.sortField = sortField;
++      this.min = min;
++      this.max = max;
++    }
++  }
++
++  // test sorts where the type of field is specified
++  public void testSortMissingLast() throws Exception {
++    
++    @SuppressWarnings("boxing")
++    SortMissingLastTestHelper[] ascendTesters = new SortMissingLastTestHelper[] {
++        new SortMissingLastTestHelper( new SortField(   "byte",   SortField.BYTE ), Byte.MIN_VALUE,    Byte.MAX_VALUE ),
++        new SortMissingLastTestHelper( new SortField(  "short",  SortField.SHORT ), Short.MIN_VALUE,   Short.MAX_VALUE ),
++        new SortMissingLastTestHelper( new SortField(    "int",    SortField.INT ), Integer.MIN_VALUE, Integer.MAX_VALUE ),
++        new SortMissingLastTestHelper( new SortField(   "long",   SortField.LONG ), Long.MIN_VALUE,    Long.MAX_VALUE ),
++        new SortMissingLastTestHelper( new SortField(  "float",  SortField.FLOAT ), Float.MIN_VALUE,   Float.MAX_VALUE ),
++        new SortMissingLastTestHelper( new SortField( "double", SortField.DOUBLE ), Double.MIN_VALUE,  Double.MAX_VALUE ),
++    };
++    
++    @SuppressWarnings("boxing")
++    SortMissingLastTestHelper[] descendTesters = new SortMissingLastTestHelper[] {
++      new SortMissingLastTestHelper( new SortField(   "byte",   SortField.BYTE, true ), Byte.MIN_VALUE,    Byte.MAX_VALUE ),
++      new SortMissingLastTestHelper( new SortField(  "short",  SortField.SHORT, true ), Short.MIN_VALUE,   Short.MAX_VALUE ),
++      new SortMissingLastTestHelper( new SortField(    "int",    SortField.INT, true ), Integer.MIN_VALUE, Integer.MAX_VALUE ),
++      new SortMissingLastTestHelper( new SortField(   "long",   SortField.LONG, true ), Long.MIN_VALUE,    Long.MAX_VALUE ),
++      new SortMissingLastTestHelper( new SortField(  "float",  SortField.FLOAT, true ), Float.MIN_VALUE,   Float.MAX_VALUE ),
++      new SortMissingLastTestHelper( new SortField( "double", SortField.DOUBLE, true ), Double.MIN_VALUE,  Double.MAX_VALUE ),
++    };
++    
++    // Default order: ascending
++    for( SortMissingLastTestHelper t : ascendTesters ) {
++      sort.setSort (t.sortField, SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "adbc" );
++
++      sort.setSort (t.sortField.setMissingValue( t.max ), SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "bcad" );
++
++      sort.setSort (t.sortField.setMissingValue( t.min ), SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "adbc" );
++    }
++    
++    // Reverse order: descending (Note: Order for un-valued documents remains the same due to tie breaker: a,d)
++    for( SortMissingLastTestHelper t : descendTesters ) {
++      sort.setSort (t.sortField, SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "cbad" );
++      
++      sort.setSort (t.sortField.setMissingValue( t.max ), SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "adcb" );
++      
++      sort.setSort (t.sortField.setMissingValue( t.min ), SortField.FIELD_DOC );
++      assertMatches("sortField:"+t.sortField, full, queryM, sort, "cbad" );
++    }
++    
++    
++  }
++  
+   /**
+    * Test String sorting: small queue to many matches, multi field sort, reverse sort
+    */
+@@ -1056,13 +1126,17 @@ private void runMultiSorts(Searcher multi, boolean isFull) throws Exception {
+ 
+   }
+ 
++  private void assertMatches(Searcher searcher, Query query, Sort sort, String expectedResult) throws IOException {
++    assertMatches( null, searcher, query, sort, expectedResult );
++  }
++
+   // make sure the documents returned by the search match the expected list
+-  private void assertMatches(Searcher searcher, Query query, Sort sort,
++  private void assertMatches(String msg, Searcher searcher, Query query, Sort sort,
+       String expectedResult) throws IOException {
+     //ScoreDoc[] result = searcher.search (query, null, 1000, sort).scoreDocs;
+     TopDocs hits = searcher.search (query, null, Math.max(1, expectedResult.length()), sort);
+     ScoreDoc[] result = hits.scoreDocs;
+-    assertEquals(hits.totalHits, expectedResult.length());
++    assertEquals(expectedResult.length(),hits.totalHits);
+     StringBuilder buff = new StringBuilder(10);
+     int n = result.length;
+     for (int i=0; i<n; ++i) {
+@@ -1072,7 +1146,7 @@ private void assertMatches(Searcher searcher, Query query, Sort sort,
+         buff.append (v[j]);
+       }
+     }
+-    assertEquals (expectedResult, buff.toString());
++    assertEquals (msg, expectedResult, buff.toString());
+   }
+ 
+   private HashMap<String,Float> getScores (ScoreDoc[] hits, Searcher searcher)

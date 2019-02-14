@@ -1,0 +1,300 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
+index 98a9c349..48656b4e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/compile/CompilerContext.java
+@@ -402,6 +402,25 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 	 */
+ 	public SchemaDescriptor setCompilationSchema(SchemaDescriptor newDefault);
+ 
++	/**
++	 * Push a default schema to use when compiling.
++	 * <p>
++	 * Sometimes, we need to temporarily change the default schema, for example
++	 * when recompiling a view, since the execution time default schema may
++	 * differ from the required default schema when the view was defined.
++	 * Another case is when compiling generated columns which reference
++	 * unqualified user functions.
++	 * </p>
++	 * @param sd schema to use
++	 */
++	public void pushCompilationSchema(SchemaDescriptor sd);
++
++
++	/**
++	 * Pop the default schema to use when compiling.
++	 */
++	public void popCompilationSchema();
++
+ 	/**
+ 	 * Get a StoreCostController for the given conglomerate.
+ 	 *
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+index 0f6f342a..9320ece0 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CompilerContextImpl.java
+@@ -1,3 +1,4 @@
++
+ /*
+ 
+    Derby - Class org.apache.derby.impl.sql.compile.CompilerContextImpl
+@@ -157,6 +158,7 @@ public	void	resetContext()
+ 		reliability = CompilerContext.SQL_LEGAL;
+ 		returnParameterFlag = false;
+ 		initRequiredPriv();
++		defaultSchemaStack = null;
+ 	}
+ 
+ 	//
+@@ -553,6 +555,31 @@ public SchemaDescriptor setCompilationSchema(SchemaDescriptor newDefault)
+ 		return tmpSchema;
+ 	}
+ 
++	/**
++	 * @see CompilerContext#pushCompilationSchema
++	 */
++	public void pushCompilationSchema(SchemaDescriptor sd)
++	{
++		if (defaultSchemaStack == null) {
++			defaultSchemaStack = new ArrayList(2);
++		}
++
++		defaultSchemaStack.add(defaultSchemaStack.size(),
++							   getCompilationSchema());
++		setCompilationSchema(sd);
++	}
++
++	/**
++	 * @see CompilerContext#popCompilationSchema
++	 */
++	public void popCompilationSchema()
++	{
++		SchemaDescriptor sd =
++			(SchemaDescriptor)defaultSchemaStack.remove(
++				defaultSchemaStack.size() - 1);
++		setCompilationSchema(sd);
++	}
++
+ 	/**
+ 	 * @see CompilerContext#setParameterList
+ 	 */
+@@ -916,6 +943,13 @@ public List getRequiredPermissionsList()
+ 	private Vector				savedObjects;
+ 	private String				classPrefix;
+ 	private SchemaDescriptor	compilationSchema;
++
++	/**
++	 * Saved execution time default schema, if we need to change it
++	 * temporarily.
++	 */
++	private ArrayList        	defaultSchemaStack;
++
+ 	private ProviderList		currentAPL;
+ 	private boolean returnParameterFlag;
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/DMLModStatementNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/DMLModStatementNode.java
+index 535311db..d5e656bc 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/DMLModStatementNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/DMLModStatementNode.java
+@@ -546,13 +546,14 @@ void forbidGenerationOverrides( ResultColumnList targetRCL, boolean forUpdate, C
+                 // created/altered. See DERBY-3945.
+                 //
+                 SchemaDescriptor    originalCurrentSchema = getSchemaDescriptor( di.getOriginalCurrentSchema(), true );
+-                SchemaDescriptor    previousSchema = compilerContext.setCompilationSchema( originalCurrentSchema );
++                compilerContext.pushCompilationSchema( originalCurrentSchema );
++
+                 try {
+                     bindRowScopedExpression( getNodeFactory(), getContextManager(), targetTableDescriptor, sourceRCL, generationClause );
+                 }
+                 finally
+                 {
+-                    compilerContext.setCompilationSchema( previousSchema );
++                    compilerContext.popCompilationSchema();
+                 }
+ 
+                 ResultColumn    newRC =  (ResultColumn) getNodeFactory().getNode
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+index 3a459fe6..06635d6b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromBaseTable.java
+@@ -78,6 +78,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.impl.sql.compile.ExpressionClassBuilder;
+ import org.apache.derby.impl.sql.compile.ActivationClassBuilder;
++import org.apache.derby.impl.sql.compile.FromSubquery;
+ 
+ import java.util.Enumeration;
+ import java.util.Properties;
+@@ -2204,12 +2205,11 @@ public ResultSetNode bindNonVTITables(DataDictionary dataDictionary,
+ 		/* Resolve the view, if this is a view */
+ 		if (tableDescriptor.getTableType() == TableDescriptor.VIEW_TYPE)
+ 		{
+-			FromTable					fsq;
++			FromSubquery                fsq;
+ 			ResultSetNode				rsn;
+ 			ViewDescriptor				vd;
+ 			CreateViewNode				cvn;
+ 			SchemaDescriptor			compSchema;
+-			SchemaDescriptor			prevCompSchema;
+ 
+ 			/* Get the associated ViewDescriptor so that we can get 
+ 			 * the view definition text.
+@@ -2224,7 +2224,7 @@ public ResultSetNode bindNonVTITables(DataDictionary dataDictionary,
+ 			*/
+ 			compSchema = dataDictionary.getSchemaDescriptor(vd.getCompSchemaId(), null);
+ 
+-			prevCompSchema = compilerContext.setCompilationSchema(compSchema);
++			compilerContext.pushCompilationSchema(compSchema);
+ 	
+ 			try
+ 			{
+@@ -2269,7 +2269,7 @@ public ResultSetNode bindNonVTITables(DataDictionary dataDictionary,
+ 						compilerContext.addRequiredColumnPriv( rc.getTableColumnDescriptor());
+ 				}
+ 
+-				fsq = (FromTable) getNodeFactory().getNode(
++				fsq = (FromSubquery) getNodeFactory().getNode(
+ 					C_NodeTypes.FROM_SUBQUERY,
+ 					rsn, 
+ 					(correlationName != null) ? 
+@@ -2287,11 +2287,16 @@ public ResultSetNode bindNonVTITables(DataDictionary dataDictionary,
+ 				//any privilege requirement for it.
+ 				fsq.disablePrivilegeCollection();
+ 				fsq.setOrigTableName(this.getOrigTableName());
++
++				// since we reset the compilation schema when we return, we
++				// need to save it for use when we bind expressions:
++				fsq.setOrigCompilationSchema(compSchema);
++
+ 				return fsq.bindNonVTITables(dataDictionary, fromListParam);
+ 			}
+ 			finally
+ 			{
+-				compilerContext.setCompilationSchema(prevCompSchema);
++				compilerContext.popCompilationSchema();
+ 			}
+ 		}
+ 		else
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromSubquery.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromSubquery.java
+index c3cfeee1..593064b8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromSubquery.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/FromSubquery.java
+@@ -24,7 +24,9 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derby.iapi.error.StandardException;
+ import org.apache.derby.iapi.sql.compile.C_NodeTypes;
++import org.apache.derby.iapi.sql.compile.CompilerContext;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
++import org.apache.derby.iapi.sql.dictionary.SchemaDescriptor;
+ 
+ import org.apache.derby.iapi.services.sanity.SanityManager;
+ 
+@@ -45,6 +47,12 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ {
+ 	ResultSetNode	subquery;
+ 
++	/**
++	 * DERBY-3270: If this subquery represents an expanded view, this holds the
++	 * current compilation schema at view definition time.
++	 */
++	private SchemaDescriptor origCompilationSchema = null;
++
+ 	/**
+ 	 * Intializer for a table in a FROM list.
+ 	 *
+@@ -213,8 +221,22 @@ public void bindExpressions(FromList fromListParam)
+ 		 */
+ 		
+ 		nestedFromList = emptyFromList;
++
++		CompilerContext compilerContext = getCompilerContext();
++
++		if (origCompilationSchema != null) {
++			// View expansion needs the definition time schema
++			compilerContext.pushCompilationSchema(origCompilationSchema);
++		}
++
++		try {
+ 		subquery.bindExpressions(nestedFromList);
+ 		subquery.bindResultColumns(nestedFromList);
++		} finally {
++			if (origCompilationSchema != null) {
++				compilerContext.popCompilationSchema();
++			}
++		}
+ 
+ 		/* Now that we've bound the expressions in the subquery, we 
+ 		 * can propagate the subquery's RCL up to the FromSubquery.
+@@ -641,4 +663,14 @@ void decrementLevel(int decrement)
+ 		super.decrementLevel(decrement);
+ 		subquery.decrementLevel(decrement);
+ 	}
++
++	/**
++	 * Associate this subquery with the original compilation schema of a view.
++	 *
++	 * @param sd schema descriptor of the original compilation schema of the
++	 * view.
++	 */
++	public void setOrigCompilationSchema(SchemaDescriptor sd) {
++		origCompilationSchema = sd;
++	}
+ }
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
+index 0fe48995..c9752457 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/ViewsTest.java
+@@ -1,5 +1,6 @@
+ package org.apache.derbyTesting.functionTests.tests.lang;
+ 
++import java.sql.Connection;
+ import java.sql.PreparedStatement;
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+@@ -9,6 +10,7 @@
+ import junit.framework.TestSuite;
+ 
+ import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.CleanDatabaseTestSetup;
+ import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.TestConfiguration;
+ 
+@@ -27,7 +29,7 @@ public static Test suite()
+     {
+         TestSuite suite = new TestSuite("views Test");
+         suite.addTest(TestConfiguration.embeddedSuite(ViewsTest.class));
+-        return suite;
++        return new CleanDatabaseTestSetup(suite);
+     }
+ 
+     public void test_views() throws Exception
+@@ -758,4 +760,30 @@ public void test_views() throws Exception
+         getConnection().rollback();
+         st.close();
+     }
++
++   /**
++    * DERBY-3270 Test that we can select from a view in another schema if the
++    * default schema does not exist.
++    *
++    * @throws SQLException
++    */
++    public void testSelectViewFromOtherSchemaWithNoDefaultSchema()
++            throws SQLException {
++        Connection conn = openDefaultConnection("joe","joepass");
++        Statement st = conn.createStatement();
++        st.execute("create table mytable(a int)");
++        st.execute("insert into mytable values (99)");
++        st.execute("create view myview as select * from mytable");
++        st.close();
++        conn.close();
++        Connection conn2 = openDefaultConnection("bill","billpass");
++        Statement st2 = conn2.createStatement();
++        ResultSet rs = st2.executeQuery("SELECT * FROM JOE.MYVIEW");
++        JDBC.assertFullResultSet(rs,new String[][] {{"99"}});
++        st2.executeUpdate("drop view joe.myview");
++        st2.executeUpdate("drop table joe.mytable");
++        st2.close();
++        conn2.close();
++   }
++
+ }

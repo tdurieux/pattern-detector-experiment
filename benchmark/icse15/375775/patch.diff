@@ -1,0 +1,183 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+index 96ffba8b..1cb1877b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/FileContainer.java
+@@ -1960,12 +1960,29 @@ private boolean pageValid(BaseContainerHandle handle, long pagenum)
+ 		return retval;
+ 	}
+ 
+-	protected long getLastPageNumber(BaseContainerHandle handle) throws StandardException
++	protected long getLastPageNumber(BaseContainerHandle handle) 
++        throws StandardException
+ 	{
+ 		long retval;
+ 		synchronized(allocCache)
+ 		{
+-			retval = allocCache.getLastPageNumber(handle, firstAllocPageNumber);
++            // check if the first alloc page number is valid, it is invalid 
++            // if some one attempts to access the container info before the 
++            // first alloc page got created. One such case is online backup. 
++            // If first alloc page itself is invalid, then there are no pages
++            // on the disk yet for this container, just return
++            // ContainerHandle.INVALID_PAGE_NUMBER, caller can decide what to
++            // do. 
++            
++            if (firstAllocPageNumber == ContainerHandle.INVALID_PAGE_NUMBER)	
++            {
++                retval = ContainerHandle.INVALID_PAGE_NUMBER;
++            }
++            else
++            {
++                retval = 
++                    allocCache.getLastPageNumber(handle, firstAllocPageNumber);
++            }
+ 		}
+ 		return retval;
+ 	}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index d5f8cfbe..3276e2f8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -1112,27 +1112,38 @@ private void privBackupContainer(BaseContainerHandle handle,
+                     }
+                 }else {
+                     // regular container file 
+-                    StorageFile file = privGetFileName((ContainerKey)getIdentity(), 
+-                                                       false, false, true);
+-                    backupFile = new File(backupLocation , file.getName());
+-                    backupRaf = new RandomAccessFile(backupFile,  "rw");
++                    long lastPageNumber= getLastPageNumber(handle);
++                    if (lastPageNumber == ContainerHandle.INVALID_PAGE_NUMBER) {
++                        // last page number is invalid if there are no pages in
++                        // the container yet. No need to backup this container, 
++                        // this container creation is yet to complete.The reason
++                        // backup is getting called on such a container is 
++                        // because container handle appears in the cache after 
++                        // the file is created on the disk but before it's 
++                        // first page is allocated. 
++                        return;
++                    }
+ 
+-					// copy all the pages of the container from the database 
+-                    // to the backup location by reading through the page cache.
++                    StorageFile file = 
++                        privGetFileName(
++                            (ContainerKey)getIdentity(), false, false, true);
+                     
+-                    long lastPageNumber= getLastPageNumber(handle);
++                    backupFile = new File(backupLocation , file.getName());
++                    backupRaf  = new RandomAccessFile(backupFile,  "rw");
+ 
+                     byte[] encryptionBuf = null;
+                     if (dataFactory.databaseEncrypted()) {
+                         // Backup uses seperate encryption buffer to encrypt the
+-                        // page instead of encryption buffer used by the regular conatiner
+-                        // writes. Otherwise writes to the backup 
++                        // page instead of encryption buffer used by the regular
++                        // conatiner writes. Otherwise writes to the backup 
+                         // has to be synchronized with regualar database writes
+                         // because backup can run in parallel to container
+                         // writes.
+                         encryptionBuf = new byte[pageSize];
+                     }
+ 
++                    // copy all the pages of the container from the database 
++                    // to the backup location by reading through the page cache.
+                     for (long pageNumber = FIRST_ALLOC_PAGE_NUMBER; 
+                          pageNumber <= lastPageNumber; pageNumber++) {
+                         page = getPageForBackup(handle, pageNumber);
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
+index cdea1e12..3cb1d67d 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/store/OnlineBackupTest1.java
+@@ -73,6 +73,7 @@ private void runTest() throws SQLException, Exception {
+ 		dbActions.createTable(TEST_TABLE_NAME);
+         dbActions.createTable(TEST_TABLE_NAME_1);
+         dbActions.createTable(TEST_TABLE_NAME_2);
++        conn.commit();
+ 
+         // start first unlogged operation
+ 		dbActions.startUnloggedAction(TEST_TABLE_NAME_1);
+@@ -102,23 +103,17 @@ private void runTest() throws SQLException, Exception {
+ 		dmlThread.start();
+ 
+         // run some DDL create/drop tables in another thread
+-
+-
+          Connection ddlConn = getConnection();
+ 
+-         /* Disabling create table operation running parallel to 
+-          * backup because of DERBY-750 bug. This block of code
+-          * should be uncommented when DERBY-750 is fixed.
+-
+          DatabaseActions ddlActions = 
+             new DatabaseActions(DatabaseActions.CREATEDROPS, ddlConn);
+             Thread ddlThread = new Thread(ddlActions, "DDL_THREAD");
+             ddlThread.start();
+-         */
+ 
+ 		// sleep for few seconds just to make sure backup thread is actually
+-		// gone to a wait state for unlogged actions to commit.
+-		java.lang.Thread.sleep(5000);
++		// gone to a wait state for unlogged actions to commit and there is
++        // some ddl and dml activity in progress. 
++		java.lang.Thread.sleep(50000);
+ 			
+ 		// backup should not even start doing real work before the
+ 		// unlogged transaction is commited
+@@ -133,9 +128,9 @@ private void runTest() throws SQLException, Exception {
+ 		backup.waitForBackupToEnd();
+ 		backupThread.join();
+ 		dmlActions.stopActivity();
+-		// ddlActions.stopActivity(); -- uncomment this when derby-750 is fixed
++        ddlActions.stopActivity(); 
+ 		dmlThread.join();
+-		// ddlThread.join(); -- uncomment this when derby-750 is fixed
++        ddlThread.join(); 
+         
+         // close the connections.
+         conn.close();
+@@ -344,28 +339,26 @@ void performCreateDropTables() throws SQLException {
+ 			
+ 			Statement s = conn.createStatement();
+ 			while(!stopActivity) {
+-				for( int i = 0 ; i < 100 ; i++) {
++				for( int i = 0 ; i < 10; i++) {
+ 					String tableName = "emp" + i ;
+ 					createTable(tableName);
+ 					//load some data
+-					insert(tableName, 100, COMMIT, 10);
+-					if((i % 2) == 0) 
++					insert(tableName, 100, OPENTX, 10);
++					if((i % 2) == 0) {
+ 						conn.commit();
++                    }
+ 					else
+ 						conn.rollback();
+ 				}
+-				conn.commit();
+ 
+-				for( int i = 0 ; i < 100 ; i=i+2) {
++                //drop all the table that are created above.
++				for( int i = 0 ; i < 10 ; i=i+2) {
+ 					String tableName = "emp" + i ;
+ 					s.executeUpdate("drop TABLE " + "emp" +i ); 
+-					if((i % 2) == 0) 
+ 						conn.commit();
+-					else
+-						conn.rollback();
+ 				}
+-				conn.commit();
+ 			}
++            s.close();
+ 		}
+ 
+ 
+@@ -499,7 +492,6 @@ void createTable(String tableName) throws SQLException {
+ 							"salary float)");
+ 			s.executeUpdate("create index " + tableName + "_id_idx on " + 
+ 							tableName + "(id)");
+-			conn.commit();
+ 			s.close();
+ 		}
+ 

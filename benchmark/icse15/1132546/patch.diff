@@ -1,0 +1,172 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+index 38c55893..1371c262 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/catalog/DataDictionaryImpl.java
+@@ -4580,6 +4580,9 @@ public void	dropSPSDescriptor(SPSDescriptor descriptor,
+ 	/**
+ 	 * Get every statement in this database.
+ 	 * Return the SPSDescriptors in an list.
++     * The returned descriptors don't contain the compiled statement, so it
++     * it safe to call this method during upgrade when it isn't known if the
++     * saved statement can still be deserialized with the new version.
+ 	 *
+ 	 * @return the list of descriptors
+ 	 *
+@@ -4592,7 +4595,23 @@ public List getAllSPSDescriptors()
+ 
+ 		List list = newSList();
+ 
++        // DERBY-3870: The compiled plan may not be possible to deserialize
++        // during upgrade. Skip the column that contains the compiled plan to
++        // prevent deserialization errors when reading the rows. We don't care
++        // about the value in that column, since this method is only called
++        // when we want to drop or invalidate rows in SYSSTATEMENTS.
++        FormatableBitSet cols = new FormatableBitSet(
++                ti.getCatalogRowFactory().getHeapColumnCount());
++        for (int i = 0; i < cols.size(); i++) {
++            if (i + 1 == SYSSTATEMENTSRowFactory.SYSSTATEMENTS_CONSTANTSTATE) {
++                cols.clear(i);
++            } else {
++                cols.set(i);
++            }
++        }
++
+ 		getDescriptorViaHeap(
++                        cols,
+ 						(ScanQualifier[][]) null,
+ 						ti,
+ 						(TupleDescriptor) null,
+@@ -4647,6 +4666,7 @@ private GenericDescriptorList getAllTriggerDescriptors()
+ 		GenericDescriptorList list = new GenericDescriptorList();
+ 
+ 		getDescriptorViaHeap(
++                        null,
+ 						(ScanQualifier[][]) null,
+ 						ti,
+ 						(TupleDescriptor) null,
+@@ -7039,10 +7059,7 @@ public ConglomerateDescriptor getConglomerateDescriptor(
+   				false);
+ 
+ 		ConglomerateDescriptorList cdl = new ConglomerateDescriptorList();
+-		getDescriptorViaHeap(scanQualifier,
+-								 ti,
+-								 null,
+-								 cdl);
++		getDescriptorViaHeap(null, scanQualifier, ti, null, cdl);
+ 
+ 		int size = cdl.size();
+ 		ConglomerateDescriptor[] cda = new ConglomerateDescriptor[size];
+@@ -9475,6 +9492,8 @@ private void debugGenerateInfo(StringBuffer strbuf,
+ 	 * Return a (single or list of) catalog row descriptor(s) from a
+ 	 * system table where the access a heap scan
+ 	 *
++     * @param columns                   which columns to fetch from the system
++     *                                  table, or null to fetch all columns
+ 	 * @param scanQualifiers			qualifiers
+ 	 * @param ti						The TabInfoImpl to use
+ 	 * @param parentTupleDescriptor		The parentDescriptor, if applicable.
+@@ -9486,6 +9505,7 @@ private void debugGenerateInfo(StringBuffer strbuf,
+ 	 * @exception StandardException		Thrown on error
+ 	 */
+ 	protected TupleDescriptor getDescriptorViaHeap(
++                        FormatableBitSet columns,
+ 						ScanQualifier [][] scanQualifiers,
+ 						TabInfoImpl ti,
+ 						TupleDescriptor parentTupleDescriptor,
+@@ -9513,7 +9533,7 @@ protected TupleDescriptor getDescriptorViaHeap(
+ 				0, 							// for read
+ 				TransactionController.MODE_TABLE,
+                 TransactionController.ISOLATION_REPEATABLE_READ,
+-				(FormatableBitSet) null,         // all fields as objects
++				columns,
+ 				(DataValueDescriptor[]) null,		// start position - first row
+ 				0,      				// startSearchOperation - none
+ 				scanQualifiers, 		// scanQualifier,
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+index fad212bd..d4a2aa0b 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/upgradeTests/BasicSetup.java
+@@ -29,6 +29,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import org.apache.derbyTesting.junit.JDBC;
+ import org.apache.derbyTesting.junit.TestConfiguration;
++import org.apache.derbyTesting.junit.XML;
+ 
+ import junit.framework.Test;
+ import junit.framework.TestSuite;
+@@ -44,6 +45,12 @@ public static Test suite() {
+         
+         suite.addTestSuite(BasicSetup.class);
+         
++        if (XML.classpathMeetsXMLReqs()) {
++            // Only test XML operators if they are supported by the version
++            // we upgrade to.
++            suite.addTest(new BasicSetup("xmlTestTriggerWithXMLOperators"));
++        }
++
+         return suite;
+     }
+ 
+@@ -772,4 +779,62 @@ private String  stringify( int[] array )
+         return buffer.toString();
+     }
+     //End of helper methods for testExhuastivePermutationOfTriggerColumns
++
++    /**
++     * Test that triggers that use XML operators work after upgrade. The
++     * first fix for DERBY-3870 broke upgrade of such triggers because the
++     * old execution plans failed to deserialize on the new version.
++     */
++    public void xmlTestTriggerWithXMLOperators() throws SQLException {
++        if (!oldAtLeast(10, 3)) {
++            // Before 10.3, the CREATE TRIGGER statement used in the test
++            // failed with a syntax error. Skip the test for older versions.
++            return;
++        }
++
++        Statement s = createStatement();
++
++        if (getPhase() == PH_CREATE) {
++            // Create test tables and a trigger that uses XML operators with
++            // the old version.
++            s.execute("create table d3870_t1(i int, x varchar(100))");
++            s.execute("create table d3870_t2(i int)");
++            try {
++                s.execute("create trigger d3870_tr after insert on d3870_t1 " +
++                          "for each statement insert into d3870_t2 " +
++                          "select i from d3870_t1 where " +
++                          "xmlexists('//a' passing by ref " +
++                          "xmlparse(document x preserve whitespace))");
++            } catch (SQLException sqle) {
++                // The CREATE TRIGGER statement will fail if the XML classpath
++                // requirements aren't satisfied for the old version. That's
++                // OK, but we'll have to skip the test for this combination.
++                assertSQLState("XML00", sqle);
++                return;
++            }
++        } else {
++            // Delete the rows to start the test from a known state in each
++            // of the phases.
++            s.executeUpdate("delete from d3870_t1");
++            s.executeUpdate("delete from d3870_t2");
++        }
++
++        // Check if the trigger exists. It won't exist if the XML requirements
++        // weren't satisfied for the old version. If we don't have the trigger,
++        // we skip the rest of the test.
++        ResultSet rs = s.executeQuery(
++            "select 1 from sys.systriggers where triggername = 'D3870_TR'");
++        boolean hasTrigger = rs.next();
++        rs.close();
++
++        // Verify that the trigger works both before and after upgrade.
++        if (hasTrigger) {
++            s.execute("insert into d3870_t1 values " +
++                      "(1, '<a/>'), (2, '<b/>'), (3, '<c/>')");
++
++            JDBC.assertSingleValueResultSet(
++                    s.executeQuery("select * from d3870_t2"), "1");
++        }
++    }
++
+ }

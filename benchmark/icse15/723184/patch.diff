@@ -1,0 +1,591 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/AlterTableNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/AlterTableNode.java
+index 643e7dbc..430a7c1f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/AlterTableNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/AlterTableNode.java
+@@ -410,12 +410,15 @@ public void bindStatement() throws StandardException
+ 			/* Now that we've finally goobered stuff up, bind and validate
+ 			 * the check constraints and generation clauses.
+ 			 */
+-			if  (numCheckConstraints > 0) { tableElementList.bindAndValidateCheckConstraints(fromList); }
+ 			if  (numGenerationClauses > 0)
+             { tableElementList.bindAndValidateGenerationClauses( schemaDescriptor, fromList, generatedColumns ); }
++			if  (numCheckConstraints > 0) { tableElementList.bindAndValidateCheckConstraints(fromList); }
+             if ( numReferenceConstraints > 0) { tableElementList.validateForeignKeysOnGenerationClauses( fromList, generatedColumns ); }
+ 		}
+ 
++        // must be done after resolving the datatypes of the generation clauses
++        if (tableElementList != null) { tableElementList.validatePrimaryKeyNullability(); }
++
+ 		//Check if we are in alter table to update the statistics. If yes, then
+ 		//check if we are here to update the statistics of a specific index. If
+ 		//yes, then verify that the indexname provided is a valid one.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTableNode.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTableNode.java
+index 43c79a3b..b9300574 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTableNode.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/CreateTableNode.java
+@@ -438,10 +438,12 @@ public void bindStatement() throws StandardException
+ 			/* Now that we've finally goobered stuff up, bind and validate
+ 			 * the check constraints and generation clauses.
+ 			 */
+-			if  (numCheckConstraints > 0) { tableElementList.bindAndValidateCheckConstraints(fromList); }
+ 			if  (numGenerationClauses > 0) { tableElementList.bindAndValidateGenerationClauses( sd, fromList, generatedColumns ); }
++			if  (numCheckConstraints > 0) { tableElementList.bindAndValidateCheckConstraints(fromList); }
+             if ( numReferenceConstraints > 0) { tableElementList.validateForeignKeysOnGenerationClauses( fromList, generatedColumns ); }
+ 		}
++
++        if ( numPrimaryKeys > 0 ) { tableElementList.validatePrimaryKeyNullability(); }
+ 	}
+ 
+ 	/**
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+index c565c550..9dd6247e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/ResultColumnList.java
+@@ -277,6 +277,21 @@ public ResultColumn getOrderByColumn(int position)
+ 	 */
+ 
+ 	public ResultColumn getResultColumn(String columnName)
++	{
++        return getResultColumn( columnName, true );
++	}
++
++	/**
++	 * Get a ResultColumn that matches the specified columnName. If requested
++	 * to, mark the column as referenced.
++	 *
++	 * @param columnName	The ResultColumn to get from the list
++	 * @param markIfReferenced True if we should mark this column as referenced.
++	 *
++	 * @return	the column that matches that name.
++	 */
++
++	public ResultColumn getResultColumn(String columnName, boolean markIfReferenced )
+ 	{
+ 		int size = size();
+ 		for (int index = 0; index < size; index++)
+@@ -286,7 +301,7 @@ public ResultColumn getResultColumn(String columnName)
+ 			if (columnName.equals( resultColumn.getName()) )
+ 			{
+ 				/* Mark ResultColumn as referenced and return it */
+-				resultColumn.setReferenced();
++                if ( markIfReferenced ) { resultColumn.setReferenced(); }
+ 				return resultColumn;
+ 			}
+ 		}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/TableElementList.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/TableElementList.java
+index 8b22c3f8..469badcd 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/TableElementList.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/compile/TableElementList.java
+@@ -344,21 +344,11 @@ else if (destConstraint instanceof ConstraintDescriptor)
+ 				}
+ 			}
+ 
++            // validation of primary key nullability moved to validatePrimaryKeyNullability().
+             if (cdn.hasPrimaryKeyConstraint())
+             {
+                 // for PRIMARY KEY, check that columns are unique
+                 verifyUniqueColumnList(ddlStmt, cdn);
+-
+-                if (td == null)
+-                {
+-                    // in CREATE TABLE so set PRIMARY KEY columns to NOT NULL
+-                    setColumnListToNotNull(cdn);
+-                }
+-                else
+-                {
+-                    // in ALTER TABLE so raise error if any columns are nullable
+-                    checkForNullColumns(cdn, td);
+-                }
+             }
+             else if (cdn.hasUniqueKeyConstraint())
+             {
+@@ -386,6 +376,44 @@ else if (cdn.hasForeignKeyConstraint())
+ 
+ 	}
+ 
++    /**
++	 * Validate nullability of primary keys. This logic was moved out of the main validate
++	 * method so that it can be called after binding generation clauses. We need
++	 * to perform the nullability checks later on because the datatype may be
++	 * omitted on the generation clause--we can't set/vet the nullability of the
++	 * datatype until we determine what the datatype is.
++	 */
++    public  void    validatePrimaryKeyNullability()
++        throws StandardException
++    {
++		int			size = size();
++		for (int index = 0; index < size; index++)
++		{
++			TableElementNode tableElement = (TableElementNode) elementAt(index);
++
++			if (! (tableElement.hasConstraint()))
++			{
++				continue;
++			}
++            
++			ConstraintDefinitionNode cdn = (ConstraintDefinitionNode) tableElement;
++
++            if (cdn.hasPrimaryKeyConstraint())
++            {
++                if (td == null)
++                {
++                    // in CREATE TABLE so set PRIMARY KEY columns to NOT NULL
++                    setColumnListToNotNull(cdn);
++                }
++                else
++                {
++                    // in ALTER TABLE so raise error if any columns are nullable
++                    checkForNullColumns(cdn, td);
++                }
++            }
++        }
++    }
++    
+     /**
+ 	 * Count the number of constraints of the specified type.
+ 	 *
+@@ -721,6 +749,7 @@ void bindAndValidateGenerationClauses( SchemaDescriptor sd, FromList fromList, F
+ 	{
+ 		CompilerContext cc;
+ 		FromBaseTable				table = (FromBaseTable) fromList.elementAt(0);
++        ResultColumnList            tableColumns = table.getResultColumns();
+         int                                 columnCount = table.getResultColumns().size();
+ 		int						  size = size();
+ 
+@@ -787,6 +816,12 @@ void bindAndValidateGenerationClauses( SchemaDescriptor sd, FromList fromList, F
+                 {
+                     cdn.setType( generationClauseType );
+ 
++                    //
++                    // Poke the type into the FromTable so that constraints will
++                    // compile.
++                    //
++                    tableColumns.getResultColumn( cdn.getColumnName(), false ).setType( generationClauseType );
++
+                     //
+                     // We skipped these steps earlier on because we didn't have
+                     // a datatype. Now that we have a datatype, revisit these
+diff --git a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+index 0ad59b09..b1e2bc44 100644
+--- a/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
++++ b/db/derby/code/trunk/java/shared/org/apache/derby/shared/common/reference/SQLState.java
+@@ -905,6 +905,7 @@ The message identifier (ie. the value that matches a field in this class)
+     String LANG_GEN_COL_BAD_RENAME                                           = "42XA8";
+     String LANG_NEEDS_DATATYPE                                                      = "42XA9";
+     String LANG_GEN_COL_BEFORE_TRIG                                             = "42XAA";
++    String LANG_NOT_NULL_NEEDS_DATATYPE                                    = "42XAB";
+ 	String LANG_INVALID_USER_AGGREGATE_DEFINITION2                     = "42Y00";
+ 	String LANG_INVALID_CHECK_CONSTRAINT                               = "42Y01";
+ 	// String LANG_NO_ALTER_TABLE_COMPRESS_ON_TARGET_TABLE                = "42Y02";
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
+index 5217ace8..7dc1cd11 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsHelper.java
+@@ -57,6 +57,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     ///////////////////////////////////////////////////////////////////////////////////
+ 
+     protected static  final   String  REDUNDANT_CLAUSE = "42613";
++    protected static  final   String  CANT_CONTAIN_NULLS = "42831";
+     protected static  final   String  ILLEGAL_AGGREGATE = "42XA1";
+     protected static  final   String  UNSTABLE_RESULTS = "42XA2";
+     protected static  final   String  CANT_OVERRIDE_GENERATION_CLAUSE = "42XA3";
+@@ -67,6 +68,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     protected static  final   String  ILLEGAL_RENAME = "42XA8";
+     protected static  final   String  NEED_EXPLICIT_DATATYPE = "42XA9";
+     protected static  final   String  BAD_BEFORE_TRIGGER = "42XAA";
++    protected static  final   String  NOT_NULL_NEEDS_DATATYPE = "42XAB";
+     
+     protected static  final   String  NOT_NULL_VIOLATION = "23502";
+     protected static  final   String  CONSTRAINT_VIOLATION = "23513";
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsTest.java
+index ffb05831..511aa731 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/lang/GeneratedColumnsTest.java
+@@ -4644,6 +4644,387 @@ public  void    test_026_onDeleteSetNull()
+              );
+     }
+     
++    /**
++     * <p>
++     * Test that we can put constraints on generated columns when we omit the datatype.
++     * DERBY-3969.
++     * </p>
++     */
++    public  void    test_027_constraintsNoDatatype()
++        throws Exception
++    {
++        Connection  conn = getConnection();
++
++        //
++        // Verify that we can declare check constraints on generated columns
++        // which omit the datatype.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_1( a int, b generated always as ( -a ) check ( b < 0 ) )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_1( a ) values ( 1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             CONSTRAINT_VIOLATION,
++             "insert into t_ccnd_1( a ) values ( -1 )"
++             );
++        goodStatement
++            (
++             conn,
++             "alter table t_ccnd_1 add column c generated always as ( -a ) check ( c > -10 )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_1( a ) values ( 2 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             CONSTRAINT_VIOLATION,
++             "insert into t_ccnd_1( a ) values ( 20 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_1 order by a",
++             new String[][]
++             {
++                 { "1", "-1", "-1" },
++                 { "2", "-2", "-2" },
++             },
++             false
++             );
++
++        //
++        // Verify that we can declare foreign keys on generated columns
++        // which omit the datatype.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_2( b int primary key )"
++             );
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_3( a int, b generated always as ( -a ) references t_ccnd_2( b ) )"
++             );
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_4( a int )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_2( b ) values ( 1 )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_3( a ) values ( -1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             FOREIGN_KEY_VIOLATION,
++             "insert into t_ccnd_3( a ) values ( -2 )"
++             );
++        goodStatement
++            (
++             conn,
++             "alter table t_ccnd_4 add column b generated always as ( -a ) references t_ccnd_2( b )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_4( a ) values ( -1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             FOREIGN_KEY_VIOLATION,
++             "insert into t_ccnd_4( a ) values ( -2 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_3 order by a",
++             new String[][]
++             {
++                 { "-1", "1", },
++             },
++             false
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_4 order by a",
++             new String[][]
++             {
++                 { "-1", "1", },
++             },
++             false
++             );
++
++        //
++        // Verify that we can declare primary keys on generated columns
++        // which omit the datatype.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_5( a int, b generated always as ( -a ) primary key )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_5( a ) values ( 1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             ILLEGAL_DUPLICATE,
++             "insert into t_ccnd_5( a ) values ( 1 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_5 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++             },
++             false
++             );
++        
++        //
++        // Verify that you CANNOT declare a generated column to be NOT NULL
++        // if you omit the datatype.
++        //
++        expectCompilationError
++            (
++             NOT_NULL_NEEDS_DATATYPE,
++             "create table t_ccnd_6( a int, b generated always as ( -a ) not null )"
++             );
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_6( a int )"
++             );
++        expectCompilationError
++            (
++             NOT_NULL_NEEDS_DATATYPE,
++             "alter table t_ccnd_6 add column b generated always as ( -a ) not null"
++             );
++        
++        //
++        // Verify that you CAN declare a generated column to be NOT NULL
++        // if you include the datatype.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_7( a int, b int generated always as ( -a ) not null )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_7( a ) values ( 1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             NOT_NULL_VIOLATION,
++             "insert into t_ccnd_7( a ) values ( null )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_7 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++             },
++             false
++             );
++        
++        //
++        // Verify that we can add generated columns with primary keys
++        // but only if you include the datatype or if the resolved datatype
++        // is not nullable.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_8( a int )"
++             );
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_9( a int not null )"
++             );
++        expectCompilationError
++            (
++             CANT_CONTAIN_NULLS,
++             "alter table t_ccnd_8 add column b generated always as ( -a ) primary key"
++             );
++        goodStatement
++            (
++             conn,
++             "alter table t_ccnd_8 add column b int not null generated always as ( -a ) primary key"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_8( a ) values ( 1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             NOT_NULL_VIOLATION,
++             "insert into t_ccnd_8( a ) values ( null )"
++             );
++        expectExecutionError
++            (
++             conn,
++             ILLEGAL_DUPLICATE,
++             "insert into t_ccnd_8( a ) values ( 1 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_8 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++             },
++             false
++             );
++
++        goodStatement
++            (
++             conn,
++             "alter table t_ccnd_9 add column b generated always as ( -a ) primary key"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_9( a ) values ( 1 )"
++             );
++        expectExecutionError
++            (
++             conn,
++             ILLEGAL_DUPLICATE,
++             "insert into t_ccnd_9( a ) values ( 1 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_9 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++             },
++             false
++             );
++        
++        //
++        // Verify that we can create generated columns with unique constraints.
++        //
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_10( a int, b generated always as ( -a ) unique )"
++             );
++        goodStatement
++            (
++             conn,
++             "create table t_ccnd_11( a int )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_10( a ) values ( 1 )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_10( a ) values ( null )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_10( a ) values ( null )"
++             );
++        expectExecutionError
++            (
++             conn,
++             ILLEGAL_DUPLICATE,
++             "insert into t_ccnd_10( a ) values ( 1 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_10 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++                 { null, null, },
++                 { null, null, },
++             },
++             false
++             );
++
++        goodStatement
++            (
++             conn,
++             "alter table t_ccnd_11 add column b generated always as ( -a ) unique"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_11( a ) values ( 1 )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_11( a ) values ( null )"
++             );
++        goodStatement
++            (
++             conn,
++             "insert into t_ccnd_11( a ) values ( null )"
++             );
++        expectExecutionError
++            (
++             conn,
++             ILLEGAL_DUPLICATE,
++             "insert into t_ccnd_11( a ) values ( 1 )"
++             );
++        assertResults
++            (
++             conn,
++             "select * from t_ccnd_11 order by a",
++             new String[][]
++             {
++                 { "1", "-1", },
++                 { null, null, },
++                 { null, null, },
++             },
++             false
++             );
++
++    }
++    
+     ///////////////////////////////////////////////////////////////////////////////////
+     //
+     // MINIONS

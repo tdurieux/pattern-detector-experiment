@@ -1,0 +1,358 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 14f0bc9f..d6dffb22 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -23,17 +23,11 @@
+ import java.lang.management.ManagementFactory;
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashSet;
+-import java.util.List;
+-import java.util.Map;
+-import java.util.PriorityQueue;
+-import java.util.Set;
+-import java.util.StringTokenizer;
++import java.util.*;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+@@ -55,7 +49,10 @@
+ import org.apache.cassandra.utils.FileUtils;
+ import org.apache.cassandra.utils.LogUtil;
+ import org.apache.cassandra.utils.TimedStatsDeque;
++import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.commons.lang.StringUtils;
++import org.cliffc.high_scale_lib.NonBlockingHashMap;
++import org.cliffc.high_scale_lib.NonBlockingHashSet;
+ 
+ /**
+  * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+@@ -63,10 +60,14 @@
+ 
+ public class ColumnFamilyStore implements ColumnFamilyStoreMBean
+ {
++    private static Logger logger_ = Logger.getLogger(ColumnFamilyStore.class);
++
+     private static int COMPACTION_THRESHOLD = 4; // compact this many sstables at a time
+     private static final int BUFSIZE = 128 * 1024 * 1024;
+     private static final int COMPACTION_MEMORY_THRESHOLD = 1 << 30;
+-    private static Logger logger_ = Logger.getLogger(ColumnFamilyStore.class);
++
++    private static NonBlockingHashMap<String, Set<Memtable>> memtablesPendingFlush = new NonBlockingHashMap<String, Set<Memtable>>();
++    private static ExecutorService flusher_ = new DebuggableThreadPoolExecutor("MEMTABLE-FLUSHER-POOL");
+ 
+     private final String table_;
+     public final String columnFamily_;
+@@ -93,10 +94,10 @@
+     private TimedStatsDeque readStats_ = new TimedStatsDeque(60000);
+     private TimedStatsDeque diskReadStats_ = new TimedStatsDeque(60000);
+ 
+-    ColumnFamilyStore(String table, String columnFamily, boolean isSuper, int indexValue) throws IOException
++    ColumnFamilyStore(String table, String columnFamilyName, boolean isSuper, int indexValue) throws IOException
+     {
+         table_ = table;
+-        columnFamily_ = columnFamily;
++        columnFamily_ = columnFamilyName;
+         isSuper_ = isSuper;
+         fileIndexGenerator_.set(indexValue);
+         memtable_ = new AtomicReference<Memtable>(new Memtable(table_, columnFamily_));
+@@ -430,6 +431,7 @@ String getTempFileName(List<String> files)
+     */
+     void switchMemtable()
+     {
++        getMemtablesPendingFlushNotNull(columnFamily_).add(memtable_.get()); // it's ok for the MT to briefly be both active and pendingFlush
+         memtable_.set(new Memtable(table_, columnFamily_));
+ 
+         if (memtableSwitchCount == Integer.MAX_VALUE)
+@@ -462,7 +464,7 @@ void forceBlockingFlush() throws IOException, ExecutionException, InterruptedExc
+         oldMemtable.forceflush();
+         // block for flush to finish by adding a no-op action to the flush executorservice
+         // and waiting for that to finish.  (this works since flush ES is single-threaded.)
+-        Future f = MemtableManager.instance().flusher_.submit(new Runnable()
++        Future f = flusher_.submit(new Runnable()
+         {
+             public void run()
+             {
+@@ -532,7 +534,7 @@ public ColumnFamily getColumnFamily(String key, String columnFamilyColumn, IFilt
+         if (columnFamilies.size() == 0 || !filter.isDone())
+         {
+             /* Check if MemtableManager has any historical information */
+-            MemtableManager.instance().getColumnFamily(key, columnFamily_, columnFamilyColumn, filter, columnFamilies);
++            getUnflushedColumnFamily(key, columnFamily_, columnFamilyColumn, filter, columnFamilies);
+         }
+         if (columnFamilies.size() == 0 || !filter.isDone())
+         {
+@@ -591,7 +593,6 @@ private void getColumnFamilyFromDisk(String key, String cf, List<ColumnFamily> c
+         }
+     }
+ 
+-
+     private ColumnFamily fetchColumnFamily(String key, String cf, IFilter filter, String ssTableFile) throws IOException
+     {
+         SSTable ssTable = new SSTable(ssTableFile, StorageService.getPartitioner());
+@@ -1443,6 +1444,64 @@ private int doFileCompaction(List<String> files, int minBufferSize) throws IOExc
+         return files.size();
+     }
+ 
++    public static List<Memtable> getUnflushedMemtables(String cfName)
++    {
++        return new ArrayList<Memtable>(getMemtablesPendingFlushNotNull(cfName));
++    }
++
++    private static Set<Memtable> getMemtablesPendingFlushNotNull(String columnFamilyName)
++    {
++        Set<Memtable> memtables = memtablesPendingFlush.get(columnFamilyName);
++        if (memtables == null)
++        {
++            memtablesPendingFlush.putIfAbsent(columnFamilyName, new NonBlockingHashSet<Memtable>());
++            memtables = memtablesPendingFlush.get(columnFamilyName); // might not be the object we just put, if there was a race!
++        }
++        return memtables;
++    }
++
++    /*
++     * Retrieve column family from the list of Memtables that have been
++     * submitted for flush but have not yet been flushed.
++     * It also filters out unneccesary columns based on the passed in filter.
++    */
++    void getUnflushedColumnFamily(String key, String cfName, String cf, IFilter filter, List<ColumnFamily> columnFamilies)
++    {
++        List<Memtable> memtables = getUnflushedMemtables(cfName);
++        Collections.sort(memtables);
++        int size = memtables.size();
++        for ( int i = size - 1; i >= 0; --i  )
++        {
++            ColumnFamily columnFamily = memtables.get(i).getLocalCopy(key, cf, filter);
++            if ( columnFamily != null )
++            {
++                columnFamilies.add(columnFamily);
++                if( filter.isDone())
++                    break;
++            }
++        }
++    }
++
++    /* Submit memtables to be flushed to disk */
++    public static void submitFlush(final Memtable memtable, final CommitLog.CommitLogContext cLogCtx)
++    {
++        flusher_.submit(new Runnable()
++        {
++            public void run()
++            {
++                try
++                {
++                    memtable.flush(cLogCtx);
++                }
++                catch (IOException e)
++                {
++                    throw new RuntimeException(e);
++                }
++                getMemtablesPendingFlushNotNull(memtable.getColumnFamily()).remove(memtable);
++            }
++        });
++    }
++
+     public boolean isSuper()
+     {
+         return isSuper_;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 735d4e8a..a9c2de23 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -393,7 +393,7 @@ public void flushWhenTerminated(final CommitLog.CommitLogContext cLogCtx)
+             {
+                 public void run()
+                 {
+-                    MemtableManager.instance().submit(cfName_, Memtable.this, cLogCtx);
++                    ColumnFamilyStore.submitFlush(Memtable.this, cLogCtx);
+                 }
+             };
+             flushQueuer = new FutureTask(runnable, null);
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MemtableManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MemtableManager.java
+index 18b08cd0..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MemtableManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/MemtableManager.java
+@@ -1,164 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.db;
+-
+-import java.io.IOException;
+-import java.util.*;
+-import java.util.concurrent.*;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantLock;
+-import java.util.concurrent.locks.ReentrantReadWriteLock;
+-
+-import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.ThreadFactoryImpl;
+-import org.apache.cassandra.utils.LogUtil;
+-import org.apache.log4j.Logger;
+-
+-/**
+- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
+- */
+-
+-public class MemtableManager
+-{
+-    private static MemtableManager instance_;
+-    private static Lock lock_ = new ReentrantLock();
+-    private static Logger logger_ = Logger.getLogger(MemtableManager.class);
+-    private ReentrantReadWriteLock rwLock_ = new ReentrantReadWriteLock(true);
+-    public static MemtableManager instance()
+-    {
+-        if ( instance_ == null )
+-        {
+-            lock_.lock();
+-            try
+-            {
+-                if ( instance_ == null )
+-                    instance_ = new MemtableManager();
+-            }
+-            finally
+-            {
+-                lock_.unlock();
+-            }
+-        }
+-        return instance_;
+-    }
+-    
+-    class MemtableFlusher implements Runnable
+-    {
+-        private Memtable memtable_;
+-        private CommitLog.CommitLogContext cLogCtx_;
+-        
+-        MemtableFlusher(Memtable memtable, CommitLog.CommitLogContext cLogCtx)
+-        {
+-            memtable_ = memtable;
+-            cLogCtx_ = cLogCtx;
+-        }
+-        
+-        public void run()
+-        {
+-            try
+-            {
+-            	memtable_.flush(cLogCtx_);
+-            }
+-            catch (IOException e)
+-            {
+-                logger_.debug( LogUtil.throwableToString(e) );
+-            }
+-        	rwLock_.writeLock().lock();
+-            try
+-            {
+-            	List<Memtable> memtables = history_.get(memtable_.getColumnFamily());
+-                memtables.remove(memtable_);                	
+-            }
+-        	finally
+-        	{
+-            	rwLock_.writeLock().unlock();
+-        	}
+-        }
+-    }
+-    
+-    private Map<String, List<Memtable>> history_ = new HashMap<String, List<Memtable>>();
+-    ExecutorService flusher_ = new DebuggableThreadPoolExecutor("MEMTABLE-FLUSHER-POOL");
+-    
+-    /* Submit memtables to be flushed to disk */
+-    void submit(String cfName, Memtable memtbl, CommitLog.CommitLogContext cLogCtx)
+-    {
+-    	rwLock_.writeLock().lock();
+-    	try
+-    	{
+-	        List<Memtable> memtables = history_.get(cfName);
+-	        if ( memtables == null )
+-	        {
+-	            memtables = new ArrayList<Memtable>();
+-	            history_.put(cfName, memtables);
+-	        }
+-	        memtables.add(memtbl);	        
+-	        flusher_.submit( new MemtableFlusher(memtbl, cLogCtx) );
+-    	}
+-    	finally
+-    	{
+-        	rwLock_.writeLock().unlock();
+-    	}
+-    }
+-    
+-
+-    /*
+-     * Retrieve column family from the list of Memtables that have been
+-     * submitted for flush but have not yet been flushed.
+-     * It also filters out unneccesary columns based on the passed in filter.
+-    */
+-    void getColumnFamily(String key, String cfName, String cf, IFilter filter, List<ColumnFamily> columnFamilies)
+-    {
+-        List<Memtable> memtables = getUnflushedMemtables(cfName);
+-        if ( memtables == null )
+-        {
+-            return;
+-        }
+-        Collections.sort(memtables);
+-        int size = memtables.size();
+-        for ( int i = size - 1; i >= 0; --i  )
+-        {
+-            ColumnFamily columnFamily = memtables.get(i).getLocalCopy(key, cf, filter);
+-            if ( columnFamily != null )
+-            {
+-                columnFamilies.add(columnFamily);
+-                if( filter.isDone())
+-                    break;
+-            }
+-        }
+-    }
+-
+-    public List<Memtable> getUnflushedMemtables(String cfName)
+-    {
+-        rwLock_.readLock().lock();
+-        try
+-        {
+-            List<Memtable> memtables = history_.get(cfName);
+-            if (memtables != null)
+-            {
+-                return new ArrayList<Memtable>(memtables);
+-            }
+-            return Arrays.asList();
+-        }
+-        finally
+-        {
+-            rwLock_.readLock().unlock();
+-        }
+-    }
+-
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 068acaa9..43714b1a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -886,7 +886,7 @@ else if(column.timestamp() == 4)
+             // memtable keys: current and historical
+             Iterator<Memtable> memtables = (Iterator<Memtable>) IteratorUtils.chainedIterator(
+                     IteratorUtils.singletonIterator(cfs.getMemtable()),
+-                    MemtableManager.instance().getUnflushedMemtables(cfName).iterator());
++                    ColumnFamilyStore.getUnflushedMemtables(cfName).iterator());
+             while (memtables.hasNext())
+             {
+                 iterators.add(IteratorUtils.filteredIterator(memtables.next().sortedKeyIterator(), new Predicate()

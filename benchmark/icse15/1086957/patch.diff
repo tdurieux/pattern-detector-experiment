@@ -1,0 +1,366 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java b/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+index 2cb052ac..ba7f581b 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/service/AntiEntropyService.java
+@@ -126,6 +126,11 @@ public RepairSession getRepairSession(String tablename, String... cfnames)
+         return new RepairSession(tablename, cfnames);
+     }
+ 
++    RepairSession getArtificialRepairSession(TreeRequest req, String tablename, String... cfnames)
++    {
++        return new RepairSession(req, tablename, cfnames);
++    }
++
+     /**
+      * Called by Differencer when a full repair round trip has been completed between the given CF and endpoints.
+      */
+@@ -621,18 +626,16 @@ static Message makeVerb(InetAddress local, Validator validator)
+         public void serialize(Validator v, DataOutputStream dos, int version) throws IOException
+         {
+             TreeRequestVerbHandler.SERIALIZER.serialize(v.request, dos, version);
+-            ObjectOutputStream oos = new ObjectOutputStream(dos);
+-            oos.writeObject(v.tree);
+-            oos.flush();
++            MerkleTree.serializer.serialize(v.tree, dos, version);
++            dos.flush();
+         }
+ 
+         public Validator deserialize(DataInputStream dis, int version) throws IOException
+         {
+             final TreeRequest request = TreeRequestVerbHandler.SERIALIZER.deserialize(dis, version);
+-            ObjectInputStream ois = new ObjectInputStream(dis);
+             try
+             {
+-                return new Validator(request, (MerkleTree)ois.readObject());
++                return new Validator(request, MerkleTree.serializer.deserialize(dis, version));
+             }
+             catch(Exception e)
+             {
+@@ -731,6 +734,19 @@ public String toString()
+         private final String[] cfnames;
+         private final SimpleCondition requestsMade;
+         private final ConcurrentHashMap<TreeRequest,Object> requests;
++        
++        public RepairSession(TreeRequest req, String tablename, String... cfnames)
++        {
++            super(req.sessionid);
++            this.tablename = tablename;
++            this.cfnames = cfnames;
++            requestsMade = new SimpleCondition();
++            this.requests = new ConcurrentHashMap<TreeRequest,Object>();
++            requests.put(req, this);
++            Callback callback = new Callback();
++            AntiEntropyService.instance.sessions.put(getName(), callback);
++        }
++        
+         public RepairSession(String tablename, String... cfnames)
+         {
+             super("manual-repair-" + UUID.randomUUID());
+@@ -760,7 +776,7 @@ public void run()
+ 
+             // begin a repair session
+             Callback callback = new Callback();
+-            AntiEntropyService.this.sessions.put(getName(), callback);
++            AntiEntropyService.instance.sessions.put(getName(), callback);
+             try
+             {
+                 // request that all relevant endpoints generate trees
+@@ -768,9 +784,9 @@ public void run()
+                 {
+                     // send requests to remote nodes and record them
+                     for (InetAddress endpoint : endpoints)
+-                        requests.put(AntiEntropyService.this.request(getName(), endpoint, tablename, cfname), this);
++                        requests.put(AntiEntropyService.instance.request(getName(), endpoint, tablename, cfname), this);
+                     // send but don't record an outstanding request to the local node
+-                    AntiEntropyService.this.request(getName(), FBUtilities.getLocalAddress(), tablename, cfname);
++                    AntiEntropyService.instance.request(getName(), FBUtilities.getLocalAddress(), tablename, cfname);
+                 }
+                 logger.info("Waiting for repair requests: " + requests.keySet());
+                 requestsMade.signalAll();
+@@ -810,7 +826,7 @@ public void completed(TreeRequest request)
+ 
+                 // all requests completed
+                 logger.info("Repair session " + getName() + " completed successfully.");
+-                AntiEntropyService.this.sessions.remove(getName());
++                AntiEntropyService.instance.sessions.remove(getName());
+                 completed.signalAll();
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
+index 4004f75e..62956bfe 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/MerkleTree.java
+@@ -18,6 +18,11 @@
+ */
+ package org.apache.cassandra.utils;
+ 
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
+ import java.io.Serializable;
+ import java.util.*;
+ 
+@@ -27,6 +32,8 @@
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.dht.Token;
++import org.apache.cassandra.io.ICompactSerializer;
++import org.apache.cassandra.net.MessagingService;
+ 
+ /**
+  * A MerkleTree implemented as a binary tree.
+@@ -50,6 +57,7 @@
+  */
+ public class MerkleTree implements Serializable
+ {
++    public static final MerkleTreeSerializer serializer = new MerkleTreeSerializer();
+     private static final long serialVersionUID = 2L;
+ 
+     public static final byte RECOMMENDED_DEPTH = Byte.MAX_VALUE - 1;
+@@ -66,6 +74,51 @@
+     private long size;
+     private Hashable root;
+ 
++    public static class MerkleTreeSerializer implements ICompactSerializer<MerkleTree>
++    {
++        public void serialize(MerkleTree mt, DataOutputStream dos, int version) throws IOException
++        {
++            if (version == MessagingService.VERSION_07)
++            {
++                ObjectOutputStream out = new ObjectOutputStream(dos);
++                out.writeObject(mt);
++            }
++            else
++            {
++                dos.writeByte(mt.hashdepth);
++                dos.writeLong(mt.maxsize);
++                dos.writeLong(mt.size);
++                Hashable.serializer.serialize(mt.root, dos, version);
++            }
++        }
++
++        public MerkleTree deserialize(DataInputStream dis, int version) throws IOException
++        {
++            if (version == MessagingService.VERSION_07)
++            {
++                ObjectInputStream in = new ObjectInputStream(dis);
++                try
++                {
++                    return (MerkleTree)in.readObject();
++                }
++                catch (ClassNotFoundException ex)
++                {
++                    throw new IOException(ex);
++                }
++            }
++            else
++            {
++                byte hashdepth = dis.readByte();
++                long maxsize = dis.readLong();
++                long size = dis.readLong();
++                MerkleTree mt = new MerkleTree(null, hashdepth, maxsize);
++                mt.size = size;
++                mt.root = Hashable.serializer.deserialize(dis, version);
++                return mt;
++            }
++        }
++    }
++
+     /**
+      * @param partitioner The partitioner in use.
+      * @param hashdepth The maximum depth of the tree. 100/(2^depth) is the %
+@@ -582,10 +635,13 @@ public TreeRange computeNext()
+     static class Inner extends Hashable
+     {
+         public static final long serialVersionUID = 1L;
++        static final byte IDENT = 2;
+         public final Token token;
+         private Hashable lchild;
+         private Hashable rchild;
+ 
++        private static ICompactSerializer<Inner> serializer = new InnerSerializer();
++        
+         /**
+          * Constructs an Inner with the given token and children, and a null hash.
+          */
+@@ -652,6 +708,35 @@ public String toString()
+             toString(buff, 1);
+             return buff.toString();
+         }
++        
++        private static class InnerSerializer implements ICompactSerializer<Inner>
++        {
++            public void serialize(Inner inner, DataOutputStream dos, int version) throws IOException
++            {
++                if (inner.hash == null)
++                    dos.writeInt(-1);
++                else
++                {
++                    dos.writeInt(inner.hash.length);
++                    dos.write(inner.hash);
++                }
++                Token.serializer().serialize(inner.token, dos);
++                Hashable.serializer.serialize(inner.lchild, dos, version);
++                Hashable.serializer.serialize(inner.rchild, dos, version);
++            }
++
++            public Inner deserialize(DataInputStream dis, int version) throws IOException
++            {
++                int hashLen = dis.readInt();
++                byte[] hash = hashLen >= 0 ? new byte[hashLen] : null;
++                if (hash != null)
++                    dis.readFully(hash);
++                Token token = Token.serializer().deserialize(dis);
++                Hashable lchild = Hashable.serializer.deserialize(dis, version);
++                Hashable rchild = Hashable.serializer.deserialize(dis, version);
++                return new Inner(token, lchild, rchild);
++            }
++        }
+     }
+ 
+     /**
+@@ -666,6 +751,9 @@ public String toString()
+     static class Leaf extends Hashable
+     {
+         public static final long serialVersionUID = 1L;
++        static final byte IDENT = 1;
++        private static ICompactSerializer<Leaf> serializer = new LeafSerializer();
++        
+         /**
+          * Constructs a null hash.
+          */
+@@ -694,6 +782,29 @@ public String toString()
+         {
+             return "#<Leaf " + Hashable.toString(hash()) + ">";
+         }
++
++        private static class LeafSerializer implements ICompactSerializer<Leaf>
++        {
++            public void serialize(Leaf leaf, DataOutputStream dos, int version) throws IOException
++            {
++                if (leaf.hash == null)
++                    dos.writeInt(-1);
++                else
++                {
++                    dos.writeInt(leaf.hash.length);
++                    dos.write(leaf.hash);
++                }
++            }
++
++            public Leaf deserialize(DataInputStream dis, int version) throws IOException
++            {
++                int hashLen = dis.readInt();
++                byte[] hash = hashLen < 0 ? null : new byte[hashLen];
++                if (hash != null)
++                    dis.readFully(hash);
++                return new Leaf(hash);
++            }
++        }
+     }
+ 
+     /**
+@@ -724,6 +835,7 @@ public String toString()
+     static abstract class Hashable implements Serializable
+     {
+         private static final long serialVersionUID = 1L;
++        private static ICompactSerializer<Hashable> serializer = new HashableSerializer();
+ 
+         protected byte[] hash;
+ 
+@@ -781,6 +893,36 @@ public static String toString(byte[] hash)
+                 return "null";
+             return "[" + FBUtilities.bytesToHex(hash) + "]";
+         }
++        
++        private static class HashableSerializer implements ICompactSerializer<Hashable>
++        {
++            public void serialize(Hashable h, DataOutputStream dos, int version) throws IOException
++            {
++                if (h instanceof Inner) 
++                {
++                    dos.writeByte(Inner.IDENT);
++                    Inner.serializer.serialize((Inner)h, dos, version);
++                }
++                else if (h instanceof Leaf)
++                {
++                    dos.writeByte(Leaf.IDENT);
++                    Leaf.serializer.serialize((Leaf)h, dos, version);
++                }
++                else
++                    throw new IOException("Unexpected Hashable: " + h.getClass().getCanonicalName());
++            }
++
++            public Hashable deserialize(DataInputStream dis, int version) throws IOException
++            {
++                byte ident = dis.readByte();
++                if (Inner.IDENT == ident)
++                    return Inner.serializer.deserialize(dis, version);
++                else if (Leaf.IDENT == ident)
++                    return Leaf.serializer.deserialize(dis, version);
++                else
++                    throw new IOException("Unexpected Hashable: " + ident);
++            }
++        }
+     }
+ 
+     /**
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/io/CompactSerializerTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/io/CompactSerializerTest.java
+index 0781995f..eb8e7ceb 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/io/CompactSerializerTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/io/CompactSerializerTest.java
+@@ -69,6 +69,10 @@ public static void scanClasspath()
+         expectedClassNames.add("StreamRequestMessageSerializer");
+         expectedClassNames.add("LegacyBloomFilterSerializer");
+         expectedClassNames.add("CounterMutationSerializer");
++        expectedClassNames.add("HashableSerializer");
++        expectedClassNames.add("InnerSerializer");
++        expectedClassNames.add("LeafSerializer");
++        expectedClassNames.add("MerkleTreeSerializer");
+         
+         discoveredClassNames = new ArrayList<String>();
+         String cp = System.getProperty("java.class.path");
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+index d3c3424c..93208c79 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTest.java
+@@ -33,14 +33,12 @@
+ import org.apache.cassandra.Util;
+ import org.apache.cassandra.concurrent.Stage;
+ import org.apache.cassandra.concurrent.StageManager;
+-import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.filter.QueryPath;
+ import org.apache.cassandra.dht.IPartitioner;
+ import org.apache.cassandra.dht.Range;
+ import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.io.PrecompactedRow;
+-import org.apache.cassandra.io.util.DataOutputBuffer;
+ import org.apache.cassandra.locator.AbstractReplicationStrategy;
+ import org.apache.cassandra.locator.TokenMetadata;
+ import org.apache.cassandra.utils.FBUtilities;
+@@ -194,6 +192,9 @@ public void testGetNeighborsTimesTwo() throws Throwable
+     @Test
+     public void testDifferencer() throws Throwable
+     {
++        // this next part does some housekeeping so that cleanup in the dfferencer doesn't error out.
++        AntiEntropyService.RepairSession sess = AntiEntropyService.instance.getArtificialRepairSession(request,  tablename, cfname);
++        
+         // generate a tree
+         Validator validator = new Validator(request);
+         validator.prepare(store);
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTestAbstract.java b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTestAbstract.java
+index 6147e3ca..69dcaf26 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTestAbstract.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/service/AntiEntropyServiceTestAbstract.java
+@@ -208,6 +208,9 @@ public void testGetNeighborsTimesTwo() throws Throwable
+     @Test
+     public void testDifferencer() throws Throwable
+     {
++        // this next part does some housekeeping so that cleanup in the differencer doesn't error out.
++        AntiEntropyService.RepairSession sess = AntiEntropyService.instance.getArtificialRepairSession(request,  tablename, cfname);
++        
+         // generate a tree
+         Validator validator = new Validator(request);
+         validator.prepare(store);

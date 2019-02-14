@@ -1,0 +1,549 @@
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
+index b1ae86e2..d6a0cd43 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/PredicateList.java
+@@ -1680,6 +1680,26 @@ boolean allPushable()
+ 	 }
+ 
+ 	/**
++      * Check if all the predicates reference a given {@code FromBaseTable}.
++      *
++      * @param fbt the {@code FromBaseTable} to check for
++      * @return {@code true} if the table is referenced by all predicates,
++      * {@code false} otherwise
++      */
++     boolean allReference(FromBaseTable fbt) {
++         int tableNumber = fbt.getTableNumber();
++
++         for (int i = 0; i < size(); i++) {
++             Predicate p = (Predicate) elementAt(i);
++             if (!p.getReferencedSet().get(tableNumber)) {
++                 return false;
++             }
++         }
++
++         return true;
++     }
++
++	/**
+ 	 * Build a list of pushable predicates, if any,
+ 	 * that satisfy the referencedTableMap.
+ 	 *
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
+index 5ddd2997..61560f80 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/ProjectRestrictNode.java
+@@ -570,7 +570,12 @@ public void pullOptPredicates(
+ 								OptimizablePredicateList optimizablePredicates)
+ 					throws StandardException
+ 	{
+-		if (restrictionList != null)
++        // DERBY-4001: Don't pull predicates if this node is part of a NOT
++        // EXISTS join. For example, in the query below, if we allowed the
++        // predicate 1<>1 (always false) to be pulled, no rows would be
++        // returned, whereas it should return all the rows in table T.
++        // SELECT * FROM T WHERE NOT EXISTS (SELECT * FROM T WHERE 1<>1)
++		if (restrictionList != null && !isNotExists())
+ 		{
+ 			// Pull up any predicates that may have been pushed further
+ 			// down the tree during optimization.
+diff --git a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+index 767d8a66..f0fb5046 100644
+--- a/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
++++ b/db/derby/code/branches/10.5/java/engine/org/apache/derby/impl/sql/compile/SubqueryNode.java
+@@ -668,10 +668,7 @@ public ValueNode preprocess(int numTables,
+ 			 * so we simply return the BinaryComparisonOperatorNode above
+ 			 * the new join condition.
+ 			 */
+-			ValueNode rightOperand;
+-			rightOperand = ((ResultColumn) rrsn.getResultColumns().elementAt(0)).
+-								getExpression();
+-			return getNewJoinCondition(leftOperand, rightOperand);
++			return getNewJoinCondition(leftOperand, getRightOperand());
+ 		}
+ 
+ 		/* Select subquery is flattenable if:
+@@ -758,17 +755,33 @@ public ValueNode preprocess(int numTables,
+ 				 * is if the predicates do not get pulled up.  If they get pulled
+ 				 * up then the single next logic for an EXISTS join does not work
+ 				 * because that row may get disqualified at a higher level.)
++                 * DERBY-4001: Extra conditions to allow flattening to a NOT
++                 * EXISTS join (in a NOT EXISTS join it does matter on which
++                 * side of the join predicates/restrictions are applied):
++                 *  o All the predicates must reference the FBT, otherwise
++                 *    predicates meant for the right side of the join may be
++                 *    applied to the left side of the join.
++                 *  o The right operand (in ALL and NOT IN) must reference the
++                 *    FBT, otherwise the generated join condition may be used
++                 *    to restrict the left side of the join.
+ 				 */
+ 				else if ( (isIN() || isANY() || isEXISTS() || flattenableNotExists) &&
+ 						  ((leftOperand == null) ? true :
+ 							 leftOperand.categorize(new JBitSet(numTables), false)) &&
+-						  select.getWherePredicates().allPushable() &&
+-						  singleFromBaseTable(select.getFromList()))
++						  select.getWherePredicates().allPushable())
++				{
++                    FromBaseTable fbt =
++                            singleFromBaseTable(select.getFromList());
++
++                    if (fbt != null && (!flattenableNotExists ||
++                         (select.getWherePredicates().allReference(fbt) &&
++                          rightOperandFlattenableToNotExists(numTables, fbt))))
+ 				{
+ 					return flattenToExistsJoin(numTables,
+ 										   outerFromList, outerSubqueryList,
+ 										   outerPredicateList, flattenableNotExists);
+ 				}
++				}
+ 
+ 				// restore leftOperand to its original value
+ 				leftOperand = origLeftOperand;
+@@ -830,29 +843,87 @@ else if (subqueryType == NOT_EXISTS_SUBQUERY)
+ 	 *
+ 	 * @param fromList	The from list from the subquery
+ 	 *
+-	 * @return Whether or not the from list from the subquery contains a
+-	 *			single entry which is a FBT or a PRN/FBT.
++     * @return the {@code FromBaseTable} if the from list from the subquery
++     * contains a single entry which is a FBT or a PRN/FBT, or {@code null}
++     * if the subquery does not contain a single FBT
+ 	 */
+-	private boolean singleFromBaseTable(FromList fromList)
++	private FromBaseTable singleFromBaseTable(FromList fromList)
+ 	{
+-		boolean retCode = (fromList.size() == 1);
++        FromBaseTable fbt = null;
+ 
+-		if (retCode)
+-		{
++        if (fromList.size() == 1) {
+ 			FromTable ft = (FromTable) fromList.elementAt(0);
+-
+-			if (((ft instanceof ProjectRestrictNode) &&
+-				 ((ProjectRestrictNode) ft).getChildResult() instanceof FromBaseTable) ||
+-				ft instanceof FromBaseTable)
+-			{
++            if (ft instanceof FromBaseTable) {
++                fbt = (FromBaseTable) ft;
++            } else if (ft instanceof ProjectRestrictNode) {
++                ResultSetNode child =
++                        ((ProjectRestrictNode) ft).getChildResult();
++                if (child instanceof FromBaseTable) {
++                    fbt = (FromBaseTable) child;
+ 			}
+-			else
+-			{
+-				retCode = false;
+ 			}
+ 		}
+ 
+-		return retCode;
++        return fbt;
++	}
++
++    /**
++     * <p>
++     * Check if the right operand is on a form that makes it possible to
++     * flatten this query to a NOT EXISTS join. We don't allow flattening if
++     * the right operand doesn't reference the base table of the subquery.
++     * (Requirement added as part of DERBY-4001.)
++     * </p>
++     *
++     * <p>
++     * The problem with the right operand not referencing the base table of the
++     * subquery, is that the join condition may then be used to filter rows
++     * from the right side (outer) table in the NOT EXISTS join. In a NOT
++     * EXISTS join, the join condition can only safely be applied to the
++     * left side (inner) table of the join. Otherwise, it will filter out all
++     * the interesting rows too early.
++     * </p>
++     *
++     * <p>Take the query below as an example:</p>
++     *
++     * <pre><code>
++     * SELECT * FROM T1 WHERE X NOT IN (SELECT 1 FROM T2)
++     * </code></pre>
++     *
++     * <p>
++     * Here, the right operand is 1, and the join condition is {@code T1.X=1}.
++     * If flattened, the join condition will be used directly on the outer
++     * table, and hide all rows with {@code X<>1}, although those are the only
++     * rows we're interested in. If the join condition had only been used on
++     * the inner table, the NOT EXISTS join logic would do the correct thing.
++     * </p>
++     *
++     * <p>
++     * If the join condition references the inner table, the condition cannot
++     * be used directly on the outer table, so it is safe to flatten the query.
++     * </p>
++     *
++     * @param numTables the number of tables in this statement
++     * @param fbt the only {@code FromBaseTable} in this subquery
++     * @return {@code true} if it is OK to flatten this query to a NOT EXISTS
++     * join, {@code false} otherwise
++     */
++    private boolean rightOperandFlattenableToNotExists(
++            int numTables, FromBaseTable fbt) throws StandardException {
++
++        boolean flattenable = true;
++
++        // If there is no left operand, there is no right operand. If there is
++        // no right operand, it cannot cause any problems for the flattening.
++        if (leftOperand != null) {
++            JBitSet tableSet = new JBitSet(numTables);
++            getRightOperand().categorize(tableSet, false);
++            // The query can be flattened to NOT EXISTS join only if the right
++            // operand references the base table.
++            flattenable = tableSet.get(fbt.getTableNumber());
++        }
++
++        return flattenable;
+ 	}
+ 
+ 	/**
+@@ -866,10 +937,8 @@ private boolean canAllBeFlattened () throws StandardException
+ 		boolean result = false;
+ 		if (isNOT_IN() || isALL())
+ 		{
+-			ValueNode rightOperand = ((ResultColumn) resultSet.getResultColumns().elementAt(0)).
+-									getExpression();
+ 			result = (! leftOperand.getTypeServices().isNullable() &&
+-						! rightOperand.getTypeServices().isNullable());
++						! getRightOperand().getTypeServices().isNullable());
+ 		}
+ 		return result;
+ 	}
+@@ -965,9 +1034,7 @@ private ValueNode flattenToNormalJoin(int numTables,
+ 		}
+ 		else
+ 		{
+-			ValueNode rightOperand;
+-			rightOperand = ((ResultColumn) select.getResultColumns().elementAt(0)).
+-								getExpression();
++			ValueNode rightOperand = getRightOperand();
+ 			/* If the right operand is a CR, then we need to decrement
+ 			 * its source level as part of flattening so that
+ 			 * transitive closure will work correctly.
+@@ -1044,6 +1111,18 @@ private ValueNode flattenToExistsJoin(int numTables,
+ 								   outerSubqueryList, outerPredicateList);
+ 	}
+ 
++	/**
++     * Get the node that will be the right operand in the join condition if
++     * this ALL/ANY/SOME/(NOT) IN subquery is flattened to a join.
++     *
++     * @return the right operand
++     */
++    private ValueNode getRightOperand() {
++        ResultColumn firstRC =
++                (ResultColumn) resultSet.getResultColumns().elementAt(0);
++        return firstRC.getExpression();
++    }
++
+ 	/**
+ 	 * Check to see if we have a Variant value below us.
+ 	 * If so, return true.  Caches the result so multiple
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SubqueryFlatteningTest.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SubqueryFlatteningTest.java
+index e69de29b..d33f1252 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SubqueryFlatteningTest.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/SubqueryFlatteningTest.java
+@@ -0,0 +1,266 @@
++/*
++ * Derby - Class org.apache.derbyTesting.functionTests.tests.lang.SubqueryFlatteningTest
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ */
++
++package org.apache.derbyTesting.functionTests.tests.lang;
++
++import java.sql.SQLException;
++import java.sql.Statement;
++import junit.framework.Test;
++import org.apache.derbyTesting.junit.BaseJDBCTestCase;
++import org.apache.derbyTesting.junit.JDBC;
++import org.apache.derbyTesting.junit.RuntimeStatisticsParser;
++import org.apache.derbyTesting.junit.SQLUtilities;
++import org.apache.derbyTesting.junit.TestConfiguration;
++
++/**
++ * This test verifies that flattening of subqueries works correctly.
++ *
++ * The test cases in <tt>subqueryFlattening.sql</tt> could be moved to this
++ * class when they are converted to JUnit.
++ */
++public class SubqueryFlatteningTest extends BaseJDBCTestCase {
++
++    public SubqueryFlatteningTest(String name) {
++        super(name);
++    }
++
++    public static Test suite() {
++        // We're testing the SQL layer, so we run the test in embedded
++        // mode only.
++        return TestConfiguration.embeddedSuite(SubqueryFlatteningTest.class);
++    }
++
++    /**
++     * Set up the test environment. Turn off auto-commit so that all the test
++     * data can easily be removed by the rollback performed in
++     * {@code BaseJDBCTestCase.tearDown()}.
++     */
++    protected void setUp() throws SQLException {
++        setAutoCommit(false);
++    }
++
++    /**
++     * Enable collection of runtime statistics in the current connection.
++     * @param s the statement to use for enabling runtime statistics
++     */
++    private void enableRuntimeStatistics(Statement s) throws SQLException {
++        s.execute("call syscs_util.syscs_set_runtimestatistics(1)");
++    }
++
++    /**
++     * Check that a query returns the expected rows and whether or not it was
++     * flattened to an exists join (or not exists join). An error is raised if
++     * wrong results are returned or if the query plan is not the expected one.
++     *
++     * @param s the statement on which the query is executed
++     * @param sql the query text
++     * @param rows the expected result
++     * @param flattenable whether or not we expect the query to be flattened
++     * to a (not) exists join
++     * @throws SQLException if a database error occurs
++     * @throws junit.framework.AssertionFailedError if the wrong results are
++     * returned from the query, or if the query plan is not as expected
++     */
++    private void checkExistsJoin(Statement s, String sql, String[][] rows,
++                                 boolean flattenable)
++            throws SQLException
++    {
++        JDBC.assertFullResultSet(s.executeQuery(sql), rows);
++        RuntimeStatisticsParser parser =
++                SQLUtilities.getRuntimeStatisticsParser(s);
++        assertEquals("unexpected plan", flattenable, parser.usedExistsJoin());
++    }
++
++    /**
++     * DERBY-4001: Test that certain NOT EXISTS/NOT IN/ALL subqueries are
++     * flattened, and that their predicates are not pulled out. Their
++     * predicates are known to be always false, so when they are (correctly)
++     * applied on the subquery, they will cause all the rows from the outer
++     * query to be returned. If the predicates are (incorrectly) pulled out to
++     * the outer query, the query won't return any rows at all. DERBY-4001.
++     */
++    public void testNotExistsFlattenablePredicatesNotPulled()
++            throws SQLException
++    {
++        Statement s = createStatement();
++        // X must be NOT NULL, otherwise X NOT IN and X < ALL won't be
++        // rewritten to NOT EXISTS
++        s.execute("create table t (x int not null)");
++        s.execute("insert into t values 1,2,3");
++
++        enableRuntimeStatistics(s);
++
++        String[][] allRows = {{"1"}, {"2"}, {"3"}};
++
++        checkExistsJoin(
++                s,
++                "select * from t where not exists (select x from t where 1<>1)",
++                allRows, true);
++
++        checkExistsJoin(
++                s,
++                "select * from t where x not in (select x from t where 1<>1)",
++                allRows, true);
++
++        checkExistsJoin(
++                s,
++                "select * from t where x < all (select x from t where 1<>1)",
++                allRows, true);
++    }
++
++    /**
++     * DERBY-4001: Test that some ALL subqueries that used to be flattened to
++     * a not exists join and return incorrect results, are not flattened.
++     * These queries should not be flattened because the generated NOT EXISTS
++     * JOIN condition or some of the subquery's predicates could be pushed
++     * down into the left side of the join, which is not allowed in a not
++     * exists join because the predicates have a completely different effect
++     * if they're used on one side of the join than if they're used on the
++     * other side of the join.
++     */
++    public void testAllNotFlattenableToNotExists() throws SQLException {
++        Statement s = createStatement();
++        // X must be NOT NULL, otherwise rewriting ALL to NOT EXISTS won't even
++        // be attempted
++        s.execute("create table t (x int not null)");
++        s.execute("insert into t values 1,2,3");
++
++        enableRuntimeStatistics(s);
++
++        String[][] allRows = {{"1"}, {"2"}, {"3"}};
++
++        // Join condition is X >= 100, which should make the right side of
++        // the not exists join empty and return all rows from the left side.
++        // If (incorrectly) pushed down on the left side, no rows will be
++        // returned.
++        checkExistsJoin(
++                s, "select * from t where x < all (select 100 from t)",
++                allRows, false);
++
++        // Join condition is 1 >= 100, which should make the right side of
++        // the not exists join empty and return all rows from the left side.
++        // If (incorrectly) pushed down on the left side, no rows will be
++        // returned.
++        checkExistsJoin(
++                s, "select * from t where 1 < all (select 2 from t)",
++                allRows, false);
++
++        // Join condition is X <> 1, which will remove the only interesting
++        // row from the left side if (incorrectly) pushed down there.
++        checkExistsJoin(
++                s, "select * from t where x = all (select 1 from t)",
++                new String[][]{{"1"}}, false);
++
++        // Join condition is T1.X >= T2.X which cannot be pushed down on the
++        // left side. The predicate in the subquery (T1.X > 100) can be pushed
++        // down on the left side and filter out rows that should not be
++        // filtered out, so check that this query is not flattened.
++        checkExistsJoin(
++                s, "select * from t t1 where x < all " +
++                "(select x from t t2 where t1.x > 100)",
++                allRows, false);
++
++        // Same as above, but with an extra, unproblematic predicate added
++        // to the subquery.
++        checkExistsJoin(
++                s, "select * from t t1 where x < all " +
++                "(select x from t t2 where t1.x > 100 and t2.x > 100)",
++                allRows, false);
++
++        // Same as above, but since the problematic predicate is ORed with
++        // an unproblematic one, it is not possible to push it down on the
++        // left side (only ANDed predicates can be split and pushed down
++        // separately), so in this case we expect the query to be flattened.
++        // (This query worked correctly also before DERBY-4001 was fixed.)
++        checkExistsJoin(
++                s, "select * from t t1 where x < all " +
++                "(select x from t t2 where t1.x > 100 or t2.x > 100)",
++                allRows, true);
++    }
++
++    /**
++     * DERBY-4001: Test that some NOT IN subqueries that used to be flattened
++     * to a not exists join and return incorrect results, are not flattened.
++     * These queries should not be flattened because the generated NOT EXISTS
++     * JOIN condition or some of the subquery's predicates could be pushed
++     * down into the left side of the join, which is not allowed in a not
++     * exists join because the predicates have a completely different effect
++     * if they're used on one side of the join than if they're used on the
++     * other side of the join.
++     */
++    public void testNotInNotFlattenableToNotExists() throws SQLException {
++        Statement s = createStatement();
++        // X must be NOT NULL, otherwise rewriting NOT IN to NOT EXISTS won't
++        // even be attempted
++        s.execute("create table t (x int not null)");
++        s.execute("insert into t values 1,2,3");
++
++        enableRuntimeStatistics(s);
++
++        String[][] allRows = {{"1"}, {"2"}, {"3"}};
++
++        // Join condition is X = 100, which should make the right side of
++        // the not exists join empty and return all rows from the left side.
++        // If (incorrectly) pushed down on the left side, no rows will be
++        // returned.
++        checkExistsJoin(
++                s, "select * from t where x not in (select 100 from t)",
++                allRows, false);
++
++        // Join condition is 1 = 100, which should make the right side of
++        // the not exists join empty and return all rows from the left side.
++        // If (incorrectly) pushed down on the left side, no rows will be
++        // returned.
++        checkExistsJoin(
++                s, "select * from t where 1 not in (select 100 from t)",
++                allRows, false);
++
++        // Join condition is X = 2, which will remove the interesting rows
++        // from the left side if (incorrectly) pushed down there.
++        checkExistsJoin(
++                s, "select * from t where x not in (select 2 from t)",
++                new String[][]{{"1"}, {"3"}}, false);
++
++        // Join condition is T1.X = T2.X which cannot be pushed down on the
++        // left side. The predicate in the subquery (T1.X > 100) can be pushed
++        // down on the left side and filter out rows that should not be
++        // filtered out, so check that this query is not flattened.
++        checkExistsJoin(
++                s, "select * from t t1 where x not in " +
++                "(select x from t t2 where t1.x > 100)",
++                allRows, false);
++
++        // Same as above, but with an extra, unproblematic predicate added
++        // to the subquery.
++        checkExistsJoin(
++                s, "select * from t t1 where x not in " +
++                "(select x from t t2 where t1.x > 100 and t2.x > 100)",
++                allRows, false);
++
++        // Same as above, but since the problematic predicate is ORed with
++        // an unproblematic one, it is not possible to push it down on the
++        // left side (only ANDed predicates can be split and pushed down
++        // separately), so in this case we expect the query to be flattened.
++        // (This query worked correctly also before DERBY-4001 was fixed.)
++        checkExistsJoin(
++                s, "select * from t t1 where x not in " +
++                "(select x from t t2 where t1.x > 100 or t2.x > 100)",
++                allRows, true);
++    }
++}
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+index 5e3c5e23..c739f154 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/functionTests/tests/lang/_Suite.java
+@@ -79,6 +79,7 @@ public static Test suite() {
+         suite.addTest(SQLAuthorizationPropTest.suite());
+         suite.addTest(StatementPlanCacheTest.suite());
+         suite.addTest(StreamsTest.suite());
++        suite.addTest(SubqueryFlatteningTest.suite());
+         suite.addTest(TimeHandlingTest.suite());
+         suite.addTest(TriggerTest.suite());
+         suite.addTest(TruncateTableTest.suite());
+diff --git a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/junit/RuntimeStatisticsParser.java b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/junit/RuntimeStatisticsParser.java
+index c8c1bb37..ff1092a1 100644
+--- a/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/junit/RuntimeStatisticsParser.java
++++ b/db/derby/code/branches/10.5/java/testing/org/apache/derbyTesting/junit/RuntimeStatisticsParser.java
+@@ -298,6 +298,15 @@ public boolean usedHashJoin()
+         return (statistics.indexOf("Hash Join ResultSet") != -1);
+     }
+ 
++    /**
++     * Check if an exists join (or a not exists join) was used.
++     *
++     * @return {@code true} if the query used a (not) exists join
++     */
++    public boolean usedExistsJoin() {
++        return statistics.indexOf("Exists Join ResultSet") != -1;
++    }
++
+     /**
+      * Search the RuntimeStatistics for a string.  It must occur
+      * at least instances times.

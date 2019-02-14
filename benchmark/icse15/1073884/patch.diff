@@ -1,0 +1,306 @@
+diff --git a/cassandra/branches/cassandra-0.7/contrib/client_only/src/ClientOnlyExample.java b/cassandra/branches/cassandra-0.7/contrib/client_only/src/ClientOnlyExample.java
+index ce1ab07b..f0d09d3c 100644
+--- a/cassandra/branches/cassandra-0.7/contrib/client_only/src/ClientOnlyExample.java
++++ b/cassandra/branches/cassandra-0.7/contrib/client_only/src/ClientOnlyExample.java
+@@ -44,7 +44,7 @@
+     private static final String KEYSPACE = "Keyspace1";
+     private static final String COLUMN_FAMILY = "Standard1";
+ 
+-    private static void testWriting() throws Exception
++    private static void startClient() throws Exception
+     {
+         StorageService.instance.initClient();
+         // sleep for a bit so that gossip can do its thing.
+@@ -56,7 +56,10 @@ private static void testWriting() throws Exception
+         {
+             throw new AssertionError(ex);
+         }
++    }
+ 
++    private static void testWriting() throws Exception
++    {
+         // do some writing.
+         for (int i = 0; i < 100; i++)
+         {
+@@ -72,22 +75,10 @@ private static void testWriting() throws Exception
+             System.out.println("wrote key" + i);
+         }
+         System.out.println("Done writing.");
+-        StorageService.instance.stopClient();
+     }
+ 
+     private static void testReading() throws Exception
+     {
+-        StorageService.instance.initClient();
+-        // sleep for a bit so that gossip can do its thing.
+-        try
+-        {
+-            Thread.sleep(10000L);
+-        }
+-        catch (Exception ex)
+-        {
+-            throw new AssertionError(ex);
+-        }
+-
+         // do some queries.
+         Collection<ByteBuffer> cols = new ArrayList<ByteBuffer>()
+         {{
+@@ -114,11 +105,6 @@ private static void testReading() throws Exception
+             else
+                 System.err.println("This output indicates that nothing was read.");
+         }
+-
+-        // no need to do this:
+-        // StorageService.instance().decommission();
+-        // do this instead:
+-        StorageService.instance.stopClient();
+     }
+ 
+     /**
+@@ -137,17 +123,26 @@ private static void testReading() throws Exception
+      */
+     public static void main(String args[]) throws Exception
+     {
+-        if (args.length == 0)
+-            System.out.println("run with \"read\" or \"write\".");
+-        else if ("read".equalsIgnoreCase(args[0]))
++        startClient();
++        setupKeyspace(createConnection());
++        testWriting();
++        logger.info("Writing is done. Sleeping, then will try to read.");
++        try
+         {
+-            testReading();
++            Thread.currentThread().sleep(10000);
+         }
+-        else if ("write".equalsIgnoreCase(args[0]))
++        catch (InterruptedException ex) 
+         {
+-            setupKeyspace(createConnection());
+-            testWriting();
++            throw new RuntimeException(ex);
+         }
++        
++        testReading();
++        
++        // no need to do this:
++        // StorageService.instance().decommission();
++        // do this instead:
++        StorageService.instance.stopClient();
++        System.exit(0); // the only way to really stop the process.
+     }
+     
+     /**
+@@ -159,6 +154,8 @@ private static void setupKeyspace(Cassandra.Iface client) throws TException, Inv
+         CfDef columnFamily = new CfDef(KEYSPACE, COLUMN_FAMILY);
+         cfDefList.add(columnFamily);
+ 
++        try 
++        {
+         client.system_add_keyspace(new KsDef(KEYSPACE, "org.apache.cassandra.locator.SimpleStrategy", 1, cfDefList));
+         int magnitude = client.describe_ring(KEYSPACE).size();
+         try
+@@ -170,6 +167,11 @@ private static void setupKeyspace(Cassandra.Iface client) throws TException, Inv
+             throw new RuntimeException(e);
+         }
+     }
++        catch (InvalidRequestException probablyExists) 
++        {
++            logger.warn("Problem creating keyspace: " + probablyExists.getMessage());    
++        }
++    }
+ 
+     private static Cassandra.Iface createConnection() throws TTransportException
+     {
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 99313bb9..0d65d355 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -362,10 +362,6 @@ else if (conf.memtable_flush_writers == null)
+                     throw new ConfigurationException("saved_caches_directory missing");
+             }
+ 
+-            /* threshold after which commit log should be rotated. */
+-            if (conf.commitlog_rotation_threshold_in_mb != null)
+-                CommitLog.setSegmentSize(conf.commitlog_rotation_threshold_in_mb * 1024 * 1024);
+-
+             // Hardcoded system tables
+             KSMetaData systemMeta = new KSMetaData(Table.SYSTEM_TABLE,
+                                                    LocalStrategy.class,
+@@ -903,6 +899,14 @@ public synchronized static String getNextAvailableDataLocation()
+         return dataFileDirectory;
+     }
+ 
++    /* threshold after which commit log should be rotated. */
++    public static int getCommitLogSegmentSize() 
++    {
++        return conf.commitlog_rotation_threshold_in_mb != null ?
++               conf.commitlog_rotation_threshold_in_mb * 1024 * 1024 :
++               128*1024*1024;
++    }
++
+     public static String getCommitLogLocation()
+     {
+         return conf.commitlog_directory;
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+index 19d56e44..4653f7f9 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -256,6 +256,15 @@ private int waitForSchemaAgreement(InetAddress endpoint) throws InterruptedExcep
+     {
+         Gossiper gossiper = Gossiper.instance;
+         int waited = 0;
++        // first, wait for schema to be gossiped.
++        while (gossiper.getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.SCHEMA) == null) {
++            Thread.sleep(1000);
++            waited += 1000;
++            if (waited > 2 * StorageService.RING_DELAY)
++                throw new RuntimeException("Didin't receive gossiped schema from " + endpoint + " in " + 2 * StorageService.RING_DELAY + "ms");
++        }
++        waited = 0;
++        // then wait for the correct schema version.
+         while (!gossiper.getEndpointStateForEndpoint(endpoint).getApplicationState(ApplicationState.SCHEMA).value.equals(
+                 gossiper.getEndpointStateForEndpoint(FBUtilities.getLocalAddress()).getApplicationState(ApplicationState.SCHEMA).value))
+         {
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+index 6eb0b144..da79fced 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/Table.java
+@@ -70,6 +70,8 @@
+     // proper directories here as well as in CassandraDaemon.
+     static
+     {
++        if (!StorageService.instance.isClientMode()) 
++        {
+         try
+         {
+             DatabaseDescriptor.createAllDirectories();
+@@ -79,6 +81,7 @@
+             throw new IOError(ex);
+         }
+     }
++    }
+ 
+     /** Table objects, one per keyspace.  only one instance should ever exist for any given keyspace. */
+     private static final Map<String, Table> instances = new NonBlockingHashMap<String, Table>();
+@@ -231,6 +234,7 @@ private Table(String table)
+             try
+             {
+                 String keyspaceDir = dataDir + File.separator + table;
++                if (!StorageService.instance.isClientMode())
+                 FileUtils.createDirectory(keyspaceDir);
+     
+                 // remove the deprecated streaming directory.
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/commitlog/CommitLog.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+index dfe2ee8e..afd6b8c3 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/commitlog/CommitLog.java
+@@ -78,7 +78,6 @@
+ public class CommitLog
+ {
+     private static final int MAX_OUTSTANDING_REPLAY_COUNT = 1024;
+-    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
+ 
+     static final Logger logger = LoggerFactory.getLogger(CommitLog.class);
+ 
+@@ -86,13 +85,10 @@
+ 
+     private final Deque<CommitLogSegment> segments = new ArrayDeque<CommitLogSegment>();
+ 
+-    public static void setSegmentSize(int size)
+-    {
+-        SEGMENT_SIZE = size;
+-    }
+-
+     private final ICommitLogExecutorService executor;
+ 
++    private volatile int segmentSize = 128*1024*1024; // roll after log gets this big
++
+     /**
+      * param @ table - name of table for which we are maintaining
+      *                 this commit log.
+@@ -104,6 +100,7 @@ private CommitLog()
+         try
+         {
+             DatabaseDescriptor.createAllDirectories();
++            segmentSize = DatabaseDescriptor.getCommitLogSegmentSize();
+         }
+         catch (IOException e)
+         {
+@@ -478,7 +475,7 @@ public void run()
+             {
+                 currentSegment().write(rowMutation, serializedRow);
+                 // roll log if necessary
+-                if (currentSegment().length() >= SEGMENT_SIZE)
++                if (currentSegment().length() >= segmentSize)
+                 {
+                     sync();
+                     segments.add(new CommitLogSegment());
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+index b1a842e1..bb601e59 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/Migration.java
+@@ -82,13 +82,16 @@
+     protected transient boolean clientMode;
+     
+     /** Subclasses must have a matching constructor */
+-    protected Migration() { /* pass */ }
++    protected Migration() 
++    {
++        clientMode = StorageService.instance.isClientMode();
++    }
+ 
+     Migration(UUID newVersion, UUID lastVersion)
+     {
++        this();
+         this.newVersion = newVersion;
+         this.lastVersion = lastVersion;
+-        clientMode = StorageService.instance.isClientMode();
+     }
+     
+     // block compactions and flushing.
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
+index b72e2377..0fafe4a2 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/gms/Gossiper.java
+@@ -921,7 +921,6 @@ public void addSavedEndpoint(InetAddress ep)
+ 
+     public void addLocalApplicationState(ApplicationState state, VersionedValue value)
+     {
+-        assert !StorageService.instance.isClientMode();
+         EndpointState epState = endpointStateMap_.get(localEndpoint_);
+         assert epState != null;
+         epState.addApplicationState(state, value);
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
+index 34037b29..85f5200a 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/service/MigrationManager.java
+@@ -71,7 +71,10 @@ public void onDead(InetAddress endpoint, EndpointState state) { }
+ 
+     public void onRemove(InetAddress endpoint) { }
+     
+-    /** will either push or pull an updating depending on who is behind. */
++    /** 
++     * will either push or pull an updating depending on who is behind.
++     * fat clients should never push their schemas (since they have no local storage).
++     */
+     public static void rectify(UUID theirVersion, InetAddress endpoint)
+     {
+         UUID myVersion = DatabaseDescriptor.getDefsVersion();
+@@ -82,7 +85,7 @@ else if (theirVersion.timestamp() > myVersion.timestamp())
+             logger.debug("My data definitions are old. Asking for updates since {}", myVersion.toString());
+             announce(myVersion, Collections.singleton(endpoint));
+         }
+-        else
++        else if (!StorageService.instance.isClientMode())
+         {
+             logger.debug("Their data definitions are old. Sending updates since {}", theirVersion.toString());
+             pushMigrations(theirVersion, myVersion, endpoint);
+@@ -101,7 +104,6 @@ public static void announce(UUID version, Set<InetAddress> hosts)
+     /** announce my version passively over gossip **/
+     public static void passiveAnnounce(UUID version)
+     {
+-        if (!StorageService.instance.isClientMode())
+             Gossiper.instance.addLocalApplicationState(ApplicationState.SCHEMA, StorageService.instance.valueFactory.migration(version));
+         logger.debug("Announcing my schema is " + version);
+     }

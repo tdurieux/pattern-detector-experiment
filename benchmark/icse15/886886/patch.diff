@@ -1,0 +1,149 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Column.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Column.java
+index ea67ca4c..a6a7ca47 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Column.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Column.java
+@@ -132,7 +132,7 @@ public long getMarkedForDeleteAt()
+         return timestamp;
+     }
+ 
+-    public long mostRecentChangeAt()
++    public long mostRecentLiveChangeAt()
+     {
+         return timestamp;
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index ff172b14..ee37d817 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1117,7 +1117,7 @@ public ColumnFamily getColumnFamily(QueryFilter filter, int gcBefore) throws IOE
+             if (filter.path.superColumnName != null)
+             {
+                 QueryFilter nameFilter = new NamesQueryFilter(filter.key, new QueryPath(columnFamily_), filter.path.superColumnName);
+-                ColumnFamily cf = getColumnFamilyInternal(nameFilter, getDefaultGCBefore());
++                ColumnFamily cf = getColumnFamilyInternal(nameFilter, gcBefore);
+                 if (cf == null || cf.getColumnCount() == 0)
+                     return cf;
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/IColumn.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/IColumn.java
+index a9208576..46d0bd15 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/IColumn.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/IColumn.java
+@@ -30,7 +30,7 @@
+ 
+     public boolean isMarkedForDelete();
+     public long getMarkedForDeleteAt();
+-    public long mostRecentChangeAt();
++    public long mostRecentLiveChangeAt();
+     public byte[] name();
+     public int size();
+     public int serializedSize();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
+index 60f61086..0531d190 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/SuperColumn.java
+@@ -20,7 +20,6 @@
+ 
+ import java.io.*;
+ import java.util.Collection;
+-import java.util.Arrays;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.ConcurrentSkipListMap;
+ import java.security.MessageDigest;
+@@ -158,14 +157,14 @@ public long timestamp(byte[] columnName)
+     	throw new IllegalArgumentException("Timestamp was requested for a column that does not exist.");
+     }
+ 
+-    public long mostRecentChangeAt()
++    public long mostRecentLiveChangeAt()
+     {
+         long max = Long.MIN_VALUE;
+         for (IColumn column : columns_.values())
+         {
+-            if (column.mostRecentChangeAt() > max)
++            if (!column.isMarkedForDelete() && column.timestamp() > max)
+             {
+-                max = column.mostRecentChangeAt();
++                max = column.timestamp();
+             }
+         }
+         return max;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
+index a77a3d20..6523354a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/NamesQueryFilter.java
+@@ -86,7 +86,7 @@ public void collectReducedColumns(IColumnContainer container, Iterator<IColumn>
+         while (reducedColumns.hasNext())
+         {
+             IColumn column = reducedColumns.next();
+-            if (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore)
++            if (QueryFilter.isRelevant(column, container, gcBefore))
+                 container.addColumn(column);
+         }
+     }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+index 251da22e..144efe1b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/QueryFilter.java
+@@ -111,4 +111,14 @@ public String getColumnFamilyName()
+     {
+         return path.columnFamilyName;
+     }
++
++    public static boolean isRelevant(IColumn column, IColumnContainer container, int gcBefore)
++    {
++        // the column itself must be not gc-able (it is live, or a still relevant tombstone, or has live subcolumns), (1)
++        // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
++        // (since otherwise, the only thing repair cares about is the container tombstone)
++        long maxChange = column.mostRecentLiveChangeAt();
++        return (!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore || maxChange > column.getMarkedForDeleteAt()) // (1)
++               && (!container.isMarkedForDelete() || maxChange > container.getMarkedForDeleteAt()); // (2)
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+index 5cac3165..fda6338f 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/filter/SliceQueryFilter.java
+@@ -35,7 +35,6 @@
+ import org.apache.cassandra.io.SSTableReader;
+ import org.apache.cassandra.db.*;
+ import org.apache.cassandra.db.marshal.AbstractType;
+-import org.apache.cassandra.config.DatabaseDescriptor;
+ 
+ public class SliceQueryFilter extends QueryFilter
+ {
+@@ -124,20 +123,14 @@ public void collectReducedColumns(IColumnContainer container, Iterator<IColumn>
+             // only count live columns towards the `count` criteria
+             if (!column.isMarkedForDelete()
+                 && (!container.isMarkedForDelete()
+-                    || column.mostRecentChangeAt() > container.getMarkedForDeleteAt()))
++                    || column.mostRecentLiveChangeAt() > container.getMarkedForDeleteAt()))
+             {
+                 liveColumns++;
+             }
+ 
+             // but we need to add all non-gc-able columns to the result for read repair:
+-            // the column itself must be not gc-able, (1)
+-            // and if its container is deleted, the column must be changed more recently than the container tombstone (2)
+-            // (since otherwise, the only thing repair cares about is the container tombstone)
+-            if ((!column.isMarkedForDelete() || column.getLocalDeletionTime() > gcBefore) // (1)
+-                && (!container.isMarkedForDelete() || column.mostRecentChangeAt() > container.getMarkedForDeleteAt())) // (2)
+-            {
++            if (QueryFilter.isRelevant(column, container, gcBefore))
+                 container.addColumn(column);
+             }
+         }
+-    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+index e462a828..31815c2e 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RemoveSuperColumnTest.java
+@@ -153,7 +153,7 @@ public void testRemoveSuperColumnWithNewData() throws IOException, ExecutionExce
+     private void validateRemoveWithNewData() throws IOException
+     {
+         ColumnFamilyStore store = Table.open("Keyspace1").getColumnFamilyStore("Super2");
+-        ColumnFamily resolved = store.getColumnFamily(new NamesQueryFilter("key1", new QueryPath("Super2", "SC1".getBytes()), getBytes(2)));
++        ColumnFamily resolved = store.getColumnFamily(new NamesQueryFilter("key1", new QueryPath("Super2", "SC1".getBytes()), getBytes(2)), Integer.MAX_VALUE);
+         Collection<IColumn> subColumns = resolved.getSortedColumns().iterator().next().getSubColumns();
+         assert subColumns.size() == 1;
+         assert subColumns.iterator().next().timestamp() == 2;

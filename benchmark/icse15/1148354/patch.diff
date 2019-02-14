@@ -1,0 +1,150 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+index 580ad66e..9f30f4f2 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer.java
+@@ -1328,11 +1328,6 @@ public Object run() throws StandardException
+                  throw StandardException.newException( SQLState.FILE_CREATE, se, file);
+              }
+ 
+-             boolean success = false;
+-             int maxTries = MAX_INTERRUPT_RETRIES;
+-             while (!success) {
+-                 success = true;
+-
+                  try {
+ 
+                      // OK not to force WAL here, in fact, this operation
+@@ -1371,27 +1366,21 @@ public Object run() throws StandardException
+ 
+                      // create an embryonic page - if this is not a temporary
+                      // container, synchronously write out the file header.
++
++                 canUpdate = true; // Need to set it now. After writeRAFHeader
++                                   // may be too late in case that method's IO
++                                   // is interrupted and container needs
++                                   // reopening. To get the correct "rw" mode
++                                   // we need canUpdate to be true.
++
+                      writeRAFHeader(
+                          actionIdentity, fileData, true,
+                          (actionIdentity.getSegmentId() !=
+                           ContainerHandle.TEMPORARY_SEGMENT));
+ 
+                  } catch (IOException ioe) {
+-                     Class clazz = ioe.getClass();
+-
+-                     // test with reflection since NIO is not in Foundation 1.1
+-                     if (clazz.getName().equals(
+-                             "java.nio.channels.ClosedByInterruptException") ||
+-                         clazz.getName().equals( // Java NIO Bug 6979009:
+-                             "java.nio.channels.AsynchronousCloseException")) {
+-
+-                         if (--maxTries > 0) {
+-                             success = false;
+-                             InterruptStatus.setInterrupted();
+-                             closeContainer();
+-                             continue;
+-                         }
+-                     }
++
++                 canUpdate = false;
+ 
+                      boolean fileDeleted;
+                      try {
+@@ -1415,9 +1404,7 @@ public Object run() throws StandardException
+                      throw StandardException.newException(
+                          SQLState.FILE_CREATE, ioe, file);
+                  }
+-             }
+ 
+-             canUpdate = true;
+              return null;
+          } // end of case CREATE_CONTAINER_ACTION
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+index d352d015..5e82a35a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/store/raw/data/RAFContainer4.java
+@@ -622,10 +622,6 @@ protected void writePage(long pageNumber, byte[] pageData, boolean syncPage)
+                     threadsInPageIO,
+                     hashCode());
+ 
+-                // Recovery is in progress, wait for another
+-                // interrupted thread to clean up, i.e. act as if we
+-                // had seen ClosedChannelException.
+-
+                 awaitRestoreChannel(e, stealthMode);
+                 if (retries-- == 0) {
+                     throw StandardException.newException(
+@@ -1089,10 +1085,68 @@ void writeAtOffset(StorageRandomAccessFile file, byte[] bytes, long offset)
+             throws IOException, StandardException
+     {
+         FileChannel ioChannel = getChannel(file);
+-        if (ioChannel != null) {
+-            writeFull(ByteBuffer.wrap(bytes), ioChannel, offset);
+-        } else {
++
++        if (ioChannel == null) {
+             super.writeAtOffset(file, bytes, offset);
++            return;
++        }
++
++        ourChannel = ioChannel;
++
++        boolean success = false;
++        boolean stealthMode = true;
++
++        while (!success) {
++
++            synchronized (this) {
++                // don't use ourChannel directly, could need re-initilization
++                // after interrupt and container reopening:
++                ioChannel = getChannel();
++            }
++
++            try {
++                writeFull(ByteBuffer.wrap(bytes), ioChannel, offset);
++                success = true;
++            //} catch (ClosedByInterruptException e) {
++            // Java NIO Bug 6979009:
++            // http://bugs.sun.com/view_bug.do?bug_id=6979009
++            // Sometimes NIO throws AsynchronousCloseException instead of
++            // ClosedByInterruptException
++            } catch (AsynchronousCloseException e) {
++                // Subsumes ClosedByInterruptException
++
++                // The interrupted thread may or may not get back here
++                // before other concurrent writers that will see
++                // ClosedChannelException, we have logic to handle that.
++
++                if (Thread.currentThread().isInterrupted()) {
++                    // Normal case
++                    if (recoverContainerAfterInterrupt(
++                                e.toString(),
++                                stealthMode)) {
++                        continue; // do I/O over again
++                    }
++                }
++                // Recovery is in progress, wait for another
++                // interrupted thread to clean up, i.e. act as if we
++                // had seen ClosedChannelException.
++
++                // stealthMode == true, so this will throw
++                // InterruptDetectedException
++                awaitRestoreChannel(e, stealthMode);
++            } catch (ClosedChannelException e) {
++                // We are not the thread that first saw the channel interrupt,
++                // so no recovery attempt.
++
++                InterruptStatus.noteAndClearInterrupt(
++                    "writeAtOffset in ClosedChannelException",
++                    threadsInPageIO,
++                    hashCode());
++
++                // stealthMode == true, so this will throw
++                // InterruptDetectedException
++                awaitRestoreChannel(e, stealthMode);
++            }
+         }
+     }
+ 

@@ -1,0 +1,119 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 43939be9..a14b495d 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1526,11 +1526,17 @@ public Object getMemtable()
+         return memtable_.get();
+     }
+ 
++    /** not threadsafe.  caller must have lock_ acquired. */
+     public Set<String> getSSTableFilenames()
+     {
+         return Collections.unmodifiableSet(ssTables_);
+     }
+ 
++    public ReentrantReadWriteLock.ReadLock getReadLock()
++    {
++        return lock_.readLock();
++    }
++
+     public int getReadCount()
+     {
+         return readStats_.size();
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 43714b1a..c3c6b192 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -395,7 +395,7 @@ private void addStreamContext(String host, StreamContextManager.StreamContext st
+     /* The AnalyticsSource instance which keeps track of statistics reported to Ganglia. */
+     private DBAnalyticsSource dbAnalyticsSource_;
+     // cache application CFs since Range queries ask for them a _lot_
+-    private Set<String> applicationColumnFamilies_;
++    private SortedSet<String> applicationColumnFamilies_;
+ 
+     public static Table open(String table)
+     {
+@@ -849,11 +849,11 @@ else if(column.timestamp() == 4)
+         dbAnalyticsSource_.updateWriteStatistics(timeTaken);
+     }
+ 
+-    public Set<String> getApplicationColumnFamilies()
++    public SortedSet<String> getApplicationColumnFamilies()
+     {
+         if (applicationColumnFamilies_ == null)
+         {
+-            applicationColumnFamilies_ = new HashSet<String>();
++            applicationColumnFamilies_ = new TreeSet<String>();
+             for (String cfName : getColumnFamilies())
+             {
+                 if (DatabaseDescriptor.isApplicationColumnFamily(cfName))
+@@ -872,6 +872,26 @@ else if(column.timestamp() == 4)
+      * @return list of keys between startWith and stopAt
+      */
+     public List<String> getKeyRange(final String startWith, final String stopAt, int maxResults) throws IOException, ExecutionException, InterruptedException
++    {
++        // TODO we need a better way to keep compactions from stomping on reads than One Big Lock per CF.
++        for (String cfName : getApplicationColumnFamilies())
++        {
++            getColumnFamilyStore(cfName).getReadLock().lock();
++        }
++        try
++        {
++            return getKeyRangeUnsafe(startWith, stopAt, maxResults);
++        }
++        finally
++        {
++            for (String cfName : getApplicationColumnFamilies())
++            {
++                getColumnFamilyStore(cfName).getReadLock().unlock();
++            }
++        }
++    }
++
++    private List<String> getKeyRangeUnsafe(final String startWith, final String stopAt, int maxResults) throws IOException, ExecutionException, InterruptedException
+     {
+         // (OPP key decoration is a no-op so using the "decorated" comparator against raw keys is fine)
+         final Comparator<String> comparator = StorageService.getPartitioner().getDecoratedKeyComparator();
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
+index 297b8a53..418386bd 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/OneCompactionTest.java
+@@ -11,17 +11,16 @@
+ 
+ public class OneCompactionTest
+ {
+-    @Test
+-    public void testOneCompaction() throws IOException, ExecutionException, InterruptedException
++    private void testCompaction(String columnFamilyName, int insertsPerTable) throws IOException, ExecutionException, InterruptedException
+     {
+         Table table = Table.open("Table1");
+-        ColumnFamilyStore store = table.getColumnFamilyStore("Standard1");
++        ColumnFamilyStore store = table.getColumnFamilyStore(columnFamilyName);
+ 
+         Set<String> inserted = new HashSet<String>();
+-        for (int j = 0; j < 2; j++) {
++        for (int j = 0; j < insertsPerTable; j++) {
+             String key = "0";
+             RowMutation rm = new RowMutation("Table1", key);
+-            rm.add("Standard1:0", new byte[0], j);
++            rm.add(columnFamilyName + ":0", new byte[0], j);
+             rm.apply();
+             inserted.add(key);
+             store.forceBlockingFlush();
+@@ -30,4 +29,16 @@ public void testOneCompaction() throws IOException, ExecutionException, Interrup
+         store.doCompaction(2);
+         assertEquals(table.getKeyRange("", "", 10000).size(), inserted.size());
+     }
++
++    @Test
++    public void testCompaction1() throws IOException, ExecutionException, InterruptedException
++    {
++        testCompaction("Standard1", 1);
++    }
++
++    @Test
++    public void testCompaction2() throws IOException, ExecutionException, InterruptedException
++    {
++        testCompaction("Standard2", 500);
++    }
+ }

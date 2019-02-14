@@ -1,0 +1,194 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+index 819fbdeb..6a5bc130 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/update/processor/DistributedUpdateProcessor.java
+@@ -1125,22 +1125,10 @@ private void zkCheck() {
+       return;
+     }
+ 
+-    if (zkController.isConnected()) {
++    if (!zkController.getZkClient().getConnectionManager().isLikelyExpired()) {
+       return;
+     }
+     
+-    long timeoutAt = System.currentTimeMillis() + zkController.getClientTimeout();
+-    while (System.currentTimeMillis() < timeoutAt) {
+-      if (zkController.isConnected()) {
+-        return;
+-      }
+-      try {
+-        Thread.sleep(100);
+-      } catch (InterruptedException e) {
+-        Thread.currentThread().interrupt();
+-        break;
+-      }
+-    }
+     throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Cannot talk to ZooKeeper - Updates are disabled.");
+   }
+ 
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
+index 4ede215e..22173525 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
+@@ -17,6 +17,8 @@
+  * limitations under the License.
+  */
+ 
++import java.util.Timer;
++import java.util.TimerTask;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeoutException;
+ 
+@@ -27,7 +29,7 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-class ConnectionManager implements Watcher {
++public class ConnectionManager implements Watcher {
+   protected static final Logger log = LoggerFactory
+       .getLogger(ConnectionManager.class);
+ 
+@@ -35,25 +37,25 @@
+   private CountDownLatch clientConnected;
+   private KeeperState state;
+   private boolean connected;
++  private boolean likelyExpired = true;
+ 
+   private final ZkClientConnectionStrategy connectionStrategy;
+ 
+   private final String zkServerAddress;
+ 
+-  private final int zkClientTimeout;
+-
+   private final SolrZkClient client;
+ 
+   private final OnReconnect onReconnect;
+ 
+   private volatile boolean isClosed = false;
+ 
++  private volatile Timer disconnectedTimer;
++
+   public ConnectionManager(String name, SolrZkClient client, String zkServerAddress, int zkClientTimeout, ZkClientConnectionStrategy strat, OnReconnect onConnect) {
+     this.name = name;
+     this.client = client;
+     this.connectionStrategy = strat;
+     this.zkServerAddress = zkServerAddress;
+-    this.zkClientTimeout = zkClientTimeout;
+     this.onReconnect = onConnect;
+     reset();
+   }
+@@ -61,6 +63,35 @@ public ConnectionManager(String name, SolrZkClient client, String zkServerAddres
+   private synchronized void reset() {
+     clientConnected = new CountDownLatch(1);
+     state = KeeperState.Disconnected;
++    disconnected();
++  }
++  
++  private synchronized void connected() {
++    connected = true;
++    if (disconnectedTimer != null) {
++      disconnectedTimer.cancel();
++      disconnectedTimer = null;
++    }
++    likelyExpired = false;
++  }
++
++  private synchronized void disconnected() {
++    if (disconnectedTimer != null) {
++      disconnectedTimer.cancel();
++      disconnectedTimer = null;
++    }
++    
++    disconnectedTimer = new Timer();
++    disconnectedTimer.schedule(new TimerTask() {
++      
++      @Override
++      public void run() {
++        synchronized (ConnectionManager.this) {
++          likelyExpired = true;
++        }
++      }
++      
++    }, (long) (client.getZkClientTimeout() * 0.90));
+     connected = false;
+   }
+ 
+@@ -78,15 +109,15 @@ public synchronized void process(WatchedEvent event) {
+ 
+     state = event.getState();
+     if (state == KeeperState.SyncConnected) {
+-      connected = true;
++      connected();
+       clientConnected.countDown();
+       connectionStrategy.connected();
+     } else if (state == KeeperState.Expired) {
+-      connected = false;
++      disconnected();
+       log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
+       
+       try {
+-        connectionStrategy.reconnect(zkServerAddress, zkClientTimeout, this,
++        connectionStrategy.reconnect(zkServerAddress, client.getZkClientTimeout(), this,
+             new ZkClientConnectionStrategy.ZkUpdate() {
+               @Override
+               public void update(SolrZooKeeper keeper) {
+@@ -114,9 +145,7 @@ public void update(SolrZooKeeper keeper) {
+                   onReconnect.command();
+                 }
+                 
+-                synchronized (ConnectionManager.this) {
+-                  ConnectionManager.this.connected = true;
+-                }
++                connected();
+                 
+               }
+             });
+@@ -126,10 +155,10 @@ public void update(SolrZooKeeper keeper) {
+       log.info("Connected:" + connected);
+     } else if (state == KeeperState.Disconnected) {
+       log.info("zkClient has disconnected");
+-      connected = false;
++      disconnected();
+       connectionStrategy.disconnected();
+     } else {
+-      connected = false;
++      disconnected();
+     }
+     notifyAll();
+   }
+@@ -142,12 +171,20 @@ public synchronized boolean isConnected() {
+   // to avoid deadlock on shutdown
+   public void close() {
+     this.isClosed = true;
++    if (this.disconnectedTimer != null) {
++      this.disconnectedTimer.cancel();
++      this.disconnectedTimer = null;
++    }
+   }
+ 
+   public synchronized KeeperState state() {
+     return state;
+   }
+ 
++  public synchronized boolean isLikelyExpired() {
++    return likelyExpired;
++  }
++
+   public synchronized void waitForConnected(long waitForConnection)
+       throws TimeoutException {
+     log.info("Waiting for client to connect to ZooKeeper");
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/SolrZkClient.java b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/SolrZkClient.java
+index 8992a935..9deaa503 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/SolrZkClient.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/SolrZkClient.java
+@@ -146,6 +146,10 @@ public void update(SolrZooKeeper zooKeeper) {
+     numOpens.incrementAndGet();
+   }
+ 
++  public ConnectionManager getConnectionManager() {
++    return connManager;
++  }
++  
+   public ZkClientConnectionStrategy getZkClientConnectionStrategy() {
+     return zkClientConnectionStrategy;
+   }

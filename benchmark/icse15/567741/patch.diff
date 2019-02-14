@@ -1,0 +1,191 @@
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XML.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XML.java
+index 2fab8fab..9ab7275d 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XML.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XML.java
+@@ -31,6 +31,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.services.io.TypedFormat;
+ import org.apache.derby.iapi.services.loader.ClassInspector;
+ import org.apache.derby.iapi.services.sanity.SanityManager;
++import org.apache.derby.iapi.sql.conn.ConnectionUtil;
+ 
+ import org.apache.derby.iapi.types.DataValueDescriptor;
+ import org.apache.derby.iapi.types.StringDataValue;
+@@ -41,6 +42,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.sql.Types;
++import java.text.RuleBasedCollator;
+ 
+ import java.io.InputStream;
+ import java.io.IOException;
+@@ -674,7 +676,8 @@ public XMLDataValue XMLParse(String text, boolean preserveWS,
+      * @exception StandardException    Thrown on error
+      */
+     public StringDataValue XMLSerialize(StringDataValue result,
+-        int targetType, int targetWidth) throws StandardException
++        int targetType, int targetWidth, int targetCollationType) 
++    throws StandardException
+     {
+         if (result == null) {
+             switch (targetType)
+@@ -694,6 +697,30 @@ public StringDataValue XMLSerialize(StringDataValue result,
+                     }
+                     return null;
+             }
++            // If the collation type is territory based, then we should use
++            // CollatorSQLxxx rather than SQLxxx types for StringDataValue. 
++            // eg
++            // CREATE TABLE T_MAIN1 (ID INT  GENERATED ALWAYS AS IDENTITY 
++            //       PRIMARY KEY, V XML);
++            // INSERT INTO T_MAIN1(V) VALUES NULL;
++            // SELECT ID, XMLSERIALIZE(V AS CLOB), XMLSERIALIZE(V AS CLOB) 
++            //       FROM T_MAIN1 ORDER BY 1;
++            // Following code is for (V AS CLOB) inside XMLSERIALIZE. The
++            // StringDataValue returned for (V AS CLOB) should consider the 
++            // passed collation type in determining whether we should
++            // generate SQLChar vs CollatorSQLChar for instance. Keep in mind
++            // that collation applies only to character string types.
++    		if (result instanceof StringDataValue) {
++    			try {
++    				RuleBasedCollator rbs = ConnectionUtil.getCurrentLCC().getDataValueFactory().
++    				getCharacterCollator(targetCollationType);
++    				result = ((StringDataValue)result).getValue(rbs);
++    			}
++    			catch( java.sql.SQLException sqle)
++    			{
++    				throw StandardException.plainWrapException( sqle);
++    			}
++    		}
+         }
+ 
+         // Else we're reusing a StringDataValue.  We only reuse
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XMLDataValue.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
+index 47d7255a..5ff48d14 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/iapi/types/XMLDataValue.java
+@@ -56,12 +56,14 @@ public XMLDataValue XMLParse(String text, boolean preserveWS,
+      *  null if not called yet.
+      * @param targetType The string type to which we want to serialize.
+      * @param targetWidth The width of the target type.
++     * @param targetCollationType The collation type of the target type.
+      * @return A serialized (to string) version of this XML object,
+      *  in the form of a StringDataValue object.
+      * @exception StandardException Thrown on error
+      */
+     public StringDataValue XMLSerialize(StringDataValue result,
+-        int targetType, int targetWidth) throws StandardException;
++        int targetType, int targetWidth, int targetCollationType) 
++    throws StandardException;
+ 
+     /**
+      * The SQL/XML XMLExists operator.
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/UnaryOperatorNode.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/UnaryOperatorNode.java
+index ef3afcab..f2532851 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/UnaryOperatorNode.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/compile/UnaryOperatorNode.java
+@@ -791,11 +791,17 @@ protected int addXmlOpMethodParams(ExpressionClassBuilder acb,
+         // the serialized version of the XML value, which we
+         // already found when the XML value was created (ex.
+         // as part of the XMLPARSE work).
++        // We also need to pass the collation type of the current
++        // compilation schema. If the JDBC type id is of type
++        // StringDataValue, then we should use the collation to
++        // decide whether we need to generate collation sensitive
++        // StringDataValue.
+             DataTypeDescriptor targetType =
+                 (DataTypeDescriptor)additionalArgs[0];
+             mb.push(targetType.getJDBCTypeId());
+             mb.push(targetType.getMaximumWidth());
+-            return 2;
++            mb.push(getSchemaDescriptor(null, false).getCollationType());
++            return 3;
+         }
+ 
+         /* Else we're here for XMLPARSE. */
+diff --git a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/execute/SqlXmlExecutor.java b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/execute/SqlXmlExecutor.java
+index 2a23d97e..827504ae 100644
+--- a/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/execute/SqlXmlExecutor.java
++++ b/db/derby/code/branches/10.3/java/engine/org/apache/derby/impl/sql/execute/SqlXmlExecutor.java
+@@ -126,10 +126,11 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+     private Activation activation;
+     private int sqlXUtilId;
+ 
+-    // Target type and target width that were specified
+-    // for an XMLSERIALIZE operator.
++    // Target type, target width and target collation type that 
++    // were specified for an XMLSERIALIZE operator.
+     private int targetTypeId;
+     private int targetMaxWidth;
++    private int targetCollationType;
+ 
+     // Whether or not to preserve whitespace for XMLPARSE
+     // operator.
+@@ -153,11 +154,14 @@ public SqlXmlExecutor(Activation activation, int utilId,
+      * Constructor 2: Used for XMLSERIALIZE op.
+      * @param targetTypeId The string type to which we want to serialize.
+      * @param targetMaxWidth The max width of the target type.
++     * @param targetCollationType The collation type of the target type.
+      */
+-    public SqlXmlExecutor(int targetTypeId, int targetMaxWidth)
++    public SqlXmlExecutor(int targetTypeId, int targetMaxWidth, 
++    		int targetCollationType)
+     {
+         this.targetTypeId = targetTypeId;
+         this.targetMaxWidth = targetMaxWidth;
++        this.targetCollationType = targetCollationType;
+     }
+ 
+     /**
+@@ -213,7 +217,8 @@ public XMLDataValue XMLParse(StringDataValue xmlText, XMLDataValue result)
+     public StringDataValue XMLSerialize(XMLDataValue xmlVal,
+         StringDataValue result) throws StandardException
+     {
+-        return xmlVal.XMLSerialize(result, targetTypeId, targetMaxWidth);
++        return xmlVal.XMLSerialize(result, targetTypeId, targetMaxWidth, 
++        		targetCollationType);
+     }
+ 
+     /**
+diff --git a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest.java b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest.java
+index 3611337c..7d85318f 100644
+--- a/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest.java
++++ b/db/derby/code/branches/10.3/java/testing/org/apache/derbyTesting/functionTests/tests/lang/CollationTest.java
+@@ -524,7 +524,7 @@ private void commonTestingForTerritoryBasedDB(Statement s) throws SQLException{
+     //The query below will work for the same reason. 
+     checkLangBasedQuery(s, "SELECT count(*) FROM SYS.SYSTABLES WHERE CASE " +
+     		" WHEN 1=1 THEN TABLENAME ELSE TABLEID END = TABLENAME",
+-    		new String[][] {{"21"} });   
++    		new String[][] {{"22"} });   
+ 
+     //Do some testing using CONCATENATION
+     //following will fail because result string of concatenation has 
+@@ -992,6 +992,18 @@ private void commonTestingForTerritoryBasedDB(Statement s) throws SQLException{
+     s.execute("CREATE INDEX DERBY_2973_I1 ON DERBY_2973 (V)");
+     s.execute("ALTER TABLE DERBY_2973 ALTER V SET DATA TYPE VARCHAR(4096)");
+     s.execute("INSERT INTO DERBY_2973 VALUES('hello')");
++    
++    //DERBY-2961
++    //Should generate collation sensitive data type when working with something
++    //like V AS CLOB insdie XMLSERIALIZE as shown below 
++    //SELECT ID, XMLSERIALIZE(V AS CLOB), XMLSERIALIZE(V AS CLOB) FROM 
++    //    DERBY_2961 ORDER BY 1
++    s.executeUpdate("set schema APP");
++    if (XML.classpathMeetsXMLReqs()) {
++        checkLangBasedQuery(s, "SELECT ID, XMLSERIALIZE(V AS CLOB) " +
++        		" FROM DERBY_2961 ORDER BY 1",
++        		null);
++    }
+     s.close();
+  
+ }
+@@ -1014,6 +1026,10 @@ private void setUpTable(Statement s) throws SQLException {
+     s.execute("create table xmlTable (x xml)");
+     s.executeUpdate("insert into xmlTable values(null)");
+     
++    s.execute("create table DERBY_2961 (ID INT  GENERATED ALWAYS AS " +
++    		" IDENTITY PRIMARY KEY, V XML)");
++    s.executeUpdate("insert into DERBY_2961(V) values(null)");
++    
+     conn.commit();
+     ps.close();
+ }

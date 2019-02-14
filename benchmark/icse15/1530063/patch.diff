@@ -1,0 +1,139 @@
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
+index a80a7ce3..f110df7d 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/ReadersAndLiveDocs.java
+@@ -209,9 +209,8 @@ public synchronized void dropReaders() throws IOException {
+   }
+ 
+   /**
+-   * Returns a ref to a clone.  NOTE: this clone is not
+-   * enrolled in the pool, so you should simply close()
+-   * it when you're done (ie, do not call release()).
++   * Returns a ref to a clone. NOTE: you should decRef() the reader when you're
++   * dont (ie do not call close()).
+    */
+   public synchronized SegmentReader getReadOnlyClone(IOContext context) throws IOException {
+     if (reader == null) {
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+index 01e5a758..daaf8675 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/java/org/apache/lucene/index/StandardDirectoryReader.java
+@@ -85,10 +85,9 @@ static DirectoryReader open(IndexWriter writer, SegmentInfos infos, boolean appl
+ 
+     final SegmentInfos segmentInfos = infos.clone();
+     int infosUpto = 0;
+-    for (int i=0;i<numSegments;i++) {
+-      IOException prior = null;
+       boolean success = false;
+       try {
++      for (int i = 0; i < numSegments; i++) {
+         // NOTE: important that we use infos not
+         // segmentInfos here, so that we are passing the
+         // actual instance of SegmentInfoPerCommit in
+@@ -109,17 +108,24 @@ static DirectoryReader open(IndexWriter writer, SegmentInfos infos, boolean appl
+         } finally {
+           writer.readerPool.release(rld);
+         }
++      }
++      StandardDirectoryReader result = new StandardDirectoryReader(dir,
++          readers.toArray(new SegmentReader[readers.size()]), writer,
++          segmentInfos, writer.getConfig().getReaderTermsIndexDivisor(), applyAllDeletes);
+         success = true;
+-      } catch(IOException ex) {
+-        prior = ex;
++      return result;
+       } finally {
+         if (!success) {
+-          IOUtils.closeWhileHandlingException(prior, readers);
++        for (SegmentReader r : readers) {
++          try {
++            r.decRef();
++          } catch (Throwable th) {
++            // ignore any exception that is thrown here to not mask any original
++            // exception. 
++          }
+         }
+       }
+     }
+-    return new StandardDirectoryReader(dir, readers.toArray(new SegmentReader[readers.size()]),
+-      writer, segmentInfos, writer.getConfig().getReaderTermsIndexDivisor(), applyAllDeletes);
+   }
+ 
+   /** This constructor is only used for {@link #doOpenIfChanged(SegmentInfos)} */
+diff --git a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+index 3c75221e..5f18f7ff 100644
+--- a/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
++++ b/lucene/dev/branches/branch_4x/lucene/core/src/test/org/apache/lucene/index/TestIndexWriterReader.java
+@@ -45,6 +45,7 @@
+ import org.apache.lucene.util.LuceneTestCase;
+ import org.apache.lucene.util.ThreadInterruptedException;
+ import org.apache.lucene.util._TestUtil;
++import org.junit.Test;
+ 
+ public class TestIndexWriterReader extends LuceneTestCase {
+   
+@@ -1075,4 +1076,64 @@ public void testReopenAfterNoRealChange() throws Exception {
+     w.close();
+     d.close();
+   }
++  
++  private static final class FakeIOException extends IOException {
++    public FakeIOException() {}
++  }
++  
++  @Test
++  public void testNRTOpenExceptions() throws Exception {
++    // LUCENE-5262: test that several failed attempts to obtain an NRT reader
++    // don't leak file handles.
++    MockDirectoryWrapper dir = newMockDirectory();
++    final AtomicBoolean shouldFail = new AtomicBoolean();
++    dir.failOn(new MockDirectoryWrapper.Failure() {
++      @Override
++      public void eval(MockDirectoryWrapper dir) throws IOException {
++        StackTraceElement[] trace = new Exception().getStackTrace();
++        if (shouldFail.get()) {
++          for (int i = 0; i < trace.length; i++) {
++            if ("getReadOnlyClone".equals(trace[i].getMethodName())) {
++              if (VERBOSE) {
++                System.out.println("TEST: now fail; exc:");
++                new Throwable().printStackTrace(System.out);
++              }
++              shouldFail.set(false);
++              throw new FakeIOException();
++            }
++          }
++        }
++      }
++    });
++    
++    IndexWriterConfig conf = newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random()));
++    conf.setMergePolicy(NoMergePolicy.COMPOUND_FILES); // prevent merges from getting in the way
++    IndexWriter writer = new IndexWriter(dir, conf);
++    
++    // create a segment and open an NRT reader
++    writer.addDocument(new Document());
++    writer.getReader().close();
++    
++    // add a new document so a new NRT reader is required
++    writer.addDocument(new Document());
++
++    // try to obtain an NRT reader twice: first time it fails and closes all the
++    // other NRT readers. second time it fails, but also fails to close the
++    // other NRT reader, since it is already marked closed!
++    for (int i = 0; i < 2; i++) {
++      shouldFail.set(true);
++      try {
++        writer.getReader().close();
++      } catch (FakeIOException e) {
++        // expected
++        if (VERBOSE) {
++          System.out.println("hit expected fake IOE");
++        }
++      }
++    }
++    
++    writer.close();
++    dir.close();
++  }
++
+ }

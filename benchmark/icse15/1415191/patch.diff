@@ -1,0 +1,141 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+index d620a3e9..67ecc770 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+@@ -239,10 +239,17 @@ void runLeaderProcess(boolean weAreReplacement) throws KeeperException,
+     } catch (Throwable t) {
+       try {
+         core = cc.getCore(coreName);
++        if (core == null) {
++          cancelElection();
++          throw new SolrException(ErrorCode.SERVER_ERROR,
++              "Fatal Error, SolrCore not found:" + coreName + " in "
++                  + cc.getCoreNames());
++        }
++        
+         core.getCoreDescriptor().getCloudDescriptor().isLeader = false;
+         
+         // we could not publish ourselves as leader - rejoin election
+-        rejoinLeaderElection(coreName, core);
++        rejoinLeaderElection(leaderSeqPath, core);
+       } finally {
+         if (core != null) {
+           core.close();
+@@ -348,12 +355,15 @@ private boolean shouldIBeLeader(ZkNodeProps leaderProps, SolrCore core) {
+       return false;
+     }
+     
+-    if (core.getCoreDescriptor().getCloudDescriptor().getLastPublished().equals(ZkStateReader.ACTIVE)) {
++    if (core.getCoreDescriptor().getCloudDescriptor().getLastPublished()
++        .equals(ZkStateReader.ACTIVE)) {
+       log.info("My last published State was Active, it's okay to be the leader.");
+       return true;
+     }
+-    
+-//    TODO: and if no is a good candidate?
++    log.info("My last published State was "
++        + core.getCoreDescriptor().getCloudDescriptor().getLastPublished()
++        + ", I won't be the leader.");
++    // TODO: and if no one is a good candidate?
+     
+     return false;
+   }
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+index 1af5b05c..96b8ee87 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+@@ -196,8 +196,6 @@ public void command() {
+               overseerElector.joinElection(context, true);
+               zkStateReader.createClusterStateWatchersAndUpdate();
+ 
+-            //  cc.newCmdDistribExecutor();
+-              
+               // we have to register as live first to pick up docs in the buffer
+               createEphemeralLiveNode();
+               
+@@ -310,7 +308,11 @@ public void close() {
+     }
+     
+     for (ElectionContext context : electionContexts.values()) {
++      try {
+       context.close();
++      } catch (Throwable t) {
++        log.error("Error closing overseer", t);
++      }
+     }
+     
+     try {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index ea551d27..a04a27c4 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -911,12 +911,15 @@ public void close() {
+       SolrException.log(log,e);
+     }
+     
+-    
++    try {
+     if (updateHandler instanceof IndexWriterCloser) {
+-      decrefSolrCoreState((IndexWriterCloser)updateHandler);
++        decrefSolrCoreState((IndexWriterCloser) updateHandler);
+     } else {
+       decrefSolrCoreState(null);
+     }
++    } catch (Throwable e) {
++      SolrException.log(log, e);
++    }
+     
+     try {
+       searcherExecutor.shutdown();
+diff --git a/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ClusterState.java b/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ClusterState.java
+index 6b729317..c1d694bc 100644
+--- a/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ClusterState.java
++++ b/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ClusterState.java
+@@ -70,6 +70,7 @@ public ClusterState(Set<String> liveNodes,
+    */
+   public ClusterState(Integer zkClusterStateVersion, Set<String> liveNodes,
+       Map<String, Map<String,Slice>> collectionStates) {
++    this.zkClusterStateVersion = zkClusterStateVersion;
+     this.liveNodes = new HashSet<String>(liveNodes.size());
+     this.liveNodes.addAll(liveNodes);
+     this.collectionStates = new HashMap<String, Map<String,Slice>>(collectionStates.size());
+diff --git a/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java b/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+index 9b51043a..7c25b123 100644
+--- a/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
++++ b/lucene/dev/branches/branch_4x/solr/solrj/src/java/org/apache/solr/common/cloud/ZkStateReader.java
+@@ -197,9 +197,13 @@ public void process(WatchedEvent event) {
+               Stat stat = new Stat();
+               byte[] data = zkClient.getData(CLUSTER_STATE, thisWatch, stat ,
+                   true);
++              List<String> liveNodes = zkClient.getChildren(
++                  LIVE_NODES_ZKNODE, this, true);
+               
+-              ClusterState clusterState = ClusterState.load(stat.getVersion(), data,
+-                  ZkStateReader.this.clusterState.getLiveNodes());
++              Set<String> liveNodesSet = new HashSet<String>();
++              liveNodesSet.addAll(liveNodes);
++              Set<String> ln = ZkStateReader.this.clusterState.getLiveNodes();
++              ClusterState clusterState = ClusterState.load(stat.getVersion(), data, ln);
+               // update volatile
+               ZkStateReader.this.clusterState = clusterState;
+             }
+@@ -301,9 +305,9 @@ private synchronized void updateClusterState(boolean immediate,
+               ZkStateReader.this.clusterState.getZkClusterStateVersion(), liveNodesSet,
+               ZkStateReader.this.clusterState.getCollectionStates());
+         }
++        this.clusterState = clusterState;
+       }
+ 
+-      this.clusterState = clusterState;
+     } else {
+       if (clusterStateUpdateScheduled) {
+         log.info("Cloud state update for ZooKeeper already scheduled");
+@@ -330,7 +334,7 @@ public void run() {
+                 clusterState = ClusterState.load(zkClient, liveNodesSet);
+               } else {
+                 log.info("Updating live nodes from ZooKeeper... ");
+-                clusterState = new ClusterState(ZkStateReader.this.clusterState .getZkClusterStateVersion(), liveNodesSet, ZkStateReader.this.clusterState.getCollectionStates());
++                clusterState = new ClusterState(ZkStateReader.this.clusterState.getZkClusterStateVersion(), liveNodesSet, ZkStateReader.this.clusterState.getCollectionStates());
+               }
+               
+               ZkStateReader.this.clusterState = clusterState;

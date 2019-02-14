@@ -1,0 +1,1166 @@
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/conn/LanguageConnectionContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/conn/LanguageConnectionContext.java
+index cceb7da2..163c5c2a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/conn/LanguageConnectionContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/sql/conn/LanguageConnectionContext.java
+@@ -1275,4 +1275,19 @@ public void setupSubStatementSessionContext(Activation a)
+      */
+     public ASTVisitor getASTVisitor( );
+     
++    /**
++     * Set the exception created and associated with the detected interruped
++     * status flag.
++     *
++     * @param e the created exception
++     */
++    public void setInterruptedException(StandardException e);
++
++    /**
++     * Get exception created when we detected interruped status
++     * flag.
++     *
++     * @return saved exception
++     */
++    public StandardException getInterruptedException();
+ }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
+index e69de29b..d13d76d8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/util/InterruptStatus.java
+@@ -0,0 +1,220 @@
++package org.apache.derby.iapi.util;
++
++import org.apache.derby.iapi.error.StandardException;
++import org.apache.derby.iapi.reference.SQLState;
++import org.apache.derby.iapi.services.sanity.SanityManager;
++import org.apache.derby.iapi.services.context.ContextService;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++
++/**
++ * Static methods to save and retrieve information about a (session) thread's
++ * interrupt status flag. If during operation we notice an interrupt, Derby will
++ * either:
++ * <ul>
++ *    <li>immediately throw an exception to cut execution short, also
++ *        resurrecting the thread's interrupted status flag. This does not
++ *        require use of this class.
++ *
++ *    <li>just note the fact using this class ({@code noteAndClearInterrupt},
++ *        or ({@code setInterrupted})), and retry whatever got interrupted,
++ *        continuing execution. To achieve this, Derby will always temporarily
++ *        clear the interrupted status flag.
++ *        Later, depending on the type of SQL statement, we may wish to
++ *        interrupt execution by throwing an SQLException at a safe place, say,
++ *        after a statement in a batch is complete ({@code throwIf}), or just
++ *        let the execution run to completion, and then just prior to returning
++ *        to the appliction, the thread's interrupted status flag will
++ *        resurrected ({@code restoreIntrFlagIfSeen})
++ *
++ * </ul>
++ * Normally, the information is saved away in the session's
++ * LanguageConnectionContext, if available. If not, we save it in a thread
++ * local variable.
++ */
++
++public class InterruptStatus {
++
++    /**
++     * Use thread local variable to store interrupt status flag *only* if we
++     * don't have lcc, e.g. during database creation.
++     */
++    private static final ThreadLocal exception = new ThreadLocal ();
++
++    /**
++     * Make a note that this thread saw an interrupt. Thread's intr
++     * status flag is presumably off alread, but we reset it here
++     * also. Use lcc if available, else thread local variable.
++     */
++    public static void setInterrupted() {
++        LanguageConnectionContext lcc =
++            (LanguageConnectionContext)ContextService.getContextOrNull(
++                LanguageConnectionContext.CONTEXT_ID);
++
++        Thread.interrupted();
++
++        StandardException e =
++            StandardException.newException(SQLState.CONN_INTERRUPT);
++
++        if (lcc != null) {
++            lcc.setInterruptedException(e);
++
++        } else {
++            exception.set(e);
++        }
++    }
++
++
++    /**
++     * Checks if the thread has been interrupted in NIO, presumably because we
++     * saw an exception indicating this. Make a note of this and clear the
++     * thread's interrupt status flag (NIO doesn't clear it when throwing) so
++     * we can retry whatever we are doing. It will be set back ON before
++     * control is transferred back to the application, cf. {@code
++     * restoreIntrFlagIfSeen}.
++     * <p/>
++     * The note that we saw an interrupt is stored in the lcc if available, if
++     * not, in thread local {@code exception}.
++     *
++     * @param s (debug info) whence
++     * @param threadsInPageIO (debug info) number of threads inside the NIO
++     *        code concurrently
++     * @param hashCode (debug info) container id
++     *
++     * @return true if the thread's interrupt status flag was set
++     */
++    public static boolean noteAndClearInterrupt(String s,
++                                                int threadsInPageIO,
++                                                int hashCode) {
++        if (Thread.currentThread().isInterrupted()) {
++
++            setInterrupted();
++
++            if (SanityManager.DEBUG) {
++
++                if (SanityManager.DEBUG_ON("DebugInterruptRecovery")) {
++                    SanityManager.DEBUG_PRINT(
++                        "DebugInterruptRecovery",
++                        Thread.currentThread().getName() + " " +
++                        Integer.toHexString(hashCode) +
++                        "@Interrupted: " + s + " threadsInPageIO: " +
++                        threadsInPageIO + "\n");
++                }
++            }
++
++            Thread.interrupted(); // clear status flag
++
++            return true;
++        } else {
++            return false;
++        }
++    }
++
++
++    /**
++     * Check if the we ever noticed and reset the thread's interrupt status
++     * flag to allow safe operation during execution.  Called from JDBC API
++     * methods before returning control to user application. Typically, this
++     * happens just prior to return in methods that catch {@code Throwable} and
++     * invoke
++     * {@code handleException} (directly or indirectly) on it, e.g.
++     * <pre>
++     *       :
++     *       InterruptStatus.restoreIntrFlagIfSeen();
++     *       return ...;
++     *    } catch (Throwable t) {
++     *       throw handleException(t);
++     *    }
++     * </pre>
++     * {@code handleException} does its own calls to {@code
++     * restoreIntrFlagIfSeen}. If {@code setupContextStack} has been called
++     * consider using the overloaded variant of {@code restoreIntrFlagIfSeen}
++     * with an lcc argument.
++     * <p/>
++     * If an interrupt status flag was seen, we set it back <em>on</em> here.
++     */
++    public static void restoreIntrFlagIfSeen() {
++
++        LanguageConnectionContext lcc =
++            (LanguageConnectionContext)ContextService.getContextOrNull(
++                LanguageConnectionContext.CONTEXT_ID);
++
++        if (lcc == null) {
++            // no lcc available for this thread, use thread local flag
++            if (exception.get() != null) {
++
++                exception.set(null);
++
++                // Set thread's interrupt status flag back on before returning
++                // control to user application
++                Thread.currentThread().interrupt();
++            }
++
++        } else if (lcc.getInterruptedException() != null) {
++
++            lcc.setInterruptedException(null);
++
++            // Set thread's interrupt status flag back on before returning
++            // control to user application
++            Thread.currentThread().interrupt();
++        }
++    }
++
++    /**
++     * Same purpose as {@code restoreIntrFlagIfSeen()}. This variant presumes
++     * we are sure we have a {@code lcc != null}, i.e. {@code
++     * setupContextStack} has been called and not yet restored.  Note that we
++     * cannot merge this code with {@code restoreContextStack}, since that is
++     * typically called in a {@code finally} block, at which point in time, the
++     * {@code lcc} may be gone due to errors of severity {@code
++     * SESSION_SEVERITY} or {@code DATABASE_SEVERITY}.
++     * <p/>
++     * If no {@code lcc} is available, use the zero-arg variant. We only need
++     * this variant for performance reasons.
++     *
++     * @param lcc the language connection context for this session
++     */
++    public static void restoreIntrFlagIfSeen(LanguageConnectionContext lcc) {
++
++        if (SanityManager.DEBUG) {
++            LanguageConnectionContext ctxLcc =
++                (LanguageConnectionContext)ContextService.
++                getContextOrNull(LanguageConnectionContext.CONTEXT_ID);
++
++            SanityManager.ASSERT(
++                lcc == ctxLcc,
++                "lcc=" + lcc + " getContextOrNull=" + ctxLcc);
++        }
++
++        if (lcc.getInterruptedException() != null) {
++
++            lcc.setInterruptedException(null);
++            // Set thread's interrupt status flag back on.
++            Thread.currentThread().interrupt();
++        }
++    }
++
++
++    /**
++     * Check if the we ever noticed and reset the thread's interrupt status
++     * flag to allow safe operation during execution.  Called when operations
++     * will be be prematurely terminated due to the interrupt.
++     * <p/>
++     * If an interrupt status flag was seen, we set it back ON here and throw
++     * session level SQLState.CONN_INTERRUPT.
++     *
++     * @param lcc the language connection context for this session
++     * @throws StandardException (SQLState.CONN_INTERRUPT)
++     */
++    public static void throwIf(LanguageConnectionContext lcc)
++            throws StandardException {
++        StandardException e = lcc.getInterruptedException();
++
++        if (e != null) {
++            lcc.setInterruptedException(null);
++            // Set thread's interrupt status flag back on.
++            Thread.currentThread().interrupt();
++
++            throw e;
++        }
++    }
++}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/ConnectionChild.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/ConnectionChild.java
+index c2b9fcba..b469ce4f 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/ConnectionChild.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/ConnectionChild.java
+@@ -22,6 +22,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ package org.apache.derby.impl.jdbc;
+ 
+ import org.apache.derby.jdbc.InternalDriver;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ import java.sql.SQLException;
+ 
+@@ -153,6 +154,17 @@ SQLException newSQLException(String messageId, Object arg1) {
+ 	SQLException newSQLException(String messageId, Object arg1, Object arg2) {
+ 		return localConn.newSQLException(messageId, arg1, arg2);
+ 	}
++
++    protected static void restoreIntrFlagIfSeen(
++        boolean pushStack, EmbedConnection ec) {
++
++        if (pushStack) {
++            InterruptStatus.restoreIntrFlagIfSeen(ec.getLanguageConnection());
++        } else {
++            // no lcc if connection is closed:
++            InterruptStatus.restoreIntrFlagIfSeen();
++        }
++    }
+ }
+ 
+ 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+index d6f00c8f..1a6170ad 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedBlob.java
+@@ -30,6 +30,8 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.types.RawToBinaryFormatStream;
+ import org.apache.derby.iapi.types.Resetable;
+ import org.apache.derby.iapi.services.io.InputStreamUtil;
++import org.apache.derby.iapi.sql.conn.LanguageConnectionContext;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ import java.sql.SQLException;
+ import java.sql.Blob;
+@@ -393,7 +395,8 @@ public long length()
+            // we have a stream
+             synchronized (getConnectionSynchronization())
+             {
+-                pushStack = !getEmbedConnection().isClosed();
++                EmbedConnection ec = getEmbedConnection();
++                pushStack = !ec.isClosed();
+                 if (pushStack)
+                     setupContextStack();
+ 
+@@ -409,6 +412,9 @@ public long length()
+ 
+                 tmpStream.close();
+                 // Save for future uses.
++
++                restoreIntrFlagIfSeen(pushStack, ec);
++
+                 return streamLength;
+             }
+         }
+@@ -469,19 +475,23 @@ public long length()
+             if (materialized) {
+                  result = new byte [length];
+                  int sz = control.read (result, 0, result.length, startPos - 1);
+-                 if (sz == -1)
++                 if (sz == -1) {
++                     InterruptStatus.restoreIntrFlagIfSeen();
+                      return new byte [0];
++                 }
+                  if (sz < length) {
+                      byte [] tmparray = new byte [sz];
+                      System.arraycopy (result, 0, tmparray, 0, sz);
+                      result = tmparray;
+                  }
++                 InterruptStatus.restoreIntrFlagIfSeen();
+             }
+             else // we have a stream
+             {
+                 synchronized (getConnectionSynchronization())
+                 {
+-                    pushStack = !getEmbedConnection().isClosed();
++                    EmbedConnection ec = getEmbedConnection();
++                    pushStack = !ec.isClosed();
+                     if (pushStack)
+                         setupContextStack();
+ 
+@@ -501,10 +511,17 @@ public long length()
+                     {
+                         byte[] result2 = new byte[n];
+                         System.arraycopy(result,0,result2,0,n);
++
++                        restoreIntrFlagIfSeen(pushStack, ec);
++
+                         return result2;
+                     }
++
++                    restoreIntrFlagIfSeen(pushStack,ec);
+                 }
+             }
++
++
+             return result;
+         }
+         catch (StandardException e)
+@@ -547,7 +564,8 @@ public long length()
+             // if we have byte array, not a stream
+             if (materialized)
+             {
+-                return control.getInputStream(0);
++                java.io.InputStream result = control.getInputStream(0);
++                return result;
+             }
+             else
+             { 
+@@ -555,15 +573,21 @@ public long length()
+ 
+                 synchronized (getConnectionSynchronization())
+                 {
+-                    pushStack = !getEmbedConnection().isClosed();
++                    EmbedConnection ec = getEmbedConnection();
++                    pushStack = !ec.isClosed();
+                     if (pushStack)
+                         setupContextStack();
+ 
+                     // Reset stream, because AutoPositionigStream wants to read
+                     // the encoded length bytes.
+                     myStream.resetStream();
+-                    return new UpdatableBlobStream (this, 
++                    UpdatableBlobStream result = new UpdatableBlobStream(
++                        this,
+                             new AutoPositioningStream (this, myStream, this));
++
++                    restoreIntrFlagIfSeen(pushStack, ec);
++
++                    return result;
+                 }
+             }
+         }
+@@ -600,6 +624,7 @@ public long position(byte[] pattern, long start)
+         checkValidity();
+         
+         boolean pushStack = false;
++
+         try
+         {
+             if (start < 1)
+@@ -612,7 +637,9 @@ public long position(byte[] pattern, long start)
+ 
+             synchronized (getConnectionSynchronization())
+             {
+-                pushStack = !getEmbedConnection().isClosed();
++                EmbedConnection ec = getEmbedConnection();
++
++                pushStack = !ec.isClosed();
+                 if (pushStack)
+                     setupContextStack();
+ 
+@@ -624,14 +651,17 @@ public long position(byte[] pattern, long start)
+                 while (true)
+                 {
+                     c = read(pos++); // Note the position increment.
+-                    if (c == -1)  // run out of stream
++                    if (c == -1) { // run out of stream
++                        restoreIntrFlagIfSeen(pushStack, ec);
+                         return -1;
++                    }
+                     if (c == lookFor)
+                     {
+                         curPos = pos;
+-                        if (checkMatch(pattern, pos))
++                        if (checkMatch(pattern, pos)) {
++                            restoreIntrFlagIfSeen(pushStack, ec);
+                             return curPos;
+-                        else
++                        } else
+                             pos = setBlobPosition(curPos);
+                     }
+                 }
+@@ -704,9 +734,12 @@ public long position(Blob pattern, long start)
+                     SQLState.BLOB_BAD_POSITION, new Long(start));
+             if (pattern == null)
+                 throw StandardException.newException(SQLState.BLOB_NULL_PATTERN_OR_SEARCH_STR);
++
+             synchronized (getConnectionSynchronization())
+             {
+-                pushStack = !getEmbedConnection().isClosed();
++                EmbedConnection ec = getEmbedConnection();
++
++                pushStack = !ec.isClosed();
+                 if (pushStack)
+                     setupContextStack();
+ 
+@@ -721,22 +754,27 @@ public long position(Blob pattern, long start)
+                 {
+                     throw StandardException.newException(SQLState.BLOB_UNABLE_TO_READ_PATTERN);
+                 }
+-                if (b == null || b.length < 1)  // the 'empty' blob
++                if (b == null || b.length < 1) { // the 'empty' blob
++                    restoreIntrFlagIfSeen(pushStack, ec);
+                     return start; // match DB2's SQL LOCATE function
++                }
+                 int lookFor = b[0];
+                 int c;
+                 long curPos;
+                 while (true)
+                 {
+                     c = read(pos++); // Note the position increment.
+-                    if (c == -1)  // run out of stream
++                    if (c == -1) {  // run out of stream
++                        restoreIntrFlagIfSeen(pushStack, ec);
+                         return -1;
++                    }
+                     if (c == lookFor)
+                     {
+                         curPos = pos;
+-                        if (checkMatch(pattern, pos))
++                        if (checkMatch(pattern, pos)) {
++                            restoreIntrFlagIfSeen(pushStack, ec);
+                             return curPos;
+-                        else
++                        } else
+                             pos = setBlobPosition(curPos);
+                     }
+                 }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedClob.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedClob.java
+index e7ac3035..a489af9e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedClob.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedClob.java
+@@ -329,13 +329,14 @@ public long position(String searchStr, long start)
+             return start; // match DB2's SQL LOCATE function
+ 
+         boolean pushStack = false;
++        EmbedConnection ec = getEmbedConnection();
+         try
+         {
+ 
+             Object synchronization = getConnectionSynchronization();
+             synchronized (synchronization)
+             {
+-                pushStack = !getEmbedConnection().isClosed();
++                pushStack = !ec.isClosed();
+                 if (pushStack)
+                     setupContextStack();
+                 int matchCount = 0;
+@@ -347,8 +348,10 @@ public long position(String searchStr, long start)
+                 for (;;) {
+                     reset = false;
+                     int readCount = reader.read (tmpClob);
+-                    if (readCount == -1)
++                    if (readCount == -1) {
++                        restoreIntrFlagIfSeen(pushStack, ec);
+                         return -1;
++                    }
+                     for (int clobOffset = 0;
+                                 clobOffset < readCount; clobOffset++) {
+                         if (tmpClob[clobOffset]
+@@ -362,6 +365,7 @@ public long position(String searchStr, long start)
+                             }
+                             matchCount ++;
+                             if (matchCount == searchStr.length()) {
++                                restoreIntrFlagIfSeen(pushStack, ec);
+                                 return pos + clobOffset
+                                         - searchStr.length() + 1;
+                             }
+@@ -399,9 +403,11 @@ public long position(String searchStr, long start)
+ 
+             }
+         } catch (EOFException eofe) {
++            restoreIntrFlagIfSeen(pushStack, ec);
+             throw Util.generateCsSQLException(
+                                         SQLState.BLOB_POSITION_TOO_LARGE, eofe);
+         } catch (IOException ioe) {
++            restoreIntrFlagIfSeen(pushStack, ec);
+             throw Util.setStreamFailure(ioe);
+         } finally {
+             if (pushStack) {
+@@ -437,6 +443,7 @@ public long position(Clob searchClob, long start)
+                                 SQLState.BLOB_NULL_PATTERN_OR_SEARCH_STR);
+ 
+         boolean pushStack = false;
++        EmbedConnection ec = getEmbedConnection();
+         try
+         {
+             synchronized (getConnectionSynchronization())
+@@ -455,9 +462,13 @@ public long position(Clob searchClob, long start)
+                                                         subPatternChar.length);
+                             if (read == -1) {
+                                 //empty pattern
+-                                if (!seenOneCharacter)
++                                if (!seenOneCharacter) {
+                                     // matches DB2 SQL LOCATE function
++                                    restoreIntrFlagIfSeen(pushStack, ec);
+                                     return start;
++                                }
++
++                                restoreIntrFlagIfSeen(pushStack, ec);
+                                 return firstPosition;
+                             }
+                             if (read == 0) {
+@@ -470,8 +481,10 @@ public long position(Clob searchClob, long start)
+                             long position = position(subPattern, start);
+                             if (position == -1) {
+                                 // never seen any match
+-                                if (firstPosition == -1)
++                                if (firstPosition == -1) {
++                                    restoreIntrFlagIfSeen(pushStack, ec);
+                                     return -1;
++                                }
+ 
+                                 start = firstPosition + 1;
+                                 continue restartScan;
+@@ -491,6 +504,7 @@ else if (position != start) {
+             } // End outer for loop
+         } // End synchronized block
+         } catch (IOException ioe) {
++            restoreIntrFlagIfSeen(pushStack, ec);
+             throw Util.setStreamFailure(ioe);
+         } finally {
+             if (pushStack) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+index a3c5e7cf..3d74aa7a 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+@@ -83,6 +83,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.util.Iterator;
+ 
+ import org.apache.derby.iapi.jdbc.EngineLOB;
++import org.apache.derby.iapi.util.InterruptStatus;
+ import org.apache.derby.impl.jdbc.authentication.NoneAuthenticationServiceImpl;
+ 
+ /**
+@@ -600,10 +601,12 @@ else if (!shutdown)
+ 			// Raise a warning in sqlAuthorization mode if authentication is not ON
+ 			if (usingNoneAuth && getLanguageConnection().usesSqlAuthorization())
+ 				addWarning(SQLWarningFactory.newSQLWarning(SQLState.SQL_AUTHORIZATION_WITH_NO_AUTHENTICATION));
++            InterruptStatus.restoreIntrFlagIfSeen(getLanguageConnection());
+ 		}
+         catch (OutOfMemoryError noMemory)
+ 		{
+ 			//System.out.println("freeA");
++            InterruptStatus.restoreIntrFlagIfSeen();
+ 			restoreContextStack();
+ 			tr.lcc = null;
+ 			tr.cm = null;
+@@ -617,6 +620,8 @@ else if (!shutdown)
+ 			throw NO_MEM;
+ 		}
+ 		catch (Throwable t) {
++            InterruptStatus.restoreIntrFlagIfSeen();
++
+             if (t instanceof StandardException)
+             {
+                 StandardException se = (StandardException) t;
+@@ -1266,6 +1271,7 @@ private void checkUserIsNotARole() throws SQLException {
+ 			}
+ 
+ 			tr.rollback();
++            InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 		} catch (StandardException e) {
+ 			try {
+ 				tr.rollback();
+@@ -1792,6 +1798,7 @@ public void commit() throws SQLException {
+ 			{
+ 		    	getTR().commit();
+ 		    	clearLOBMapping();
++                InterruptStatus.restoreIntrFlagIfSeen(getLanguageConnection());
+ 			}
+             catch (Throwable t)
+ 			{
+@@ -1828,6 +1835,7 @@ public void rollback() throws SQLException {
+ 			{
+ 		    	getTR().rollback();
+ 		    	clearLOBMapping();
++                InterruptStatus.restoreIntrFlagIfSeen(getLanguageConnection());
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			}
+@@ -1895,6 +1903,8 @@ private void close(StandardException e) throws SQLException {
+ 						setupContextStack();
+ 						try {
+ 							tr.rollback();
++                            InterruptStatus.
++                                    restoreIntrFlagIfSeen(tr.getLcc());
+ 							
+ 							// Let go of lcc reference so it can be GC'ed after
+ 							// cleanupOnError, the tr will stay around until the
+@@ -1913,6 +1923,7 @@ private void close(StandardException e) throws SQLException {
+ 						// DERBY-1947: If another connection has closed down
+ 						// the database, the transaction is not active, but
+ 						// the cleanup has not been done yet.
++                        InterruptStatus.restoreIntrFlagIfSeen();
+ 						tr.clearLcc(); 
+ 						tr.cleanupOnError(e);
+ 					}
+@@ -2012,7 +2023,9 @@ public final void setReadOnly(boolean readOnly) throws SQLException
+ 		{
+                         setupContextStack();
+ 			try {
+-				getLanguageConnection().setReadOnly(readOnly);
++                LanguageConnectionContext lcc = getLanguageConnection();
++                lcc.setReadOnly(readOnly);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (StandardException e) {
+ 				throw handleException(e);
+ 			} finally {
+@@ -2106,7 +2119,9 @@ public void setTransactionIsolation(int level) throws SQLException {
+ 		{
+             setupContextStack();
+ 			try {
+-				getLanguageConnection().setIsolationLevel(iLevel);
++                LanguageConnectionContext lcc = getLanguageConnection();
++                lcc.setIsolationLevel(iLevel);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (StandardException e) {
+ 				throw handleException(e);
+ 			} finally {
+@@ -2392,6 +2407,7 @@ protected void commitIfNeeded() throws SQLException
+             {
+                 getTR().commit();
+                 clearLOBMapping();
++                InterruptStatus.restoreIntrFlagIfSeen(getLanguageConnection());
+             } 
+             catch (Throwable t)
+             {
+@@ -2424,6 +2440,7 @@ protected void commitIfAutoCommit() throws SQLException
+             {
+                 getTR().commit();
+                 clearLOBMapping();
++                InterruptStatus.restoreIntrFlagIfSeen(getLanguageConnection());
+             } 
+             catch (Throwable t)
+             {
+@@ -2513,6 +2530,7 @@ private Database createDatabase(String dbname, Properties info)
+ 				// service already exists, create a warning
+ 				addWarning(SQLWarningFactory.newSQLWarning(SQLState.DATABASE_EXISTS, dbname));
+ 			}
++
+ 		} catch (StandardException mse) {
+             throw Util.seeNextException(SQLState.CREATE_DATABASE_FAILED,
+                                         new Object[] { dbname },
+@@ -2735,6 +2753,10 @@ PreparedStatement prepareMetaDataStatement(String sql)
+ 											  null,
+ 											  null);
+ 			} finally {
++                // Restore here, cf. comment in
++                // EmbedDatabaseMetaData#getPreparedQuery:
++                InterruptStatus.
++                    restoreIntrFlagIfSeen(getLanguageConnection());
+ 			    restoreContextStack();
+ 			}
+ 			return s;
+@@ -2839,7 +2861,9 @@ public void resetFromPool() throws SQLException {
+ 		{
+ 			setupContextStack();
+ 			try {
+-				getLanguageConnection().resetFromPool();
++                LanguageConnectionContext lcc = getLanguageConnection();
++                lcc.resetFromPool();
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (StandardException t) {
+ 				throw handleException(t);
+ 			}
+@@ -2875,8 +2899,9 @@ public final int xa_prepare() throws SQLException {
+             setupContextStack();
+ 			try
+ 			{
++                LanguageConnectionContext lcc = getLanguageConnection();
+ 				XATransactionController tc = 
+-					(XATransactionController) getLanguageConnection().getTransactionExecute();
++                    (XATransactionController)lcc.getTransactionExecute();
+ 
+ 				int ret = tc.xa_prepare();
+ 
+@@ -2891,8 +2916,9 @@ public final int xa_prepare() throws SQLException {
+ 					// consistent.  Since the transaction is read only, there is
+ 					// probably not much that needs to be done.
+ 
+-					getLanguageConnection().internalCommit(false /* don't commitStore again */);
++                    lcc.internalCommit(false /* don't commitStore again */);
+ 				}
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 				return ret;
+ 			} catch (StandardException t)
+ 			{
+@@ -2918,7 +2944,9 @@ public final void xa_commit(boolean onePhase) throws SQLException {
+             setupContextStack();
+ 			try
+ 			{
+-		    	getLanguageConnection().xaCommit(onePhase);
++                LanguageConnectionContext lcc = getLanguageConnection();
++                lcc.xaCommit(onePhase);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (StandardException t)
+ 			{
+ 				throw handleException(t);
+@@ -2942,7 +2970,9 @@ public final void xa_rollback() throws SQLException {
+             setupContextStack();
+ 			try
+ 			{
+-		    	getLanguageConnection().xaRollback();
++                LanguageConnectionContext lcc = getLanguageConnection();
++                lcc.xaRollback();
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (StandardException t)
+ 			{
+ 				throw handleException(t);
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedDatabaseMetaData.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedDatabaseMetaData.java
+index a7a0b933..252e302b 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedDatabaseMetaData.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedDatabaseMetaData.java
+@@ -51,6 +51,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /**
+  * This class provides information about the database as a whole.
+@@ -2311,10 +2312,12 @@ private boolean notInSoftUpgradeMode()
+ 			throw Util.noCurrentConnection();
+ 
+ 		boolean notInSoftUpgradeMode;
++        LanguageConnectionContext lcc = getLanguageConnectionContext();
+ 		try {
+ 			notInSoftUpgradeMode =
+-				getLanguageConnectionContext().getDataDictionary().checkVersion(
++               lcc.getDataDictionary().checkVersion(
+ 						DataDictionary.DD_VERSION_CURRENT,null);
++            InterruptStatus.restoreIntrFlagIfSeen();
+ 		} catch (Throwable t) {
+ 			throw handleException(t);
+ 		}
+@@ -3497,6 +3500,8 @@ private PreparedStatement getPreparedQueryUsingSystemTables(String nameKey,
+ 				}
+ 				
+                 ps = prepareSPS(nameKey, queryText, net);
++                InterruptStatus.
++                    restoreIntrFlagIfSeen(getLanguageConnectionContext());
+ 			}
+ 
+ 			catch (Throwable t) 
+@@ -3553,6 +3558,8 @@ private PreparedStatement getPreparedQuery(String queryName,
+                                 //metadata.properties file or metadata_net.properties
+ 				String queryText = getQueryFromDescription(queryName, net);
+ 				s = getEmbedConnection().prepareMetaDataStatement(queryText);
++                // InterruptStatus.restoreIntrFlagIfSeen: called inside
++                // prepareMetaDataStatement while we still have context pushed.
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			} 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+index 60c5d7d4..ada893b8 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedPreparedStatement.java
+@@ -66,6 +66,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.jdbc.EnginePreparedStatement;
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.types.StringDataValue;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /**
+  *
+@@ -144,9 +145,11 @@ public EmbedPreparedStatement (EmbedConnection conn, String sql, boolean forMeta
+   				if (autoGeneratedKeys == Statement.RETURN_GENERATED_KEYS)
+   					activation.setAutoGeneratedKeysResultsetInfo(columnIndexes, columnNames);
+ 
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (Throwable t) {
+ 		    throw handleException(t);
+ 			}
++
+ 	}
+ 
+ 	/**
+@@ -251,6 +254,8 @@ void closeActions() throws SQLException {
+ 		{
+ 		    activation.close();
+ 			activation = null;
++
++            InterruptStatus.restoreIntrFlagIfSeen();
+ 		} catch (Throwable t)
+ 		{
+ 			throw handleException(t);
+@@ -1109,6 +1114,7 @@ public void clearParameters() throws SQLException {
+ 				    		rMetaData = newEmbedResultSetMetaData(resd);
+ 					}
+ 				}
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			}	finally {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
+index eba531b9..ec7fe776 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedResultSet.java
+@@ -80,6 +80,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.sql.dictionary.DataDictionary;
+ import org.apache.derby.iapi.types.StringDataValue;
+ import org.apache.derby.iapi.util.IdUtil;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /**
+  * A EmbedResultSet for results from the EmbedStatement family. 
+@@ -459,7 +460,7 @@ protected boolean movePosition(int position, int row, String positionText)
+ 				}
+ 
+ 				lcc.popStatementContext(statementContext, null);
+-				
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 		    } catch (Throwable t) {
+ 				/*
+ 				 * Need to close the result set here because the error might
+@@ -571,6 +572,9 @@ public void close() throws SQLException	{
+ 			}
+             
+ 			try	{
++                LanguageConnectionContext lcc =
++                    getEmbedConnection().getLanguageConnection();
++
+ 				try	{
+ 					theResults.close(); 
+ 				    
+@@ -580,6 +584,7 @@ public void close() throws SQLException	{
+ 				    	this.singleUseActivation = null;
+ 				    }
+ 				    
++                    InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 				} catch (Throwable t) {
+ 					throw handleException(t);
+ 				}
+@@ -597,7 +602,6 @@ public void close() throws SQLException	{
+ 		        //
+ 		        if (forMetaData) {
+ 
+-					LanguageConnectionContext lcc = getEmbedConnection().getLanguageConnection();
+ 		        	if (lcc.getActivationCount() > 1) {
+ 		     		  // we do not want to commit here as there seems to be other
+ 					  // statements/resultSets currently opened for this connection.
+@@ -3657,6 +3661,7 @@ public void insertRow() throws SQLException {
+                 act.close();
+ 
+                 lcc.popStatementContext(statementContext, null);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+             } catch (Throwable t) {
+                 throw closeOnTransactionError(t);
+             } finally {
+@@ -3757,6 +3762,7 @@ public void updateRow() throws SQLException {
+                 movePosition(RELATIVE, 0, "relative");
+             }
+             lcc.popStatementContext(statementContext, null);
++            InterruptStatus.restoreIntrFlagIfSeen(lcc);
+         } catch (Throwable t) {
+             throw closeOnTransactionError(t);
+         } finally {
+@@ -3834,6 +3840,7 @@ public void deleteRow() throws SQLException {
+                 //the next row.
+                 currentRow = null;
+                 lcc.popStatementContext(statementContext, null);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+             } catch (Throwable t) {
+                     throw closeOnTransactionError(t);
+             } finally {
+@@ -3940,6 +3947,8 @@ public void moveToInsertRow() throws SQLException {
+ 					updateRow.setColumn(i, 
+ 						resultDescription.getColumnDescriptor(i).getType().getNull());
+ 				}
++                InterruptStatus.restoreIntrFlagIfSeen(
++                    getEmbedConnection().getLanguageConnection());
+ 			} catch (Throwable ex) {
+ 				handleException(ex);
+ 			} finally {
+@@ -3973,6 +3982,9 @@ public void moveToCurrentRow() throws SQLException {
+ 
+ 					isOnInsertRow = false;
+ 				}
++
++                InterruptStatus.restoreIntrFlagIfSeen();
++
+ 			} catch (Throwable ex) {
+ 				handleException(ex);
+ 			}
+@@ -4009,9 +4021,12 @@ public Blob getBlob(int columnIndex) throws SQLException {
+ 			boolean pushStack = false;
+ 			try {
+ 				DataValueDescriptor dvd = getColumn(columnIndex);
++                EmbedConnection ec = getEmbedConnection();
+ 
+-				if (wasNull = dvd.isNull())
++                if (wasNull = dvd.isNull()) {
++                    InterruptStatus.restoreIntrFlagIfSeen();
+ 					return null;
++                }
+ 
+ 				// should set up a context stack if we have a long column,
+ 				// since a blob may keep a pointer to a long column in the
+@@ -4022,7 +4037,9 @@ public Blob getBlob(int columnIndex) throws SQLException {
+ 				if (pushStack)
+ 					setupContextStack();
+ 
+-				return new EmbedBlob(dvd, getEmbedConnection());
++                EmbedBlob result = new EmbedBlob(dvd, ec);
++                restoreIntrFlagIfSeen(pushStack, ec);
++                return result;
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			} finally {
+@@ -4060,12 +4077,16 @@ public final Clob getClob(int columnIndex) throws SQLException {
+ 				throw dataTypeConversion("java.sql.Clob", columnIndex);
+ 
+ 			boolean pushStack = false;
++            EmbedConnection ec = getEmbedConnection();
+ 			try {
+ 
+ 				StringDataValue dvd = (StringDataValue)getColumn(columnIndex);
++                LanguageConnectionContext lcc = ec.getLanguageConnection();
+ 
+-				if (wasNull = dvd.isNull())
++                if (wasNull = dvd.isNull()) {
++                    InterruptStatus.restoreIntrFlagIfSeen();
+ 					return null;
++                }
+ 
+                 // Set up a context stack if we have CLOB whose value is a long
+                 // column in the database.
+@@ -4074,7 +4095,9 @@ public final Clob getClob(int columnIndex) throws SQLException {
+                     setupContextStack();
+                 }
+ 
+-                return new EmbedClob(getEmbedConnection(), dvd);
++                EmbedClob result =  new EmbedClob(ec, dvd);
++                restoreIntrFlagIfSeen(pushStack, ec);
++                return result;
+ 			} catch (Throwable t) {
+ 				throw handleException(t);
+ 			} finally {
+@@ -4511,6 +4534,10 @@ private boolean checkRowPosition(int position, String positionText)
+ 
+ 		synchronized (getConnectionSynchronization()) {
+ 			setupContextStack();
++
++            LanguageConnectionContext lcc =
++                getEmbedConnection().getLanguageConnection();
++
+ 			try {
+ 				try {
+ 
+@@ -4519,8 +4546,6 @@ private boolean checkRowPosition(int position, String positionText)
+ 					 * that the ResultSet will get correctly closed down on an
+ 					 * error. (Cache the LanguageConnectionContext)
+ 					 */
+-					LanguageConnectionContext lcc = getEmbedConnection()
+-							.getLanguageConnection();
+                     // No timeout for this operation (use 0)
+ 					StatementContext statementContext =
+                         lcc.pushStatementContext(isAtomic, 
+@@ -4532,7 +4557,7 @@ private boolean checkRowPosition(int position, String positionText)
+ 					boolean result = theResults.checkRowPosition(position);
+ 
+ 					lcc.popStatementContext(statementContext, null);
+-
++                    InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 					return result;
+ 
+ 				} catch (Throwable t) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
+index b8ef5bfc..e94ed73e 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedStatement.java
+@@ -37,6 +37,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import java.sql.SQLWarning;
+ import java.sql.Statement;
+ import java.util.Vector;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ /*
+  We would import these, but have name-overlap
+@@ -610,6 +611,7 @@ private boolean execute(String sql, boolean executeQuery, boolean executeUpdate,
+ 					preparedStatement.getActivation(lcc, resultSetType ==
+                         java.sql.ResultSet.TYPE_SCROLL_INSENSITIVE);
+ 				checkRequiresCallableStatement(activation);
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 			 } catch (Throwable t) {
+ 				throw handleException(t);
+ 			 }
+@@ -971,10 +973,17 @@ public final void clearBatch() throws SQLException {
+ 			try {
+ 				for (; i< size; i++) 
+ 				{
++                    // If we saw an interrupt, stop execution of batch now.
++                    // throwIf will likely only throw after at least one stm
++                    // has been executed, since first time around we probably
++                    // didn't do anything to notice interrupts yet.
++                    InterruptStatus.throwIf(lcc);
+ 					if (executeBatchElement(stmts.elementAt(i)))
+ 						throw newSQLException(SQLState.RESULTSET_RETURN_NOT_ALLOWED);
+ 					returnUpdateCountForBatch[i] = getUpdateCount();
+ 				}
++
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
+ 				return returnUpdateCountForBatch;
+ 			}
+ 			catch (StandardException se) {
+@@ -1314,6 +1323,9 @@ boolean executeStatement(Activation a,
+ 
+                     retval = (dynamicResultCount > 0);
+ 				}
++
++                InterruptStatus.restoreIntrFlagIfSeen(lcc);
++
+ 	        } catch (Throwable t) {
+ 				if (a.isSingleExecution()) {
+ 					try { a.close(); } catch (Throwable tt) {;}
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/StoreStreamClob.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/StoreStreamClob.java
+index 23784611..e4f8f03d 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/StoreStreamClob.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/StoreStreamClob.java
+@@ -165,6 +165,8 @@ public long getCharLength()
+                 } catch (Throwable t) {
+                     throw noStateChangeLOB(t);
+                 } finally {
++                    conChild.restoreIntrFlagIfSeen(
++                        true, conChild.getEmbedConnection());
+                     this.conChild.restoreContextStack();
+                 }
+             }
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
+index 2eeea2f3..c98028b5 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/TransactionResourceImpl.java
+@@ -39,6 +39,7 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+ import org.apache.derby.iapi.reference.Property;
+ import org.apache.derby.iapi.util.StringUtil;
+ import org.apache.derby.iapi.util.IdUtil;
++import org.apache.derby.iapi.util.InterruptStatus;
+ 
+ import java.util.Properties;
+ import java.sql.SQLException;
+@@ -304,6 +305,7 @@ final SQLException handleException(Throwable thrownException,
+ 			 */
+ 			if (thrownException instanceof SQLException) {
+ 
++                InterruptStatus.restoreIntrFlagIfSeen();
+ 				return (SQLException) thrownException;
+ 
+ 			} 
+@@ -341,7 +343,7 @@ final SQLException handleException(Throwable thrownException,
+ 				}
+ 			}
+ 
+-
++            InterruptStatus.restoreIntrFlagIfSeen();
+ 
+ 			return wrapInSQLException(thrownException);
+ 
+@@ -350,6 +352,9 @@ final SQLException handleException(Throwable thrownException,
+ 			if (cm!=null) { // something to let us cleanup?
+ 				cm.cleanupOnError(t);
+ 			}
++
++            InterruptStatus.restoreIntrFlagIfSeen();
++
+ 			/*
+ 			   We'd rather throw the Throwable,
+ 			   but then javac complains...
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/UTF8Reader.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/UTF8Reader.java
+index f25dc04d..e2b5debb 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/UTF8Reader.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/UTF8Reader.java
+@@ -522,6 +522,7 @@ private boolean fillBuffer() throws IOException
+         }
+         return true;
+         } finally {
++            parent.restoreIntrFlagIfSeen(true, parent.getEmbedConnection());
+             parent.restoreContextStack();
+         }
+         } catch (SQLException sqle) {
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+index de5d07a6..f2c7f907 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/sql/conn/GenericLanguageConnectionContext.java
+@@ -296,6 +296,13 @@ be more appropriate to have it in a separate context (LanguageTransactionContext
+     // User-written inspector to print out query tree
+     private ASTVisitor astWalker;
+     
++    /**
++     * Interrupt status flag of this session's thread, in the form of an
++     * exception created where an interrupt was (last) detected during operation,
++     * null if no interrupt has been seen.
++     */
++    private StandardException interruptedException;
++    
+     /*
+        constructor
+     */
+@@ -382,6 +389,7 @@ public void initialize() throws StandardException
+ 
+ 
+         setDefaultSchema(initDefaultSchemaDescriptor());
++        interruptedException = null;
+     }
+ 
+     /**
+@@ -3860,4 +3868,11 @@ public ASTVisitor getASTVisitor( )
+         return astWalker;
+     }
+ 
++    public void setInterruptedException(StandardException e) {
++        interruptedException = e;
++    }
++
++    public StandardException getInterruptedException() {
++        return interruptedException;
++    }
+ }

@@ -1,0 +1,236 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index b8295e3a..35cb3d8a 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -28,6 +28,9 @@
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.ExecutionException;
+ import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.locks.ReentrantLock;
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ 
+@@ -57,6 +60,8 @@
+     public static final String MBEAN_OBJECT_NAME = "org.apache.cassandra.db:type=CompactionManager";
+     private static final Logger logger = LoggerFactory.getLogger(CompactionManager.class);
+     public static final CompactionManager instance;
++    private final ReentrantLock compactionLock = new ReentrantLock();
++    // todo: should provide a way to unlock in mbean?
+ 
+     static
+     {
+@@ -75,6 +80,16 @@
+     private CompactionExecutor executor = new CompactionExecutor();
+     private Map<ColumnFamilyStore, Integer> estimatedCompactions = new NonBlockingHashMap<ColumnFamilyStore, Integer>();
+ 
++    public void lockCompactions()
++    {
++        compactionLock.lock();
++    }
++    
++    public void unlockCompactions()
++    {
++        compactionLock.unlock();
++    }
++
+     /**
+      * Call this whenever a compaction might be needed on the given columnfamily.
+      * It's okay to over-call (within reason) since the compactions are single-threaded,
+@@ -86,6 +101,9 @@
+         {
+             public Integer call() throws IOException
+             {
++                compactionLock.lock();
++                try
++                {
+                 Integer minThreshold = cfs.getMinimumCompactionThreshold();
+                 Integer maxThreshold = cfs.getMaximumCompactionThreshold();
+ 
+@@ -108,6 +126,11 @@ public Integer call() throws IOException
+                         return doCompaction(cfs, sstables.subList(0, Math.min(sstables.size(), maxThreshold)), (int) (System.currentTimeMillis() / 1000) - cfs.metadata.gcGraceSeconds);
+                     }
+                 }
++                }
++                finally 
++                {
++                    compactionLock.unlock();
++                }
+                 return 0;
+             }
+         };
+@@ -143,9 +166,17 @@ public void performCleanup(final ColumnFamilyStore cfStore) throws InterruptedEx
+         {
+             public Object call() throws IOException
+             {
++                compactionLock.lock();
++                try 
++                {
+                 doCleanupCompaction(cfStore);
+                 return this;
+             }
++                finally 
++                {
++                    compactionLock.unlock();
++                }
++            }
+         };
+         executor.submit(runnable).get();
+     }
+@@ -161,6 +192,9 @@ public void performMajor(final ColumnFamilyStore cfStore) throws InterruptedExce
+         {
+             public Object call() throws IOException
+             {
++                compactionLock.lock();
++                try
++                {
+                 Collection<SSTableReader> sstables;
+                 if (skip > 0)
+                 {
+@@ -181,6 +215,11 @@ public Object call() throws IOException
+                 doCompaction(cfStore, sstables, gcBefore);
+                 return this;
+             }
++                finally 
++                {
++                    compactionLock.unlock();
++                }
++            }
+         };
+         return executor.submit(callable);
+     }
+@@ -191,9 +230,17 @@ public Object call() throws IOException
+         {
+             public Object call() throws IOException
+             {
++                compactionLock.lock();
++                try
++                {
+                 doValidationCompaction(cfStore, validator);
+                 return this;
+             }
++                finally
++                {
++                    compactionLock.unlock();
++                }
++            }
+         };
+         return executor.submit(callable);
+     }
+@@ -495,10 +542,26 @@ public Future submitIndexBuild(final ColumnFamilyStore cfs, final Table.IndexBui
+         {
+             public void run()
+             {
++                compactionLock.lock();
++                try
++                {
+                 executor.beginCompaction(cfs, builder);
+                 builder.build();
+             }
++                finally
++                {
++                    compactionLock.unlock();
++                }
++            }
+         };
++        
++        // don't submit to the executor if the compaction lock is held by the current thread. Instead return a simple
++        // future that will be immediately immediately get()ed and executed. Happens during a migration, which locks
++        // the compaction thread and then reinitializes a ColumnFamilyStore. Under normal circumstances, CFS spawns
++        // index jobs to the compaction manager (this) and blocks on them.
++        if (compactionLock.isHeldByCurrentThread())
++            return new SimpleFuture(runnable);
++        else
+         return executor.submit(runnable);
+     }
+ 
+@@ -509,9 +572,17 @@ public void run()
+         {
+             public SSTableReader call() throws IOException
+             {
++                compactionLock.lock();
++                try
++                {
+                 executor.beginCompaction(builder.cfs, builder);
+                 return builder.build();
+             }
++                finally
++                {
++                    compactionLock.unlock();
++                }
++            }
+         };
+         return executor.submit(callable);
+     }
+@@ -681,4 +752,46 @@ public long getCompletedTasks()
+     {
+         return executor.getCompletedTaskCount();
+     }
++    
++    private class SimpleFuture implements Future
++    {
++        private Runnable runnable;
++        
++        private SimpleFuture(Runnable r) 
++        {
++            runnable = r;
++        }
++        
++        @Override
++        public boolean cancel(boolean mayInterruptIfRunning)
++        {
++            throw new IllegalStateException("May not call SimpleFuture.cancel()");
++        }
++
++        @Override
++        public boolean isCancelled()
++        {
++            return false;
++        }
++
++        @Override
++        public boolean isDone()
++        {
++            return runnable == null;
++        }
++
++        @Override
++        public Object get() throws InterruptedException, ExecutionException
++        {
++            runnable.run();
++            runnable = null;
++            return runnable;
++        }
++
++        @Override
++        public Object get(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
++        {
++            throw new IllegalStateException("May not call SimpleFuture.get(long, TimeUnit)");
++        }
++    }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index be516739..36e29976 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -34,6 +34,7 @@
+ import java.util.concurrent.Future;
+ import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantReadWriteLock;
+ 
+ import org.apache.cassandra.config.CFMetaData;
+@@ -122,6 +123,11 @@ public static Table open(String table)
+         return tableInstance;
+     }
+ 
++    public static Lock getFlushLock()
++    {
++        return flusherLock.writeLock();
++    }
++
+     public static Table clear(String table) throws IOException
+     {
+         synchronized (Table.class)

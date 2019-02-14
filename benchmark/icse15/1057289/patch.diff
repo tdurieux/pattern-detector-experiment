@@ -1,0 +1,209 @@
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java b/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
+index bd41a977..5671770d 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansClusterer.java
+@@ -20,7 +20,6 @@
+ import java.util.ArrayList;
+ import java.util.List;
+ 
+-import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.io.IntWritable;
+ import org.apache.hadoop.io.Text;
+ import org.apache.hadoop.io.SequenceFile.Writer;
+@@ -44,8 +43,6 @@
+   /** Distance to use for point to cluster comparison. */
+   private final DistanceMeasure measure;
+ 
+-  private final double convergenceDelta;
+-
+   /**
+    * Init the k-means clusterer with the distance measure to use for comparison.
+    * 
+@@ -55,17 +52,6 @@
+    */
+   public KMeansClusterer(DistanceMeasure measure) {
+     this.measure = measure;
+-    this.convergenceDelta = 0;
+-  }
+-
+-  public KMeansClusterer(Configuration conf)
+-      throws ClassNotFoundException, InstantiationException, IllegalAccessException {
+-    ClassLoader ccl = Thread.currentThread().getContextClassLoader();
+-    this.measure = ccl.loadClass(conf.get(KMeansConfigKeys.DISTANCE_MEASURE_KEY))
+-        .asSubclass(DistanceMeasure.class).newInstance();
+-    this.measure.configure(conf);
+-
+-    this.convergenceDelta = Double.parseDouble(conf.get(KMeansConfigKeys.CLUSTER_CONVERGENCE_KEY));
+   }
+ 
+   /**
+@@ -121,7 +107,7 @@ protected void addPointToNearestCluster(Vector point, Iterable<Cluster> clusters
+   protected boolean testConvergence(Iterable<Cluster> clusters, double distanceThreshold) {
+     boolean converged = true;
+     for (Cluster cluster : clusters) {
+-      if (!computeConvergence(cluster)) {
++      if (!computeConvergence(cluster, distanceThreshold)) {
+         converged = false;
+       }
+       cluster.computeParameters();
+@@ -232,8 +218,8 @@ protected static boolean runKMeansIteration(Iterable<Vector> points,
+     return clusterer.testConvergence(clusters, distanceThreshold);
+   }
+ 
+-  public boolean computeConvergence(Cluster cluster) {
+-    return cluster.computeConvergence(measure, convergenceDelta);
++  public boolean computeConvergence(Cluster cluster, double distanceThreshold) {
++    return cluster.computeConvergence(measure, distanceThreshold);
+   }
+ 
+ }
+diff --git a/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansReducer.java b/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansReducer.java
+index 396e2cc1..9d8dfebb 100644
+--- a/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansReducer.java
++++ b/mahout/trunk/core/src/main/java/org/apache/mahout/clustering/kmeans/KMeansReducer.java
+@@ -32,17 +32,18 @@
+ public class KMeansReducer extends Reducer<Text, ClusterObservations, Text, Cluster> {
+ 
+   private Map<String, Cluster> clusterMap;
+-
++  private double convergenceDelta;
+   private KMeansClusterer clusterer;
+ 
+   @Override
+-  protected void reduce(Text key, Iterable<ClusterObservations> values, Context context) throws IOException, InterruptedException {
++  protected void reduce(Text key, Iterable<ClusterObservations> values, Context context)
++    throws IOException, InterruptedException {
+     Cluster cluster = clusterMap.get(key.toString());
+     for (ClusterObservations delta : values) {
+       cluster.observe(delta);
+     }
+     // force convergence calculation
+-    boolean converged = clusterer.computeConvergence(cluster);
++    boolean converged = clusterer.computeConvergence(cluster, convergenceDelta);
+     if (converged) {
+       context.getCounter("Clustering", "Converged Clusters").increment(1);
+     }
+@@ -55,7 +56,13 @@ protected void setup(Context context) throws IOException, InterruptedException {
+     super.setup(context);
+     Configuration conf = context.getConfiguration();
+     try {
+-      this.clusterer = new KMeansClusterer(conf);
++      ClassLoader ccl = Thread.currentThread().getContextClassLoader();
++      DistanceMeasure measure = ccl.loadClass(conf.get(KMeansConfigKeys.DISTANCE_MEASURE_KEY))
++          .asSubclass(DistanceMeasure.class).newInstance();
++      measure.configure(conf);
++
++      this.convergenceDelta = Double.parseDouble(conf.get(KMeansConfigKeys.CLUSTER_CONVERGENCE_KEY));
++      this.clusterer = new KMeansClusterer(measure);
+       this.clusterMap = new HashMap<String, Cluster>();
+ 
+       String path = conf.get(KMeansConfigKeys.CLUSTER_PATH_KEY);
+diff --git a/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestKmeansClustering.java b/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestKmeansClustering.java
+index 4d0d8310..5a905a7c 100644
+--- a/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestKmeansClustering.java
++++ b/mahout/trunk/core/src/test/java/org/apache/mahout/clustering/kmeans/TestKmeansClustering.java
+@@ -18,6 +18,7 @@
+ package org.apache.mahout.clustering.kmeans;
+ 
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.List;
+@@ -55,8 +56,9 @@
+ 
+ public final class TestKmeansClustering extends MahoutTestCase {
+ 
+-  public static final double[][] REFERENCE = { { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 4 }, { 4, 5 },
+-      { 5, 5 } };
++  public static final double[][] REFERENCE = {
++      { 1, 1 }, { 2, 1 }, { 1, 2 }, { 2, 2 }, { 3, 3 }, { 4, 4 }, { 5, 4 }, { 4, 5 }, { 5, 5 }
++  };
+ 
+   private static final int[][] EXPECTED_NUM_POINTS = { { 9 }, { 4, 5 }, { 4, 4, 1 }, { 1, 2, 1, 5 }, { 1, 1, 1, 2, 4 },
+       { 1, 1, 1, 1, 1, 4 }, { 1, 1, 1, 1, 1, 2, 2 }, { 1, 1, 1, 1, 1, 1, 2, 1 }, { 1, 1, 1, 1, 1, 1, 1, 1, 1 } };
+@@ -91,6 +93,40 @@ public void setUp() throws Exception {
+     return points;
+   }
+ 
++  /**
++   * Tests {@link KMeansClusterer#runKMeansIteration) single run convergence with a given distance threshold.
++   */
++  @Test
++  public void testRunKMeansIteration_convergesInOneRunWithGivenDistanceThreshold() {
++    double[][] rawPoints = { {0,0}, {0,0.25}, {0,0.75}, {0, 1}};
++    List<Vector> points = getPoints(rawPoints);
++
++    ManhattanDistanceMeasure distanceMeasure = new ManhattanDistanceMeasure();
++    List<Cluster> clusters = Arrays.asList(
++        new Cluster(points.get(0), 0, distanceMeasure),
++        new Cluster(points.get(3), 3, distanceMeasure));
++
++    // To converge in a single run, the given distance threshold should be greater than or equal to 0.125,
++    // since 0.125 will be the distance between center and centroid for the initial two clusters after one run.
++    double distanceThreshold = 0.25;
++
++    boolean converged = KMeansClusterer.runKMeansIteration(
++            points,
++            clusters,
++            distanceMeasure,
++            distanceThreshold);
++
++    Vector cluster1Center = clusters.get(0).getCenter();
++    assertEquals(0, cluster1Center.get(0), EPSILON);
++    assertEquals(0.125, cluster1Center.get(1), EPSILON);
++
++    Vector cluster2Center = clusters.get(1).getCenter();
++    assertEquals(0, cluster2Center.get(0), EPSILON);
++    assertEquals(0.875, cluster2Center.get(1), EPSILON);
++
++    assertTrue("KMeans iteration should be converged after a single run", converged);
++  }
++
+   /** Story: Test the reference implementation */
+   @Test
+   public void testReferenceImplementation() throws Exception {
+@@ -274,11 +310,8 @@ public void testKMeansReducer() throws Exception {
+       KMeansReducer reducer = new KMeansReducer();
+       reducer.setup(clusters, measure);
+       DummyRecordWriter<Text, Cluster> reducerWriter = new DummyRecordWriter<Text, Cluster>();
+-      Reducer<Text, ClusterObservations, Text, Cluster>.Context reducerContext = DummyRecordWriter.build(reducer,
+-                                                                                                         conf,
+-                                                                                                         reducerWriter,
+-                                                                                                         Text.class,
+-                                                                                                         ClusterObservations.class);
++      Reducer<Text, ClusterObservations, Text, Cluster>.Context reducerContext =
++          DummyRecordWriter.build(reducer, conf, reducerWriter, Text.class, ClusterObservations.class);
+       for (Text key : combinerWriter.getKeys()) {
+         reducer.reduce(new Text(key), combinerWriter.getValue(key), reducerContext);
+       }
+@@ -364,7 +397,8 @@ public void testKMeansSeqJob() throws Exception {
+       Path clusteredPointsPath = new Path(outputPath, "clusteredPoints");
+       SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(clusteredPointsPath, "part-m-0"), conf);
+       int[] expect = EXPECTED_NUM_POINTS[k];
+-      DummyOutputCollector<IntWritable, WeightedVectorWritable> collector = new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
++      DummyOutputCollector<IntWritable, WeightedVectorWritable> collector =
++          new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
+       // The key is the clusterId
+       IntWritable clusterId = new IntWritable(0);
+       // The value is the weighted vector
+@@ -421,7 +455,8 @@ public void testKMeansMRJob() throws Exception {
+       // assertEquals("output dir files?", 4, outFiles.length);
+       SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(clusteredPointsPath, "part-m-00000"), conf);
+       int[] expect = EXPECTED_NUM_POINTS[k];
+-      DummyOutputCollector<IntWritable, WeightedVectorWritable> collector = new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
++      DummyOutputCollector<IntWritable, WeightedVectorWritable> collector =
++          new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
+       // The key is the clusterId
+       IntWritable clusterId = new IntWritable(0);
+       // The value is the weighted vector
+@@ -467,7 +502,8 @@ public void testKMeansWithCanopyClusterInput() throws Exception {
+ 
+     // now compare the expected clusters with actual
+     Path clusteredPointsPath = new Path(outputPath, "clusteredPoints");
+-    DummyOutputCollector<IntWritable, WeightedVectorWritable> collector = new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
++    DummyOutputCollector<IntWritable, WeightedVectorWritable> collector =
++        new DummyOutputCollector<IntWritable, WeightedVectorWritable>();
+     SequenceFile.Reader reader = new SequenceFile.Reader(fs, new Path(clusteredPointsPath, "part-m-00000"), conf);
+ 
+     // The key is the clusterId

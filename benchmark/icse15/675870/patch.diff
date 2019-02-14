@@ -1,0 +1,452 @@
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+index 99989532..e95129be 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/Connection.java
+@@ -705,16 +705,30 @@ synchronized public void close() throws SQLException {
+         closeX();
+     }
+ 
++    /**
++     * Check if the transaction is in progress and the connection cannot be
++     * closed.
++     *
++     * @throws SqlException if the connection cannot be closed because the
++     * transaction is active
++     */
+     void checkForTransactionInProgress() throws SqlException {
+         // The following precondition matches CLI semantics, see SQLDisconnect()
+-        if (transactionInProgress() && !allowCloseInUOW_()) {
++        if (transactionInProgress()) {
+             throw new SqlException(agent_.logWriter_,
+                     new ClientMessageId (SQLState.CANNOT_CLOSE_ACTIVE_CONNECTION));                   
+         }
+     }
+     
++    /**
++     * Check if there are uncommitted operations in the current transaction
++     * that prevent us from closing the connection.
++     *
++     * @return {@code true} if the connection cannot be closed due to
++     * uncommitted operations in the transaction
++     */
+     public boolean transactionInProgress() {
+-        return !autoCommit_ && inUnitOfWork_;
++        return inUnitOfWork_ && !allowCloseInUOW_();
+     }
+ 
+     // This is a no-op if the connection is already closed.
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/am/LogicalConnection.java b/db/derby/code/trunk/java/client/org/apache/derby/client/am/LogicalConnection.java
+index 37660a4d..4fffa8f7 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/am/LogicalConnection.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/am/LogicalConnection.java
+@@ -84,6 +84,7 @@ synchronized public void close() throws SQLException {
+                     new ClientMessageId(
+                         SQLState.PHYSICAL_CONNECTION_ALREADY_CLOSED)));
+             } else {
++                physicalConnection_.checkForTransactionInProgress();
+                 physicalConnection_.closeForReuse(
+                         pooledConnection_.isStatementPoolingEnabled());
+                 if (!physicalConnection_.isGlobalPending_()) {
+diff --git a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetConnection.java b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetConnection.java
+index 8bffb008..9899d38c 100644
+--- a/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetConnection.java
++++ b/db/derby/code/trunk/java/client/org/apache/derby/client/net/NetConnection.java
+@@ -1505,13 +1505,33 @@ protected boolean doCloseStatementsOnClose_() {
+         return closeStatementsOnClose;
+     }
+ 
++    /**
++     * Check if the connection can be closed when there are uncommitted
++     * operations.
++     *
++     * @return if this connection can be closed when it has uncommitted
++     * operations, {@code true}; otherwise, {@code false}
++     */
+     protected boolean allowCloseInUOW_() {
+-        return false;
++        // We allow closing in unit of work in two cases:
++        //
++        //   1) if auto-commit is on, since then Connection.close() will cause
++        //   a commit so we won't leave uncommitted changes around
++        //
++        //   2) if we're not allowed to commit or roll back the transaction via
++        //   the connection object (because the it is part of an XA
++        //   transaction). In that case, commit and rollback are performed via
++        //   the XAResource, and it is therefore safe to close the connection.
++        //
++        // Otherwise, the transaction must be idle before a call to close() is
++        // allowed.
++
++        return autoCommit_ || !allowLocalCommitRollback_();
+     }
+ 
+     // Driver-specific determination if local COMMIT/ROLLBACK is allowed;
+     // Allow local COMMIT/ROLLBACK only if we are not in an XA transaction
+-    protected boolean allowLocalCommitRollback_() throws org.apache.derby.client.am.SqlException {
++    protected boolean allowLocalCommitRollback_() {
+        
+     	if (getXAState() == XA_T0_NOT_ASSOCIATED) {
+             return true;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnection.java
+index b456fd65..c4913216 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnection.java
+@@ -166,6 +166,8 @@ public final void close() throws SQLException
+ 			return;
+ 
+ 		try {
++            control.checkClose();
++
+ 			if (!control.closingConnection()) {
+ 				isClosed = true;
+ 				return;
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnectionControl.java b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnectionControl.java
+index 78ad2d6b..e2e7abd4 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnectionControl.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/iapi/jdbc/BrokeredConnectionControl.java
+@@ -63,6 +63,14 @@ Allow control over creating a Savepoint (JDBC 3.0)
+ 	*/
+ 	public void checkCommit() throws SQLException;
+ 
++	/**
++     * Check if the brokered connection can be closed.
++     *
++     * @throws SQLException if it is not allowed to call close on the brokered
++     * connection
++     */
++    public void checkClose() throws SQLException;
++
+ 	/**
+ 		Can cursors be held across commits.
+         @param downgrade true to downgrade the holdability,
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+index ebdaeb31..a04bb51c 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/impl/jdbc/EmbedConnection.java
+@@ -1778,15 +1778,24 @@ public void rollback() throws SQLException {
+      * @exception SQLException if a database-access error occurs.
+      */
+     public void close() throws SQLException {
+-		// JDK 1.4 javadoc indicates close on a closed connection is a no-op
+-		if (!isClosed() &&
+-				(rootConnection == this) && 
+-				(!autoCommit && !transactionIsIdle())) {
+-			throw newSQLException(
+-				SQLState.CANNOT_CLOSE_ACTIVE_CONNECTION);
++        checkForTransactionInProgress();
++		close(exceptionClose);
+ 		}
+ 		
+-		close(exceptionClose);
++    /**
++     * Check if the transaction is active so that we cannot close down the
++     * connection. If auto-commit is on, the transaction is committed when the
++     * connection is closed, so it is always OK to close the connection in that
++     * case. Otherwise, throw an exception if a transaction is in progress.
++     *
++     * @throws SQLException if this transaction is active and the connection
++     * cannot be closed
++     */
++    public void checkForTransactionInProgress() throws SQLException {
++        if (!isClosed() && (rootConnection == this) &&
++                !autoCommit && !transactionIsIdle()) {
++            throw newSQLException(SQLState.CANNOT_CLOSE_ACTIVE_CONNECTION);
++        }
+ 	}
+ 
+ 	// This inner close takes the exception and calls 
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
+index c2b7ef9a..c49c2e22 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedPooledConnection.java
+@@ -153,11 +153,6 @@ public synchronized Connection getConnection() throws SQLException
+ 	{
+ 		checkActive();
+ 
+-		// need to do this in case the connection is forcibly removed without
+-		// first being closed.
+-		closeCurrentConnectionHandle();
+-
+-
+ 		// RealConnection is not null if the app server yanks a local
+ 		// connection from one client and give it to another.  In this case,
+ 		// the real connection is ready to be used.  Otherwise, set it up
+@@ -171,6 +166,12 @@ public synchronized Connection getConnection() throws SQLException
+ 			resetRealConnection();
+ 		}
+ 
++        // Need to do this in case the connection is forcibly removed without
++        // first being closed. Must be performed after resetRealConnection(),
++        // otherwise closing the logical connection may fail if the transaction
++        // is not idle.
++        closeCurrentConnectionHandle();
++
+ 		// now make a brokered connection wrapper and give this to the user
+ 		// we reuse the EmbedConnection(ie realConnection).
+ 		Connection c = getNewCurrentConnectionHandle();		
+@@ -452,6 +453,13 @@ public void checkRollback() throws SQLException {
+ 	public void checkCommit() throws SQLException {
+ 	}
+ 
++    /** @see BrokeredConnectionControl#checkClose() */
++    public void checkClose() throws SQLException {
++        if (realConnection != null) {
++            realConnection.checkForTransactionInProgress();
++        }
++    }
++
+ 	/**
+ 		Close called on BrokeredConnection. If this call
+ 		returns true then getRealConnection().close() will be called.
+diff --git a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAConnection.java b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAConnection.java
+index 7f62b40f..14101b35 100644
+--- a/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAConnection.java
++++ b/db/derby/code/trunk/java/engine/org/apache/derby/jdbc/EmbedXAConnection.java
+@@ -53,6 +53,16 @@ Licensed to the Apache Software Foundation (ASF) under one or more
+                 xaRes = new EmbedXAResource (this, ra);
+ 	}
+ 
++    /**
++     * Check if this connection is part of a global XA transaction.
++     *
++     * @return {@code true} if the transaction is global, {@code false} if the
++     * transaction is local
++     */
++    private boolean isGlobal() {
++        return xaRes.getCurrentXid () != null;
++    }
++
+ 	/*
+ 	** XAConnection methods
+ 	*/
+@@ -69,7 +79,7 @@ public final synchronized XAResource getXAResource() throws SQLException {
+ 		Allow control over setting auto commit mode.
+ 	*/
+ 	public void checkAutoCommit(boolean autoCommit) throws SQLException {
+-		if (autoCommit && (xaRes.getCurrentXid () != null))
++		if (autoCommit && isGlobal())
+ 			throw Util.generateCsSQLException(SQLState.CANNOT_AUTOCOMMIT_XA);
+ 
+ 		super.checkAutoCommit(autoCommit);
+@@ -86,7 +96,7 @@ public int  checkHoldCursors(int holdability, boolean downgrade)
+         throws SQLException
+     {
+ 		if (holdability == ResultSet.HOLD_CURSORS_OVER_COMMIT) {		
+-			if (xaRes.getCurrentXid () != null) {
++			if (isGlobal()) {
+                 if (!downgrade)
+                     throw Util.generateCsSQLException(SQLState.CANNOT_HOLD_CURSOR_XA);
+                 
+@@ -102,7 +112,7 @@ Allow control over creating a Savepoint (JDBC 3.0)
+ 	*/
+ 	public void checkSavepoint() throws SQLException {
+ 
+-		if (xaRes.getCurrentXid () != null)
++		if (isGlobal())
+ 			throw Util.generateCsSQLException(SQLState.CANNOT_ROLLBACK_XA);
+ 
+ 		super.checkSavepoint();
+@@ -113,7 +123,7 @@ public void checkSavepoint() throws SQLException {
+ 	*/
+ 	public void checkRollback() throws SQLException {
+ 
+-		if (xaRes.getCurrentXid () != null)
++		if (isGlobal())
+ 			throw Util.generateCsSQLException(SQLState.CANNOT_ROLLBACK_XA);
+ 
+ 		super.checkRollback();
+@@ -123,18 +133,32 @@ public void checkRollback() throws SQLException {
+ 	*/
+ 	public void checkCommit() throws SQLException {
+ 
+-		if (xaRes.getCurrentXid () != null)
++		if (isGlobal())
+ 			throw Util.generateCsSQLException(SQLState.CANNOT_COMMIT_XA);
+ 
+ 		super.checkCommit();
+ 	}
+ 
++    /**
++     * @see org.apache.derby.iapi.jdbc.BrokeredConnectionControl#checkClose()
++     */
++    public void checkClose() throws SQLException {
++        if (isGlobal()) {
++            // It is always OK to close a connection associated with a global
++            // XA transaction, even if it isn't idle, since we still can commit
++            // or roll back the global transaction with the XAResource after
++            // the connection has been closed.
++        } else {
++            super.checkClose();
++        }
++    }
++
+ 	public Connection getConnection() throws SQLException
+ 	{
+ 		Connection handle;
+ 
+ 		// Is this just a local transaction?
+-		if (xaRes.getCurrentXid () == null) {
++		if (!isGlobal()) {
+ 			handle = super.getConnection();
+ 		} else {
+ 
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
+index 835b5c46..a7950290 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/J2EEDataSourceTest.java
+@@ -136,6 +136,12 @@ private static Test baseSuite(String postfix) {
+         suite.addTest(new J2EEDataSourceTest("testSetIsolationWithStatement"));
+         suite.addTest(new J2EEDataSourceTest("testJira95xads"));
+         suite.addTest(new J2EEDataSourceTest("testBadConnectionAttributeSyntax"));
++        suite.addTest(new J2EEDataSourceTest("testCloseActiveConnection_DS"));
++        suite.addTest(new J2EEDataSourceTest("testCloseActiveConnection_CP"));
++        suite.addTest(
++            new J2EEDataSourceTest("testCloseActiveConnection_XA_local"));
++        suite.addTest(
++            new J2EEDataSourceTest("testCloseActiveConnection_XA_global"));
+         suite.addTest(new J2EEDataSourceTest("testDescriptionProperty"));
+         suite.addTest(new J2EEDataSourceTest("testConnectionErrorEvent"));
+         suite.addTest(new J2EEDataSourceTest(
+@@ -668,6 +674,109 @@ private void subtestErrorEventWithNullListener(PooledConnection pc)
+         pc.close();
+     }
+ 
++    /**
++     * Test that {@code Connection.close()} behaves as expected when the
++     * transaction is active (DERBY-3319).
++     *
++     * @param c the connection to test
++     * @param autoCommit the expected auto-commit value. When auto-commit is
++     * on, {@code close()} shouldn't fail when the transaction is active.
++     * @param global tells whether the connection is part of a global XA
++     * transaction. If it is, {@code close()} shouldn't fail, since the
++     * transaction can be finished later without using the connection.
++     */
++    private void testCloseActiveConnection(Connection c, boolean autoCommit,
++                                           boolean global)
++        throws SQLException
++    {
++        if (global) {
++            assertFalse("auto-commit should be false in XA", autoCommit);
++        }
++        assertEquals("auto-commit", autoCommit, c.getAutoCommit());
++        Statement s = c.createStatement();
++        JDBC.assertDrainResults(s.executeQuery("SELECT * FROM SYS.SYSTABLES"));
++        s.close();
++        try {
++            c.close();
++            // should not fail in auto-commit or global XA, but should fail
++            // otherwise
++            assertTrue("close() should fail", autoCommit || global);
++        } catch (SQLException e) {
++            // no exception expected in auto-commit or global XA, re-throw
++            if (autoCommit || global) {
++                throw e;
++            }
++            assertSQLState("25001", e);
++        }
++        if (!autoCommit && !global) {
++            c.rollback();
++        }
++        c.close();
++    }
++
++    /**
++     * Test that connections retrieved from {@code DataSource} behave as
++     * expected when {@code close()} is called and the transaction is active.
++     */
++    public void testCloseActiveConnection_DS() throws SQLException {
++        DataSource ds = JDBCDataSource.getDataSource();
++        testCloseActiveConnection(ds.getConnection(), true, false);
++        Connection c = ds.getConnection();
++        c.setAutoCommit(false);
++        testCloseActiveConnection(c, false, false);
++    }
++
++    /**
++     * Test that connections retrieved from {@code ConnectionPoolDataSource}
++     * behave as expected when {@code close()} is called and the transaction is
++     * active.
++     */
++    public void testCloseActiveConnection_CP() throws SQLException {
++        ConnectionPoolDataSource ds =
++            J2EEDataSource.getConnectionPoolDataSource();
++        PooledConnection pc = ds.getPooledConnection();
++        testCloseActiveConnection(pc.getConnection(), true, false);
++        Connection c = pc.getConnection();
++        c.setAutoCommit(false);
++        testCloseActiveConnection(c, false, false);
++    }
++
++    /**
++     * Test that connections retrieved from {@code XADataSource} that are not
++     * part of a global XA transaction, behave as expected when {@code close()}
++     * is called and the transaction is active.
++     */
++    public void testCloseActiveConnection_XA_local() throws SQLException {
++        XADataSource ds = J2EEDataSource.getXADataSource();
++        XAConnection xa = ds.getXAConnection();
++        testCloseActiveConnection(xa.getConnection(), true, false);
++        Connection c = xa.getConnection();
++        c.setAutoCommit(false);
++        testCloseActiveConnection(c, false, false);
++    }
++
++    /**
++     * Test that connections retrieved from {@code XADataSource} that are part
++     * of a global XA transaction, behave as expected when {@code close()} is
++     * called and the transaction is active.
++     */
++    public void testCloseActiveConnection_XA_global()
++        throws SQLException, XAException
++    {
++        XADataSource ds = J2EEDataSource.getXADataSource();
++        XAConnection xa = ds.getXAConnection();
++        XAResource xar = xa.getXAResource();
++        Xid xid = new cdsXid(1, (byte) 2, (byte) 3);
++        xar.start(xid, XAResource.TMNOFLAGS);
++        // auto-commit is always off in XA transactions, so we expect
++        // getAutoCommit() to return false without having set it explicitly
++        testCloseActiveConnection(xa.getConnection(), false, true);
++        Connection c = xa.getConnection();
++        c.setAutoCommit(false);
++        testCloseActiveConnection(c, false, true);
++        xar.end(xid, XAResource.TMSUCCESS);
++    }
++
+     /**
+      * Test that a PooledConnection can be reused and closed
+      * (separately) during the close event raised by the
+diff --git a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/StatementPoolingTest.java b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/StatementPoolingTest.java
+index ddec14a5..cf630ebf 100644
+--- a/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/StatementPoolingTest.java
++++ b/db/derby/code/trunk/java/testing/org/apache/derbyTesting/functionTests/tests/jdbcapi/StatementPoolingTest.java
+@@ -359,7 +359,7 @@ public void testCachingLogicalConnectionCloseLeavesPhysicalStatementsOpen()
+         Statement stmt = createStatement();
+         stmt.executeUpdate("create table clcclso (id int)");
+         PreparedStatement ps = con.prepareStatement(SELECT_SQL);
+-        commit();
++        con.commit();
+         con.close();
+         try {
+             // Should fail because the logical statement has been closed.
+@@ -586,6 +586,7 @@ private void doTestResultSetCloseForHoldability(int holdability)
+         if (holdability == ResultSet.HOLD_CURSORS_OVER_COMMIT) {
+             assertTrue(rs.next());
+             assertEquals(2, rs.getInt(1));
++            rollback();
+         }
+         getConnection().close();
+         try {
+@@ -829,9 +830,8 @@ public static Test suite() {
+                 "resTestNoCommitOnReuse"));
+         reqDataSuite.addTest(new StatementPoolingTest(
+                 "resTestCommitOnReuse"));
+-        // This test fails, DERBY-3319 is probably the cause.
+-        //reqDataSuite.addTest(new StatementPoolingTest(
+-        //        "resTestNoDataCommittedOnInvalidTransactionState"));
++        reqDataSuite.addTest(new StatementPoolingTest(
++                "resTestNoDataCommittedOnInvalidTransactionState"));
+         suite.addTest(TestConfiguration.connectionCPDecorator(
+                 new BaseJDBCTestSetup(reqDataSuite) {
+                 public void setUp() throws Exception {

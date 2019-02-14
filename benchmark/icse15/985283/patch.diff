@@ -1,0 +1,294 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/concurrent/StageManager.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/concurrent/StageManager.java
+index c65f564f..24e9d7f3 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/concurrent/StageManager.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/concurrent/StageManager.java
+@@ -70,7 +70,7 @@ private static ThreadPoolExecutor multiThreadedStage(String name, int numThreads
+                                                 numThreads,
+                                                 Integer.MAX_VALUE,
+                                                 TimeUnit.SECONDS,
+-                                                new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getStageQueueSize()),
++                                                new LinkedBlockingQueue<Runnable>(),
+                                                 new NamedThreadFactory(name));
+     }
+     
+@@ -82,7 +82,7 @@ private static ThreadPoolExecutor multiThreadedConfigurableStage(String name, in
+                                                      numThreads,
+                                                      Integer.MAX_VALUE,
+                                                      TimeUnit.SECONDS,
+-                                                     new LinkedBlockingQueue<Runnable>(DatabaseDescriptor.getStageQueueSize()),
++                                                     new LinkedBlockingQueue<Runnable>(),
+                                                      new NamedThreadFactory(name));
+     }
+ 
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 4b14bf39..f117f3f2 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -156,8 +156,6 @@ static String getStorageConfigPath()
+         throw new RuntimeException("Cannot locate " + STORAGE_CONF_FILE + " via storage-config system property or classpath lookup.");
+     }
+ 
+-    private static int stageQueueSize_ = 4096;
+-
+     static
+     {
+         try
+@@ -1114,11 +1112,6 @@ public static AbstractType getSubComparator(String tableName, String cfName)
+         return getCFMetaData(tableName, cfName).subcolumnComparator;
+     }
+ 
+-    public static int getStageQueueSize()
+-    {
+-        return stageQueueSize_;
+-    }
+-
+     /**
+      * @return The absolute number of keys that should be cached per table.
+      */
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/IncomingTcpConnection.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
+index 07794dab..b1f13728 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/IncomingTcpConnection.java
+@@ -26,6 +26,7 @@
+ 
+ import org.apache.log4j.Logger;
+ 
++import org.apache.cassandra.net.sink.SinkManager;
+ import org.apache.cassandra.streaming.IncomingStreamReader;
+ 
+ public class IncomingTcpConnection extends Thread
+@@ -70,7 +71,9 @@ public void run()
+                     int size = input.readInt();
+                     byte[] contentBytes = new byte[size];
+                     input.readFully(contentBytes);
+-                    MessagingService.getDeserializationExecutor().submit(new MessageDeserializationTask(new ByteArrayInputStream(contentBytes)));
++                    
++                    Message message = Message.serializer().deserialize(new DataInputStream(new ByteArrayInputStream(contentBytes)));
++                    MessagingService.receive(message);
+                 }
+             }
+             catch (EOFException e)
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeliveryTask.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeliveryTask.java
+index 88cce5bf..ab75d234 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeliveryTask.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeliveryTask.java
+@@ -20,12 +20,15 @@
+ 
+ import org.apache.log4j.Logger;
+ 
++import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.service.StorageService;
+ 
+ public class MessageDeliveryTask implements Runnable
+ {
++    private static final Logger logger_ = Logger.getLogger(MessageDeliveryTask.class);    
++
+     private Message message_;
+-    private static Logger logger_ = Logger.getLogger(MessageDeliveryTask.class);    
++    private final long constructionTime_ = System.currentTimeMillis();
+     
+     public MessageDeliveryTask(Message message)
+     {
+@@ -34,6 +37,12 @@ public MessageDeliveryTask(Message message)
+     
+     public void run()
+     { 
++        if (System.currentTimeMillis() >  constructionTime_ + DatabaseDescriptor.getRpcTimeout())
++        {
++            MessagingService.incrementDroppedMessages();
++            return;
++        }
++
+         StorageService.Verb verb = message_.getVerb();
+         IVerbHandler verbHandler = MessagingService.instance.getVerbHandler(verb);
+         assert verbHandler != null : "unknown verb " + verb;
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
+index 296d3841..e69de29b 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessageDeserializationTask.java
+@@ -1,55 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.net;
+-
+-import java.io.ByteArrayInputStream;
+-import java.io.DataInputStream;
+-import java.io.IOException;
+-
+-import org.apache.log4j.Logger;
+-
+-import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.net.sink.SinkManager;
+-import org.apache.cassandra.utils.WrappedRunnable;
+-
+-class MessageDeserializationTask extends WrappedRunnable
+-{
+-    private static Logger logger = Logger.getLogger(MessageDeserializationTask.class);
+-    
+-    private final ByteArrayInputStream bytes;
+-    private final long constructionTime = System.currentTimeMillis();
+-    
+-    MessageDeserializationTask(ByteArrayInputStream bytes)
+-    {
+-        this.bytes = bytes;
+-    }
+-
+-    public void runMayThrow() throws IOException
+-    {
+-        if (System.currentTimeMillis() >  constructionTime + DatabaseDescriptor.getRpcTimeout())
+-        {
+-            MessagingService.incrementDroppedMessages();
+-            return;
+-        }
+-
+-        Message message = Message.serializer().deserialize(new DataInputStream(bytes));
+-        message = SinkManager.processServerMessageSink(message);
+-        MessagingService.receive(message);
+-    }
+-}
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
+index 1c5d7ad8..3847a6e4 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -18,21 +18,6 @@
+ 
+ package org.apache.cassandra.net;
+ 
+-import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.NamedThreadFactory;
+-import org.apache.cassandra.concurrent.StageManager;
+-import org.apache.cassandra.config.DatabaseDescriptor;
+-import org.apache.cassandra.gms.IFailureDetectionEventListener;
+-import org.apache.cassandra.io.util.DataOutputBuffer;
+-import org.apache.cassandra.net.io.SerializerType;
+-import org.apache.cassandra.net.sink.SinkManager;
+-import org.apache.cassandra.service.StorageService;
+-import org.apache.cassandra.utils.ExpiringMap;
+-import org.apache.cassandra.utils.GuidGenerator;
+-import org.apache.cassandra.utils.SimpleCondition;
+-import org.apache.log4j.Logger;
+-import org.cliffc.high_scale_lib.NonBlockingHashMap;
+-
+ import java.io.IOError;
+ import java.io.IOException;
+ import java.net.InetAddress;
+@@ -47,12 +32,24 @@
+ import java.util.Map;
+ import java.util.Timer;
+ import java.util.TimerTask;
+-import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
++import org.apache.log4j.Logger;
++
++import org.apache.cassandra.concurrent.JMXEnabledThreadPoolExecutor;
++import org.apache.cassandra.concurrent.StageManager;
++import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.io.util.DataOutputBuffer;
++import org.apache.cassandra.net.io.SerializerType;
++import org.apache.cassandra.net.sink.SinkManager;
++import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.utils.ExpiringMap;
++import org.apache.cassandra.utils.GuidGenerator;
++import org.apache.cassandra.utils.SimpleCondition;
++import org.cliffc.high_scale_lib.NonBlockingHashMap;
++
+ public class MessagingService
+ {
+     private static int version_ = 1;
+@@ -69,8 +66,8 @@
+     /* Lookup table for registering message handlers based on the verb. */
+     private static Map<StorageService.Verb, IVerbHandler> verbHandlers_;
+ 
+-    /* Thread pool to handle deserialization of messages read from the socket. */
+-    private static ExecutorService messageDeserializerExecutor_;
++    /* Thread pool to handle messages without a specialized stage */
++    private static ExecutorService defaultExecutor_;
+     
+     /* Thread pool to handle messaging write activities */
+     private static ExecutorService streamExecutor_;
+@@ -105,13 +102,7 @@ protected MessagingService()
+         callbackMap_ = new ExpiringMap<String, IAsyncCallback>( 2 * DatabaseDescriptor.getRpcTimeout() );
+         taskCompletionMap_ = new ExpiringMap<String, IAsyncResult>( 2 * DatabaseDescriptor.getRpcTimeout() );
+ 
+-        // read executor puts messages to deserialize on this.
+-        messageDeserializerExecutor_ = new JMXEnabledThreadPoolExecutor(1,
+-                                                                        Runtime.getRuntime().availableProcessors(),
+-                                                                        Integer.MAX_VALUE,
+-                                                                        TimeUnit.SECONDS,
+-                                                                        new LinkedBlockingQueue<Runnable>(),
+-                                                                        new NamedThreadFactory("MESSAGE-DESERIALIZER-POOL"));
++        defaultExecutor_ = new JMXEnabledThreadPoolExecutor("MISCELLANEOUS-POOL");
+ 
+         streamExecutor_ = new JMXEnabledThreadPoolExecutor("MESSAGE-STREAMING-POOL");
+         TimerTask logDropped = new TimerTask()
+@@ -354,8 +345,8 @@ public void stream(String file, long startPosition, long endPosition, InetAddres
+     /** blocks until the processing pools are empty and done. */
+     public static void waitFor() throws InterruptedException
+     {
+-        while (!messageDeserializerExecutor_.isTerminated())
+-            messageDeserializerExecutor_.awaitTermination(5, TimeUnit.SECONDS);
++        while (!defaultExecutor_.isTerminated())
++            defaultExecutor_.awaitTermination(5, TimeUnit.SECONDS);
+         while (!streamExecutor_.isTerminated())
+             streamExecutor_.awaitTermination(5, TimeUnit.SECONDS);
+     }
+@@ -373,7 +364,7 @@ public static void shutdown()
+             throw new IOError(e);
+         }
+ 
+-        messageDeserializerExecutor_.shutdownNow();
++        defaultExecutor_.shutdownNow();
+         streamExecutor_.shutdownNow();
+ 
+         /* shut down the cachetables */
+@@ -385,14 +376,16 @@ public static void shutdown()
+ 
+     public static void receive(Message message)
+     {
+-        Runnable runnable = new MessageDeliveryTask(message);
++        message = SinkManager.processServerMessageSink(message);
+ 
++        Runnable runnable = new MessageDeliveryTask(message);
+         ExecutorService stage = StageManager.getStage(message.getMessageType());
++
+         if (stage == null)
+         {
+             if (logger_.isDebugEnabled())
+                 logger_.debug("Running " + message.getMessageType() + " on default stage");
+-            messageDeserializerExecutor_.execute(runnable);
++            defaultExecutor_.execute(runnable);
+         }
+         else
+         {
+@@ -425,11 +418,6 @@ public static long getAsyncResultAge(String key)
+         return taskCompletionMap_.getAge(key);
+     }
+ 
+-    public static ExecutorService getDeserializationExecutor()
+-    {
+-        return messageDeserializerExecutor_;
+-    }
+-
+     public static void validateMagic(int magic) throws IOException
+     {
+         if (magic != PROTOCOL_MAGIC)

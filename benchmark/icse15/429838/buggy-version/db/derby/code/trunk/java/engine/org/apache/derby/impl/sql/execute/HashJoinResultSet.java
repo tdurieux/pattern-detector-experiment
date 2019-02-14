@@ -1,0 +1,67 @@
+/*
+
+   Derby - Class org.apache.derby.impl.sql.execute.HashJoinResultSet
+
+   Copyright 1999, 2004 The Apache Software Foundation or its licensors, as applicable.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+
+ */
+
+package org.apache.derby.impl.sql.execute;
+
+import org.apache.derby.iapi.services.monitor.Monitor;
+
+import org.apache.derby.iapi.services.sanity.SanityManager;
+
+import org.apache.derby.iapi.services.stream.HeaderPrintWriter;
+import org.apache.derby.iapi.services.stream.InfoStreams;
+
+import org.apache.derby.iapi.error.StandardException;
+import org.apache.derby.iapi.sql.Activation;
+import org.apache.derby.iapi.sql.ResultSet;
+import org.apache.derby.iapi.types.DataValueDescriptor;
+
+import org.apache.derby.iapi.sql.execute.ExecutionContext;
+import org.apache.derby.iapi.sql.execute.NoPutResultSet;
+
+import org.apache.derby.iapi.services.loader.GeneratedMethod;
+
+
+/**
+ * Hash join of 2 arbitrary result sets.
+ * Simple subclass of nested loop, differentiated
+ * to ease RunTimeStatistics output generation.
+ */
+public class HashJoinResultSet extends NestedLoopJoinResultSet
+{
+    public HashJoinResultSet(NoPutResultSet leftResultSet,
+								   int leftNumCols,
+								   NoPutResultSet rightResultSet,
+								   int rightNumCols,
+								   Activation activation,
+								   GeneratedMethod restriction,
+								   int resultSetNumber,
+								   boolean oneRowRightSide,
+								   boolean notExistsRightSide,
+								   double optimizerEstimatedRowCount,
+								   double optimizerEstimatedCost,
+								   String userSuppliedOptimizerOverrides,
+								   GeneratedMethod closeCleanup)
+    {
+		super(leftResultSet, leftNumCols, rightResultSet, rightNumCols,
+			  activation, restriction, resultSetNumber, 
+			  oneRowRightSide, notExistsRightSide, optimizerEstimatedRowCount, 
+			  optimizerEstimatedCost, userSuppliedOptimizerOverrides, closeCleanup);
+    }
+}

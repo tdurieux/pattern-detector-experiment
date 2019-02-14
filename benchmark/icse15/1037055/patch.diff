@@ -1,0 +1,284 @@
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
+index 05ac6696..7de11407 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/CollatingOrderPreservingPartitioner.java
+@@ -20,10 +20,7 @@
+ 
+ import java.math.BigInteger;
+ import java.text.Collator;
+-import java.util.Arrays;
+-import java.util.Comparator;
+-import java.util.Locale;
+-import java.util.Random;
++import java.util.*;
+ 
+ import org.apache.commons.lang.ArrayUtils;
+ 
+@@ -152,4 +149,6 @@ public BytesToken getToken(String key)
+             return MINIMUM;
+         return new BytesToken(collator.getCollationKey(key).toByteArray());
+     }
++
++    public Map<Token, Float> describeOwnership(List<Token> sortedTokens){ throw new UnsupportedOperationException(); }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/IPartitioner.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/IPartitioner.java
+index 02fd665c..11b9777f 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/IPartitioner.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/IPartitioner.java
+@@ -18,7 +18,8 @@
+ 
+ package org.apache.cassandra.dht;
+ 
+-import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
+ 
+ import org.apache.cassandra.db.DecoratedKey;
+ 
+@@ -80,4 +81,13 @@
+      * it generates.
+      */
+     public boolean preservesOrder();
++
++    /**
++     * Calculate the deltas between tokens in the ring in order to compare
++     *  relative sizes.
++     *
++     * @param sortedTokens a sorted List of Tokens
++     * @return the mapping from 'token' to 'percentage of the ring owned by that token'.
++     */
++    public Map<Token, Float> describeOwnership(List<Token> sortedTokens);
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
+index 9f13b956..dcc21c7f 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/OrderPreservingPartitioner.java
+@@ -20,12 +20,10 @@
+ 
+ import java.io.UnsupportedEncodingException;
+ import java.math.BigInteger;
+-import java.util.Arrays;
+-import java.util.Comparator;
+-import java.util.Random;
++import java.util.*;
+ 
+-import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.db.DecoratedKey;
++import org.apache.cassandra.service.StorageService;
+ import org.apache.cassandra.utils.FBUtilities;
+ import org.apache.cassandra.utils.Pair;
+ 
+@@ -165,4 +163,35 @@ public StringToken getToken(String key)
+     {
+         return new StringToken(key);
+     }
++
++    public Map<Token, Float> describeOwnership(List<Token> sortedTokens)
++    {
++        // alltokens will contain the count and be returned, sorted_ranges is shorthand for token<->token math.
++        Map<Token, Float> alltokens = new HashMap<Token, Float>();
++        List<Range> sorted_ranges = new ArrayList<Range>();
++
++        // this initializes the counts to 0 and calcs the ranges in order.
++        Token last_t = sortedTokens.get(sortedTokens.size()-1);
++        for (Token node : sortedTokens)
++        {
++            alltokens.put(node, new Float(0.0));
++            sorted_ranges.add(new Range(last_t, node));
++            last_t = node;
++        }
++
++        for (Range r : sorted_ranges)
++        {
++            // Looping over every KS:CF:Range, get the splits size and add it to the count
++            alltokens.put(r.right, alltokens.get(r.right) + StorageService.instance.getSplits(r, 1).size());
++        }
++
++        // Sum every count up and divide count/total for the fractional ownership.
++        Float total = new Float(0.0);
++        for (Float f : alltokens.values()) { total += f; }
++        for (Map.Entry<Token, Float> row : alltokens.entrySet()) {
++            alltokens.put(row.getKey(), row.getValue() / total);
++        }
++        
++        return alltokens;
++    }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/RandomPartitioner.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/RandomPartitioner.java
+index ebd0dfeb..94a4dffb 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/RandomPartitioner.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/dht/RandomPartitioner.java
+@@ -18,8 +18,9 @@
+ 
+ package org.apache.cassandra.dht;
+ 
++import java.math.BigDecimal;
+ import java.math.BigInteger;
+-import java.util.Comparator;
++import java.util.*;
+ import java.util.regex.Pattern;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
+@@ -117,4 +118,36 @@ public BigIntegerToken getToken(String key)
+             return MINIMUM;
+         return new BigIntegerToken(FBUtilities.hash(key));
+     }
++
++    public Map<Token, Float> describeOwnership(List<Token> sortedTokens)
++    {
++        Map<Token, Float> ownerships = new HashMap<Token, Float>();
++        Iterator i = sortedTokens.iterator();
++
++        // 0-case
++        if (!i.hasNext()) { throw new RuntimeException("No nodes present in the cluster. How did you call this?"); }
++        // 1-case
++        if (sortedTokens.size() == 1) {
++            ownerships.put((Token)i.next(), new Float(1.0));
++        }
++        // n-case
++        else {
++            // NOTE: All divisions must take place in BigDecimals, and all modulo operators must take place in BigIntegers.
++            final BigInteger ri = new BigInteger("2").pow(127);                             //  (used for addition later)
++            final BigDecimal r  = new BigDecimal(ri);                                       // The entire range, 2**127
++            Token start = (Token)i.next(); BigInteger ti = ((BigIntegerToken)start).token;  // The first token and its value
++            Token t; BigInteger tim1 = ti;                                                  // The last token and its value (after loop)
++            while (i.hasNext()) {
++                t = (Token)i.next(); ti = ((BigIntegerToken)t).token;                       // The next token and its value
++                float x = new BigDecimal(ti.subtract(tim1)).divide(r).floatValue();         // %age = T(i) - T(i-1) / R
++                ownerships.put(t, x);                                                       // save (T(i) -> %age)
++                tim1 = ti;                                                                  // -> advance loop
++            }
++            // The start token's range extends backward to the last token, which is why both were saved
++            //  above. The simple calculation for this is: T(start) - T(end) + r % r / r.
++            //  (In the 1-case, this produces 0% instead of 100%.)
++            ownerships.put(start, new BigDecimal(((BigIntegerToken)start).token.subtract(ti).add(ri).mod(ri)).divide(r).floatValue());
++        }
++        return ownerships;
++    }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+index 4b9a731a..66e35fb7 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageService.java
+@@ -1645,4 +1645,14 @@ TokenMetadata setTokenMetadataUnsafe(TokenMetadata tmd)
+         tokenMetadata_ = tmd;
+         return old;
+     }
++
++    public Map<Token, Float> getOwnership()
++    {
++        List<Range> ranges = new ArrayList<Range>(getRangeToEndPointMap(null).keySet());
++        List<Token> sortedTokens = new ArrayList<Token>();
++        for(Range r : ranges) { sortedTokens.add(r.left); }
++        Collections.sort(sortedTokens);
++
++        return partitioner_.describeOwnership(sortedTokens);
++    }
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+index 5ca76f30..3f8cc4b6 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/service/StorageServiceMBean.java
+@@ -27,6 +27,7 @@
+ import java.util.concurrent.ExecutionException;
+ 
+ import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
+ 
+ 
+ public interface StorageServiceMBean
+@@ -184,4 +185,10 @@
+ 
+     /** save row and key caches */
+     public void saveCaches() throws ExecutionException, InterruptedException;
++
++    /**
++     * given a list of tokens (representing the nodes in the cluster), returns
++     *   a mapping from "token -> %age of cluster owned by that token"
++     */
++    public Map<Token, Float> getOwnership();
+ }
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeCmd.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeCmd.java
+index de6723c0..47e4fb11 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeCmd.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeCmd.java
+@@ -26,6 +26,7 @@
+ import org.apache.cassandra.db.ColumnFamilyStoreMBean;
+ import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.utils.EstimatedHistogram;
+ import org.apache.commons.cli.*;
+ 
+@@ -33,6 +34,7 @@
+ import java.io.PrintStream;
+ import java.lang.management.MemoryUsage;
+ import java.net.InetAddress;
++import java.text.DecimalFormat;
+ import java.util.*;
+ import java.util.Map.Entry;
+ import java.util.concurrent.ExecutionException;
+@@ -90,18 +92,20 @@ public void printRing(PrintStream outs)
+         Set<String> liveNodes = probe.getLiveNodes();
+         Set<String> deadNodes = probe.getUnreachableNodes();
+         Map<String, String> loadMap = probe.getLoadMap();
++        Map<Token, Float> ownerships = probe.getOwnership();
+ 
+         // Print range-to-endpoint mapping
+         int counter = 0;
+         outs.print(String.format("%-14s", "Address"));
+         outs.print(String.format("%-11s", "Status"));
+         outs.print(String.format("%-14s", "Load"));
++        outs.print(String.format("%-8s", "Owns"));
+         outs.print(String.format("%-43s", "Range"));
+         outs.println("Ring");
+         // emphasize that we're showing the right part of each range
+         if (ranges.size() > 1)
+         {
+-            outs.println(String.format("%-14s%-11s%-14s%-43s", "", "", "", ranges.get(0).left));
++            outs.println(String.format("%-14s%-11s%-14s%-8s%-43s", "", "", "", "", ranges.get(0).left));
+         }
+         // normal range & node info
+         for (Range range : ranges) {
+@@ -120,6 +124,9 @@ public void printRing(PrintStream outs)
+             String load = loadMap.containsKey(primaryEndpoint) ? loadMap.get(primaryEndpoint) : "?";
+             outs.print(String.format("%-14s", load));
+ 
++            DecimalFormat df = new DecimalFormat("##0.00%");
++            outs.print(String.format("%-8s", df.format(ownerships.get(range.right))));
++
+             outs.print(String.format("%-43s", range.right));
+ 
+             String asciiRingArt;
+diff --git a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeProbe.java b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeProbe.java
+index e7335470..1fbb9544 100644
+--- a/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeProbe.java
++++ b/cassandra/branches/cassandra-0.6/src/java/org/apache/cassandra/tools/NodeProbe.java
+@@ -24,6 +24,7 @@
+ import java.lang.management.MemoryMXBean;
+ import java.lang.management.MemoryUsage;
+ import java.lang.management.RuntimeMXBean;
++import java.lang.reflect.Constructor;
+ import java.net.InetAddress;
+ import java.util.AbstractMap;
+ import java.util.ArrayList;
+@@ -46,6 +47,7 @@
+ import org.apache.cassandra.db.CompactionManager;
+ import org.apache.cassandra.db.CompactionManagerMBean;
+ import org.apache.cassandra.dht.Range;
++import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.service.StorageServiceMBean;
+ import org.apache.cassandra.streaming.StreamingService;
+ import org.apache.cassandra.streaming.StreamingServiceMBean;
+@@ -250,6 +252,11 @@ else if ((rangeMap.size() > 4) && ((counter % 2) != 0))
+         return ssProxy.getLoadMap();
+     }
+ 
++    public Map<Token, Float> getOwnership()
++    {
++        return ssProxy.getOwnership();
++    }
++
+     public Iterator<Map.Entry<String, ColumnFamilyStoreMBean>> getColumnFamilyStoreMBeanProxies()
+     {
+         try

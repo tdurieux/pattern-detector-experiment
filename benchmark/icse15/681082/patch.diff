@@ -1,0 +1,217 @@
+diff --git a/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
+index 4a147377..c3693d22 100644
+--- a/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/java/trunk/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -1618,38 +1618,41 @@ public void close() throws CorruptIndexException, IOException {
+    * then return.
+    */
+   public void close(boolean waitForMerges) throws CorruptIndexException, IOException {
+-    boolean doClose;
+ 
+     // If any methods have hit OutOfMemoryError, then abort
+     // on close, in case the internal state of IndexWriter
+     // or DocumentsWriter is corrupt
+-    if (hitOOM)
+-      abort();
++    if (hitOOM) {
++      rollback();
++      return;
++    }
+ 
+-    synchronized(this) {
+       // Ensure that only one thread actually gets to do the closing:
+-      if (!closing) {
+-        doClose = true;
+-        closing = true;
+-      } else
+-        doClose = false;
+-    }
+-    if (doClose)
++    if (shouldClose())
+       closeInternal(waitForMerges);
+-    else
+-      // Another thread beat us to it (is actually doing the
+-      // close), so we will block until that other thread
+-      // has finished closing
+-      waitForClose();
+   }
+ 
+-  synchronized private void waitForClose() {
+-    while(!closed && closing) {
++  // Returns true if this thread should attempt to close, or
++  // false if IndexWriter is now closed; else, waits until
++  // another thread finishes closing
++  synchronized private boolean shouldClose() {
++    while(true) {
++      if (!closed) {
++        if (!closing) {
++          closing = true;
++          return true;
++        } else {
++          // Another thread is presently trying to close;
++          // wait until it finishes one way (closes
++          // successfully) or another (fails to close)
+       try {
+         wait();
+       } catch (InterruptedException ie) {
+       }
+     }
++      } else
++        return false;
++    }
+   }
+ 
+   private void closeInternal(boolean waitForMerges) throws CorruptIndexException, IOException {
+@@ -1702,12 +1705,10 @@ private void closeInternal(boolean waitForMerges) throws CorruptIndexException,
+       throw oom;
+     } finally {
+       synchronized(this) {
+-        if (!closed) {
+           closing = false;
+-          if (infoStream != null)
+-            message("hit exception while closing");
+-        }
+         notifyAll();
++        if (!closed && infoStream != null)
++          message("hit exception while closing");
+       }
+     }
+   }
+@@ -2614,28 +2615,18 @@ public void abort() throws IOException {
+   public void rollback() throws IOException {
+     ensureOpen();
+     if (autoCommit)
+-      throw new IllegalStateException("abort() can only be called when IndexWriter was opened with autoCommit=false");
+-
+-    boolean doClose;
+-    synchronized(this) {
+-
+-      if (pendingCommit != null) {
+-        pendingCommit.rollbackCommit(directory);
+-        deleter.decRef(pendingCommit);
+-        pendingCommit = null;
+-        notifyAll();
+-      }
++      throw new IllegalStateException("rollback() can only be called when IndexWriter was opened with autoCommit=false");
+ 
+       // Ensure that only one thread actually gets to do the closing:
+-      if (!closing) {
+-        doClose = true;
+-        closing = true;
+-      } else
+-        doClose = false;
++    if (shouldClose())
++      rollbackInternal();
+     }
+ 
+-    if (doClose) {
++  private void rollbackInternal() throws IOException {
+ 
++    boolean success = false;
++
++    try {
+       finishMerges(false);
+ 
+       // Must pre-close these two, in case they increment
+@@ -2645,6 +2636,14 @@ public void rollback() throws IOException {
+       mergeScheduler.close();
+ 
+       synchronized(this) {
++
++        if (pendingCommit != null) {
++          pendingCommit.rollbackCommit(directory);
++          deleter.decRef(pendingCommit);
++          pendingCommit = null;
++          notifyAll();
++        }
++
+         // Keep the same segmentInfos instance but replace all
+         // of its SegmentInfo instances.  This is so the next
+         // attempt to commit using this instance of IndexWriter
+@@ -2655,6 +2654,8 @@ public void rollback() throws IOException {
+         
+         docWriter.abort();
+ 
++        assert testPoint("rollback before checkpoint");
++
+         // Ask deleter to locate unreferenced files & remove
+         // them:
+         deleter.checkpoint(segmentInfos, false);
+@@ -2662,9 +2663,23 @@ public void rollback() throws IOException {
+       }
+ 
+       lastCommitChangeCount = changeCount;
++
++      success = true;
++    } catch (OutOfMemoryError oom) {
++      hitOOM = true;
++      throw oom;
++    } finally {
++      synchronized(this) {
++        if (!success) {
++          closing = false;
++          notifyAll();
++          if (infoStream != null)
++            message("hit exception during rollback");
++        }
++      }
++    }
++
+       closeInternal(false);
+-    } else
+-      waitForClose();
+   }
+ 
+   private synchronized void finishMerges(boolean waitForMerges) throws IOException {
+@@ -3561,7 +3576,7 @@ synchronized private boolean commitMerge(MergePolicy.OneMerge merge, SegmentMerg
+ 
+     assert merge.registerDone;
+ 
+-    // If merge was explicitly aborted, or, if abort() or
++    // If merge was explicitly aborted, or, if rollback() or
+     // rollbackTransaction() had been called since our merge
+     // started (which results in an unqualified
+     // deleter.refresh() call that will remove any index
+diff --git a/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java b/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
+index 295c0035..53170bc0 100644
+--- a/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
++++ b/lucene/java/trunk/src/test/org/apache/lucene/index/TestIndexWriter.java
+@@ -3731,4 +3731,38 @@ public void testPrepareCommitNoChanges() throws IOException {
+     reader.close();
+     dir.close();
+   }
++
++  // LUCENE-1347
++  public class MockIndexWriter4 extends IndexWriter {
++
++    public MockIndexWriter4(Directory dir, boolean autoCommit, Analyzer a, boolean create, MaxFieldLength mfl) throws IOException {
++      super(dir, autoCommit, a, create, mfl);
++    }
++
++    boolean doFail;
++
++    boolean testPoint(String name) {
++      if (doFail && name.equals("rollback before checkpoint"))
++        throw new RuntimeException("intentionally failing");
++      return true;
++    }
++  }
++
++  // LUCENE-1347
++  public void testRollbackExceptionHang() throws Throwable {
++    MockRAMDirectory dir = new MockRAMDirectory();
++    MockIndexWriter4 w = new MockIndexWriter4(dir, false, new WhitespaceAnalyzer(), true, IndexWriter.MaxFieldLength.LIMITED);
++
++    addDoc(w);
++    w.doFail = true;
++    try {
++      w.rollback();
++      fail("did not hit intentional RuntimeException");
++    } catch (RuntimeException re) {
++      // expected
++    }
++    
++    w.doFail = false;
++    w.rollback();
++  }
+ }

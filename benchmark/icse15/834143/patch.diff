@@ -1,0 +1,538 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingConfig.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingConfig.java
+index 4df69f61..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingConfig.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingConfig.java
+@@ -1,92 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.net;
+-
+-public class MessagingConfig
+-{
+-    // The expected time for one message round trip.  It does not reflect message processing
+-    // time at the receiver.
+-    private static int expectedRoundTripTime_ = 400;
+-    private static int numberOfPorts_ = 2;
+-    private static int threadCount_ = 4;
+-
+-    public static int getMessagingThreadCount()
+-    {
+-        return threadCount_;
+-    }
+-
+-    public static void setMessagingThreadCount(int threadCount)
+-    {
+-        threadCount_ = threadCount;
+-    }
+-
+-    public static void setExpectedRoundTripTime(int roundTripTimeMillis) {
+-    	if(roundTripTimeMillis > 0 )
+-    		expectedRoundTripTime_ = roundTripTimeMillis;
+-    }
+-
+-    public static int getExpectedRoundTripTime()
+-    {
+-        return expectedRoundTripTime_;
+-    }
+-
+-    public static int getConnectionPoolInitialSize()
+-    {
+-        return ConnectionPoolConfiguration.initialSize_;
+-    }
+-
+-    public static int getConnectionPoolGrowthFactor()
+-    {
+-        return ConnectionPoolConfiguration.growthFactor_;
+-    }
+-
+-    public static int getConnectionPoolMaxSize()
+-    {
+-        return ConnectionPoolConfiguration.maxSize_;
+-    }
+-
+-    public static int getConnectionPoolWaitTimeout()
+-    {
+-        return ConnectionPoolConfiguration.waitTimeout_;
+-    }
+-
+-    public static int getConnectionPoolMonitorInterval()
+-    {
+-        return ConnectionPoolConfiguration.monitorInterval_;
+-    }
+-
+-    public static void setNumberOfPorts(int n)
+-    {
+-        numberOfPorts_ = n;
+-    }
+-
+-    public static int getNumberOfPorts()
+-    {
+-        return numberOfPorts_;
+-    }
+-}
+-
+-class ConnectionPoolConfiguration
+-{
+-    public static int initialSize_ = 1;
+-    public static int growthFactor_ = 1;
+-    public static int maxSize_ = 1;
+-    public static int waitTimeout_ = 10;
+-    public static int monitorInterval_ = 300;
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index 20a0d2b8..70e68556 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -91,6 +91,8 @@
+     
+     private static IMessagingService messagingService_ = new MessagingService();
+ 
++    private static final int MESSAGE_DESERIALIZE_THREADS = 4;
++
+     public static int getVersion()
+     {
+         return version_;
+@@ -137,7 +139,7 @@ protected MessagingService()
+          * which is the sum of the threads in the pool that adds shit into the table and the 
+          * pool that retrives the callback from here.
+         */ 
+-        int maxSize = MessagingConfig.getMessagingThreadCount();
++        int maxSize = MESSAGE_DESERIALIZE_THREADS;
+         callbackMap_ = new Cachetable<String, IAsyncCallback>( 2 * DatabaseDescriptor.getRpcTimeout() );
+         taskCompletionMap_ = new Cachetable<String, IAsyncResult>( 2 * DatabaseDescriptor.getRpcTimeout() );        
+         
+@@ -224,9 +226,7 @@ public static TcpConnectionManager getConnectionPool(InetAddress from, InetAddre
+                 cp = poolTable_.get(key);
+                 if (cp == null )
+                 {
+-                    cp = new TcpConnectionManager(MessagingConfig.getConnectionPoolInitialSize(), 
+-                            MessagingConfig.getConnectionPoolGrowthFactor(), 
+-                            MessagingConfig.getConnectionPoolMaxSize(), from, to);
++                    cp = new TcpConnectionManager(from, to);
+                     poolTable_.put(key, cp);
+                 }
+             }
+@@ -238,9 +238,9 @@ public static TcpConnectionManager getConnectionPool(InetAddress from, InetAddre
+         return cp;
+     }
+ 
+-    public static TcpConnection getConnection(InetAddress from, InetAddress to) throws IOException
++    public static TcpConnection getConnection(InetAddress from, InetAddress to, Message msg) throws IOException
+     {
+-        return getConnectionPool(from, to).getConnection();
++        return getConnectionPool(from, to).getConnection(msg);
+     }
+     
+     private void checkForReservedVerb(String type)
+@@ -340,7 +340,7 @@ public void sendOneWay(Message message, InetAddress to)
+             {
+                 return;
+             }
+-            connection = MessagingService.getConnection(processedMessage.getFrom(), to);
++            connection = MessagingService.getConnection(processedMessage.getFrom(), to, message);
+             connection.write(message);
+         }
+         catch (SocketException se)
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+index 83c534be..8d68b943 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnection.java
+@@ -68,12 +68,10 @@
+     private Lock lock_;
+     private Condition condition_;
+     
+-    // used from getConnection - outgoing
+-    TcpConnection(TcpConnectionManager pool, InetAddress from, InetAddress to) throws IOException
++    private TcpConnection(InetAddress from, InetAddress to, TcpConnectionManager pool, boolean streaming) throws IOException
+     {          
+         socketChannel_ = SocketChannel.open();            
+         socketChannel_.configureBlocking(false);        
+-        pool_ = pool;
+         
+         localEp_ = from;
+         remoteEp_ = to;
+@@ -86,6 +84,24 @@
+         {
+             key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_READ);
+         }
++
++        if ((pool != null && streaming) || (pool == null && !streaming))
++            throw new RuntimeException("Invalid configuration. You must either specify a pool or streaming, not both or neither.");
++
++        if (pool != null)
++            pool_ = pool;
++        if (streaming)
++        {
++            bStream_ = true;
++            lock_ = new ReentrantLock();
++            condition_ = lock_.newCondition();
++        }
++    }
++    
++    // used from getConnection - outgoing
++    TcpConnection(TcpConnectionManager pool, InetAddress from, InetAddress to) throws IOException
++    {          
++        this(from, to, pool, false);
+     }
+     
+     /*
+@@ -93,23 +109,7 @@
+     */
+     TcpConnection(InetAddress from, InetAddress to) throws IOException
+     {
+-        socketChannel_ = SocketChannel.open();               
+-        socketChannel_.configureBlocking(false);       
+-        
+-        localEp_ = from;
+-        remoteEp_ = to;
+-        
+-        if (!socketChannel_.connect(new InetSocketAddress(remoteEp_, DatabaseDescriptor.getStoragePort())))
+-        {
+-            key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_CONNECT);
+-        }
+-        else
+-        {
+-            key_ = SelectorManager.getSelectorManager().register(socketChannel_, this, SelectionKey.OP_READ);
+-        }
+-        bStream_ = true;
+-        lock_ = new ReentrantLock();
+-        condition_ = lock_.newCondition();
++        this(from, to, null, true);
+     }
+     
+     /*
+@@ -136,26 +136,12 @@ private void registerReadInterest() throws IOException
+         localEp_ = localEp;
+     }
+     
+-    InetAddress getLocalEp()
+-    {
+-        return localEp_;
+-    }
+-    
+-    public void setLocalEp(InetAddress localEp)
+-    {
+-        localEp_ = localEp;
+-    }
+ 
+     public InetAddress getEndPoint()
+     {
+         return remoteEp_;
+     }
+     
+-    public boolean isIncoming()
+-    {
+-        return isIncoming_;
+-    }    
+-    
+     public SocketChannel getSocketChannel()
+     {
+         return socketChannel_;
+@@ -274,8 +260,6 @@ private void resumeStreaming()
+     public void close()
+     {
+         inUse_ = false;
+-        if ( pool_.contains(this) )
+-            pool_.decUsed();               
+     }
+ 
+     public boolean isConnected()
+@@ -305,10 +289,6 @@ public String toString()
+     void closeSocket()
+     {
+         logger_.warn("Closing down connection " + socketChannel_ + " with " + pendingWrites_.size() + " writes remaining.");            
+-        if ( pool_ != null )
+-        {
+-            pool_.removeConnection(this);
+-        }
+         cancel(key_);
+         pendingWrites_.clear();
+     }
+@@ -319,10 +299,7 @@ void errorClose()
+         pendingWrites_.clear();
+         cancel(key_);
+         pendingWrites_.clear();        
+-        if ( pool_ != null )
+-        {
+-            pool_.removeConnection(this);            
+-        }
++        pool_.destroy(this);
+     }
+     
+     private void cancel(SelectionKey key)
+@@ -456,9 +433,6 @@ public void run()
+                         if (remoteEp_ == null)
+                         {
+                             remoteEp_ = socketChannel_.socket().getInetAddress();
+-                            // put connection into pool if possible
+-                            pool_ = MessagingService.getConnectionPool(localEp_, remoteEp_);                            
+-                            pool_.addToPool(TcpConnection.this);                            
+                         }
+                         
+                         /* Deserialize and handle the message */
+@@ -497,11 +471,6 @@ private void handleException(Throwable th)
+         }
+     }
+     
+-    public int pending()
+-    {
+-        return pendingWrites_.size();
+-    }
+-    
+     public int compareTo(Object o)
+     {
+         if (o instanceof TcpConnection) 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnectionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnectionManager.java
+index 7cbbde36..444e91e9 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnectionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/net/TcpConnectionManager.java
+@@ -27,205 +27,61 @@
+ 
+ class TcpConnectionManager
+ {
+-    private Lock lock_ = new ReentrantLock();
+-    private List<TcpConnection> allConnections_;
+     private InetAddress localEp_;
+     private InetAddress remoteEp_;
+-    private int maxSize_;
++    private TcpConnection cmdCon;
++    private TcpConnection ackCon;
+ 
+-    private int inUse_;
+-
+-    // TODO! this whole thing is a giant no-op, since "contains" only relies on TcpConnection.equals, which
+-    // is true for any (local, remote) pairs.  So there is only ever at most one TcpConnection per Manager!
+-    TcpConnectionManager(int initialSize, int growthFactor, int maxSize, InetAddress localEp, InetAddress remoteEp)
++    TcpConnectionManager(InetAddress localEp, InetAddress remoteEp)
+     {
+-        maxSize_ = maxSize;
+         localEp_ = localEp;
+         remoteEp_ = remoteEp;
+-        allConnections_ = new ArrayList<TcpConnection>();
+     }
+ 
+-    /**
+-     * returns the least loaded connection to remoteEp, creating a new connection if necessary
+-     */
+-    TcpConnection getConnection() throws IOException
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            if (allConnections_.isEmpty())
++    private TcpConnection newCon() throws IOException
+             {
+-                TcpConnection conn = new TcpConnection(this, localEp_, remoteEp_);
+-                addToPool(conn);
+-                conn.inUse_ = true;
+-                incUsed();
+-                return conn;
++        TcpConnection con = new TcpConnection(this, localEp_, remoteEp_);
++        con.inUse_ = true;
++        return con;
+             }
+ 
+-            TcpConnection least = getLeastLoaded();
+-
+-            if ((least != null && least.pending() == 0) || allConnections_.size() == maxSize_)
++    /**
++     * returns the appropriate connection based on message type.
++     */
++    synchronized TcpConnection getConnection(Message msg) throws IOException
+             {
+-                least.inUse_ = true;
+-                incUsed();
+-                return least;
+-            }
+-
+-            TcpConnection connection = new TcpConnection(this, localEp_, remoteEp_);
+-            if (!contains(connection))
++        if (MessagingService.responseStage_.equals(msg.getMessageType()))
+             {
+-                addToPool(connection);
+-                connection.inUse_ = true;
+-                incUsed();
+-                return connection;
++            if (ackCon == null)
++                ackCon = newCon();
++            return ackCon;
+             }
+             else
+             {
+-                connection.closeSocket();
+-                return getLeastLoaded();
+-            }
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-    }
+-
+-    protected TcpConnection getLeastLoaded()
+-    {
+-        TcpConnection connection = null;
+-        lock_.lock();
+-        try
+-        {
+-            Collections.sort(allConnections_);
+-            connection = (allConnections_.size() > 0) ? allConnections_.get(0) : null;
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-        return connection;
+-    }
+-
+-    void removeConnection(TcpConnection connection)
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            allConnections_.remove(connection);
+-        }
+-        finally
+-        {
+-            lock_.unlock();
++            if (cmdCon == null)
++                cmdCon = newCon();
++            return cmdCon;
+         }
+     }
+ 
+-    void incUsed()
++    synchronized void shutdown()
+     {
+-        inUse_++;
++        for (TcpConnection con : new TcpConnection[] { cmdCon, ackCon })
++            if (con != null)
++                con.closeSocket();
+     }
+ 
+-    void decUsed()
++    synchronized void destroy(TcpConnection con)
+     {
+-        inUse_--;
+-    }
+-
+-    int getConnectionsInUse()
++        assert con != null;
++        if (cmdCon == con)
+     {
+-        return inUse_;
+-    }
+-
+-    void addToPool(TcpConnection connection)
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            if (contains(connection))
+-                return;
+-
+-            if (allConnections_.size() < maxSize_)
+-            {
+-                allConnections_.add(connection);
++            cmdCon = null;
+             }
+             else
+             {
+-                connection.closeSocket();
+-            }
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-    }
+-
+-    void shutdown()
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            while (allConnections_.size() > 0)
+-            {
+-                TcpConnection connection = allConnections_.remove(0);
+-                connection.closeSocket();
+-            }
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-    }
+-
+-    int getPoolSize()
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            return allConnections_.size();
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-    }
+-
+-    InetAddress getLocalEndPoint()
+-    {
+-        return localEp_;
+-    }
+-
+-    InetAddress getRemoteEndPoint()
+-    {
+-        return remoteEp_;
+-    }
+-
+-    int getPendingWrites()
+-    {
+-        int total = 0;
+-        lock_.lock();
+-        try
+-        {
+-            for (TcpConnection connection : allConnections_)
+-            {
+-                total += connection.pending();
+-            }
+-        }
+-        finally
+-        {
+-            lock_.unlock();
+-        }
+-        return total;
+-    }
+-
+-    boolean contains(TcpConnection connection)
+-    {
+-        lock_.lock();
+-        try
+-        {
+-            return allConnections_.contains(connection);
+-        }
+-        finally
+-        {
+-            lock_.unlock();
++            assert ackCon == con;
++            ackCon = null;
+         }
+     }
+ }

@@ -1,0 +1,375 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableScheduledThreadPoolExecutor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableScheduledThreadPoolExecutor.java
+index 622c4629..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableScheduledThreadPoolExecutor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableScheduledThreadPoolExecutor.java
+@@ -1,56 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.concurrent;
+-
+-import java.util.concurrent.*;
+-
+-import org.apache.cassandra.utils.LogUtil;
+-import org.apache.log4j.Logger;
+-import org.apache.cassandra.utils.*;
+-
+-/**
+- * This is a wrapper class for the <i>ScheduledThreadPoolExecutor</i>. It provides an implementation
+- * for the <i>afterExecute()</i> found in the <i>ThreadPoolExecutor</i> class to log any unexpected 
+- * Runtime Exceptions.
+- */
+-public final class DebuggableScheduledThreadPoolExecutor extends ScheduledThreadPoolExecutor
+-{
+-    private static Logger logger_ = Logger.getLogger(DebuggableScheduledThreadPoolExecutor.class);
+-    
+-    public DebuggableScheduledThreadPoolExecutor(int threads,
+-            ThreadFactory threadFactory)
+-    {
+-        super(threads, threadFactory);        
+-    }
+-    
+-    /**
+-     *  (non-Javadoc)
+-     * @see java.util.concurrent.ThreadPoolExecutor#afterExecute(java.lang.Runnable, java.lang.Throwable)
+-     */
+-    public void afterExecute(Runnable r, Throwable t)
+-    {
+-        super.afterExecute(r,t);
+-
+-        DebuggableThreadPoolExecutor.logFutureExceptions(r);
+-        if (t != null)
+-        {
+-            logger_.error("Error in ThreadPoolExecutor", t);
+-        }
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java
+index d8cda7f8..3280168a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/concurrent/DebuggableThreadPoolExecutor.java
+@@ -68,31 +68,16 @@ public long getPendingTasks()
+         return getTaskCount() - getCompletedTaskCount();
+     }
+ 
+-    /*
+-     * 
+-     *  (non-Javadoc)
+-     * @see java.util.concurrent.ThreadPoolExecutor#afterExecute(java.lang.Runnable, java.lang.Throwable)
+-     * Helps us in figuring out why sometimes the threads are getting 
+-     * killed and replaced by new ones.
+-     */
+     public void afterExecute(Runnable r, Throwable t)
+     {
+         super.afterExecute(r,t);
+ 
+-        logFutureExceptions(r);
+-        if (t != null)
+-        {
+-            logger_.error("Error in ThreadPoolExecutor", t);
+-        }
+-    }
+-
+-    public static void logFutureExceptions(Runnable r)
+-    {
++        // exceptions wrapped by FutureTask
+         if (r instanceof FutureTask)
+         {
+             try
+             {
+-                ((FutureTask)r).get();
++                ((FutureTask) r).get();
+             }
+             catch (InterruptedException e)
+             {
+@@ -103,5 +88,12 @@ public static void logFutureExceptions(Runnable r)
+                 logger_.error("Error in executor futuretask", e);
+             }
+         }
++
++        // exceptions for non-FutureTask runnables [i.e., added via execute() instead of submit()]
++        if (t != null)
++        {
++            logger_.error("Error in ThreadPoolExecutor", t);
++        }
+     }
++
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index 8efdc115..c7c696a5 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -85,6 +85,7 @@
+                                                new LinkedBlockingQueue<Runnable>(),
+                                                new NamedThreadFactory("FLUSH-WRITER-POOL"));
+     private static ExecutorService commitLogUpdater_ = new DebuggableThreadPoolExecutor("MEMTABLE-POST-FLUSHER");
++    private static Timer flushTimer_ = new Timer("FLUSH-TIMER");
+ 
+     private final String table_;
+     public final String columnFamily_;
+@@ -218,14 +219,27 @@ void onStart() throws IOException
+         // schedule hinted handoff
+         if (table_.equals(Table.SYSTEM_TABLE) && columnFamily_.equals(HintedHandOffManager.HINTS_CF))
+         {
+-            HintedHandOffManager.instance().submit(this);
++            HintedHandOffManager.instance().scheduleHandoffsFor(this);
+         }
+ 
+         // schedule periodic flusher if required
+-        int flushPeriod = DatabaseDescriptor.getFlushPeriod(table_, columnFamily_);
+-        if (flushPeriod > 0)
++        int flushPeriodMS = DatabaseDescriptor.getFlushPeriod(table_, columnFamily_) * 60 * 1000;
++        if (flushPeriodMS > 0)
+         {
+-            PeriodicFlushManager.instance().submitPeriodicFlusher(this, flushPeriod);
++            flushTimer_.schedule(new TimerTask()
++            {
++                public void run()
++                {
++                    try
++                    {
++                        forceFlush();
++                    }
++                    catch (IOException e)
++                    {
++                        throw new RuntimeException(e);
++                    }
++                }
++            }, flushPeriodMS, flushPeriodMS);
+         }
+     }
+ 
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+index 5625b15b..e8ebcb72 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CompactionManager.java
+@@ -22,20 +22,19 @@
+ import java.lang.management.ManagementFactory;
+ import java.util.List;
+ import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Future;
+-import java.util.concurrent.ScheduledExecutorService;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ import javax.management.MBeanServer;
+ import javax.management.ObjectName;
+ 
+-import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.NamedThreadFactory;
++import org.apache.log4j.Logger;
++
++import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.cassandra.dht.Range;
+-import org.apache.cassandra.net.EndPoint;
+ import org.apache.cassandra.io.SSTableReader;
+-
+-import org.apache.log4j.Logger;
++import org.apache.cassandra.net.EndPoint;
+ 
+ public class CompactionManager implements CompactionManagerMBean
+ {
+@@ -159,7 +158,7 @@ public void run()
+     }
+     
+     
+-    private ScheduledExecutorService compactor_ = new DebuggableScheduledThreadPoolExecutor(1, new NamedThreadFactory("COMPACTION-POOL"));
++    private ExecutorService compactor_ = new DebuggableThreadPoolExecutor("COMPACTION-POOL");
+ 
+     /**
+      * Call this whenever a compaction might be needed on the given columnfamily.
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+index 4ae87e2a..6f070469 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/HintedHandOffManager.java
+@@ -19,17 +19,18 @@
+ package org.apache.cassandra.db;
+ 
+ import java.util.Collection;
+-import java.util.concurrent.ScheduledExecutorService;
++import java.util.Timer;
++import java.util.TimerTask;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.TimeoutException;
++import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.locks.Lock;
+ import java.util.concurrent.locks.ReentrantLock;
+ import java.io.IOException;
+ 
+ import org.apache.log4j.Logger;
+ 
+-import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+-import org.apache.cassandra.concurrent.NamedThreadFactory;
++import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.cassandra.config.DatabaseDescriptor;
+ import org.apache.cassandra.gms.FailureDetector;
+ import org.apache.cassandra.net.EndPoint;
+@@ -54,8 +55,9 @@
+     private static HintedHandOffManager instance_;
+     private static Lock lock_ = new ReentrantLock();
+     private static Logger logger_ = Logger.getLogger(HintedHandOffManager.class);
+-    final static long intervalInMins_ = 60;
+-    private ScheduledExecutorService executor_ = new DebuggableScheduledThreadPoolExecutor(1, new NamedThreadFactory("HINTED-HANDOFF-POOL"));
++    final static long INTERVAL_IN_MS = 3600 * 1000;
++    private ExecutorService executor_ = new DebuggableThreadPoolExecutor("HINTED-HANDOFF-POOL");
++    Timer timer = new Timer("HINTED-HANDOFF-TIMER");
+     public static final String HINTS_CF = "HintsColumnFamily";
+ 
+ 
+@@ -234,9 +236,9 @@ private static void deliverHintsToEndpoint(EndPoint endPoint) throws IOException
+           logger_.debug("Finished hinted handoff for endpoint " + endPoint.getHost());
+     }
+ 
+-    public void submit(final ColumnFamilyStore columnFamilyStore)
++    public void scheduleHandoffsFor(final ColumnFamilyStore columnFamilyStore)
+     {
+-        Runnable r = new Runnable()
++        final Runnable r = new Runnable()
+         {
+             public void run()
+             {
+@@ -250,7 +252,13 @@ public void run()
+                 }
+             }
+         };
+-    	executor_.scheduleWithFixedDelay(r, HintedHandOffManager.intervalInMins_, HintedHandOffManager.intervalInMins_, TimeUnit.MINUTES);
++        timer.schedule(new TimerTask()
++        {
++            public void run()
++            {
++                executor_.execute(r);
++            }
++        }, INTERVAL_IN_MS, INTERVAL_IN_MS);
+     }
+ 
+     /*
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/PeriodicFlushManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/PeriodicFlushManager.java
+index 11bd2e30..e69de29b 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/PeriodicFlushManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/PeriodicFlushManager.java
+@@ -1,77 +0,0 @@
+-/**
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-package org.apache.cassandra.db;
+-
+-import java.util.concurrent.ScheduledExecutorService;
+-import java.util.concurrent.TimeUnit;
+-import java.util.concurrent.locks.Lock;
+-import java.util.concurrent.locks.ReentrantLock;
+-import java.io.IOException;
+-
+-import org.apache.log4j.Logger;
+-
+-import org.apache.cassandra.concurrent.*;
+-
+-/**
+- *  Background flusher that force-flushes a column family periodically.
+- */
+-class PeriodicFlushManager
+-{
+-    private static Logger logger_ = Logger.getLogger(PeriodicFlushManager.class);
+-    private static PeriodicFlushManager instance_;
+-    private static Lock lock_ = new ReentrantLock();
+-    private ScheduledExecutorService flusher_ = new DebuggableScheduledThreadPoolExecutor(1, new NamedThreadFactory("PERIODIC-FLUSHER-POOL"));
+-
+-    public static PeriodicFlushManager instance()
+-    {
+-        if ( instance_ == null )
+-        {
+-            lock_.lock();
+-            try
+-            {
+-                if ( instance_ == null )
+-                    instance_ = new PeriodicFlushManager();
+-            }
+-            finally
+-            {
+-                lock_.unlock();
+-            }
+-        }
+-        return instance_;
+-    }
+-
+-    public void submitPeriodicFlusher(final ColumnFamilyStore columnFamilyStore, int flushPeriodInMinutes)
+-    {        
+-        Runnable runnable= new Runnable()
+-        {
+-            public void run()
+-            {
+-                try
+-                {
+-                    columnFamilyStore.forceFlush();
+-                }
+-                catch (IOException e)
+-                {
+-                    throw new RuntimeException(e);
+-                }
+-            }
+-        };
+-        flusher_.scheduleWithFixedDelay(runnable, flushPeriodInMinutes, flushPeriodInMinutes, TimeUnit.MINUTES);       
+-    }
+-}
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageLoadBalancer.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+index 65b61d4b..53ecdd1a 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/service/StorageLoadBalancer.java
+@@ -22,16 +22,13 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.ScheduledThreadPoolExecutor;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ import org.apache.log4j.Logger;
+ 
+-import org.apache.cassandra.concurrent.DebuggableScheduledThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.DebuggableThreadPoolExecutor;
+ import org.apache.cassandra.concurrent.SingleThreadedStage;
+ import org.apache.cassandra.concurrent.StageManager;
+-import org.apache.cassandra.concurrent.NamedThreadFactory;
+ import org.apache.cassandra.dht.Token;
+ import org.apache.cassandra.gms.ApplicationState;
+ import org.apache.cassandra.gms.EndPointState;
+@@ -184,10 +181,7 @@ public void doVerb(Message message)
+     /* This map is a clone of the one above and is used for various calculations during LB operation */
+     private Map<EndPoint, LoadInfo> loadInfo2_ = new HashMap<EndPoint, LoadInfo>();
+     /* This thread pool is used for initiating load balancing operations */
+-    private ScheduledThreadPoolExecutor lb_ = new DebuggableScheduledThreadPoolExecutor(
+-            1,
+-            new NamedThreadFactory("LB-OPERATIONS")
+-            );
++    private ExecutorService lb_ = new DebuggableThreadPoolExecutor("LB-OPERATIONS");
+     /* This thread pool is used by target node to leave the ring. */
+     private ExecutorService lbOperations_ = new DebuggableThreadPoolExecutor("LB-TARGET");
+ 

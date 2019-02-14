@@ -1,0 +1,156 @@
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/avro/CassandraServer.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/avro/CassandraServer.java
+index 36213928..0a780261 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/avro/CassandraServer.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/avro/CassandraServer.java
+@@ -691,7 +691,7 @@ public CharSequence system_update_column_family(CfDef cf_def) throws AvroRemoteE
+         
+         try
+         {
+-            oldCfm.apply(cf_def);
++            CFMetaData.applyImplicitDefaults(cf_def);
+             UpdateColumnFamily update = new UpdateColumnFamily(cf_def);
+             applyMigrationOnStage(update);
+             return DatabaseDescriptor.getDefsVersion().toString();
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/CFMetaData.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/CFMetaData.java
+index 59ec9f5a..f782b401 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/CFMetaData.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/config/CFMetaData.java
+@@ -30,6 +30,7 @@
+ import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.apache.avro.util.Utf8;
++import org.apache.cassandra.avro.CfDef;
+ import org.apache.cassandra.avro.ColumnDef;
+ import org.apache.cassandra.db.ColumnFamilyType;
+ import org.apache.cassandra.db.HintedHandOffManager;
+@@ -585,6 +586,25 @@ public AbstractType getValueValidator(ByteBuffer column)
+         return validator;
+     }
+     
++    /** applies implicit defaults to cf definition. useful in updates */
++    public static void applyImplicitDefaults(org.apache.cassandra.avro.CfDef cf_def)
++    {
++        if (cf_def.min_compaction_threshold == null)
++            cf_def.min_compaction_threshold = CFMetaData.DEFAULT_MIN_COMPACTION_THRESHOLD;
++        if (cf_def.max_compaction_threshold == null)
++            cf_def.max_compaction_threshold = CFMetaData.DEFAULT_MAX_COMPACTION_THRESHOLD;
++        if (cf_def.row_cache_save_period_in_seconds == null)
++            cf_def.row_cache_save_period_in_seconds = CFMetaData.DEFAULT_ROW_CACHE_SAVE_PERIOD_IN_SECONDS;
++        if (cf_def.key_cache_save_period_in_seconds == null)
++            cf_def.key_cache_save_period_in_seconds = CFMetaData.DEFAULT_KEY_CACHE_SAVE_PERIOD_IN_SECONDS;
++        if (cf_def.memtable_flush_after_mins == null)
++            cf_def.memtable_flush_after_mins = CFMetaData.DEFAULT_MEMTABLE_LIFETIME_IN_MINS;
++        if (cf_def.memtable_throughput_in_mb == null)
++            cf_def.memtable_throughput_in_mb = CFMetaData.DEFAULT_MEMTABLE_THROUGHPUT_IN_MB;
++        if (cf_def.memtable_operations_in_millions == null)
++            cf_def.memtable_operations_in_millions = CFMetaData.DEFAULT_MEMTABLE_OPERATIONS_IN_MILLIONS; 
++    }
++    
+     /** applies implicit defaults to cf definition. useful in updates */
+     public static void applyImplicitDefaults(org.apache.cassandra.thrift.CfDef cf_def) 
+     {
+@@ -751,7 +771,7 @@ else if (subcolumnComparator != DatabaseDescriptor.getComparator(cf_def.subcompa
+         {
+             org.apache.cassandra.avro.ColumnDef tcd = new org.apache.cassandra.avro.ColumnDef();
+             tcd.index_name = cd.getIndexName();
+-            tcd.index_type = org.apache.cassandra.avro.IndexType.valueOf(cd.getIndexType().name());
++            tcd.index_type = cd.getIndexType() == null ? null : org.apache.cassandra.avro.IndexType.valueOf(cd.getIndexType().name());
+             tcd.name = ByteBufferUtil.clone(cd.name);
+             tcd.validation_class = cd.validator.getClass().getName();
+             column_meta.add(tcd);
+diff --git a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
+index 9835afc0..74de8035 100644
+--- a/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
++++ b/cassandra/branches/cassandra-0.7/src/java/org/apache/cassandra/db/migration/UpdateColumnFamily.java
+@@ -39,6 +39,7 @@
+ /** todo: doesn't work with secondary indices yet. See CASSANDRA-1415. */
+ public class UpdateColumnFamily extends Migration
+ {
++    // does not point to a CFM stored in DatabaseDescriptor.
+     private CFMetaData metadata;
+     
+     protected UpdateColumnFamily() { }
+@@ -53,11 +54,15 @@ public UpdateColumnFamily(org.apache.cassandra.avro.CfDef cf_def) throws Configu
+             throw new ConfigurationException("Keyspace does not already exist.");
+         
+         CFMetaData oldCfm = DatabaseDescriptor.getCFMetaData(CFMetaData.getId(cf_def.keyspace.toString(), cf_def.name.toString()));
+-        oldCfm.apply(cf_def); 
+-        this.metadata = oldCfm;
+         
+-        // clone ksm but include the new cf def.
+-        rm = Migration.makeDefinitionMutation(ksm, null, newVersion);
++        // create a copy of the old CF meta data. Apply new settings on top of it.
++        this.metadata = CFMetaData.inflate(oldCfm.deflate());
++        this.metadata.apply(cf_def);
++        
++        // create a copy of the old KS meta data. Use it to create a RowMutation that gets applied to schema and migrations.
++        KSMetaData newKsMeta = KSMetaData.inflate(ksm.deflate());
++        newKsMeta.cfMetaData().get(cf_def.name.toString()).apply(cf_def);
++        rm = Migration.makeDefinitionMutation(newKsMeta, null, newVersion);
+     }
+     
+     public void beforeApplyModels()
+@@ -70,7 +75,16 @@ public void beforeApplyModels()
+ 
+     void applyModels() throws IOException
+     {
+-        logger.debug("Updating " + metadata + " to " + metadata);
++        logger.debug("Updating " + DatabaseDescriptor.getCFMetaData(metadata.cfId) + " to " + metadata);
++        // apply the meta update.
++        try 
++        {
++            DatabaseDescriptor.getCFMetaData(metadata.cfId).apply(CFMetaData.convertToAvro(metadata));
++        } 
++        catch (ConfigurationException ex) 
++        {
++            throw new IOException(ex);
++        }
+         DatabaseDescriptor.setTableDefinition(null, newVersion);
+ 
+         if (!clientMode)
+diff --git a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/DefsTest.java b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/DefsTest.java
+index 925f6196..05bcaf49 100644
+--- a/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/cassandra/branches/cassandra-0.7/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -34,6 +34,8 @@
+ import java.util.UUID;
+ import java.util.concurrent.ExecutionException;
+ 
++import org.apache.avro.Schema;
++import org.apache.avro.util.Utf8;
+ import org.apache.cassandra.CleanupHelper;
+ import org.apache.cassandra.Util;
+ import org.apache.cassandra.config.CFMetaData;
+@@ -54,6 +56,7 @@
+ import org.apache.cassandra.db.migration.RenameKeyspace;
+ import org.apache.cassandra.db.migration.UpdateColumnFamily;
+ import org.apache.cassandra.db.migration.UpdateKeyspace;
++import org.apache.cassandra.io.SerDeUtils;
+ import org.apache.cassandra.locator.OldNetworkTopologyStrategy;
+ import org.apache.cassandra.locator.SimpleStrategy;
+ import org.apache.cassandra.thrift.CfDef;
+@@ -67,6 +70,24 @@
+ 
+ public class DefsTest extends CleanupHelper
+ {   
++    @Test
++    public void testZeroInjection() throws IOException
++    {
++        org.apache.cassandra.avro.CfDef cd = new org.apache.cassandra.avro.CfDef();
++        // populate only fields that must be non-null.
++        cd.keyspace = new Utf8("Lest Ks");
++        cd.name = new Utf8("Mest Cf");
++        
++        org.apache.cassandra.avro.CfDef cd2 = SerDeUtils.deserializeWithSchema(SerDeUtils.serializeWithSchema(cd), new org.apache.cassandra.avro.CfDef());
++        assert cd.equals(cd2);
++        // make sure some of the fields didn't get unexpected zeros put in during [de]serialize operations.
++        assert cd.min_compaction_threshold == null;
++        assert cd2.min_compaction_threshold == null;
++        assert cd.row_cache_save_period_in_seconds == null;
++        assert cd2.row_cache_save_period_in_seconds == null;
++        
++    }
++    
+     @Test
+     public void ensureStaticCFMIdsAreLessThan1000()
+     {

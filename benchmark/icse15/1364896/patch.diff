@@ -1,0 +1,125 @@
+diff --git a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
+index 05aa9b4d..97d447dc 100644
+--- a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
++++ b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/ConcurrentMergeScheduler.java
+@@ -243,8 +243,10 @@ public void close() {
+     sync();
+   }
+ 
+-  /** Wait for any running merge threads to finish */
++  /** Wait for any running merge threads to finish. This call is not interruptible as used by {@link #close()}. */
+   public void sync() {
++    boolean interrupted = false;
++    try {
+     while (true) {
+       MergeThread toSync = null;
+       synchronized (this) {
+@@ -259,12 +261,17 @@ public void sync() {
+         try {
+           toSync.join();
+         } catch (InterruptedException ie) {
+-          throw new ThreadInterruptedException(ie);
++            // ignore this Exception, we will retry until all threads are dead
++            interrupted = true;
+         }
+       } else {
+         break;
+       }
+     }
++    } finally {
++      // finally, restore interrupt status:
++      if (interrupted) Thread.currentThread().interrupt();
++    }
+   }
+ 
+   /**
+diff --git a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+index 409a8f53..aeeb69d4 100644
+--- a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
++++ b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/IndexWriter.java
+@@ -842,7 +842,7 @@ public void close(boolean waitForMerges) throws IOException {
+         if (hitOOM) {
+           rollbackInternal();
+         } else {
+-          closeInternal(waitForMerges, !hitOOM);
++          closeInternal(waitForMerges, true);
+         }
+       }
+     }
+@@ -870,7 +870,7 @@ synchronized private boolean shouldClose() {
+   }
+ 
+   private void closeInternal(boolean waitForMerges, boolean doFlush) throws IOException {
+-
++    boolean interrupted = Thread.interrupted();
+     try {
+ 
+       if (pendingCommit != null) {
+@@ -891,17 +891,35 @@ private void closeInternal(boolean waitForMerges, boolean doFlush) throws IOExce
+         docWriter.abort(); // already closed
+       }
+ 
+-      if (waitForMerges)
++      if (waitForMerges) {
++        try {
+         // Give merge scheduler last chance to run, in case
+         // any pending merges are waiting:
+         mergeScheduler.merge(this);
++        } catch (ThreadInterruptedException tie) {
++          // ignore any interruption, does not matter
++          interrupted = true;
++        }
++      }
+ 
+       mergePolicy.close();
+ 
+       synchronized(this) {
+-        finishMerges(waitForMerges);
++        for (;;) {
++          try {
++            finishMerges(waitForMerges && !interrupted);
++            break;
++          } catch (ThreadInterruptedException tie) {
++            // by setting the interrupted status, the
++            // next call to finishMerges will pass false,
++            // so it will not wait
++            interrupted = true;
++          }
++        }
+         stopMerges = true;
+       }
++      
++      // shutdown scheduler and all threads (this call is not interruptible):
+       mergeScheduler.close();
+ 
+       if (infoStream.isEnabled("IW")) {
+@@ -943,6 +961,8 @@ private void closeInternal(boolean waitForMerges, boolean doFlush) throws IOExce
+           }
+         }
+       }
++      // finally, restore interrupt status:
++      if (interrupted) Thread.currentThread().interrupt();
+     }
+   }
+ 
+diff --git a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java
+index 7be73ff2..23978969 100644
+--- a/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java
++++ b/lucene/dev/trunk/lucene/core/src/java/org/apache/lucene/index/MergeScheduler.java
+@@ -17,6 +17,7 @@
+  * limitations under the License.
+  */
+ 
++import java.io.Closeable;
+ import java.io.IOException;
+ 
+ /** <p>Expert: {@link IndexWriter} uses an instance
+@@ -26,7 +27,7 @@
+  *
+  * @lucene.experimental
+ */
+-public abstract class MergeScheduler {
++public abstract class MergeScheduler implements Closeable {
+ 
+   /** Run the merges provided by {@link IndexWriter#getNextMerge()}. */
+   public abstract void merge(IndexWriter writer) throws IOException;

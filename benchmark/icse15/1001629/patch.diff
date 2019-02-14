@@ -1,0 +1,187 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+index fadbb5c1..647fd4aa 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/FileStreamTask.java
+@@ -16,7 +16,7 @@
+  * limitations under the License.
+  */
+ 
+-package org.apache.cassandra.net;
++package org.apache.cassandra.streaming;
+ 
+ import java.io.*;
+ import java.net.InetAddress;
+@@ -31,6 +31,7 @@
+ import org.slf4j.LoggerFactory;
+ 
+ import org.apache.cassandra.config.DatabaseDescriptor;
++import org.apache.cassandra.net.MessagingService;
+ import org.apache.cassandra.utils.Pair;
+ import org.apache.cassandra.utils.WrappedRunnable;
+ 
+@@ -38,13 +39,15 @@
+ {
+     private static Logger logger = LoggerFactory.getLogger( FileStreamTask.class );
+     
++    // 10MB chunks
++    public static final int CHUNK_SIZE = 10*1024*1024;
+     // around 10 minutes at the default rpctimeout
+     public static final int MAX_CONNECT_ATTEMPTS = 8;
+ 
+     private final StreamHeader header;
+     private final InetAddress to;
+     
+-    FileStreamTask(StreamHeader header, InetAddress to)
++    public FileStreamTask(StreamHeader header, InetAddress to)
+     {
+         this.header = header;
+         this.to = to;
+@@ -94,9 +97,14 @@ private void stream(SocketChannel channel) throws IOException
+                 long length = section.right - section.left;
+                 long bytesTransferred = 0;
+                 while (bytesTransferred < length)
+-                    bytesTransferred += fc.transferTo(section.left + bytesTransferred, length - bytesTransferred, channel);
++                {
++                    long toTransfer = Math.min(CHUNK_SIZE, length - bytesTransferred);
++                    long lastWrite = fc.transferTo(section.left + bytesTransferred, toTransfer, channel);
++                    bytesTransferred += lastWrite;
++                    header.file.progress += lastWrite;
++                }
+                 if (logger.isDebugEnabled())
+-                    logger.debug("Bytes transferred " + bytesTransferred);
++                    logger.debug("Bytes transferred " + bytesTransferred + "/" + header.file.size);
+             }
+         }
+         finally
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+index d0a4029a..3e74f5f4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/net/MessagingService.java
+@@ -46,6 +46,7 @@
+ import org.apache.cassandra.net.io.SerializerType;
+ import org.apache.cassandra.net.sink.SinkManager;
+ import org.apache.cassandra.service.StorageService;
++import org.apache.cassandra.streaming.FileStreamTask;
+ import org.apache.cassandra.streaming.StreamHeader;
+ import org.apache.cassandra.utils.ExpiringMap;
+ import org.apache.cassandra.utils.GuidGenerator;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index 0eafae94..a2f7aee8 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -50,6 +50,8 @@ public IncomingStreamReader(StreamHeader header, SocketChannel socketChannel) th
+ 
+         session = StreamInSession.get(remoteAddress.getAddress(), header.sessionId);
+         session.addFiles(header.pendingFiles);
++        // set the current file we are streaming so progress shows up in jmx
++        session.setCurrentFile(header.file);
+         session.setTable(header.table);
+         // pendingFile gets the new context for the local node.
+         remoteFile = header.file;
+@@ -82,7 +84,12 @@ private void readFile() throws IOException
+                 long length = section.right - section.left;
+                 long bytesRead = 0;
+                 while (bytesRead < length)
+-                    bytesRead += fc.transferFrom(socketChannel, offset + bytesRead, length - bytesRead);
++                {
++                    long toRead = Math.min(FileStreamTask.CHUNK_SIZE, length - bytesRead);
++                    long lastRead = fc.transferFrom(socketChannel, offset + bytesRead, toRead);
++                    bytesRead += lastRead;
++                    remoteFile.progress += lastRead;
++                }
+                 offset += length;
+             }
+         }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+index 447b5634..45d7ca59 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/PendingFile.java
+@@ -48,6 +48,8 @@ public static PendingFileSerializer serializer()
+     public final Descriptor desc;
+     public final String component;
+     public final List<Pair<Long,Long>> sections;
++    public final long size;
++    public long progress;
+ 
+     public PendingFile(Descriptor desc, PendingFile pf)
+     {
+@@ -59,6 +61,12 @@ public PendingFile(Descriptor desc, String component, List<Pair<Long,Long>> sect
+         this.desc = desc;
+         this.component = component;
+         this.sections = sections;
++        long tempSize = 0;
++        for(Pair<Long,Long> section : sections)
++        {
++            tempSize += section.right - section.left;
++        }
++        size = tempSize;
+     }
+ 
+     public String getFilename()
+@@ -82,7 +90,7 @@ public int hashCode()
+ 
+     public String toString()
+     {
+-        return getFilename() + "/" + StringUtils.join(sections, ",");
++        return getFilename() + "/" + StringUtils.join(sections, ",") + "\n\t progress=" + progress + "/" + size + " - " + progress*100/size + "%";
+     }
+ 
+     public static class PendingFileSerializer implements ICompactSerializer<PendingFile>
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
+index dab9f8cc..cd43c52e 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/StreamInSession.java
+@@ -49,6 +49,7 @@
+     private String table;
+     private final List<Future<SSTableReader>> buildFutures = new ArrayList<Future<SSTableReader>>();
+     private ColumnFamilyStore cfs;
++    private PendingFile current;
+ 
+     private StreamInSession(Pair<InetAddress, Long> context, Runnable callback)
+     {
+@@ -80,6 +81,11 @@ public static StreamInSession get(InetAddress host, long sessionId)
+         return session;
+     }
+ 
++    public void setCurrentFile(PendingFile file)
++    {
++        this.current = file;
++    }
++
+     public void setTable(String table)
+     {
+         this.table = table;
+@@ -106,6 +112,8 @@ public void finished(PendingFile remoteFile, PendingFile localFile) throws IOExc
+         buildFutures.add(future);
+ 
+         files.remove(remoteFile);
++        if (remoteFile.equals(current))
++            current = null;
+         StreamReply reply = new StreamReply(remoteFile.getFilename(), getSessionId(), StreamReply.Status.FILE_FINISHED);
+         // send a StreamStatus message telling the source node it can delete this file
+         MessagingService.instance.sendOneWay(reply.createMessage(), getHost());
+@@ -179,17 +187,20 @@ public InetAddress getHost()
+     }
+ 
+     /** query the status of incoming files. */
+-    public static List<PendingFile> getIncomingFiles(InetAddress host)
++    public static Set<PendingFile> getIncomingFiles(InetAddress host)
+     {
+-        List<PendingFile> list = new ArrayList<PendingFile>();
++        Set<PendingFile> set = new HashSet<PendingFile>();
+         for (Map.Entry<Pair<InetAddress, Long>, StreamInSession> entry : sessions.entrySet())
+         {
+             if (entry.getKey().left.equals(host))
+             {
+                 StreamInSession session = entry.getValue();
+-                list.addAll(session.files);
++                set.addAll(session.files);
++                if(session.current != null) {
++                    set.add(session.current);
+             }
+         }
+-        return list;
++        }
++        return set;
+     }
+ }

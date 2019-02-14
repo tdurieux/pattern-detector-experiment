@@ -1,0 +1,360 @@
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
+index 085cb8e0..b92f539b 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
+@@ -89,7 +89,7 @@ public void move(Directory fromDir, Directory toDir, String fileName, IOContext
+       throws IOException {
+     
+     Directory baseFromDir = getBaseDir(fromDir);
+-    Directory baseToDir = getBaseDir(fromDir);
++    Directory baseToDir = getBaseDir(toDir);
+     
+     if (baseFromDir instanceof FSDirectory && baseToDir instanceof FSDirectory) {
+       File dir1 = ((FSDirectory) baseFromDir).getDirectory();
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+index 963bc620..a6038c27 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/ReplicationHandler.java
+@@ -19,6 +19,7 @@
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.IOException;
++import java.io.InputStream;
+ import java.io.OutputStream;
+ import java.io.Writer;
+ import java.nio.ByteBuffer;
+@@ -69,6 +70,7 @@
+ import org.apache.solr.search.SolrIndexSearcher;
+ import org.apache.solr.update.SolrIndexWriter;
+ import org.apache.solr.util.NumberUtils;
++import org.apache.solr.util.PropertiesInputStream;
+ import org.apache.solr.util.RefCounted;
+ import org.apache.solr.util.plugin.SolrCoreAware;
+ import org.slf4j.Logger;
+@@ -473,7 +475,7 @@ long getIndexSize() {
+     Directory dir;
+     long size = 0;
+     try {
+-      dir = core.getDirectoryFactory().get(core.getNewIndexDir(), DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType);
++      dir = core.getDirectoryFactory().get(core.getIndexDir(), DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType);
+       try {
+         size = DirectoryFactory.sizeOfDirectory(dir);
+       } finally {
+@@ -593,15 +595,19 @@ public NamedList getStatistics() {
+     }
+ 
+     SnapPuller snapPuller = tempSnapPuller;
+-    if (showSlaveDetails && snapPuller != null) {
++    if (snapPuller != null) {
+       Properties props = loadReplicationProperties();
++      if (showSlaveDetails) {
+       try {
+         NamedList nl = snapPuller.getDetails();
+         slave.add("masterDetails", nl.get(CMD_DETAILS));
+       } catch (Exception e) {
+-        LOG.warn("Exception while invoking 'details' method for replication on master ", e);
++          LOG.warn(
++              "Exception while invoking 'details' method for replication on master ",
++              e);
+         slave.add(ERR_STATUS, "invalid_master");
+       }
++      }
+       slave.add(MASTER_URL, snapPuller.getMasterUrl());
+       if (snapPuller.getPollInterval() != null) {
+         slave.add(SnapPuller.POLL_INTERVAL, snapPuller.getPollInterval());
+@@ -709,7 +715,7 @@ public NamedList getStatistics() {
+ 
+     if (isMaster)
+       details.add("master", master);
+-    if (isSlave && showSlaveDetails)
++    if (slave.size() > 0)
+       details.add("slave", slave);
+     
+     NamedList snapshotStats = snapShootDetails;
+@@ -759,20 +765,32 @@ private long getTimeElapsed(SnapPuller snapPuller) {
+   }
+ 
+   Properties loadReplicationProperties() {
+-    FileInputStream inFile = null;
+-    Properties props = new Properties();
++    Directory dir = null;
+     try {
+-      File f = new File(core.getDataDir(), SnapPuller.REPLICATION_PROPERTIES);
+-      if (f.exists()) {
+-        inFile = new FileInputStream(f);
+-        props.load(inFile);
++      try {
++        dir = core.getDirectoryFactory().get(core.getDataDir(),
++            DirContext.META_DATA, core.getSolrConfig().indexConfig.lockType);
++        if (!dir.fileExists(SnapPuller.REPLICATION_PROPERTIES)) {
++          return new Properties();
+       }
+-    } catch (Exception e) {
+-      LOG.warn("Exception while reading " + SnapPuller.REPLICATION_PROPERTIES);
++        final IndexInput input = dir.openInput(
++            SnapPuller.REPLICATION_PROPERTIES, IOContext.DEFAULT);
++        try {
++          final InputStream is = new PropertiesInputStream(input);
++          Properties props = new Properties();
++          props.load(is);
++          return props;
+     } finally {
+-      IOUtils.closeQuietly(inFile);
++          input.close();
++        }
++      } finally {
++        if (dir != null) {
++          core.getDirectoryFactory().release(dir);
++        }
++      }
++    } catch (IOException e) {
++      throw new SolrException(ErrorCode.SERVER_ERROR, e);
+     }
+-    return props;
+   }
+ 
+ 
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+index 195ffd2d..2e2eb25c 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+@@ -654,18 +654,12 @@ private void doCommit(boolean isFullCopyNeeded) throws IOException {
+         try {
+          waitSearcher[0].get();
+        } catch (InterruptedException e) {
+-         SolrException.log(LOG,e);
++          SolrException.log(LOG, e);
+        } catch (ExecutionException e) {
+-         SolrException.log(LOG,e);
++          SolrException.log(LOG, e);
+        }
+      }
+ 
+-      // update our commit point to the right dir
+-      CommitUpdateCommand cuc = new CommitUpdateCommand(req, false);
+-      cuc.waitSearcher = false;
+-      cuc.openSearcher = false;
+-      solrCore.getUpdateHandler().commit(cuc);
+-
+     } finally {
+       req.close();
+     }
+@@ -741,7 +735,7 @@ private void downloadIndexFiles(boolean downloadCompleteIndex,
+           dirFileFetcher.fetchFile();
+           filesDownloaded.add(new HashMap<String,Object>(file));
+         } else {
+-          LOG.info("Skipping download for " + file.get(NAME));
++          LOG.info("Skipping download for " + file.get(NAME) + " because it already exists");
+         }
+       }
+     } finally {
+@@ -776,6 +770,7 @@ private boolean moveAFile(Directory tmpIdxDir, Directory indexDir, String fname,
+     boolean success = false;
+     try {
+       if (indexDir.fileExists(fname)) {
++        LOG.info("Skipping move file - it already exists:" + fname);
+         return true;
+       }
+     } catch (IOException e) {
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitUpdateCommand.java b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitUpdateCommand.java
+index 2a7649b5..ee5df599 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitUpdateCommand.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/java/org/apache/solr/update/CommitUpdateCommand.java
+@@ -54,6 +54,7 @@ public String toString() {
+             +",waitSearcher="+waitSearcher
+             +",expungeDeletes="+expungeDeletes
+             +",softCommit="+softCommit
++            +",prepareCommit="+prepareCommit
+             +'}';
+   }
+ }
+diff --git a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+index f1efff3c..49e0102a 100644
+--- a/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
++++ b/lucene/dev/branches/branch_4x/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+@@ -28,7 +28,9 @@
+ import java.io.InputStreamReader;
+ import java.io.OutputStreamWriter;
+ import java.io.Writer;
++import java.net.MalformedURLException;
+ import java.net.URL;
++import java.util.ArrayList;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -532,15 +534,17 @@ private void doTestSnapPullWithMasterUrl() throws Exception {
+       index(masterClient, "id", i, "name", "name = " + i);
+ 
+     // make sure prepareCommit doesn't mess up commit  (SOLR-3938)
++    
+     // todo: make SolrJ easier to pass arbitrary params to
++    // TODO: precommit WILL screw with the rest of this test
+     String masterUrl = "http://127.0.0.1:" + masterJetty.getLocalPort() + "/solr/update?prepareCommit=true";
+     URL url = new URL(masterUrl);
+-    InputStream stream = url.openStream();
+-    try {
+-      stream.close();
+-    } catch (IOException e) {
+-      //e.printStackTrace();
+-    }
++//    InputStream stream = url.openStream();
++//    try {
++//      stream.close();
++//    } catch (IOException e) {
++//      //e.printStackTrace();
++//    }
+ 
+     masterClient.commit();
+ 
+@@ -552,7 +556,7 @@ private void doTestSnapPullWithMasterUrl() throws Exception {
+     masterUrl = "http://127.0.0.1:" + slaveJetty.getLocalPort() + "/solr/replication?command=fetchindex&masterUrl=";
+     masterUrl += "http://127.0.0.1:" + masterJetty.getLocalPort() + "/solr/replication";
+     url = new URL(masterUrl);
+-    stream = url.openStream();
++    InputStream stream = url.openStream();
+     try {
+       stream.close();
+     } catch (IOException e) {
+@@ -567,7 +571,6 @@ private void doTestSnapPullWithMasterUrl() throws Exception {
+     String cmp = BaseDistributedSearchTestCase.compare(masterQueryResult, slaveQueryResult, 0, null);
+     assertEquals(null, cmp);
+ 
+-    System.out.println("replicate slave to master");
+     // snappull from the slave to the master
+     
+     for (int i = 0; i < 3; i++)
+@@ -575,20 +578,72 @@ private void doTestSnapPullWithMasterUrl() throws Exception {
+ 
+     slaveClient.commit();
+     
+-    masterUrl = "http://127.0.0.1:" + masterJetty.getLocalPort() + "/solr/replication?command=fetchindex&masterUrl=";
+-    masterUrl += "http://127.0.0.1:" + slaveJetty.getLocalPort() + "/solr/replication";
+-    url = new URL(masterUrl);
+-    stream = url.openStream();
+-    try {
+-      stream.close();
+-    } catch (IOException e) {
+-      //e.printStackTrace();
+-    }
++    pullFromSlaveToMaster();
++    
++    //get docs from slave and check if number is equal to master
++    slaveQueryRsp = rQuery(nDocs, "*:*", slaveClient);
++    slaveQueryResult = (SolrDocumentList) slaveQueryRsp.get("response");
++    assertEquals(nDocs, slaveQueryResult.getNumFound());
++    //compare results
++    masterQueryRsp = rQuery(nDocs, "*:*", masterClient);
++    masterQueryResult = (SolrDocumentList) masterQueryRsp.get("response");
++    cmp = BaseDistributedSearchTestCase.compare(masterQueryResult, slaveQueryResult, 0, null);
++    assertEquals(null, cmp);
+ 
+     // get the details
+     // just ensures we don't get an exception
++    assertVersions();
++    
++    pullFromSlaveToMaster();
++    
++    //get docs from slave and check if number is equal to master
++    slaveQueryRsp = rQuery(nDocs, "*:*", slaveClient);
++    slaveQueryResult = (SolrDocumentList) slaveQueryRsp.get("response");
++    assertEquals(nDocs, slaveQueryResult.getNumFound());
++    //compare results
++    masterQueryRsp = rQuery(nDocs, "*:*", masterClient);
++    masterQueryResult = (SolrDocumentList) masterQueryRsp.get("response");
++    cmp = BaseDistributedSearchTestCase.compare(masterQueryResult, slaveQueryResult, 0, null);
++    assertEquals(null, cmp);
++    
++    assertVersions();
++    
++    // now force a new index directory
++    for (int i = 0; i < 3; i++)
++      index(masterClient, "id", i, "name", "name = " + i);
++    
++    masterClient.commit();
++    
++    pullFromSlaveToMaster();
++    
++    //get docs from slave and check if number is equal to master
++    slaveQueryRsp = rQuery(nDocs, "*:*", slaveClient);
++    slaveQueryResult = (SolrDocumentList) slaveQueryRsp.get("response");
++    assertEquals(nDocs, slaveQueryResult.getNumFound());
++    //compare results
++    masterQueryRsp = rQuery(nDocs, "*:*", masterClient);
++    masterQueryResult = (SolrDocumentList) masterQueryRsp.get("response");
++    cmp = BaseDistributedSearchTestCase.compare(masterQueryResult, slaveQueryResult, 0, null);
++    assertEquals(null, cmp);
++    
++    assertVersions();
++    pullFromSlaveToMaster();
++    
++    //get docs from slave and check if number is equal to master
++    slaveQueryRsp = rQuery(nDocs, "*:*", slaveClient);
++    slaveQueryResult = (SolrDocumentList) slaveQueryRsp.get("response");
++    assertEquals(nDocs, slaveQueryResult.getNumFound());
++    //compare results
++    masterQueryRsp = rQuery(nDocs, "*:*", masterClient);
++    masterQueryResult = (SolrDocumentList) masterQueryRsp.get("response");
++    cmp = BaseDistributedSearchTestCase.compare(masterQueryResult, slaveQueryResult, 0, null);
++    assertEquals(null, cmp);
++    
++    assertVersions();
++    
+     NamedList<Object> details = getDetails(masterClient);
+-    //System.out.println("details:" + details);
++   
++    details = getDetails(slaveClient);
+     
+     // NOTE: at this point, the slave is not polling any more
+     // restore it.
+@@ -598,6 +653,42 @@ private void doTestSnapPullWithMasterUrl() throws Exception {
+     slaveClient = createNewSolrServer(slaveJetty.getLocalPort());
+   }
+ 
++  private void assertVersions() throws Exception {
++    NamedList<Object> details = getDetails(masterClient);
++    ArrayList<NamedList<Object>> commits = (ArrayList<NamedList<Object>>) details.get("commits");
++    Long maxVersionMaster = 0L;
++    for(NamedList<Object> commit : commits) {
++      Long version = (Long) commit.get("indexVersion");
++      maxVersionMaster = Math.max(version, maxVersionMaster);
++    }
++    
++    details = getDetails(slaveClient);
++    commits = (ArrayList<NamedList<Object>>) details.get("commits");
++    Long maxVersionSlave= 0L;
++    for(NamedList<Object> commit : commits) {
++      Long version = (Long) commit.get("indexVersion");
++      maxVersionSlave = Math.max(version, maxVersionSlave);
++    }
++    
++    assertEquals(maxVersionMaster, maxVersionSlave);
++  }
++
++  private void pullFromSlaveToMaster() throws MalformedURLException,
++      IOException {
++    String masterUrl;
++    URL url;
++    InputStream stream;
++    masterUrl = "http://127.0.0.1:" + masterJetty.getLocalPort() + "/solr/replication?command=fetchindex&masterUrl=";
++    masterUrl += "http://127.0.0.1:" + slaveJetty.getLocalPort() + "/solr/replication";
++    url = new URL(masterUrl);
++    stream = url.openStream();
++    try {
++      stream.close();
++    } catch (IOException e) {
++      //e.printStackTrace();
++    }
++  }
++
+ 
+   private void doTestReplicateAfterStartup() throws Exception {
+     //stop slave
+@@ -662,8 +753,6 @@ private void doTestReplicateAfterStartup() throws Exception {
+   }
+   
+   private void doTestReplicateAfterStartupWithNoActivity() throws Exception {
+-    String factory = System.getProperty("solr.directoryFactory");
+-    System.out.println("factory:" + factory);
+     useFactory(null);
+     try {
+     

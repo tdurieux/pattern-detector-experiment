@@ -1,0 +1,322 @@
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/FacetComponent.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/FacetComponent.java
+index b4a3a9b4..36147852 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/FacetComponent.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/handler/component/FacetComponent.java
+@@ -211,9 +211,9 @@ public void modifyRequest(ResponseBuilder rb, SearchComponent who, ShardRequest
+             dff.initialLimit = dff.limit;
+           }
+ 
+-          // TEST: Uncomment the following line when testing to supress over-requesting facets and
+-          // thus cause more facet refinement queries.
+-          // if (dff.limit > 0) dff.initialLimit = dff.offset + dff.limit;
++          // Currently this is for testing only and allows overriding of the
++          // facet.limit set to the shards
++          dff.initialLimit = rb.req.getParams().getInt("facet.shard.limit", dff.initialLimit);
+ 
+           sreq.params.set(paramStart + FacetParams.FACET_LIMIT,  dff.initialLimit);
+       }
+@@ -245,6 +245,8 @@ private void countFacets(ResponseBuilder rb, ShardRequest sreq) {
+       int shardNum = rb.getShardNum(srsp.getShard());
+       NamedList facet_counts = (NamedList)srsp.getSolrResponse().getResponse().get("facet_counts");
+ 
++      fi.addExceptions((List)facet_counts.get("exception"));
++
+       // handle facet queries
+       NamedList facet_queries = (NamedList)facet_counts.get("facet_queries");
+       if (facet_queries != null) {
+@@ -259,18 +261,12 @@ private void countFacets(ResponseBuilder rb, ShardRequest sreq) {
+       // step through each facet.field, adding results from this shard
+       NamedList facet_fields = (NamedList)facet_counts.get("facet_fields");
+ 
+-      // an error could cause facet_fields to come back null
+-      if (facet_fields == null) {
+-        String msg = (String)facet_counts.get("exception");
+-        if (msg == null) msg = "faceting exception in sub-request - missing facet_fields";
+-        throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, msg);
+-
+-      }
+-
++      if (facet_fields != null) {
+       for (DistribFieldFacet dff : fi.facets.values()) {
+         dff.add(shardNum, (NamedList)facet_fields.get(dff.getKey()), dff.initialLimit);
+       }
+     }
++    }
+ 
+ 
+     //
+@@ -339,6 +335,10 @@ private void refineFacets(ResponseBuilder rb, ShardRequest sreq) {
+       NamedList facet_counts = (NamedList)srsp.getSolrResponse().getResponse().get("facet_counts");
+       NamedList facet_fields = (NamedList)facet_counts.get("facet_fields");
+ 
++      fi.addExceptions((List)facet_counts.get("exception"));
++
++      if (facet_fields == null) continue; // this can happen when there's an exception      
++
+       for (int i=0; i<facet_fields.size(); i++) {
+         String key = facet_fields.getName(i);
+         DistribFieldFacet dff = (DistribFieldFacet)fi.facets.get(key);
+@@ -366,6 +366,11 @@ public void finishStage(ResponseBuilder rb) {
+     FacetInfo fi = rb._facetInfo;
+ 
+     NamedList facet_counts = new SimpleOrderedMap();
++
++    if (fi.exceptionList != null) {
++      facet_counts.add("exception",fi.exceptionList);
++    }
++
+     NamedList facet_queries = new SimpleOrderedMap();
+     facet_counts.add("facet_queries",facet_queries);
+     for (QueryFacet qf : fi.queryFacets.values()) {
+@@ -462,6 +467,7 @@ public String getSource() {
+   public static class FacetInfo {
+     public LinkedHashMap<String,QueryFacet> queryFacets;
+     public LinkedHashMap<String,DistribFieldFacet> facets;
++    public List exceptionList;
+ 
+     void parse(SolrParams params, ResponseBuilder rb) {
+       queryFacets = new LinkedHashMap<String,QueryFacet>();
+@@ -484,6 +490,12 @@ void parse(SolrParams params, ResponseBuilder rb) {
+         }
+       }
+     }
++        
++    public void addExceptions(List exceptions) {
++      if (exceptions == null) return;
++      if (exceptionList == null) exceptionList = new ArrayList();
++      exceptionList.addAll(exceptions);
++    }
+   }
+ 
+   /**
+@@ -606,7 +618,8 @@ private void fillParams(ResponseBuilder rb, SolrParams params, String field) {
+     }
+ 
+     void add(int shardNum, NamedList shardCounts, int numRequested) {
+-      int sz = shardCounts.size();
++      // shardCounts could be null if there was an exception
++      int sz = shardCounts == null ? 0 : shardCounts.size();
+       int numReceived = sz;
+ 
+       OpenBitSet terms = new OpenBitSet(termNum+sz);
+diff --git a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/request/SimpleFacets.java b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/request/SimpleFacets.java
+index e6ecfcd8..5dd256ef 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/request/SimpleFacets.java
++++ b/lucene/dev/branches/branch_3x/solr/src/java/org/apache/solr/request/SimpleFacets.java
+@@ -66,6 +66,8 @@
+   protected SolrQueryRequest req;
+   protected ResponseBuilder rb;
+ 
++  protected SimpleOrderedMap facetResponse;
++
+   public final Date NOW = new Date();
+ 
+   // per-facet values
+@@ -170,19 +172,29 @@ public NamedList getFacetCounts() {
+     if (!params.getBool(FacetParams.FACET,true))
+       return null;
+ 
+-    NamedList res = new SimpleOrderedMap();
++    facetResponse = new SimpleOrderedMap();
+     try {
+-
+-      res.add("facet_queries", getFacetQueryCounts());
+-      res.add("facet_fields", getFacetFieldCounts());
+-      res.add("facet_dates", getFacetDateCounts());
+-      res.add("facet_ranges", getFacetRangeCounts());
++      facetResponse.add("facet_queries", getFacetQueryCounts());
++      facetResponse.add("facet_fields", getFacetFieldCounts());
++      facetResponse.add("facet_dates", getFacetDateCounts());
++      facetResponse.add("facet_ranges", getFacetRangeCounts());
+ 
+     } catch (Exception e) {
+       SolrException.logOnce(SolrCore.log, "Exception during facet counts", e);
+-      res.add("exception", SolrException.toStr(e));
++      addException("Exception during facet counts", e);
+     }
+-    return res;
++    return facetResponse;
++  }
++
++  public void addException(String msg, Exception e) {
++    List exceptions = (List)facetResponse.get("exception");
++    if (exceptions == null) {
++      exceptions = new ArrayList();
++      facetResponse.add("exception", exceptions);
++    }
++
++    String entry = msg + '\n' + SolrException.toStr(e);
++    exceptions.add(entry);
+   }
+ 
+   /**
+@@ -203,14 +215,22 @@ public NamedList getFacetQueryCounts() throws IOException,ParseException {
+     // SolrQueryParser qp = searcher.getSchema().getSolrQueryParser(null);
+ 
+     String[] facetQs = params.getParams(FacetParams.FACET_QUERY);
++
+     if (null != facetQs && 0 != facetQs.length) {
+       for (String q : facetQs) {
++        try {
+         parseParams(FacetParams.FACET_QUERY, q);
+ 
+         // TODO: slight optimization would prevent double-parsing of any localParams
+         Query qobj = QParser.getParser(q, null, req).getQuery();
+         res.add(key, searcher.numDocs(qobj, base));
+       }
++        catch (Exception e) {
++          String msg = "Exception during facet.query of " + q;
++          SolrException.logOnce(SolrCore.log, msg, e);
++          addException(msg , e);
++        }
++      }
+     }
+ 
+     return res;
+@@ -287,6 +307,7 @@ public NamedList getFacetFieldCounts()
+     String[] facetFs = params.getParams(FacetParams.FACET_FIELD);
+     if (null != facetFs) {
+       for (String f : facetFs) {
++        try {
+         parseParams(FacetParams.FACET_FIELD, f);
+         String termList = localParams == null ? null : localParams.get(CommonParams.TERMS);
+         if (termList != null) {
+@@ -294,6 +315,11 @@ public NamedList getFacetFieldCounts()
+         } else {
+           res.add(key, getTermCounts(facetValue));
+         }
++        } catch (Exception e) {
++          String msg = "Exception during facet.field of " + f;
++          SolrException.logOnce(SolrCore.log, msg, e);
++          addException(msg , e);
++        }
+       }
+     }
+     return res;
+@@ -556,6 +582,7 @@ public NamedList getFacetTermEnumCounts(SolrIndexSearcher searcher, DocSet docs,
+    *
+    * @see FacetParams#FACET_DATE
+    */
++
+   public NamedList getFacetDateCounts()
+     throws IOException, ParseException {
+ 
+@@ -564,10 +591,26 @@ public NamedList getFacetDateCounts()
+     
+     if (null == fields || 0 == fields.length) return resOuter;
+     
+-    final IndexSchema schema = searcher.getSchema();
+     for (String f : fields) {
+-      parseParams(FacetParams.FACET_DATE, f);
+-      f = facetValue;
++      try {
++        getFacetDateCounts(f, resOuter);
++      } catch (Exception e) {
++        String msg = "Exception during facet.date of " + f;
++        SolrException.logOnce(SolrCore.log, msg, e);
++        addException(msg , e);
++      }
++    }
++
++    return resOuter;
++  }
++
++  public void getFacetDateCounts(String dateFacet, NamedList resOuter)
++      throws IOException, ParseException {
++
++    final IndexSchema schema = searcher.getSchema();
++
++    parseParams(FacetParams.FACET_DATE, dateFacet);
++    String f = facetValue;
+ 
+ 
+       final NamedList resInner = new SimpleOrderedMap();
+@@ -704,9 +747,6 @@ public NamedList getFacetDateCounts()
+       }
+     }
+     
+-    return resOuter;
+-  }
+-
+   
+   /**
+    * Returns a list of value constraints and the associated facet
+@@ -715,18 +755,33 @@ public NamedList getFacetDateCounts()
+    *
+    * @see FacetParams#FACET_RANGE
+    */
+-  public NamedList getFacetRangeCounts()
+-    throws IOException, ParseException {
+     
++  public NamedList getFacetRangeCounts() {
+     final NamedList resOuter = new SimpleOrderedMap();
+     final String[] fields = params.getParams(FacetParams.FACET_RANGE);
+     
+     if (null == fields || 0 == fields.length) return resOuter;
+     
+-    final IndexSchema schema = searcher.getSchema();
+     for (String f : fields) {
+-      parseParams(FacetParams.FACET_RANGE, f);
+-      f = facetValue;
++      try {
++        getFacetRangeCounts(f, resOuter);
++      } catch (Exception e) {
++        String msg = "Exception during facet.range of " + f;
++        SolrException.logOnce(SolrCore.log, msg, e);
++        addException(msg , e);
++      }
++    }
++
++    return resOuter;
++  }
++
++  void getFacetRangeCounts(String facetRange, NamedList resOuter)
++      throws IOException, ParseException {
++
++    final IndexSchema schema = searcher.getSchema();
++
++    parseParams(FacetParams.FACET_RANGE, facetRange);
++    String f = facetValue;
+       
+       final SchemaField sf = schema.getField(f);
+       final FieldType ft = sf.getType();
+@@ -773,9 +828,6 @@ public NamedList getFacetRangeCounts()
+       resOuter.add(key, getFacetRangeCounts(sf, calc));
+     }
+     
+-    return resOuter;
+-  }
+-
+   private <T extends Comparable<T>> NamedList getFacetRangeCounts
+     (final SchemaField sf, 
+      final RangeEndpointCalculator<T> calc) throws IOException {
+diff --git a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/TestDistributedSearch.java b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/TestDistributedSearch.java
+index 22649622..310de58e 100644
+--- a/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/TestDistributedSearch.java
++++ b/lucene/dev/branches/branch_3x/solr/src/test/org/apache/solr/TestDistributedSearch.java
+@@ -183,6 +183,7 @@ public void doTest() throws Exception {
+ 
+     query("q","*:*", "sort",i1+" desc", "stats", "true", "stats.field", i1);
+ 
++    /*** TODO: the failure may come back in "exception"
+     try {
+       // test error produced for field that is invalid for schema
+       query("q","*:*", "rows",100, "facet","true", "facet.field",invalidField, "facet.mincount",2);
+@@ -190,6 +191,17 @@ public void doTest() throws Exception {
+     } catch (SolrServerException ex) {
+       // expected
+     }
++    ***/
++
++    // Try to get better coverage for refinement queries by turning off over requesting.
++    // This makes it much more likely that we may not get the top facet values and hence
++    // we turn of that checking.
++    handle.put("facet_fields", SKIPVAL);    
++    query("q","*:*", "rows",0, "facet","true", "facet.field",t1,"facet.limit",5, "facet.shard.limit",5);
++    // check a complex key name
++   // query("q","*:*", "rows",0, "facet","true", "facet.field","{!key=a/b/c}"+t1,"facet.limit",5, "facet.shard.limit",5);
++    handle.remove("facet_fields");
++
+ 
+     // index the same document to two servers and make sure things
+     // don't blow up.

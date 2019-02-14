@@ -1,0 +1,226 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
+index bf06e76e..42057593 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/io/sstable/SSTableIdentityIterator.java
+@@ -21,11 +21,7 @@
+  */
+ 
+ 
+-import java.io.DataInput;
+-import java.io.DataOutput;
+-import java.io.EOFException;
+-import java.io.IOError;
+-import java.io.IOException;
++import java.io.*;
+ 
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -44,7 +40,6 @@
+     private static final Logger logger = LoggerFactory.getLogger(SSTableIdentityIterator.class);
+ 
+     private final DecoratedKey key;
+-    private final long finishedAt;
+     private final DataInput input;
+     private final long dataStart;
+     public final long dataSize;
+@@ -110,7 +105,6 @@ private SSTableIdentityIterator(CFMetaData metadata, DataInput input, DecoratedK
+         this.expireBefore = (int)(System.currentTimeMillis() / 1000);
+         this.fromRemote = fromRemote;
+         this.validateColumns = checkData;
+-        finishedAt = dataStart + dataSize;
+ 
+         try
+         {
+@@ -118,6 +112,9 @@ private SSTableIdentityIterator(CFMetaData metadata, DataInput input, DecoratedK
+             {
+                 RandomAccessReader file = (RandomAccessReader) input;
+                 file.seek(this.dataStart);
++                if (dataStart + dataSize > file.length())
++                    throw new IOException(String.format("dataSize of %s starting at %s would be larger than file %s length %s",
++                                          dataSize, dataStart, file.getPath(), file.length()));
+                 if (checkData)
+                 {
+                     try
+@@ -141,6 +138,7 @@ private SSTableIdentityIterator(CFMetaData metadata, DataInput input, DecoratedK
+                         logger.debug("Invalid row summary in {}; will rebuild it", sstable);
+                     }
+                     file.seek(this.dataStart);
++                    inputWithTracker.reset(0);
+                 }
+             }
+ 
+@@ -150,11 +148,7 @@ private SSTableIdentityIterator(CFMetaData metadata, DataInput input, DecoratedK
+             ColumnFamily.serializer().deserializeFromSSTableNoColumns(columnFamily, inputWithTracker);
+             columnCount = inputWithTracker.readInt();
+ 
+-            if (input instanceof RandomAccessReader)
+-            {
+-                RandomAccessReader file = (RandomAccessReader) input;
+-                columnPosition = file.getFilePointer();
+-            }
++            columnPosition = dataStart + inputWithTracker.getBytesRead();
+         }
+         catch (IOException e)
+         {
+@@ -174,16 +168,8 @@ public ColumnFamily getColumnFamily()
+ 
+     public boolean hasNext()
+     {
+-        if (input instanceof RandomAccessReader)
+-        {
+-            RandomAccessReader file = (RandomAccessReader) input;
+-            return file.getFilePointer() < finishedAt;
+-        }
+-        else
+-        {
+             return inputWithTracker.getBytesRead() < dataSize;
+         }
+-    }
+ 
+     public IColumn next()
+     {
+@@ -230,36 +216,21 @@ public String getPath()
+ 
+     public void echoData(DataOutput out) throws IOException
+     {
+-        // only effective when input is from file
+-        if (input instanceof RandomAccessReader)
+-        {
+-            RandomAccessReader file = (RandomAccessReader) input;
+-            file.seek(dataStart);
+-            while (file.getFilePointer() < finishedAt)
+-            {
+-                out.write(file.readByte());
+-            }
+-        }
+-        else
+-        {
++        if (!(input instanceof RandomAccessReader))
+             throw new UnsupportedOperationException();
+-        }
++
++        ((RandomAccessReader) input).seek(dataStart);
++        inputWithTracker.reset(0);
++        while (inputWithTracker.getBytesRead() < dataSize)
++            out.write(inputWithTracker.readByte());
+     }
+ 
+     public ColumnFamily getColumnFamilyWithColumns() throws IOException
+     {
++        assert inputWithTracker.getBytesRead() == headerSize();
+         ColumnFamily cf = columnFamily.cloneMeShallow();
+-        if (input instanceof RandomAccessReader)
+-        {
+-            RandomAccessReader file = (RandomAccessReader) input;
+-            file.seek(columnPosition - 4); // seek to before column count int
+-            ColumnFamily.serializer().deserializeColumns(inputWithTracker, cf, false, fromRemote);
+-        }
+-        else
+-        {
+             // since we already read column count, just pass that value and continue deserialization
+             ColumnFamily.serializer().deserializeColumns(inputWithTracker, cf, columnCount, false, fromRemote);
+-        }
+         if (validateColumns)
+         {
+             try
+@@ -274,6 +245,11 @@ public ColumnFamily getColumnFamilyWithColumns() throws IOException
+         return cf;
+     }
+ 
++    private long headerSize()
++    {
++        return columnPosition - dataStart;
++    }
++
+     public int compareTo(SSTableIdentityIterator o)
+     {
+         return key.compareTo(o.key);
+@@ -281,9 +257,9 @@ public int compareTo(SSTableIdentityIterator o)
+ 
+     public void reset()
+     {
+-        // only effective when input is from file
+-        if (input instanceof RandomAccessReader)
+-        {
++        if (!(input instanceof RandomAccessReader))
++            throw new UnsupportedOperationException();
++
+             RandomAccessReader file = (RandomAccessReader) input;
+             try
+             {
+@@ -293,11 +269,6 @@ public void reset()
+             {
+                 throw new IOError(e);
+             }
+-            inputWithTracker.reset();
+-        }
+-        else
+-        {
+-            throw new UnsupportedOperationException();
+-        }
++        inputWithTracker.reset(headerSize());
+     }
+ }
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+index 1a7ee95d..22883cb4 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/streaming/IncomingStreamReader.java
+@@ -117,7 +117,7 @@ private SSTableReader streamIn(DataInput input, PendingFile localFile, PendingFi
+                 long bytesRead = 0;
+                 while (bytesRead < length)
+                 {
+-                    in.reset();
++                    in.reset(0);
+                     key = SSTableReader.decodeKey(StorageService.getPartitioner(), localFile.desc, ByteBufferUtil.readWithShortLength(in));
+                     long dataSize = SSTableReader.readRowSize(in, localFile.desc);
+                     ColumnFamily cf = null;
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/utils/BytesReadTracker.java b/cassandra/trunk/src/java/org/apache/cassandra/utils/BytesReadTracker.java
+index 51971aa9..95dd8766 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/utils/BytesReadTracker.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/utils/BytesReadTracker.java
+@@ -42,11 +42,11 @@ public long getBytesRead()
+     }
+     
+     /**
+-     * reset counter to 0
++     * reset counter to @param count
+      */
+-    public void reset()
++    public void reset(long count)
+     {
+-        bytesRead = 0;
++        bytesRead = count;
+     }
+ 
+     public boolean readBoolean() throws IOException
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/utils/BytesReadTrackerTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/utils/BytesReadTrackerTest.java
+index 7724196c..b26cb9a7 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/utils/BytesReadTrackerTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/utils/BytesReadTrackerTest.java
+@@ -115,7 +115,7 @@ public void testBytesRead() throws Exception
+             dis.close();
+         }
+ 
+-        tracker.reset();
++        tracker.reset(0);
+         assertEquals(0, tracker.getBytesRead());
+     }
+ 
+@@ -152,6 +152,8 @@ public void testUnsignedRead() throws Exception
+             int s = tracker.readUnsignedShort();
+             assertEquals(1, s);
+             assertEquals(3, tracker.getBytesRead());
++
++            assertEquals(testData.length, tracker.getBytesRead());
+         }
+         finally
+         {
+@@ -185,6 +187,8 @@ public void testSkipBytesAndReadFully() throws Exception
+             tracker.readFully(out);
+             assertEquals("890", new String(out));
+             assertEquals(10, tracker.getBytesRead());
++
++            assertEquals(testData.length, tracker.getBytesRead());
+         }
+         finally
+         {

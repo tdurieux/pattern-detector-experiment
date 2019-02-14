@@ -1,0 +1,251 @@
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java
+index 3ae6d7e8..4a3446c4 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/java/org/apache/lucene/store/NRTCachingDirectory.java
+@@ -196,7 +196,7 @@ public synchronized void deleteFile(String name) throws IOException {
+       System.out.println("nrtdir.deleteFile name=" + name);
+     }
+     if (cache.fileExists(name)) {
+-      assert !delegate.fileExists(name);
++      assert !delegate.fileExists(name): "name=" + name;
+       cache.deleteFile(name);
+     } else {
+       delegate.deleteFile(name);
+@@ -225,8 +225,18 @@ public IndexOutput createOutput(String name) throws IOException {
+       if (VERBOSE) {
+         System.out.println("  to cache");
+       }
++      try {
++        delegate.deleteFile(name);
++      } catch (IOException ioe) {
++        // This is fine: file may not exist
++      }
+       return cache.createOutput(name);
+     } else {
++      try {
++        cache.deleteFile(name);
++      } catch (IOException ioe) {
++        // This is fine: file may not exist
++      }
+       return delegate.createOutput(name);
+     }
+   }
+@@ -270,6 +280,11 @@ public synchronized IndexInput openInput(String name, int bufferSize) throws IOE
+    *  to the delegate and then closes the delegate. */
+   @Override
+   public void close() throws IOException {
++    // NOTE: technically we shouldn't have to do this, ie,
++    // IndexWriter should have sync'd all files, but we do
++    // it for defensive reasons... or in case the app is
++    // doing something custom (creating outputs directly w/o
++    // using IndexWriter):
+     for(String fileName : cache.listAll()) {
+       unCache(fileName);
+     }
+@@ -301,29 +316,40 @@ protected boolean doCacheWrite(String name) {
+     return !name.equals(IndexFileNames.SEGMENTS_GEN) && (merge == null || merge.estimatedMergeBytes <= maxMergeSizeBytes) && cache.sizeInBytes() <= maxCachedBytes;
+   }
+ 
++  private final Object uncacheLock = new Object();
++
+   private void unCache(String fileName) throws IOException {
+-    final IndexOutput out;
+-    synchronized(this) {
+-      if (!delegate.fileExists(fileName)) {
+-        assert cache.fileExists(fileName);
+-        out = delegate.createOutput(fileName);
+-      } else {
+-        out = null;
++    // Only let one thread uncache at a time; this only
++    // happens during commit() or close():
++    IndexOutput out = null;
++    IndexInput in = null;
++    try {
++      synchronized(uncacheLock) {
++        if (VERBOSE) {
++          System.out.println("nrtdir.unCache name=" + fileName);
++        }
++        if (!cache.fileExists(fileName)) {
++          // Another thread beat us...
++          return;
+       }
++        if (delegate.fileExists(fileName)) {
++          throw new IOException("cannot uncache file=\"" + fileName + "\": it was separately also created in the delegate directory");
+     }
++        out = delegate.createOutput(fileName);
+ 
+-    if (out != null) {
+-      IndexInput in = null;
+-      try {
+         in = cache.openInput(fileName);
+         in.copyBytes(out, in.length());
+-      } finally {
+-        IOUtils.close(in, out);
+-      }
++
++        // Lock order: uncacheLock -> this
+       synchronized(this) {
++          // Must sync here because other sync methods have
++          // if (cache.fileExists(name)) { ... } else { ... }:
+         cache.deleteFile(fileName);
+       }
+     }
++    } finally {
++      IOUtils.close(in, out);
++    }
+   }
+ }
+ 
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestCrash.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestCrash.java
+index f58a60f4..f8ca92b8 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestCrash.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestCrash.java
+@@ -31,9 +31,7 @@
+ public class TestCrash extends LuceneTestCase {
+ 
+   private IndexWriter initIndex(Random random, boolean initialCommit) throws IOException {
+-    // note: we pass 'false' here so our crashing/deleting won't trigger assertions in NRTCachingDir
+-    // TODO: don't remember why this is ok... maybe we should check again that it really actually is.
+-    return initIndex(random, newDirectory(random, false), initialCommit);
++    return initIndex(random, newDirectory(random), initialCommit);
+   }
+ 
+   private IndexWriter initIndex(Random random, MockDirectoryWrapper dir, boolean initialCommit) throws IOException {
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestDoc.java b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestDoc.java
+index a49305c3..d121823b 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestDoc.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test/org/apache/lucene/index/TestDoc.java
+@@ -106,8 +106,7 @@ public void testIndexAndMerge() throws Exception {
+       StringWriter sw = new StringWriter();
+       PrintWriter out = new PrintWriter(sw, true);
+       
+-      // TODO: why does this test trigger NRTCachingDirectory's assert?
+-      Directory directory = newFSDirectory(indexDir, null, false);
++      Directory directory = newFSDirectory(indexDir, null);
+       IndexWriter writer = new IndexWriter(
+           directory,
+           newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).
+@@ -135,14 +134,14 @@ public void testIndexAndMerge() throws Exception {
+       directory.close();
+       out.close();
+       sw.close();
++
+       String multiFileOutput = sw.getBuffer().toString();
+       //System.out.println(multiFileOutput);
+ 
+       sw = new StringWriter();
+       out = new PrintWriter(sw, true);
+ 
+-      // TODO: why does this test trigger NRTCachingDirectory's assert?
+-      directory = newFSDirectory(indexDir, null, false);
++      directory = newFSDirectory(indexDir, null);
+       writer = new IndexWriter(
+           directory,
+           newIndexWriterConfig(TEST_VERSION_CURRENT, new MockAnalyzer(random)).
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/store/MockDirectoryWrapper.java b/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/store/MockDirectoryWrapper.java
+index 418ef1a8..00ea205c 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/store/MockDirectoryWrapper.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/store/MockDirectoryWrapper.java
+@@ -231,9 +231,31 @@ public synchronized void crash() throws IOException {
+       } else if (damage == 2) {
+         action = "partially truncated";
+         // Partially Truncate the file:
+-        IndexOutput out = delegate.createOutput(name);
+-        out.setLength(fileLength(name)/2);
++
++        // First, make temp file and copy only half this
++        // file over:
++        String tempFileName;
++        while (true) {
++          tempFileName = ""+randomState.nextInt();
++          if (!delegate.fileExists(tempFileName)) {
++            break;
++          }
++        }
++        final IndexOutput tempOut = delegate.createOutput(tempFileName);
++        IndexInput in = delegate.openInput(name);
++        tempOut.copyBytes(in, in.length()/2);
++        tempOut.close();
++        in.close();
++
++        // Delete original and copy bytes back:
++        deleteFile(name, true);
++        
++        final IndexOutput out = delegate.createOutput(name);
++        in = delegate.openInput(tempFileName);
++        out.copyBytes(in, in.length());
+         out.close();
++        in.close();
++        deleteFile(tempFileName, true);
+       } else if (damage == 3) {
+         // The file survived intact:
+         action = "didn't change";
+diff --git a/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/util/LuceneTestCase.java b/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/util/LuceneTestCase.java
+index 1dca61dc..ac6e3658 100644
+--- a/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/util/LuceneTestCase.java
++++ b/lucene/dev/branches/branch_3x/lucene/src/test-framework/java/org/apache/lucene/util/LuceneTestCase.java
+@@ -944,18 +944,8 @@ public static MockDirectoryWrapper newDirectory() throws IOException {
+    * See {@link #newDirectory()} for more information.
+    */
+   public static MockDirectoryWrapper newDirectory(Random r) throws IOException {
+-    return newDirectory(r, true);
+-  }
+-  
+-  /**
+-   * Returns a new Directory instance, using the specified random. You
+-   * can specify maybeWrap as to whether the directory might be also
+-   * wrapped by NRTCachingDirectory or FileSwitchDirectory
+-   * See {@link #newDirectory()} for more information.
+-   */
+-  public static MockDirectoryWrapper newDirectory(Random r, boolean maybeWrap) throws IOException {
+     Directory impl = newDirectoryImpl(r, TEST_DIRECTORY);
+-    MockDirectoryWrapper dir = new MockDirectoryWrapper(r, maybeWrap ? maybeNRTWrap(r, impl) : impl);
++    MockDirectoryWrapper dir = new MockDirectoryWrapper(r, maybeNRTWrap(r, impl));
+     stores.put(dir, Thread.currentThread().getStackTrace());
+     return dir;
+   }
+@@ -966,7 +956,7 @@ public static MockDirectoryWrapper newDirectory(Random r, boolean maybeWrap) thr
+    * information.
+    */
+   public static MockDirectoryWrapper newDirectory(Directory d) throws IOException {
+-    return newDirectory(random, d, true);
++    return newDirectory(random, d);
+   }
+   
+   /** Returns a new FSDirectory instance over the given file, which must be a folder. */
+@@ -976,11 +966,6 @@ public static MockDirectoryWrapper newFSDirectory(File f) throws IOException {
+   
+   /** Returns a new FSDirectory instance over the given file, which must be a folder. */
+   public static MockDirectoryWrapper newFSDirectory(File f, LockFactory lf) throws IOException {
+-    return newFSDirectory(f, lf, true);
+-  }
+-
+-  /** Returns a new FSDirectory instance over the given file, which must be a folder. */
+-  public static MockDirectoryWrapper newFSDirectory(File f, LockFactory lf, boolean maybeWrap) throws IOException {
+     String fsdirClass = TEST_DIRECTORY;
+     if (fsdirClass.equals("random")) {
+       fsdirClass = FS_DIRECTORIES[random.nextInt(FS_DIRECTORIES.length)];
+@@ -997,7 +982,7 @@ public static MockDirectoryWrapper newFSDirectory(File f, LockFactory lf, boolea
+       }
+       
+       Directory fsdir = newFSDirectoryImpl(clazz, f);
+-      MockDirectoryWrapper dir = new MockDirectoryWrapper(random, maybeWrap ? maybeNRTWrap(random, fsdir) : fsdir);
++      MockDirectoryWrapper dir = new MockDirectoryWrapper(random, maybeNRTWrap(random, fsdir));
+       if (lf != null) {
+         dir.setLockFactory(lf);
+       }
+@@ -1013,12 +998,12 @@ public static MockDirectoryWrapper newFSDirectory(File f, LockFactory lf, boolea
+    * with contents copied from the provided directory. See 
+    * {@link #newDirectory()} for more information.
+    */
+-  public static MockDirectoryWrapper newDirectory(Random r, Directory d, boolean maybeWrap) throws IOException {
++  public static MockDirectoryWrapper newDirectory(Random r, Directory d) throws IOException {
+     Directory impl = newDirectoryImpl(r, TEST_DIRECTORY);
+     for (String file : d.listAll()) {
+      d.copy(impl, file, file);
+     }
+-    MockDirectoryWrapper dir = new MockDirectoryWrapper(r, maybeWrap ? maybeNRTWrap(r, impl) : impl);
++    MockDirectoryWrapper dir = new MockDirectoryWrapper(r, maybeNRTWrap(r, impl));
+     stores.put(dir, Thread.currentThread().getStackTrace());
+     return dir;
+   }

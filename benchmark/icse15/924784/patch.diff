@@ -1,0 +1,262 @@
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index b99c9040..e75554aa 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -1108,6 +1108,12 @@ public static void setTableDefinition(KSMetaData ksm, UUID newVersion)
+         DatabaseDescriptor.defsVersion = newVersion;
+     }
+ 
++    public static void clearTableDefinition(KSMetaData ksm, UUID newVersion)
++    {
++        tables.remove(ksm.name);
++        DatabaseDescriptor.defsVersion = newVersion;
++    }
++
+     public static class ConfigurationException extends Exception
+     {
+         public ConfigurationException(String message)
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java b/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+index ebd07b47..698076ad 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/DefsTable.java
+@@ -86,7 +86,7 @@ else if (ksm.cfMetaData().containsKey(cfm.cfName))
+     /**
+      * drop a column family. blockOnDeletion was added to make testing simpler.
+      */
+-    public static Future drop(final CFMetaData cfm, final boolean blockOnDeletion)
++    public static Future drop(final CFMetaData cfm, final boolean blockOnFileDeletion)
+     {
+         return executor.submit(new WrappedRunnable() 
+         {
+@@ -118,23 +118,7 @@ else if (!ksm.cfMetaData().containsKey(cfm.cfName))
+                 // we don't really need a new segment, but let's force it to be consistent with other operations.
+                 CommitLog.instance().forceNewSegment();
+         
+-                
+-                if (blockOnDeletion)
+-                {
+-                    // notify the compaction manager that it needs to clean up the dropped cf files.
+-                    try
+-                    {
+-                        CompactionManager.instance.submitGraveyardCleanup().get();
+-                    }
+-                    catch (InterruptedException e)
+-                    {
+-                        throw new RuntimeException(e);
+-                    }
+-                    catch (ExecutionException e)
+-                    {
+-                        throw new RuntimeException(e);
+-                    }
+-                }     
++                cleanupDeadFiles(blockOnFileDeletion);    
+             }
+         });
+     }
+@@ -205,6 +189,45 @@ protected void runMayThrow() throws Exception
+         });
+     }
+     
++    /** drop a keyspace. */
++    public static Future drop(final KSMetaData ksm, final boolean blockOnFileDeletion)
++    {
++        return executor.submit(new WrappedRunnable()
++        {
++            protected void runMayThrow() throws Exception
++            {
++                if (DatabaseDescriptor.getTableDefinition(ksm.name) != ksm)
++                    throw new ConfigurationException("Either keyspace doesn't exist or the name of the one you supplied doesn't match with the one being used.");
++                
++                // remove the table from the static instances.
++                Table table = Table.clear(ksm.name);
++                if (table == null)
++                    throw new ConfigurationException("Table is not active. " + ksm.name);
++                
++                // remove all cfs from the table instance.
++                for (CFMetaData cfm : ksm.cfMetaData().values())
++                {
++                    CFMetaData.purge(cfm);
++                    table.dropCf(cfm.cfName);
++                    SystemTable.markForRemoval(cfm);
++                }
++                                
++                // update internal table.
++                UUID versionId = UUIDGen.makeType1UUIDFromHost(FBUtilities.getLocalAddress());
++                RowMutation rm = new RowMutation(Table.DEFINITIONS, versionId.toString());
++                rm.delete(new QueryPath(SCHEMA_CF, null, ksm.name.getBytes()), System.currentTimeMillis());
++                rm.apply();
++                
++                // reset defs.
++                DatabaseDescriptor.clearTableDefinition(ksm, versionId);
++                
++                CommitLog.instance().forceNewSegment();
++                cleanupDeadFiles(blockOnFileDeletion);
++                
++            }
++        });
++    }
++    
+     /** dumps current keyspace definitions to storage */
+     public static synchronized void dumpToStorage(UUID version) throws IOException
+     {
+@@ -255,6 +278,26 @@ public boolean accept(File pathname)
+         return found;
+     }
+     
++    private static void cleanupDeadFiles(boolean wait)
++    {
++        Future cleanup = CompactionManager.instance.submitGraveyardCleanup();
++        if (wait)
++        {
++            // notify the compaction manager that it needs to clean up the dropped cf files.
++            try
++            {
++                cleanup.get();
++            }
++            catch (InterruptedException e)
++            {
++                throw new RuntimeException(e);
++            }
++            catch (ExecutionException e)
++            {
++                throw new RuntimeException(e);
++            }
++        } 
++    }
+     // if this errors out, we are in a world of hurt.
+     private static void renameStorageFiles(String table, String oldCfName, String newCfName) throws IOException
+     {
+diff --git a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+index 89559329..d376985f 100644
+--- a/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
++++ b/cassandra/trunk/src/java/org/apache/cassandra/db/Table.java
+@@ -85,6 +85,7 @@
+     private final Map<String, ColumnFamilyStore> columnFamilyStores = new HashMap<String, ColumnFamilyStore>();
+     // cache application CFs since Range queries ask for them a _lot_
+     private SortedSet<String> applicationColumnFamilies;
++    private final TimerTask flushTask;
+     
+     public static Table open(String table)
+     {
+@@ -106,6 +107,17 @@ public static Table open(String table)
+         return tableInstance;
+     }
+     
++    public static Table clear(String table) throws IOException
++    {
++        synchronized (Table.class)
++        {
++            Table t = instances.remove(table);
++            if (t != null)
++                t.flushTask.cancel();
++            return t;
++        }
++    }
++    
+     public Set<String> getColumnFamilies()
+     {
+         return DatabaseDescriptor.getTableDefinition(name).cfMetaData().keySet();
+@@ -260,7 +272,7 @@ private Table(String table)
+ 
+         // check 10x as often as the lifetime, so we can exceed lifetime by 10% at most
+         int checkMs = DatabaseDescriptor.getMemtableLifetimeMS() / 10;
+-        flushTimer.schedule(new TimerTask()
++        flushTask = new TimerTask()
+         {
+             public void run()
+             {
+@@ -269,7 +281,8 @@ public void run()
+                     cfs.forceFlushIfExpired();
+                 }
+             }
+-        }, checkMs, checkMs);
++        };
++        flushTimer.schedule(flushTask, checkMs, checkMs);
+     }
+     
+     /** removes a cf from internal structures (doesn't change disk files). */
+diff --git a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+index 72ac90c3..f134858c 100644
+--- a/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
++++ b/cassandra/trunk/test/unit/org/apache/cassandra/db/DefsTest.java
+@@ -113,7 +113,7 @@ public void addNewCF() throws IOException, ExecutionException, InterruptedExcept
+     }
+ 
+     @Test
+-    public void removeCf() throws IOException, ExecutionException, InterruptedException
++    public void dropCf() throws IOException, ExecutionException, InterruptedException
+     {
+         // sanity
+         final KSMetaData ks = DatabaseDescriptor.getTableDefinition("Keyspace1");
+@@ -122,7 +122,7 @@ public void removeCf() throws IOException, ExecutionException, InterruptedExcept
+         assert cfm != null;
+         
+         // write some data, force a flush, then verify that files exist on disk.
+-        RowMutation rm = new RowMutation(ks.name, "key0");
++        RowMutation rm = new RowMutation(ks.name, "dropCf");
+         for (int i = 0; i < 100; i++)
+             rm.add(new QueryPath(cfm.cfName, null, ("col" + i).getBytes()), "anyvalue".getBytes(), 1L);
+         rm.apply();
+@@ -137,7 +137,7 @@ public void removeCf() throws IOException, ExecutionException, InterruptedExcept
+         assert !DatabaseDescriptor.getTableDefinition(ks.name).cfMetaData().containsKey(cfm.cfName);
+         
+         // any write should fail.
+-        rm = new RowMutation(ks.name, "key0");
++        rm = new RowMutation(ks.name, "dropCf");
+         try
+         {
+             rm.add(new QueryPath("Standard1", null, "col0".getBytes()), "value0".getBytes(), 1L);
+@@ -224,4 +224,53 @@ public void addNewKS() throws IOException, ExecutionException, InterruptedExcept
+         IColumn col = cfam.getColumn("col0".getBytes());
+         assert Arrays.equals("value0".getBytes(), col.value());
+     }
++    
++    @Test
++    public void dropKS() throws IOException, ExecutionException, InterruptedException
++    {
++        // sanity
++        final KSMetaData ks = DatabaseDescriptor.getTableDefinition("Keyspace1");
++        assert ks != null;
++        final CFMetaData cfm = ks.cfMetaData().get("Standard2");
++        assert cfm != null;
++        
++        // write some data, force a flush, then verify that files exist on disk.
++        RowMutation rm = new RowMutation(ks.name, "dropKs");
++        for (int i = 0; i < 100; i++)
++            rm.add(new QueryPath(cfm.cfName, null, ("col" + i).getBytes()), "anyvalue".getBytes(), 1L);
++        rm.apply();
++        ColumnFamilyStore store = Table.open(cfm.tableName).getColumnFamilyStore(cfm.cfName);
++        assert store != null;
++        store.forceBlockingFlush();
++        store.getFlushPath();
++        assert DefsTable.getFiles(cfm.tableName, cfm.cfName).size() > 0;
++        
++        DefsTable.drop(ks, true).get();
++        
++        assert DatabaseDescriptor.getTableDefinition(ks.name) == null;
++        
++        // write should fail.
++        rm = new RowMutation(ks.name, "dropKs");
++        try
++        {
++            rm.add(new QueryPath("Standard1", null, "col0".getBytes()), "value0".getBytes(), 1L);
++            rm.apply();
++            assert false : "This mutation should have failed since the CF no longer exists.";
++        }
++        catch (Throwable th)
++        {
++            assert th instanceof IllegalArgumentException;
++        }
++        
++        // reads should fail too.
++        try
++        {
++            Table.open(ks.name);
++        }
++        catch (Throwable th)
++        {
++            // this is what has historically happened when you try to open a table that doesn't exist.
++            assert th instanceof NullPointerException;
++        }
++    }
+ }

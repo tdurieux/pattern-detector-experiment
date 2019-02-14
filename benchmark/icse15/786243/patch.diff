@@ -1,0 +1,352 @@
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+index 12aac018..0b008d99 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/config/DatabaseDescriptor.java
+@@ -24,10 +24,7 @@
+ 
+ import org.apache.log4j.Logger;
+ 
+-import org.apache.cassandra.db.ColumnFamily;
+-import org.apache.cassandra.db.Table;
+-import org.apache.cassandra.db.TypeInfo;
+-import org.apache.cassandra.db.SystemTable;
++import org.apache.cassandra.db.*;
+ import org.apache.cassandra.utils.FileUtils;
+ import org.apache.cassandra.utils.XMLUtils;
+ import org.w3c.dom.Node;
+@@ -63,7 +60,6 @@
+     private static int currentIndex_ = 0;
+     private static String logFileDirectory_;
+     private static String bootstrapFileDirectory_;
+-    private static int logRotationThreshold_ = 128*1024*1024;
+     private static boolean fastSync_ = false;
+     private static boolean rackAware_ = false;
+     private static int threadsPerPool_ = 4;
+@@ -293,7 +289,7 @@
+             /* threshold after which commit log should be rotated. */
+             String value = xmlUtils.getNodeValue("/Storage/CommitLogRotationThresholdInMB");
+             if ( value != null)
+-                logRotationThreshold_ = Integer.parseInt(value) * 1024 * 1024;
++                CommitLog.setSegmentSize(Integer.parseInt(value) * 1024 * 1024);
+ 
+             /* fast sync option */
+             value = xmlUtils.getNodeValue("/Storage/CommitLogFastSync");
+@@ -743,11 +739,6 @@ public static void setBootstrapFileLocation(String bfLocation)
+         bootstrapFileDirectory_ = bfLocation;
+     }
+ 
+-    public static int getLogFileSizeThreshold()
+-    {
+-        return logRotationThreshold_;
+-    }
+-
+     public static String getLogFileLocation()
+     {
+         return logFileDirectory_;
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+index ae3026c7..81d4b700 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/ColumnFamilyStore.java
+@@ -1661,4 +1661,17 @@ protected IColumn getReduced()
+             lock_.readLock().unlock();
+         }
+     }
++
++    void clearUnsafe()
++    {
++        lock_.writeLock().lock();
++        try
++        {
++            memtable_.clearUnsafe();
++        }
++        finally
++        {
++            lock_.writeLock().unlock();
++        }
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CommitLog.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CommitLog.java
+index 511ecf08..9f288131 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CommitLog.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/CommitLog.java
+@@ -61,7 +61,7 @@
+  */
+ public class CommitLog
+ {
+-    private static final int bufSize_ = 128*1024*1024;
++    private static volatile int SEGMENT_SIZE = 128*1024*1024; // roll after log gets this big
+     private static Map<String, CommitLog> instances_ = new HashMap<String, CommitLog>();
+     private static Lock lock_ = new ReentrantLock();
+     private static Logger logger_ = Logger.getLogger(CommitLog.class);
+@@ -112,6 +112,16 @@ public boolean equals(Object o)
+         }
+     }
+ 
++    public static void setSegmentSize(int size)
++    {
++        SEGMENT_SIZE = size;
++    }
++
++    static int getSegmentCount()
++    {
++        return clHeaders_.size();
++    }
++
+     static long getCreationTime(String file)
+     {
+         String[] entries = FBUtilities.strip(file, "-.");
+@@ -134,9 +144,7 @@ private static IFileWriter createWriter(String file) throws IOException
+     {        
+         if ( DatabaseDescriptor.isFastSync() )
+         {
+-            /* Add this to the threshold */
+-            int bufSize = 4*1024*1024;
+-            return SequenceFile.fastWriter(file, CommitLog.bufSize_ + bufSize);
++            return SequenceFile.fastWriter(file, 4*1024*1024);
+         }
+         else
+             return SequenceFile.writer(file);
+@@ -178,9 +186,6 @@ static String getTableName(String file)
+     private CommitLogHeader clHeader_;
+     private IFileWriter logWriter_;
+     private long commitHeaderStartPos_;
+-    /* Force rollover the commit log on the next insert */
+-    private boolean forcedRollOver_ = false;
+-
+ 
+     /*
+      * Generates a file name of the format CommitLog-<table>-<timestamp>.log in the
+@@ -456,8 +461,7 @@ synchronized CommitLogContext add(Row row) throws IOException
+             /* Update the header */
+             updateHeader(row);
+             logWriter_.append(table_, cfBuffer);
+-            fileSize = logWriter_.getFileSize();                       
+-            checkThresholdAndRollLog(fileSize);            
++            checkThresholdAndRollLog();
+         }
+         catch (IOException e)
+         {
+@@ -573,13 +577,11 @@ private void discard(CommitLog.CommitLogContext cLogCtx, int id) throws IOExcept
+         }
+     }
+ 
+-    private void checkThresholdAndRollLog( long fileSize )
++    private void checkThresholdAndRollLog()
+     {
+         try
+         {
+-            if ( fileSize >= DatabaseDescriptor.getLogFileSizeThreshold() || forcedRollOver_ )
+-            {
+-                if ( logWriter_.getFileSize() >= DatabaseDescriptor.getLogFileSizeThreshold() || forcedRollOver_ )
++            if (logWriter_.getFileSize() >= SEGMENT_SIZE)
+                 {
+ 	                /* Rolls the current log file over to a new one. */
+ 	                setNextFileName();
+@@ -591,7 +593,7 @@ private void checkThresholdAndRollLog( long fileSize )
+ 	                // logWriter_ = SequenceFile.writer(logFile_);
+ 	                logWriter_ = CommitLog.createWriter(logFile_);
+ 	                /* squirrel away the old commit log header */
+-	                clHeaders_.put(oldLogFile, new CommitLogHeader( clHeader_ ));
++                clHeaders_.put(oldLogFile, new CommitLogHeader(clHeader_));
+ 	                /*
+ 	                 * We need to zero out positions because the positions in
+ 	                 * the old file do not make sense in the new one.
+@@ -603,20 +605,10 @@ private void checkThresholdAndRollLog( long fileSize )
+ 	                // by accumulating the commit logs .
+                 }
+             }
+-        }
+-        catch ( IOException e )
++        catch (IOException e)
+         {
+             logger_.info(LogUtil.throwableToString(e));
+         }
+-        finally
+-        {
+-        	forcedRollOver_ = false;
+-        }
+-    }
+-
+-    public void setForcedRollOver()
+-    {
+-    	forcedRollOver_ = true;
+     }
+ 
+     public static void main(String[] args) throws Throwable
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+index 48470e82..51d67fd6 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/Memtable.java
+@@ -388,4 +388,9 @@ public void remove()
+             }
+         };
+     }
++
++    public void clearUnsafe()
++    {
++        columnFamilies_.clear();
++    }
+ }
+diff --git a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RecoveryManager.java b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RecoveryManager.java
+index 513b1dcf..19f48746 100644
+--- a/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RecoveryManager.java
++++ b/incubator/cassandra/trunk/src/java/org/apache/cassandra/db/RecoveryManager.java
+@@ -70,7 +70,7 @@ synchronized static RecoveryManager instance() throws IOException
+         return tableToCommitLogs;
+     }
+     
+-    public void doRecovery() throws IOException
++    public static void doRecovery() throws IOException
+     {
+         File[] files = getListofCommitLogs();
+         Map<String, List<File>> tableToCommitLogs = getListOFCommitLogsPerTable();
+@@ -78,7 +78,7 @@ public void doRecovery() throws IOException
+         FileUtils.delete(files);
+     }
+     
+-    private void recoverEachTable(Map<String, List<File>> tableToCommitLogs) throws IOException
++    private static void recoverEachTable(Map<String, List<File>> tableToCommitLogs) throws IOException
+     {
+         Comparator<File> fCmp = new FileUtils.FileComparator();
+         Set<String> tables = tableToCommitLogs.keySet();
+@@ -90,12 +90,4 @@ private void recoverEachTable(Map<String, List<File>> tableToCommitLogs) throws
+             clog.recover(clogs);
+         }
+     }
+-    
+-    public static void main(String[] args) throws Throwable
+-    {
+-        long start = System.currentTimeMillis();
+-        RecoveryManager rm = RecoveryManager.instance();
+-        rm.doRecovery();  
+-        logger_.debug( "Time taken : " + (System.currentTimeMillis() - start) + " ms.");
+-    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CommitLogTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CommitLogTest.java
+index c9b2b48b..1eab316e 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CommitLogTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/CommitLogTest.java
+@@ -19,6 +19,7 @@
+ package org.apache.cassandra.db;
+ 
+ import java.io.IOException;
++import java.util.concurrent.ExecutionException;
+ 
+ import org.junit.Test;
+ 
+@@ -27,32 +28,33 @@
+ public class CommitLogTest extends CleanupHelper
+ {
+     @Test
+-    public void testMain() throws IOException {
+-        // TODO this is useless, since it assumes we have a working set of commit logs to parse
+-        /*
+-        File logDir = new File(DatabaseDescriptor.getLogFileLocation());
+-        File[] files = logDir.listFiles();
+-        Arrays.sort( files, new FileUtils.FileComparator() );
+-
+-        byte[] bytes = new byte[CommitLogHeader.size(Integer.parseInt(args[0]))];
+-        for ( File file : files )
++    public void testCleanup() throws IOException, ExecutionException, InterruptedException
+         {
+-            CommitLog clog = new CommitLog( file );
+-            clog.readCommitLogHeader(file.getAbsolutePath(), bytes);
+-            DataInputBuffer bufIn = new DataInputBuffer();
+-            bufIn.reset(bytes, 0, bytes.length);
+-            CommitLogHeader clHeader = CommitLogHeader.serializer().deserialize(bufIn);
+-
+-            StringBuilder sb = new StringBuilder("");
+-            for ( byte b : bytes )
++        assert CommitLog.getSegmentCount() == 0;
++        CommitLog.setSegmentSize(1000);
++
++        Table table = Table.open("Table1");
++        ColumnFamilyStore store1 = table.getColumnFamilyStore("Standard1");
++        ColumnFamilyStore store2 = table.getColumnFamilyStore("Standard2");
++        RowMutation rm;
++        byte[] value = new byte[501];
++
++        // add data.  use relatively large values to force quick segment creation since we have a low flush threshold in the test config.
++        for (int i = 0; i < 10; i++)
+             {
+-                sb.append(b);
+-                sb.append(" ");
++            rm = new RowMutation("Table1", "key1");
++            rm.add("Standard1:Column1", value, 0);
++            rm.add("Standard2:Column1", value, 0);
++            rm.apply();
+             }
++        assert CommitLog.getSegmentCount() > 1;
++
++        // nothing should get removed after flushing just Standard1
++        store1.forceBlockingFlush();
++        assert CommitLog.getSegmentCount() > 1;
+ 
+-            System.out.println("FILE:" + file);
+-            System.out.println(clHeader.toString());
+-        }
+-        */
++        // after flushing Standard2 we should be able to clean out all segments
++        store2.forceBlockingFlush();
++        assert CommitLog.getSegmentCount() == 1;
+     }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+index 0e2c7324..e2edc37b 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/RecoveryManagerTest.java
+@@ -19,17 +19,40 @@
+ package org.apache.cassandra.db;
+ 
+ import java.io.IOException;
++import java.util.concurrent.ExecutionException;
+ 
+ import org.junit.Test;
+ 
+ import org.apache.cassandra.CleanupHelper;
++import static org.apache.cassandra.db.TableTest.assertColumns;
+ 
+ public class RecoveryManagerTest extends CleanupHelper
+ {
+     @Test
+-    public void testDoRecovery() throws IOException {
++    public void testNothing() throws IOException {
+         // TODO nothing to recover
+         RecoveryManager rm = RecoveryManager.instance();
+         rm.doRecovery();  
+     }
++
++    @Test
++    public void testSomething() throws IOException, ExecutionException, InterruptedException
++    {
++        Table table1 = Table.open("Table1");
++
++        RowMutation rm;
++        ColumnFamily cf;
++
++        rm = new RowMutation("Table1", "keymulti");
++        cf = new ColumnFamily("Standard1", "Standard");
++        cf.addColumn(new Column("col1", "val1".getBytes(), 1L));
++        rm.add(cf);
++        rm.apply();
++
++        table1.getColumnFamilyStore("Standard1").clearUnsafe();
++
++        RecoveryManager.doRecovery();
++
++        assertColumns(table1.get("keymulti", "Standard1"), "col1");
++    }
+ }
+diff --git a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+index 5f0cc8ab..b6363199 100644
+--- a/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
++++ b/incubator/cassandra/trunk/test/unit/org/apache/cassandra/db/TableTest.java
+@@ -349,7 +349,7 @@ public void testGetSliceFromLarge() throws Throwable
+         assertEquals(new String(cfres.getColumn("col1992").value()), "vvvvvvvvvvvvvvvv1992");
+     }
+ 
+-    private void assertColumns(ColumnFamily columnFamily, String... columnNames)
++    public static void assertColumns(ColumnFamily columnFamily, String... columnNames)
+     {
+         assertNotNull(columnFamily);
+         SortedSet<IColumn> columns = columnFamily.getAllColumns();

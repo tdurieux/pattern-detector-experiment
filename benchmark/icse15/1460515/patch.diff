@@ -1,0 +1,1150 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+index 7859cd54..9472c7fa 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/CachingDirectoryFactory.java
+@@ -36,6 +36,7 @@
+ import org.apache.lucene.store.SimpleFSLockFactory;
+ import org.apache.lucene.store.SingleInstanceLockFactory;
+ import org.apache.solr.common.SolrException;
++import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.util.NamedList;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -52,7 +53,8 @@
+   protected class CacheValue {
+     final public String path;
+     final public Directory directory;
+-    
++    // for debug
++    //final Exception originTrace;
+     // use the setter!
+     private boolean deleteOnClose = false;
+     
+@@ -60,10 +62,12 @@ public CacheValue(String path, Directory directory) {
+       this.path = path;
+       this.directory = directory;
+       this.closeEntries.add(this);
++      // for debug
++      // this.originTrace = new RuntimeException("Originated from:");
+     }
+     public int refCnt = 1;
+-    // has close(Directory) been called on this?
+-    public boolean closeDirectoryCalled = false;
++    // has doneWithDirectory(Directory) been called on this?
++    public boolean closeCacheValueCalled = false;
+     public boolean doneWithDir = false;
+     private boolean deleteAfterCoreClose = false;
+     public Set<CacheValue> removeEntries = new HashSet<CacheValue>();
+@@ -79,7 +83,7 @@ public void setDeleteOnClose(boolean deleteOnClose, boolean deleteAfterCoreClose
+     
+     @Override
+     public String toString() {
+-      return "CachedDir<<" + directory.toString() + ";refCount=" + refCnt + ";path=" + path + ";done=" + doneWithDir + ">>";
++      return "CachedDir<<" + "refCount=" + refCnt + ";path=" + path + ";done=" + doneWithDir + ">>";
+     }
+   }
+   
+@@ -137,9 +141,11 @@ public void doneWithDirectory(Directory directory) throws IOException {
+             + " " + byDirectoryCache);
+       }
+       cacheValue.doneWithDir = true;
+-      if (cacheValue.refCnt == 0) {
+-        cacheValue.refCnt++; // this will go back to 0 in close
+-        close(directory);
++      if (cacheValue.refCnt == 0 && !closed) {
++        boolean cl = closeCacheValue(cacheValue);
++        if (cl) {
++          removeFromCache(cacheValue);
++        }
+       }
+     }
+   }
+@@ -152,9 +158,9 @@ public void doneWithDirectory(Directory directory) throws IOException {
+   @Override
+   public void close() throws IOException {
+     synchronized (this) {
++      log.info("Closing " + this.getClass().getSimpleName() + " - " + byDirectoryCache.size() + " directories currently being tracked");
+       this.closed = true;
+-      Collection<CacheValue> values = new ArrayList<CacheValue>();
+-      values.addAll(byDirectoryCache.values());
++      Collection<CacheValue> values = byDirectoryCache.values();
+       for (CacheValue val : values) {
+         try {
+           // if there are still refs out, we have to wait for them
+@@ -162,9 +168,12 @@ public void close() throws IOException {
+           while(val.refCnt != 0) {
+             wait(100);
+             
+-            if (cnt++ >= 1200) {
+-              log.error("Timeout waiting for all directory ref counts to be released");
+-              break;
++            if (cnt++ >= 120) {
++              String msg = "Timeout waiting for all directory ref counts to be released - gave up waiting on " + val;
++              log.error(msg);
++              // debug
++              // val.originTrace.printStackTrace();
++              throw new SolrException(ErrorCode.SERVER_ERROR, msg);
+             }
+           }
+           assert val.refCnt == 0 : val.refCnt;
+@@ -174,52 +183,47 @@ public void close() throws IOException {
+       }
+       
+       values = byDirectoryCache.values();
++      Set<CacheValue> closedDirs = new HashSet<CacheValue>();
+       for (CacheValue val : values) {
+         try {
+-          assert val.refCnt == 0 : val.refCnt;
+-          log.info("Closing directory when closing factory: " + val.path);
+-          closeDirectory(val);
++          for (CacheValue v : val.closeEntries) {
++            assert v.refCnt == 0 : val.refCnt;
++            log.debug("Closing directory when closing factory: " + v.path);
++            boolean cl = closeCacheValue(v);
++            if (cl) {
++              closedDirs.add(v);
++            }
++          }
+         } catch (Throwable t) {
+           SolrException.log(log, "Error closing directory", t);
+         }
+       }
+       
+-      byDirectoryCache.clear();
+-      byPathCache.clear();
+-      
+       for (CacheValue val : removeEntries) {
+-        log.info("Removing directory: " + val.path);
++        log.info("Removing directory after core close: " + val.path);
++        try {
+         removeDirectory(val);
+-      }
++        } catch (Throwable t) {
++          SolrException.log(log, "Error removing directory", t);
+     }
+   }
+   
+-  private void close(Directory directory) throws IOException {
+-    synchronized (this) {
+-      // don't check if already closed here - we need to able to release
+-      // while #close() waits.
+-      
+-      CacheValue cacheValue = byDirectoryCache.get(directory);
+-      if (cacheValue == null) {
+-        throw new IllegalArgumentException("Unknown directory: " + directory
+-            + " " + byDirectoryCache);
++      for (CacheValue v : closedDirs) {
++        removeFromCache(v);
+       }
+-      log.debug("Releasing directory: " + cacheValue.path);
+-
+-      cacheValue.refCnt--;
+-
+-      if (cacheValue.refCnt == 0 && cacheValue.doneWithDir) {
+-        closeDirectory(cacheValue);
+-        
+-        byDirectoryCache.remove(directory);
+-        
+-        byPathCache.remove(cacheValue.path);
+-        
+       }
+     }
++
++  private void removeFromCache(CacheValue v) {
++    byDirectoryCache.remove(v.directory);
++    byPathCache.remove(v.path);
++    
+   }
+ 
+-  private void closeDirectory(CacheValue cacheValue) {
++  // be sure this is called with the this sync lock
++  // returns true if we closed the cacheValue, false if it will be closed later
++  private boolean closeCacheValue(CacheValue cacheValue) {
++    log.info("looking to close " + cacheValue.path + " " + cacheValue.closeEntries.toString());
+     List<CloseListener> listeners = closeListeners.remove(cacheValue.directory);
+     if (listeners != null) {
+       for (CloseListener listener : listeners) {
+@@ -230,21 +234,16 @@ private void closeDirectory(CacheValue cacheValue) {
+         }
+       }
+     }
+-    
+-    cacheValue.closeDirectoryCalled = true;
+-    
++    cacheValue.closeCacheValueCalled = true;
+     if (cacheValue.deleteOnClose) {
+-      
+       // see if we are a subpath
+       Collection<CacheValue> values = byPathCache.values();
+       
+-      Collection<CacheValue> cacheValues = new ArrayList<CacheValue>();
+-      cacheValues.addAll(values);
++      Collection<CacheValue> cacheValues = new ArrayList<CacheValue>(values);
+       cacheValues.remove(cacheValue);
+       for (CacheValue otherCacheValue : cacheValues) {
+-        // if we are a parent path and all our sub children are not already closed,
+-        // get a sub path to close us later
+-        if (otherCacheValue.path.startsWith(cacheValue.path) && !otherCacheValue.closeDirectoryCalled) {
++        // if we are a parent path and a sub path is not already closed, get a sub path to close us later
++        if (isSubPath(cacheValue, otherCacheValue) && !otherCacheValue.closeCacheValueCalled) {
+           // we let the sub dir remove and close us
+           if (!otherCacheValue.deleteAfterCoreClose && cacheValue.deleteAfterCoreClose) {
+             otherCacheValue.deleteAfterCoreClose = true;
+@@ -252,15 +251,24 @@ private void closeDirectory(CacheValue cacheValue) {
+           otherCacheValue.removeEntries.addAll(cacheValue.removeEntries);
+           otherCacheValue.closeEntries.addAll(cacheValue.closeEntries);
+           cacheValue.closeEntries.clear();
+-          break;
++          cacheValue.removeEntries.clear();
++          return false;
++        }
++      }
+         }
++
++    boolean cl = false;
++    for (CacheValue val : cacheValue.closeEntries) {
++      close(val);
++      if (val == cacheValue) {
++        cl = true;
+       }
+     }
+     
+     for (CacheValue val : cacheValue.removeEntries) {
+       if (!val.deleteAfterCoreClose) {
++        log.info("Removing directory before core close: " + val.path);
+         try {
+-          log.info("Removing directory: " + val.path);
+           removeDirectory(val);
+         } catch (Throwable t) {
+           SolrException.log(log, "Error removing directory", t);
+@@ -270,16 +278,6 @@ private void closeDirectory(CacheValue cacheValue) {
+       }
+     }
+     
+-    for (CacheValue val : cacheValue.closeEntries) {
+-      try {
+-        log.info("Closing directory: " + val.path);
+-        val.directory.close();
+-      } catch (Throwable t) {
+-        SolrException.log(log, "Error closing directory", t);
+-      }
+-      
+-    }
+-
+     if (listeners != null) {
+       for (CloseListener listener : listeners) {
+         try {
+@@ -289,6 +287,23 @@ private void closeDirectory(CacheValue cacheValue) {
+         }
+       }
+     }
++    return cl;
++  }
++
++  private void close(CacheValue val) {
++    try {
++      log.info("Closing directory: " + val.path);
++      val.directory.close();
++    } catch (Throwable t) {
++      SolrException.log(log, "Error closing directory", t);
++    }
++  }
++
++  private boolean isSubPath(CacheValue cacheValue, CacheValue otherCacheValue) {
++    int one = cacheValue.path.lastIndexOf('/');
++    int two = otherCacheValue.path.lastIndexOf('/');
++    
++    return otherCacheValue.path.startsWith(cacheValue.path + "/") && two > one;
+   }
+ 
+   @Override
+@@ -383,6 +398,9 @@ private Directory rateLimit(Directory directory) {
+   @Override
+   public void incRef(Directory directory) {
+     synchronized (this) {
++      if (closed) {
++        throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
++      }
+       CacheValue cacheValue = byDirectoryCache.get(directory);
+       if (cacheValue == null) {
+         throw new IllegalArgumentException("Unknown directory: " + directory);
+@@ -412,7 +430,28 @@ public void release(Directory directory) throws IOException {
+     if (directory == null) {
+       throw new NullPointerException();
+     }
+-    close(directory);
++    synchronized (this) {
++      // don't check if already closed here - we need to able to release
++      // while #close() waits.
++      
++      CacheValue cacheValue = byDirectoryCache.get(directory);
++      if (cacheValue == null) {
++        throw new IllegalArgumentException("Unknown directory: " + directory
++            + " " + byDirectoryCache);
++      }
++      log.debug("Releasing directory: " + cacheValue.path + " " + (cacheValue.refCnt - 1) + " " + cacheValue.doneWithDir);
++
++      cacheValue.refCnt--;
++      
++      assert cacheValue.refCnt >= 0 : cacheValue.refCnt;
++
++      if (cacheValue.refCnt == 0 && cacheValue.doneWithDir && !closed) {
++        boolean cl = closeCacheValue(cacheValue);
++        if (cl) {
++          removeFromCache(cacheValue);
++        }
++      }
++    }
+   }
+   
+   @Override
+@@ -475,8 +514,8 @@ private static Directory injectLockFactory(Directory dir, String lockPath,
+     return dir;
+   }
+   
+-  protected void removeDirectory(CacheValue cacheValue) throws IOException {
+-    empty(cacheValue.directory);
++  protected synchronized void removeDirectory(CacheValue cacheValue) throws IOException {
++     // this page intentionally left blank
+   }
+   
+   @Override
+@@ -491,4 +530,9 @@ private String stripTrailingSlash(String path) {
+     }
+     return path;
+   }
++  
++  // for tests
++  public synchronized Set<String> getPaths() {
++    return byPathCache.keySet();
++  }
+ }
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/EphemeralDirectoryFactory.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/EphemeralDirectoryFactory.java
+index bff04e05..904db07e 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/EphemeralDirectoryFactory.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/EphemeralDirectoryFactory.java
+@@ -16,12 +16,9 @@
+  * limitations under the License.
+  */
+ 
+-import java.io.File;
+ import java.io.IOException;
+ 
+-import org.apache.commons.io.FileUtils;
+ import org.apache.lucene.store.Directory;
+-import org.apache.solr.core.CachingDirectoryFactory.CacheValue;
+ 
+ /**
+  * Directory provider for implementations that do not persist over reboots.
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/SolrCore.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/SolrCore.java
+index b2ef54bf..f72b7ad4 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/SolrCore.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/SolrCore.java
+@@ -485,7 +485,6 @@ void initIndex(boolean reload) throws IOException {
+                   "Index locked for write for core " + name);
+             }
+             
+-            directoryFactory.release(dir);
+           }
+         } finally {
+           directoryFactory.release(dir);
+@@ -983,12 +982,13 @@ public void close() {
+       SolrException.log(log,e);
+     }
+     
++    boolean coreStateClosed = false;
+     try {
+       if (solrCoreState != null) {
+         if (updateHandler instanceof IndexWriterCloser) {
+-          solrCoreState.decrefSolrCoreState((IndexWriterCloser) updateHandler);
++          coreStateClosed = solrCoreState.decrefSolrCoreState((IndexWriterCloser) updateHandler);
+         } else {
+-          solrCoreState.decrefSolrCoreState(null);
++          coreStateClosed = solrCoreState.decrefSolrCoreState(null);
+         }
+       }
+     } catch (Throwable e) {
+@@ -1014,14 +1014,13 @@ public void close() {
+       SolrException.log(log,e);
+     }
+     
+-    if (solrCoreState != null) { // bad startup case
+-      if (solrCoreState.getSolrCoreStateRefCnt() == 0) {
++    if (coreStateClosed) {
++      
+         try {
+           directoryFactory.close();
+         } catch (Throwable t) {
+           SolrException.log(log, t);
+         }
+-      }
+       
+     }
+ 
+@@ -1363,21 +1362,25 @@ public UpdateHandler getUpdateHandler() {
+         DirectoryReader newReader;
+         DirectoryReader currentReader = newestSearcher.get().getIndexReader();
+ 
+-        if (updateHandlerReopens) {
+           // SolrCore.verbose("start reopen from",previousSearcher,"writer=",writer);
+-          RefCounted<IndexWriter> writer = getUpdateHandler().getSolrCoreState().getIndexWriter(this);
+-          try {
+-            newReader = DirectoryReader.openIfChanged(currentReader, writer.get(), true);
+-          } finally {
+-            writer.decref();
+-          }
+ 
++        RefCounted<IndexWriter> writer = getUpdateHandler().getSolrCoreState()
++            .getIndexWriter(null);
++        try {
++          if (writer != null) {
++            newReader = DirectoryReader.openIfChanged(currentReader,
++                writer.get(), true);
+         } else {
+           // verbose("start reopen without writer, reader=", currentReader);
+           newReader = DirectoryReader.openIfChanged(currentReader);
+      
+           // verbose("reopen result", newReader);
+         }
++        } finally {
++          if (writer != null) {
++            writer.decref();
++          }
++        }
+ 
+         if (newReader == null) {
+           // if this is a request for a realtime searcher, just return the same searcher if there haven't been any changes.
+@@ -1391,7 +1394,7 @@ public UpdateHandler getUpdateHandler() {
+         }
+ 
+        // for now, turn off caches if this is for a realtime reader (caches take a little while to instantiate)
+-        tmp = new SolrIndexSearcher(this, newIndexDir, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
++        tmp = new SolrIndexSearcher(this, newIndexDir, schema, getSolrConfig().indexConfig, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
+ 
+       } else {
+         // newestSearcher == null at this point
+@@ -1401,7 +1404,7 @@ public UpdateHandler getUpdateHandler() {
+           // so that we pick up any uncommitted changes and so we don't go backwards
+           // in time on a core reload
+           DirectoryReader newReader = newReaderCreator.call();
+-          tmp = new SolrIndexSearcher(this, newIndexDir, schema, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
++          tmp = new SolrIndexSearcher(this, newIndexDir, schema, getSolrConfig().indexConfig, (realtime ? "realtime":"main"), newReader, true, !realtime, true, directoryFactory);
+         } else {
+          // normal open that happens at startup
+         // verbose("non-reopen START:");
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
+index 8cfed390..85bc9b0a 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/core/StandardDirectoryFactory.java
+@@ -49,6 +49,13 @@ public String normalize(String path) throws IOException {
+     return super.normalize(cpath);
+   }
+   
++  @Override
++  public boolean exists(String path) throws IOException {
++    // we go by the persistent storage ... 
++    File dirFile = new File(path);
++    return dirFile.canRead() && dirFile.list().length > 0;
++  }
++  
+   public boolean isPersistent() {
+     return true;
+   }
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/handler/SnapPuller.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+index 90e46125..b9fd98e5 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/handler/SnapPuller.java
+@@ -84,7 +84,6 @@
+ import org.apache.solr.common.util.ExecutorUtil;
+ import org.apache.solr.common.util.FastInputStream;
+ import org.apache.solr.common.util.NamedList;
+-import org.apache.solr.core.CachingDirectoryFactory.CloseListener;
+ import org.apache.solr.core.DirectoryFactory;
+ import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.apache.solr.core.IndexDeletionPolicyWrapper;
+@@ -382,10 +381,9 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+ 
+       tmpIndexDir = core.getDirectoryFactory().get(tmpIndex, DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType);
+       
+-      // make sure it's the newest known index dir...
+-      indexDirPath = core.getNewIndexDir();
++      // cindex dir...
++      indexDirPath = core.getIndexDir();
+       indexDir = core.getDirectoryFactory().get(indexDirPath, DirContext.DEFAULT, core.getSolrConfig().indexConfig.lockType);
+-      Directory oldDirectory = null;
+ 
+       try {
+         
+@@ -407,6 +405,16 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+             successfulInstall = moveIndexFiles(tmpIndexDir, indexDir);
+           }
+           if (successfulInstall) {
++            if (isFullCopyNeeded) {
++              // let the system know we are changing dir's and the old one
++              // may be closed
++              if (indexDir != null) {
++                LOG.info("removing old index directory " + indexDir);
++                core.getDirectoryFactory().doneWithDirectory(indexDir);
++                core.getDirectoryFactory().remove(indexDir);
++              }
++            }
++            
+             LOG.info("Configuration files are modified, core will be reloaded");
+             logReplicationTimeAndConfFiles(modifiedConfFiles, successfulInstall);//write to a file time of replication and conf files.
+             reloadCore();
+@@ -416,12 +424,6 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+           if (isFullCopyNeeded) {
+             successfulInstall = modifyIndexProps(tmpIdxDirName);
+             deleteTmpIdxDir =  false;
+-            RefCounted<IndexWriter> iw = core.getUpdateHandler().getSolrCoreState().getIndexWriter(core);
+-            try {
+-               oldDirectory = iw.get().getDirectory();
+-            } finally {
+-              iw.decref();
+-            }
+           } else {
+             successfulInstall = moveIndexFiles(tmpIndexDir, indexDir);
+           }
+@@ -430,42 +432,15 @@ boolean fetchLatestIndex(final SolrCore core, boolean forceReplication) throws I
+           }
+         }
+         
+-        if (isFullCopyNeeded) {
+-          // we have to do this before commit
+-          final Directory freezeIndexDir = indexDir;
+-          final String freezeIndexDirPath = indexDirPath;
+-          core.getDirectoryFactory().addCloseListener(oldDirectory, new CloseListener(){
+-
+-            @Override
+-            public void preClose() {
+-              LOG.info("removing old index files " + freezeIndexDir);
+-              try {
+-                if (core.getDirectoryFactory().exists(freezeIndexDirPath)) {
+-                  DirectoryFactory.empty(freezeIndexDir);
+-                }
+-              } catch (IOException e) {
+-                SolrException.log(LOG, null, e);
+-              }
+-            }
+-            
+-            @Override
+-            public void postClose() {
+-              LOG.info("removing old index directory " + freezeIndexDir);
+-              try {
+-                core.getDirectoryFactory().remove(freezeIndexDir);
+-              } catch (IOException e) {
+-                SolrException.log(LOG, "Error removing directory " + freezeIndexDir, e);
+-              }
+-            }
+-            
+-          });
+-        }
+-
+         if (successfulInstall) {
+           if (isFullCopyNeeded) {
+             // let the system know we are changing dir's and the old one
+             // may be closed
+-            core.getDirectoryFactory().doneWithDirectory(oldDirectory);
++            if (indexDir != null) {
++              LOG.info("removing old index directory " + indexDir);
++              core.getDirectoryFactory().doneWithDirectory(indexDir);
++              core.getDirectoryFactory().remove(indexDir);
++            }
+           }
+           openNewWriterAndSearcher(isFullCopyNeeded);
+         }
+@@ -499,6 +474,7 @@ public void postClose() {
+       } finally {
+         if (deleteTmpIdxDir && tmpIndexDir != null) {
+           try {
++            core.getDirectoryFactory().doneWithDirectory(tmpIndexDir);
+             core.getDirectoryFactory().remove(tmpIndexDir);
+           } catch (IOException e) {
+             SolrException.log(LOG, "Error removing directory " + tmpIndexDir, e);
+@@ -647,8 +623,6 @@ private void openNewWriterAndSearcher(boolean isFullCopyNeeded) throws IOExcepti
+     RefCounted<SolrIndexSearcher> searcher = null;
+     IndexCommit commitPoint;
+     try {
+-      // first try to open an NRT searcher so that the new
+-      // IndexWriter is registered with the reader
+       Future[] waitSearcher = new Future[1];
+       searcher = solrCore.getSearcher(true, true, waitSearcher, true);
+       if (waitSearcher[0] != null) {
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+index b2514713..ed52f8b2 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/search/SolrIndexSearcher.java
+@@ -20,7 +20,17 @@
+ import java.io.Closeable;
+ import java.io.IOException;
+ import java.net.URL;
+-import java.util.*;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.Date;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedList;
++import java.util.List;
++import java.util.Set;
+ import java.util.concurrent.atomic.AtomicLong;
+ 
+ import org.apache.lucene.document.Document;
+@@ -33,23 +43,54 @@
+ import org.apache.lucene.document.LongField;
+ import org.apache.lucene.document.StoredField;
+ import org.apache.lucene.document.TextField;
+-import org.apache.lucene.index.*;
+-import org.apache.lucene.search.*;
++import org.apache.lucene.index.AtomicReader;
++import org.apache.lucene.index.AtomicReaderContext;
++import org.apache.lucene.index.DirectoryReader;
++import org.apache.lucene.index.DocsEnum;
++import org.apache.lucene.index.FieldInfo;
++import org.apache.lucene.index.FieldInfos;
++import org.apache.lucene.index.Fields;
++import org.apache.lucene.index.IndexReader;
++import org.apache.lucene.index.IndexableField;
++import org.apache.lucene.index.MultiDocsEnum;
++import org.apache.lucene.index.SlowCompositeReaderWrapper;
++import org.apache.lucene.index.StoredFieldVisitor;
++import org.apache.lucene.index.Term;
++import org.apache.lucene.index.Terms;
++import org.apache.lucene.index.TermsEnum;
++import org.apache.lucene.search.Collector;
++import org.apache.lucene.search.DocIdSet;
++import org.apache.lucene.search.DocIdSetIterator;
++import org.apache.lucene.search.Explanation;
++import org.apache.lucene.search.Filter;
++import org.apache.lucene.search.IndexSearcher;
++import org.apache.lucene.search.MatchAllDocsQuery;
++import org.apache.lucene.search.Query;
++import org.apache.lucene.search.ScoreDoc;
++import org.apache.lucene.search.Scorer;
++import org.apache.lucene.search.Sort;
++import org.apache.lucene.search.SortField;
++import org.apache.lucene.search.TermQuery;
++import org.apache.lucene.search.TimeLimitingCollector;
++import org.apache.lucene.search.TopDocs;
++import org.apache.lucene.search.TopDocsCollector;
++import org.apache.lucene.search.TopFieldCollector;
++import org.apache.lucene.search.TopScoreDocCollector;
++import org.apache.lucene.search.Weight;
+ import org.apache.lucene.store.Directory;
+-import org.apache.lucene.store.FSDirectory;
+-import org.apache.lucene.store.NRTCachingDirectory;
+ import org.apache.lucene.util.Bits;
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.OpenBitSet;
+ import org.apache.solr.common.SolrException;
++import org.apache.solr.common.SolrException.ErrorCode;
+ import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.common.util.SimpleOrderedMap;
+ import org.apache.solr.core.DirectoryFactory;
++import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.apache.solr.core.SolrConfig;
+ import org.apache.solr.core.SolrCore;
+ import org.apache.solr.core.SolrInfoMBean;
+-import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.apache.solr.request.LocalSolrQueryRequest;
+ import org.apache.solr.request.SolrQueryRequest;
+ import org.apache.solr.request.SolrRequestInfo;
+@@ -118,25 +159,42 @@
+   
+   private final AtomicReader atomicReader;
+   private String path; 
++  private final boolean reserveDirectory;
++  private final boolean createdDirectory; 
++  
++  private static DirectoryReader getReader(SolrCore core, SolrIndexConfig config, DirectoryFactory directoryFactory, String path) throws IOException {
++    DirectoryReader reader = null;
++    Directory dir = directoryFactory.get(path, DirContext.DEFAULT, config.lockType);
++    try {
++      reader = core.getIndexReaderFactory().newReader(dir, core);
++    } catch (Throwable t) {
++      directoryFactory.release(dir);
++      throw new SolrException(ErrorCode.SERVER_ERROR, "Error opening Reader", t);
++    }
++    return reader;
++  }
+ 
+   public SolrIndexSearcher(SolrCore core, String path, IndexSchema schema, SolrIndexConfig config, String name, boolean enableCache, DirectoryFactory directoryFactory) throws IOException {
+     // we don't need to reserve the directory because we get it from the factory
+-    this(core, path, schema,name, core.getIndexReaderFactory().newReader(directoryFactory.get(path, DirContext.DEFAULT, config.lockType), core), true, enableCache, false, directoryFactory);
++    this(core, path, schema, config, name, null, true, enableCache, false, directoryFactory);
+   }
+ 
+-  public SolrIndexSearcher(SolrCore core, String path, IndexSchema schema, String name, DirectoryReader r, boolean closeReader, boolean enableCache, boolean reserveDirectory, DirectoryFactory directoryFactory) throws IOException {
+-    super(r);
++  public SolrIndexSearcher(SolrCore core, String path, IndexSchema schema, SolrIndexConfig config, String name, DirectoryReader r, boolean closeReader, boolean enableCache, boolean reserveDirectory, DirectoryFactory directoryFactory) throws IOException {
++    super(r == null ? getReader(core, config, directoryFactory, path) : r);
++
+     this.path = path;
+     this.directoryFactory = directoryFactory;
+-    this.reader = r;
+-    this.atomicReader = SlowCompositeReaderWrapper.wrap(r);
++    this.reader = (DirectoryReader) super.readerContext.reader();
++    this.atomicReader = SlowCompositeReaderWrapper.wrap(this.reader);
+     this.core = core;
+     this.schema = schema;
+     this.name = "Searcher@" + Integer.toHexString(hashCode()) + (name!=null ? " "+name : "");
+     log.info("Opening " + this.name);
+ 
+-    Directory dir = r.directory();
++    Directory dir = this.reader.directory();
+     
++    this.reserveDirectory = reserveDirectory;
++    this.createdDirectory = r == null;
+     if (reserveDirectory) {
+       // keep the directory from being released while we use it
+       directoryFactory.incRef(dir);
+@@ -281,8 +339,12 @@ public void close() throws IOException {
+       cache.close();
+     }
+ 
+-
++    if (reserveDirectory) {
+     directoryFactory.release(getIndexReader().directory());
++    }
++    if (createdDirectory) {
++      directoryFactory.release(getIndexReader().directory());
++    }
+    
+     
+     // do this at the end so it only gets done if there are no exceptions
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+index 00e83009..46bf7ab4 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/DefaultSolrCoreState.java
+@@ -49,7 +49,6 @@
+ 
+   private volatile boolean recoveryRunning;
+   private RecoveryStrategy recoveryStrat;
+-  private volatile boolean closed = false;
+ 
+   private RefCounted<IndexWriter> refCntWriter;
+ 
+@@ -81,13 +80,11 @@ private void closeIndexWriter(IndexWriterCloser closer) {
+   @Override
+   public RefCounted<IndexWriter> getIndexWriter(SolrCore core)
+       throws IOException {
+-    
++    synchronized (writerPauseLock) {
+     if (closed) {
+       throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "SolrCoreState already closed");
+     }
+     
+-    synchronized (writerPauseLock) {
+-
+       while (pauseWriter) {
+         try {
+           writerPauseLock.wait(100);
+@@ -101,11 +98,15 @@ private void closeIndexWriter(IndexWriterCloser closer) {
+       if (core == null) {
+         // core == null is a signal to just return the current writer, or null
+         // if none.
++        initRefCntWriter();
++        if (refCntWriter == null) return null;
++        writerFree = false;
++        writerPauseLock.notifyAll();
+         if (refCntWriter != null) refCntWriter.incref();
++        
+         return refCntWriter;
+       }
+       
+-      
+       if (indexWriter == null) {
+         indexWriter = createMainIndexWriter(core, "DirectUpdateHandler2", false);
+       }
+@@ -118,7 +119,7 @@ private void closeIndexWriter(IndexWriterCloser closer) {
+   }
+ 
+   private void initRefCntWriter() {
+-    if (refCntWriter == null) {
++    if (refCntWriter == null && indexWriter != null) {
+       refCntWriter = new RefCounted<IndexWriter>(indexWriter) {
+         @Override
+         public void close() {
+@@ -133,12 +134,13 @@ public void close() {
+ 
+   @Override
+   public synchronized void newIndexWriter(SolrCore core, boolean rollback, boolean forceNewDir) throws IOException {
+-    if (closed) {
+-      throw new AlreadyClosedException("SolrCoreState already closed");
+-    }
+     log.info("Creating new IndexWriter...");
+     String coreName = core.getName();
+     synchronized (writerPauseLock) {
++      if (closed) {
++        throw new SolrException(ErrorCode.SERVICE_UNAVAILABLE, "Already closed");
++      }
++      
+       // we need to wait for the Writer to fall out of use
+       // first lets stop it from being lent out
+       pauseWriter = true;
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrCoreState.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+index 12483736..e3b1d083 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrCoreState.java
+@@ -37,6 +37,7 @@
+ public abstract class SolrCoreState {
+   public static Logger log = LoggerFactory.getLogger(SolrCoreState.class);
+   
++  protected boolean closed = false;
+   private final Object deleteLock = new Object();
+   
+   public Object getUpdateLock() {
+@@ -45,10 +46,6 @@ public Object getUpdateLock() {
+   
+   private int solrCoreStateRefCnt = 1;
+   
+-  public synchronized int getSolrCoreStateRefCnt() {
+-    return solrCoreStateRefCnt;
+-  }
+-
+   public void increfSolrCoreState() {
+     synchronized (this) {
+       if (solrCoreStateRefCnt == 0) {
+@@ -58,11 +55,13 @@ public void increfSolrCoreState() {
+     }
+   }
+   
+-  public void decrefSolrCoreState(IndexWriterCloser closer) {
++  public boolean decrefSolrCoreState(IndexWriterCloser closer) {
+     boolean close = false;
+     synchronized (this) {
+       solrCoreStateRefCnt--;
++      assert solrCoreStateRefCnt >= 0;
+       if (solrCoreStateRefCnt == 0) {
++        closed = true;
+         close = true;
+       }
+     }
+@@ -75,6 +74,7 @@ public void decrefSolrCoreState(IndexWriterCloser closer) {
+         log.error("Error closing SolrCoreState", t);
+       }
+     }
++    return close;
+   }
+   
+   public abstract Lock getCommitLock();
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+index 1bf0c1c0..741d7a3b 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/java/org/apache/solr/update/SolrIndexWriter.java
+@@ -179,6 +179,7 @@ public void close() throws IOException {
+ 
+   @Override
+   public void rollback() throws IOException {
++    Directory dir = getDirectory();
+     try {
+       while (true) {
+         try {
+@@ -191,7 +192,7 @@ public void rollback() throws IOException {
+       }
+     } finally {
+       isClosed = true;
+-      directoryFactory.release(getDirectory());
++      directoryFactory.release(dir);
+       numCloses.incrementAndGet();
+     }
+   }
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/core/CachingDirectoryFactoryTest.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/core/CachingDirectoryFactoryTest.java
+index e49dac21..773a2875 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/core/CachingDirectoryFactoryTest.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/core/CachingDirectoryFactoryTest.java
+@@ -12,6 +12,7 @@
+ 
+ import org.apache.lucene.store.Directory;
+ import org.apache.solr.SolrTestCaseJ4;
++import org.apache.solr.common.SolrException;
+ import org.apache.solr.core.DirectoryFactory.DirContext;
+ import org.junit.Test;
+ 
+@@ -132,7 +133,7 @@ public void run() {
+         } catch (InterruptedException e1) {
+           throw new RuntimeException(e1);
+         }
+-        try {
++        
+           synchronized (dirs) {
+             int sz = dirs.size();
+             List<Tracker> dirsList = new ArrayList<Tracker>();
+@@ -140,24 +141,25 @@ public void run() {
+             if (sz > 0) {
+               Tracker tracker = dirsList.get(Math.min(dirsList.size() - 1,
+                   random.nextInt(sz + 1)));
++            try {
+               if (tracker.refCnt.get() > 0) {
+                 if (random.nextBoolean()) {
+                   df.doneWithDirectory(tracker.dir);
+                 }
+                 if (random.nextBoolean()) {
+                   df.remove(tracker.dir);
+-                }
+-                if (random.nextBoolean()) {
++                } else {
+                   df.remove(tracker.path);
+                 }
+                 tracker.refCnt.decrementAndGet();
+                 df.release(tracker.dir);
+               }
++            } catch (Exception e) {
++              throw new RuntimeException("path:" + tracker.path + "ref cnt:" + tracker.refCnt, e);
+             }
+           }
+-        } catch (IOException e) {
+-          throw new RuntimeException(e);
+         }
++        
+       }
+     }
+   }
+@@ -180,7 +182,16 @@ public void run() {
+           throw new RuntimeException(e1);
+         }
+         try {
+-          String path = "path" + random.nextInt(20);
++          String path;
++          if (random.nextBoolean()) {
++            path = "path" + random.nextInt(20);
++          } else {
++            if (random.nextBoolean()) {
++              path = "path" + random.nextInt(20) + "/" + random.nextInt(20);
++            } else {
++              path = "path" + random.nextInt(20) + "/" + random.nextInt(20) + "/" + random.nextInt(20);
++            }
++          }
+           synchronized (dirs) {
+             Tracker tracker = dirs.get(path);
+             if (tracker == null) {
+@@ -235,8 +246,14 @@ public void run() {
+           Tracker tracker = dirs.get(path);
+           
+           if (tracker != null && tracker.refCnt.get() > 0) {
+-            tracker.refCnt.incrementAndGet();
++            try {
+             df.incRef(tracker.dir);
++            } catch (SolrException e) {
++              log.warn("", e);
++              continue;
++            }
++            
++            tracker.refCnt.incrementAndGet();
+           }
+         }
+         
+diff --git a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+index 3222ea74..1af46335 100644
+--- a/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
++++ b/lucene/dev/branches/lucene_solr_4_2/solr/core/src/test/org/apache/solr/handler/TestReplicationHandler.java
+@@ -29,6 +29,8 @@
+ import java.net.MalformedURLException;
+ import java.net.URL;
+ import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collection;
+ import java.util.regex.Matcher;
+ import java.util.regex.Pattern;
+ 
+@@ -55,6 +57,11 @@
+ import org.apache.solr.common.params.ModifiableSolrParams;
+ import org.apache.solr.common.util.NamedList;
+ import org.apache.solr.common.util.SimpleOrderedMap;
++import org.apache.solr.core.CachingDirectoryFactory;
++import org.apache.solr.core.CoreContainer;
++import org.apache.solr.core.SolrCore;
++import org.apache.solr.core.StandardDirectoryFactory;
++import org.apache.solr.servlet.SolrDispatchFilter;
+ import org.apache.solr.util.AbstractSolrTestCase;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -66,7 +73,6 @@
+  *
+  * @since 1.4
+  */
+-// TODO: can this test be sped up? it used to not be so slow...
+ @Slow
+ public class TestReplicationHandler extends SolrTestCaseJ4 {
+ 
+@@ -184,7 +190,7 @@ private NamedList rQuery(int expectedDocCount, String query, SolrServer server)
+       docList = (SolrDocumentList) res.get("response");
+       timeSlept += 100;
+       Thread.sleep(100);
+-    } while(docList.getNumFound() != expectedDocCount && timeSlept < 45000);
++    } while(docList.getNumFound() != expectedDocCount && timeSlept < 30000);
+     return res;
+   }
+   
+@@ -462,6 +468,9 @@ public void doTestIndexAndConfigReplication() throws Exception {
+     assertTrue(slaveXsltDir.isDirectory());
+     assertTrue(slaveXsl.exists());
+     
++    checkForSingleIndex(masterJetty);
++    checkForSingleIndex(slaveJetty);
++    
+   }
+ 
+   @Test
+@@ -646,12 +655,137 @@ public void doTestSnapPullWithMasterUrl() throws Exception {
+    
+     details = getDetails(slaveClient);
+ 
+-    // NOTE: at this point, the slave is not polling any more
+-    // restore it.
+-    slave.copyConfigFile(CONF_DIR + "solrconfig-slave.xml", "solrconfig.xml");
++    checkForSingleIndex(masterJetty);
++    checkForSingleIndex(slaveJetty);
++  }
++  
++  @Test
++  public void doTestStressReplication() throws Exception {
++    // change solrconfig on slave
++    // this has no entry for pollinginterval
++    
++    // get us a straight standard fs dir rather than mock*dir
++    boolean useStraightStandardDirectory = random().nextBoolean();
++    
++    if (useStraightStandardDirectory) {
++      useFactory(null);
++    }
++    try {
++      
++      slave
++          .copyConfigFile(CONF_DIR + "solrconfig-slave1.xml", "solrconfig.xml");
+     slaveJetty.stop();
+     slaveJetty = createJetty(slave);
+     slaveClient = createNewSolrServer(slaveJetty.getLocalPort());
++      
++      master.copyConfigFile(CONF_DIR + "solrconfig-master3.xml",
++          "solrconfig.xml");
++      masterJetty.stop();
++      masterJetty = createJetty(master);
++      masterClient = createNewSolrServer(masterJetty.getLocalPort());
++      
++      masterClient.deleteByQuery("*:*");
++      slaveClient.deleteByQuery("*:*");
++      slaveClient.commit();
++      
++      int maxDocs = TEST_NIGHTLY ? 1000 : 200;
++      int rounds = TEST_NIGHTLY ? 80 : 8;
++      int totalDocs = 0;
++      int id = 0;
++      for (int x = 0; x < rounds; x++) {
++        
++        // we randomly trigger a configuration replication
++        // if (random().nextBoolean()) {
++        master.copyConfigFile(CONF_DIR + "schema-replication"
++            + (random().nextInt(2) + 1) + ".xml", "schema.xml");
++        // }
++        
++        int docs = random().nextInt(maxDocs);
++        for (int i = 0; i < docs; i++) {
++          index(masterClient, "id", id++, "name", "name = " + i);
++        }
++        
++        totalDocs += docs;
++        masterClient.commit();
++        
++        NamedList masterQueryRsp = rQuery(totalDocs, "*:*", masterClient);
++        SolrDocumentList masterQueryResult = (SolrDocumentList) masterQueryRsp
++            .get("response");
++        assertEquals(totalDocs, masterQueryResult.getNumFound());
++        
++        // snappull
++        pullFromMasterToSlave();
++        
++        // get docs from slave and check if number is equal to master
++        NamedList slaveQueryRsp = rQuery(totalDocs, "*:*", slaveClient);
++        SolrDocumentList slaveQueryResult = (SolrDocumentList) slaveQueryRsp
++            .get("response");
++        assertEquals(totalDocs, slaveQueryResult.getNumFound());
++        // compare results
++        String cmp = BaseDistributedSearchTestCase.compare(masterQueryResult,
++            slaveQueryResult, 0, null);
++        assertEquals(null, cmp);
++        
++        assertVersions(masterClient, slaveClient);
++        
++        checkForSingleIndex(masterJetty);
++        checkForSingleIndex(slaveJetty);
++        
++        if (random().nextBoolean()) {
++          // move the slave ahead
++          for (int i = 0; i < 3; i++) {
++            index(slaveClient, "id", id++, "name", "name = " + i);
++          }
++          slaveClient.commit();
++        }
++        
++      }
++      
++    } finally {
++      if (useStraightStandardDirectory) {
++        resetFactory();
++      }
++    }
++  }
++
++  private void checkForSingleIndex(JettySolrRunner jetty) {
++    CoreContainer cores = ((SolrDispatchFilter) jetty.getDispatchFilter().getFilter()).getCores();
++    Collection<SolrCore> theCores = cores.getCores();
++    for (SolrCore core : theCores) {
++      String ddir = core.getDataDir();
++      CachingDirectoryFactory dirFactory = (CachingDirectoryFactory) core.getDirectoryFactory();
++      synchronized (dirFactory) {
++        assertEquals(dirFactory.getPaths().toString(), 2, dirFactory.getPaths().size());
++      }
++      if (dirFactory instanceof StandardDirectoryFactory) {
++        System.out.println(Arrays.asList(new File(ddir).list()));
++        assertEquals(Arrays.asList(new File(ddir).list()).toString(), 1, indexDirCount(ddir));
++      }
++    }
++  }
++
++  private int indexDirCount(String ddir) {
++    String[] list = new File(ddir).list();
++    int cnt = 0;
++    for (String file : list) {
++      if (!file.endsWith(".properties")) {
++        cnt++;
++      }
++    }
++    return cnt;
++  }
++
++  private void pullFromMasterToSlave() throws MalformedURLException,
++      IOException {
++    String masterUrl = "http://127.0.0.1:" + slaveJetty.getLocalPort() + "/solr/replication?command=fetchindex&masterUrl=";
++    masterUrl += "http://127.0.0.1:" + masterJetty.getLocalPort() + "/solr/replication";
++    URL url = new URL(masterUrl);
++    InputStream stream = url.openStream();
++    try {
++      stream.close();
++    } catch (IOException e) {
++      //e.printStackTrace();
++    }
+   }
+   
+   @Test
+@@ -742,7 +876,6 @@ private void assertVersions(SolrServer client1, SolrServer client2) throws Excep
+     // check vs /replication?command=indexversion call
+     resp = client2.request(req);
+     version = (Long) resp.get("indexversion");
+-    
+     assertEquals(maxVersionClient2, version);
+   }
+ 
+@@ -1039,6 +1172,8 @@ public void doTestIndexAndConfigAliasReplication() throws Exception {
+     SolrDocument d = ((SolrDocumentList) slaveQueryRsp.get("response")).get(0);
+     assertEquals("newname = 2001", (String) d.getFieldValue("newname"));
+     
++    checkForSingleIndex(masterJetty);
++    checkForSingleIndex(slaveJetty);
+   }
+ 
+ 

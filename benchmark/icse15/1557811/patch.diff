@@ -1,0 +1,242 @@
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+index 04c0d983..371fa8ea 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ElectionContext.java
+@@ -443,4 +443,8 @@ void runLeaderProcess(boolean weAreReplacement) throws KeeperException,
+     overseer.start(id);
+   }
+   
++  public void cancelElection() throws InterruptedException, KeeperException {
++    super.cancelElection();
++    overseer.close();
++  }
+ }
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/LeaderElector.java b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/LeaderElector.java
+index ff8f0013..9ebf9cbf 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/LeaderElector.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/LeaderElector.java
+@@ -64,11 +64,17 @@
+   
+   private ZkCmdExecutor zkCmdExecutor;
+   
++  private volatile ElectionContext context;
++
+   public LeaderElector(SolrZkClient zkClient) {
+     this.zkClient = zkClient;
+     zkCmdExecutor = new ZkCmdExecutor(zkClient.getZkClientTimeout());
+   }
+   
++  public ElectionContext getContext() {
++    return context;
++  }
++  
+   /**
+    * Check if the candidate with the given n_* sequence number is the leader.
+    * If it is, set the leaderId on the leader zk node. If it is not, start
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ZkController.java b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+index 20fa0c35..02b4c204 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ZkController.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/core/src/java/org/apache/solr/cloud/ZkController.java
+@@ -139,13 +139,13 @@ public boolean equals(Object obj) {
+   }
+   private final Map<ContextKey, ElectionContext> electionContexts = Collections.synchronizedMap(new HashMap<ContextKey, ElectionContext>());
+   
+-  private SolrZkClient zkClient;
+-  private ZkCmdExecutor cmdExecutor;
+-  private ZkStateReader zkStateReader;
++  private final SolrZkClient zkClient;
++  private final ZkCmdExecutor cmdExecutor;
++  private final ZkStateReader zkStateReader;
+ 
+-  private LeaderElector leaderElector;
++  private final LeaderElector leaderElector;
+   
+-  private String zkServerAddress;          // example: 127.0.0.1:54062/solr
++  private final String zkServerAddress;          // example: 127.0.0.1:54062/solr
+ 
+   private final String localHostPort;      // example: 54065
+   private final String localHostContext;   // example: solr
+@@ -226,6 +226,11 @@ public void command() {
+ 
+               ZkController.this.overseer = new Overseer(shardHandler, adminPath, zkStateReader);
+               ElectionContext context = new OverseerElectionContext(zkClient, overseer, getNodeName());
++              ElectionContext prevContext = overseerElector.getContext();
++              if (prevContext != null) {
++                prevContext.cancelElection();
++              }
++              
+               overseerElector.joinElection(context, true);
+               zkStateReader.createClusterStateWatchersAndUpdate();
+               
+@@ -939,6 +944,17 @@ public ZkCoreNodeProps getLeaderProps(final String collection,
+ 
+ 
+   private void joinElection(CoreDescriptor cd, boolean afterExpiration) throws InterruptedException, KeeperException, IOException {
++    // look for old context - if we find it, cancel it
++    String collection = cd.getCloudDescriptor().getCollectionName();
++    final String coreNodeName = cd.getCloudDescriptor().getCoreNodeName();
++    
++    ContextKey contextKey = new ContextKey(collection, coreNodeName);
++    
++    ElectionContext prevContext = electionContexts.get(contextKey);
++    
++    if (prevContext != null) {
++      prevContext.cancelElection();
++    }
+     
+     String shardId = cd.getCloudDescriptor().getShardId();
+     
+@@ -948,16 +964,15 @@ private void joinElection(CoreDescriptor cd, boolean afterExpiration) throws Int
+     props.put(ZkStateReader.CORE_NAME_PROP, cd.getName());
+     props.put(ZkStateReader.NODE_NAME_PROP, getNodeName());
+     
+-    final String coreNodeName = cd.getCloudDescriptor().getCoreNodeName();
++ 
+     ZkNodeProps ourProps = new ZkNodeProps(props);
+-    String collection = cd.getCloudDescriptor()
+-        .getCollectionName();
++
+     
+     ElectionContext context = new ShardLeaderElectionContext(leaderElector, shardId,
+         collection, coreNodeName, ourProps, this, cc);
+ 
+     leaderElector.setup(context);
+-    electionContexts.put(new ContextKey(collection, coreNodeName), context);
++    electionContexts.put(contextKey, context);
+     leaderElector.joinElection(context, false);
+   }
+ 
+diff --git a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
+index 93a10c92..aeb22712 100644
+--- a/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
++++ b/lucene/dev/branches/lucene_solr_4_6/solr/solrj/src/java/org/apache/solr/common/cloud/ConnectionManager.java
+@@ -36,10 +36,8 @@
+       .getLogger(ConnectionManager.class);
+ 
+   private final String name;
+-  private CountDownLatch clientConnected;
+-  private KeeperState state = KeeperState.Disconnected;
++  private CountDownLatch clientConnected = new CountDownLatch(1);
+   private boolean connected = false;
+-  private boolean likelyExpired = true;
+ 
+   private final ZkClientConnectionStrategy connectionStrategy;
+ 
+@@ -49,7 +47,9 @@
+ 
+   private final OnReconnect onReconnect;
+ 
++  private volatile KeeperState state = KeeperState.Disconnected;
+   private volatile boolean isClosed = false;
++  private volatile boolean likelyExpired = true;
+   
+   private volatile Timer disconnectedTimer;
+ 
+@@ -59,16 +59,16 @@ public ConnectionManager(String name, SolrZkClient client, String zkServerAddres
+     this.connectionStrategy = strat;
+     this.zkServerAddress = zkServerAddress;
+     this.onReconnect = onConnect;
+-    clientConnected = new CountDownLatch(1);
+   }
+   
+   private synchronized void connected() {
+-    connected = true;
+     if (disconnectedTimer != null) {
+       disconnectedTimer.cancel();
+       disconnectedTimer = null;
+     }
++    connected = true;
+     likelyExpired = false;
++    notifyAll();
+   }
+ 
+   private synchronized void disconnected() {
+@@ -82,18 +82,17 @@ private synchronized void disconnected() {
+         
+         @Override
+         public void run() {
+-          synchronized (ConnectionManager.this) {
+             likelyExpired = true;
+           }
+-        }
+         
+       }, (long) (client.getZkClientTimeout() * 0.90));
+     }
+     connected = false;
++    notifyAll();
+   }
+ 
+   @Override
+-  public synchronized void process(WatchedEvent event) {
++  public void process(WatchedEvent event) {
+     if (log.isInfoEnabled()) {
+       log.info("Watcher " + this + " name:" + name + " got event " + event
+           + " path:" + event.getPath() + " type:" + event.getType());
+@@ -105,6 +104,7 @@ public synchronized void process(WatchedEvent event) {
+     }
+ 
+     state = event.getState();
++    
+     if (state == KeeperState.SyncConnected) {
+       connected();
+       clientConnected.countDown();
+@@ -117,10 +117,12 @@ public synchronized void process(WatchedEvent event) {
+       
+       connected = false;
+       likelyExpired = true;
++      
+       log.info("Our previous ZooKeeper session was expired. Attempting to reconnect to recover relationship with ZooKeeper...");
+       
+       try {
+-        connectionStrategy.reconnect(zkServerAddress, client.getZkClientTimeout(), this,
++        connectionStrategy.reconnect(zkServerAddress,
++            client.getZkClientTimeout(), this,
+             new ZkClientConnectionStrategy.ZkUpdate() {
+               @Override
+               public void update(SolrZooKeeper keeper) {
+@@ -144,12 +146,22 @@ public void update(SolrZooKeeper keeper) {
+                   throw new RuntimeException(t);
+                 }
+                 
++                connected();
++                
+                 if (onReconnect != null) {
++                  Thread thread = new Thread() {
++                    @Override
++                    public void run() {
++                      try {
+                   onReconnect.command();
++                      } catch (Exception e) {
++                        log.warn("Exception running onReconnect command", e);
++                      }
++                    }
++                  };
++                  thread.start();
+                 }
+                 
+-                connected();
+-                
+               }
+             });
+       } catch (Exception e) {
+@@ -163,7 +175,6 @@ public void update(SolrZooKeeper keeper) {
+     } else {
+       disconnected();
+     }
+-    notifyAll();
+   }
+ 
+   public synchronized boolean isConnected() {
+@@ -183,11 +194,7 @@ public void close() {
+     }
+   }
+ 
+-  public synchronized KeeperState state() {
+-    return state;
+-  }
+-  
+-  public synchronized boolean isLikelyExpired() {
++  public boolean isLikelyExpired() {
+     return likelyExpired;
+   }
+ 
