@@ -12,14 +12,14 @@ Install <https://github.com/lascam-UFU/automatic-diff-dissection>
 ```bash
 git clone https://github.com/lascam-UFU/automatic-diff-dissection
 cd automatic-diff-dissection
-mvn install
+mvn package
 ```
 
 Run [extract_feature.py](https://github.com/tdurieux/pattern-detector-experiment/blob/master/script/extract_feature.py). This creates one JSON file per patch:
 
 ```bash
-python extract_feature.py <path to benchmark> <path to automatic-diff-dissection> <output folder>
-python extract_feature.py ../benchmark/defects4j/ ../../automatic-diff-dissection/ output
+python extract_feature.py <name of benchmark> <path to automatic-diff-dissection> <output folder>
+python extract_feature.py defects4j ../../automatic-diff-dissection/ output
 ```
 
 Run [merge_features.py](https://github.com/tdurieux/pattern-detector-experiment/blob/master/script/merge_features.py), this will create a unique file `dissection.json` with the output folder of the previous step as input
