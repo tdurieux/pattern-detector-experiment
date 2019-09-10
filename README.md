@@ -9,7 +9,7 @@ It allows us to navigate and filter the diffs to have a better understanding of 
 A benchmark folder contains files as follows:
 
 * a folder `<project>/<commit-id>`
-* a file  `<project>/<commit-id>/path.diff`
+* a file  `<project>/<commit-id>/path.diff` (if there are several files modified in the commit, it must be a multi patch in unified diff format)
 * a file  `<project>/<commit-id>/buggy-version/**/*.java` (it will be found automatically by recursing into the empty folder)
 
 
