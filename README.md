@@ -4,6 +4,14 @@ This repository contains the data and the scripts to identify patterns automatic
 The result produced by this repository is available at this address: https://durieux.me/pattern-detector-experiment/.
 It allows us to navigate and filter the diffs to have a better understanding of the benchmarks.
 
+## Data format
+
+A benchmark folder contains files as follows:
+
+* a folder `<project>/<commit-id>`
+* a file  `<project>/<commit-id>/path.diff`
+* a file  `<project>/<commit-id>/**/*.java` (it will be found automatically by recursing into the empty folder)
+
 
 ## How to create a new dissection?
 
