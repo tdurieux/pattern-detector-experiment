@@ -1,10 +1,4 @@
 #!/usr/bin/env python
-# usage 
-# python merge_features.py <benchmark_path> <benchmark_name> <folder_json>
-# python merge_features.py ../../benchmarks/ defects4j /tmp/out
-#
-# folder_json is the output of extract_feature.py
-
 
 from __future__ import print_function
 import os
@@ -33,9 +27,14 @@ for file_name in sorted(os.listdir(path_json_file)):
         data = json.load(fd)
         data['benchmark'] = benchmark
         project=file_name.split('_')[0]
-        with codecs.open(os.path.join(path_benchmark, project, file_name.replace("_all.json", ""), "path.diff"), "r", encoding='utf8', errors='ignore') as fd:
-            data['diff'] = fd.read()
+        for category in data:
+            if category == 'metrics':
+                continue
+            for key in sorted(data[category]):
+                if type(data[category]) is dict:
+                    if data[category][key] == 0:
+                        del data[category][key]
         output.append(data)
 
-with codecs.open(os.path.join("%s/dissection.json" % benchmark), "w",encoding='utf8') as fd:
+with codecs.open(os.path.join("dissection.json"), "w",encoding='utf8') as fd:
     json.dump(output, fd)
