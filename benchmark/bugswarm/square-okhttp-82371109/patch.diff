@@ -1,0 +1,118 @@
+diff --git a/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/WebSocketWriterTest.java b/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/WebSocketWriterTest.java
+index 053e4e7a22..d662fdec43 100755
+--- a/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/WebSocketWriterTest.java
++++ b/okhttp-ws-tests/src/test/java/com/squareup/okhttp/internal/ws/WebSocketWriterTest.java
+@@ -22,6 +22,7 @@
+ import okio.BufferedSink;
+ import okio.ByteString;
+ import okio.Okio;
++import okio.Sink;
+ import org.junit.Rule;
+ import org.junit.Test;
+ import org.junit.rules.TestRule;
+@@ -30,6 +31,8 @@
+ 
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.OPCODE_BINARY;
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.OPCODE_TEXT;
++import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_MAX;
++import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_SHORT_MAX;
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.toggleMask;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.fail;
+@@ -108,22 +111,44 @@
+     assertData("8000");
+   }
+ 
+-  @Test public void serverBinaryMessageLengthShort() throws IOException {
+-    BufferedSink sink = Okio.buffer(serverWriter.newMessageSink(OPCODE_BINARY));
++  @Test public void serverMessageLengthShort() throws IOException {
++    Sink sink = serverWriter.newMessageSink(OPCODE_BINARY);
++
++    // Create a payload which will overload the normal payload byte size.
++    Buffer payload = new Buffer();
++    while (payload.completeSegmentByteCount() <= PAYLOAD_MAX) {
++      payload.writeByte('0');
++    }
++    long byteCount = payload.completeSegmentByteCount();
+ 
+-    byte[] payload = binaryData(0xffff);
+-    sink.write(payload).close();
+-    assertData("827effff");
+-    assertData(payload);
++    // Write directly to the unbuffered sink. This ensures it will become single frame.
++    sink.write(payload.clone(), byteCount);
++    assertData("027e"); // 'e' == 4-byte follow-up length.
++    assertData(String.format("%04X", payload.completeSegmentByteCount()));
++    assertData(payload.readByteArray());
++
++    sink.close();
++    assertData("8000");
+   }
+ 
+-  @Test public void serverBinaryMessageLengthLong() throws IOException {
+-    BufferedSink sink = Okio.buffer(serverWriter.newMessageSink(OPCODE_BINARY));
++  @Test public void serverMessageLengthLong() throws IOException {
++    Sink sink = serverWriter.newMessageSink(OPCODE_BINARY);
++
++    // Create a payload which will overload the normal and short payload byte size.
++    Buffer payload = new Buffer();
++    while (payload.completeSegmentByteCount() <= PAYLOAD_SHORT_MAX) {
++      payload.writeByte('0');
++    }
++    long byteCount = payload.completeSegmentByteCount();
+ 
+-    byte[] payload = binaryData(65537);
+-    sink.write(payload).close();
+-    assertData("827f0000000000010001");
+-    assertData(payload);
++    // Write directly to the unbuffered sink. This ensures it will become single frame.
++    sink.write(payload.clone(), byteCount);
++    assertData("027f"); // 'f' == 16-byte follow-up length.
++    assertData(String.format("%016X", byteCount));
++    assertData(payload.readByteArray(byteCount));
++
++    sink.close();
++    assertData("8000");
+   }
+ 
+   @Test public void clientBinary() throws IOException {
+diff --git a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketProtocol.java b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketProtocol.java
+index 2b93398fa5..8cd86c0dea 100755
+--- a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketProtocol.java
++++ b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketProtocol.java
+@@ -71,11 +71,13 @@
+    * Maximum length of frame payload. Larger payloads, if supported, can use the special values
+    * {@link #PAYLOAD_SHORT} or {@link #PAYLOAD_LONG}.
+    */
+-  static final int PAYLOAD_MAX = 125;
++  static final long PAYLOAD_MAX = 125L;
+   /**
+    * Value for {@link #B1_MASK_LENGTH} which indicates the next two bytes are the unsigned length.
+    */
+   static final int PAYLOAD_SHORT = 126;
++  /** Maximum length of a frame payload to be denoted as {@link #PAYLOAD_SHORT}. */
++  static final long PAYLOAD_SHORT_MAX = 0xffffL;
+   /**
+    * Value for {@link #B1_MASK_LENGTH} which indicates the next eight bytes are the unsigned
+    * length.
+diff --git a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketWriter.java b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketWriter.java
+index 19c87259df..b2a10da7f3 100755
+--- a/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketWriter.java
++++ b/okhttp-ws/src/main/java/com/squareup/okhttp/internal/ws/WebSocketWriter.java
+@@ -32,6 +32,7 @@
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_LONG;
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_MAX;
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_SHORT;
++import static com.squareup.okhttp.internal.ws.WebSocketProtocol.PAYLOAD_SHORT_MAX;
+ import static com.squareup.okhttp.internal.ws.WebSocketProtocol.toggleMask;
+ 
+ /**
+@@ -185,7 +186,7 @@ private void writeMessageFrameSynchronized(int formatOpcode, long byteCount, boo
+     if (byteCount <= PAYLOAD_MAX) {
+       b1 |= (int) byteCount;
+       sink.writeByte(b1);
+-    } else if (byteCount <= 0xffffL) { // Unsigned short.
++    } else if (byteCount <= PAYLOAD_SHORT_MAX) { // Unsigned short.
+       b1 |= PAYLOAD_SHORT;
+       sink.writeByte(b1);
+       sink.writeShort((int) byteCount);

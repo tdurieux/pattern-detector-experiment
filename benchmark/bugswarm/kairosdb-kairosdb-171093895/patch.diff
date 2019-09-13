@@ -1,0 +1,748 @@
+diff --git a/src/main/java/org/kairosdb/core/CoreModule.java b/src/main/java/org/kairosdb/core/CoreModule.java
+index 01b0729dd7..861c86144e 100755
+--- a/src/main/java/org/kairosdb/core/CoreModule.java
++++ b/src/main/java/org/kairosdb/core/CoreModule.java
+@@ -40,6 +40,7 @@
+ import org.kairosdb.core.queue.QueueProcessor;
+ import org.kairosdb.core.scheduler.KairosDBScheduler;
+ import org.kairosdb.core.scheduler.KairosDBSchedulerImpl;
++import org.kairosdb.util.CongestionExecutorService;
+ import org.kairosdb.util.MemoryMonitor;
+ import org.kairosdb.util.Util;
+ import se.ugli.bigqueue.BigArray;
+@@ -177,6 +178,8 @@ public void afterInjection(I i)
+ 
+ 		bind(KairosDataPointFactory.class).to(GuiceKairosDataPointFactory.class).in(Singleton.class);
+ 
++		bind(CongestionExecutorService.class);
++
+ 		String hostIp = m_props.getProperty("kairosdb.host_ip");
+ 		bindConstant().annotatedWith(Names.named("HOST_IP")).to(hostIp != null ? hostIp: InetAddresses.toAddrString(Util.findPublicIp()));
+ 	}
+diff --git a/src/main/java/org/kairosdb/core/queue/QueueProcessor.java b/src/main/java/org/kairosdb/core/queue/QueueProcessor.java
+index c28e14a387..398adacd85 100755
+--- a/src/main/java/org/kairosdb/core/queue/QueueProcessor.java
++++ b/src/main/java/org/kairosdb/core/queue/QueueProcessor.java
+@@ -42,6 +42,7 @@
+ 	private final DataPointEventSerializer m_eventSerializer;
+ 
+ 	private AtomicInteger m_readFromFileCount = new AtomicInteger();
++	private AtomicInteger m_readFromQueueCount = new AtomicInteger();
+ 
+ 	private ProcessorHandler m_processorHandler;
+ 	private long m_nextIndex = -1L;
+@@ -68,7 +69,6 @@ public QueueProcessor(
+ 		m_secondsTillCheckpoint = secondsTillCheckpoint;
+ 		m_eventSerializer = eventSerializer;
+ 		m_nextIndex = m_bigArray.getTailIndex();
+-		System.out.println("Next index: "+m_nextIndex);
+ 
+ 		executor.execute(m_deliveryThread);
+ 	}
+@@ -147,6 +147,8 @@ public void put(DataPointEvent dataPointEvent)
+ 			}
+ 		}
+ 
++		m_readFromQueueCount.getAndAdd(ret.size());
++
+ 		return Pair.of(returnIndex, ret);
+ 	}
+ 
+@@ -205,6 +207,12 @@ private void waitForEvent()
+ 
+ 		ret.add(dps);
+ 
++		dps = new DataPointSet("kairosdb.queue.process_count");
++		dps.addTag("host", m_hostName);
++		dps.addDataPoint(m_dataPointFactory.createDataPoint(now, m_readFromQueueCount.getAndSet(0)));
++
++		ret.add(dps);
++
+ 		return ret;
+ 	}
+ 
+diff --git a/src/main/java/org/kairosdb/datastore/cassandra/CassandraDatastore.java b/src/main/java/org/kairosdb/datastore/cassandra/CassandraDatastore.java
+index e4afa2f6a6..e3837784ea 100755
+--- a/src/main/java/org/kairosdb/datastore/cassandra/CassandraDatastore.java
++++ b/src/main/java/org/kairosdb/datastore/cassandra/CassandraDatastore.java
+@@ -51,6 +51,7 @@
+ import org.kairosdb.core.reporting.ThreadReporter;
+ import org.kairosdb.events.DataPointEvent;
+ import org.kairosdb.events.RowKeyEvent;
++import org.kairosdb.util.CongestionExecutorService;
+ import org.kairosdb.util.KDataOutput;
+ import org.kairosdb.util.MemoryMonitor;
+ import org.slf4j.Logger;
+@@ -60,6 +61,7 @@
+ import java.nio.ByteBuffer;
+ import java.nio.charset.Charset;
+ import java.util.*;
++import java.util.concurrent.Callable;
+ import java.util.concurrent.locks.Condition;
+ import java.util.concurrent.locks.ReentrantLock;
+ 
+@@ -162,6 +164,7 @@
+ 
+ 	private final KairosDataPointFactory m_kairosDataPointFactory;
+ 	private final QueueProcessor m_queueProcessor;
++	private final CongestionExecutorService m_congestionExecutor;
+ 
+ 	private CassandraConfiguration m_cassandraConfiguration;
+ 
+@@ -176,11 +179,13 @@ public CassandraDatastore(@Named("HOSTNAME") final String hostname,
+ 			HectorConfiguration configuration,
+ 			KairosDataPointFactory kairosDataPointFactory,
+ 			QueueProcessor queueProcessor,
+-			EventBus eventBus) throws DatastoreException
++			EventBus eventBus,
++			CongestionExecutorService congestionExecutor) throws DatastoreException
+ 	{
+ 		m_cassandraClient = cassandraClient;
+ 		m_kairosDataPointFactory = kairosDataPointFactory;
+ 		m_queueProcessor = queueProcessor;
++		m_congestionExecutor = congestionExecutor;
+ 		m_eventBus = eventBus;
+ 
+ 		setupSchema();
+@@ -443,154 +448,8 @@ public void putDataPoint(DataPointEvent dataPointEvent) throws DatastoreExceptio
+ 	@Override
+ 	public void handleEvents(List<DataPointEvent> events, EventCompletionCallBack eventCompletionCallBack)
+ 	{
+-		BatchStatement metricNamesBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+-		BatchStatement tagNameBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+-		BatchStatement tagValueBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+-		BatchStatement dataPointBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+-		BatchStatement rowKeyBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
+-
+-		//System.out.println(events.size());
+-		try
+-		{
+-			for (DataPointEvent event : events)
+-			{
+-				String metricName = event.getMetricName();
+-				ImmutableSortedMap<String, String> tags = event.getTags();
+-				DataPoint dataPoint = event.getDataPoint();
+-				int ttl = event.getTtl();
+-
+-				DataPointsRowKey rowKey = null;
+-				//time the data is written.
+-				long writeTime = System.currentTimeMillis();
+-				if (0 == ttl)
+-					ttl = m_cassandraConfiguration.getDatapointTtl();
+-
+-				int rowKeyTtl = 0;
+-				//Row key will expire 3 weeks after the data in the row expires
+-				if (ttl != 0)
+-					rowKeyTtl = ttl + ((int) (ROW_WIDTH / 1000));
+-
+-				long rowTime = calculateRowTime(dataPoint.getTimestamp());
+-
+-				rowKey = new DataPointsRowKey(metricName, rowTime, dataPoint.getDataStoreDataType(),
+-						tags);
+-
+-				//Write out the row key if it is not cached
+-				DataPointsRowKey cachedKey = m_rowKeyCache.cacheItem(rowKey);
+-				if (cachedKey == null)
+-				{
+-					BoundStatement bs = new BoundStatement(m_psInsertRowKey);
+-					bs.setBytes(0, ByteBuffer.wrap(metricName.getBytes(UTF_8)));
+-					bs.setBytes(1, DATA_POINTS_ROW_KEY_SERIALIZER.toByteBuffer(rowKey));
+-					bs.setInt(2, rowKeyTtl);
+-					rowKeyBatch.add(bs);
+-
+-					m_eventBus.post(new RowKeyEvent(metricName, rowKey, rowKeyTtl));
+-				}
+-				else
+-					rowKey = cachedKey;
+-
+-				//Write metric name if not in cache
+-				String cachedName = m_metricNameCache.cacheItem(metricName);
+-				if (cachedName == null)
+-				{
+-					if (metricName.length() == 0)
+-					{
+-						logger.warn(
+-								"Attempted to add empty metric name to string index. Row looks like: " + dataPoint
+-						);
+-					}
+-					BoundStatement bs = new BoundStatement(m_psInsertString);
+-					bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_METRIC_NAMES.getBytes(UTF_8)));
+-					bs.setString(1, metricName);
+-
+-					metricNamesBatch.add(bs);
+-				/*m_stringIndexWriteBuffer.addData(ROW_KEY_METRIC_NAMES,
+-						metricName, "", now);*/
+-				}
+-
+-				//Check tag names and values to write them out
+-				for (String tagName : tags.keySet())
+-				{
+-					String cachedTagName = m_tagNameCache.cacheItem(tagName);
+-					if (cachedTagName == null)
+-					{
+-						if (tagName.length() == 0)
+-						{
+-							logger.warn(
+-									"Attempted to add empty tagName to string cache for metric: " + metricName
+-							);
+-						}
+-						BoundStatement bs = new BoundStatement(m_psInsertString);
+-						bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_TAG_NAMES.getBytes(UTF_8)));
+-						bs.setString(1, tagName);
+-
+-						tagNameBatch.add(bs);
+-
+-					}
+-
+-					String value = tags.get(tagName);
+-					String cachedValue = m_tagValueCache.cacheItem(value);
+-					if (cachedValue == null)
+-					{
+-						if (value.length() == 0)
+-						{
+-							logger.warn(
+-									"Attempted to add empty tagValue (tag name " + tagName + ") to string cache for metric: " + metricName
+-							);
+-						}
+-						BoundStatement bs = new BoundStatement(m_psInsertString);
+-						bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_TAG_VALUES.getBytes(UTF_8)));
+-						bs.setString(1, value);
+-
+-						tagValueBatch.add(bs);
+-					/*m_stringIndexWriteBuffer.addData(ROW_KEY_TAG_VALUES,
+-							value, "", now);*/
+-					}
+-				}
+-
+-				int columnTime = getColumnName(rowTime, dataPoint.getTimestamp());
+-				KDataOutput kDataOutput = new KDataOutput();
+-				dataPoint.writeValueToBuffer(kDataOutput);
+-			/*m_dataPointWriteBuffer.addData(rowKey, columnTime,
+-					kDataOutput.getBytes(), writeTime, ttl);*/
+-
+-
+-				BoundStatement boundStatement = new BoundStatement(m_psInsertData);
+-				boundStatement.setBytes(0, DATA_POINTS_ROW_KEY_SERIALIZER.toByteBuffer(rowKey));
+-				ByteBuffer b = ByteBuffer.allocate(4);
+-				b.putInt(columnTime);
+-				b.rewind();
+-				boundStatement.setBytes(1, b);
+-				boundStatement.setBytes(2, ByteBuffer.wrap(kDataOutput.getBytes()));
+-				boundStatement.setInt(3, ttl);
+-				//m_session.executeAsync(boundStatement);
+-
+-				dataPointBatch.add(boundStatement);
+-
+-				//m_session.executeAsync(m_batchStatement);
+-			}
+-
+-			if (metricNamesBatch.size() != 0)
+-				m_session.executeAsync(metricNamesBatch);
+-
+-			if (tagNameBatch.size() != 0)
+-				m_session.executeAsync(tagNameBatch);
+-
+-			if (tagValueBatch.size() != 0)
+-				m_session.executeAsync(tagValueBatch);
+-
+-			if (rowKeyBatch.size() != 0)
+-				m_session.executeAsync(rowKeyBatch);
+-
+-			m_session.execute(dataPointBatch);
+-			eventCompletionCallBack.complete();
+-
+-		}
+-		catch (Exception e)
+-		{
+-			logger.error("Error sending data points", e);
+-		}
++		BatchHandler batchHandler = new BatchHandler(events, eventCompletionCallBack);
++		m_congestionExecutor.submit(batchHandler);
+ 	}
+ 
+ 
+@@ -869,6 +728,176 @@ public static boolean isLongValue(int columnName)
+ 	}
+ 
+ 
++	private class BatchHandler implements Callable<Long>
++	{
++		private final List<DataPointEvent> m_events;
++		private final EventCompletionCallBack m_callBack;
++
++		public BatchHandler(List<DataPointEvent> events, EventCompletionCallBack eventCompletionCallBack)
++		{
++			m_events = events;
++			m_callBack = eventCompletionCallBack;
++		}
++
++		@Override
++		public Long call()
++		{
++			//System.out.println("Running Batch");
++			BatchStatement metricNamesBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
++			BatchStatement tagNameBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
++			BatchStatement tagValueBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
++			BatchStatement dataPointBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
++			BatchStatement rowKeyBatch = new BatchStatement(BatchStatement.Type.UNLOGGED);
++
++			//System.out.println(events.size());
++			try
++			{
++				for (DataPointEvent event : m_events)
++				{
++					String metricName = event.getMetricName();
++					ImmutableSortedMap<String, String> tags = event.getTags();
++					DataPoint dataPoint = event.getDataPoint();
++					int ttl = event.getTtl();
++
++					DataPointsRowKey rowKey = null;
++					//time the data is written.
++					long writeTime = System.currentTimeMillis();
++					if (0 == ttl)
++						ttl = m_cassandraConfiguration.getDatapointTtl();
++
++					int rowKeyTtl = 0;
++					//Row key will expire 3 weeks after the data in the row expires
++					if (ttl != 0)
++						rowKeyTtl = ttl + ((int) (ROW_WIDTH / 1000));
++
++					long rowTime = calculateRowTime(dataPoint.getTimestamp());
++
++					rowKey = new DataPointsRowKey(metricName, rowTime, dataPoint.getDataStoreDataType(),
++							tags);
++
++					//Write out the row key if it is not cached
++					DataPointsRowKey cachedKey = m_rowKeyCache.cacheItem(rowKey);
++					if (cachedKey == null)
++					{
++						BoundStatement bs = new BoundStatement(m_psInsertRowKey);
++						bs.setBytes(0, ByteBuffer.wrap(metricName.getBytes(UTF_8)));
++						bs.setBytes(1, DATA_POINTS_ROW_KEY_SERIALIZER.toByteBuffer(rowKey));
++						bs.setInt(2, rowKeyTtl);
++						rowKeyBatch.add(bs);
++
++						m_eventBus.post(new RowKeyEvent(metricName, rowKey, rowKeyTtl));
++					}
++					else
++						rowKey = cachedKey;
++
++					//Write metric name if not in cache
++					String cachedName = m_metricNameCache.cacheItem(metricName);
++					if (cachedName == null)
++					{
++						if (metricName.length() == 0)
++						{
++							logger.warn(
++									"Attempted to add empty metric name to string index. Row looks like: " + dataPoint
++							);
++						}
++						BoundStatement bs = new BoundStatement(m_psInsertString);
++						bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_METRIC_NAMES.getBytes(UTF_8)));
++						bs.setString(1, metricName);
++
++						metricNamesBatch.add(bs);
++				/*m_stringIndexWriteBuffer.addData(ROW_KEY_METRIC_NAMES,
++						metricName, "", now);*/
++					}
++
++					//Check tag names and values to write them out
++					for (String tagName : tags.keySet())
++					{
++						String cachedTagName = m_tagNameCache.cacheItem(tagName);
++						if (cachedTagName == null)
++						{
++							if (tagName.length() == 0)
++							{
++								logger.warn(
++										"Attempted to add empty tagName to string cache for metric: " + metricName
++								);
++							}
++							BoundStatement bs = new BoundStatement(m_psInsertString);
++							bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_TAG_NAMES.getBytes(UTF_8)));
++							bs.setString(1, tagName);
++
++							tagNameBatch.add(bs);
++
++						}
++
++						String value = tags.get(tagName);
++						String cachedValue = m_tagValueCache.cacheItem(value);
++						if (cachedValue == null)
++						{
++							if (value.length() == 0)
++							{
++								logger.warn(
++										"Attempted to add empty tagValue (tag name " + tagName + ") to string cache for metric: " + metricName
++								);
++							}
++							BoundStatement bs = new BoundStatement(m_psInsertString);
++							bs.setBytes(0, ByteBuffer.wrap(ROW_KEY_TAG_VALUES.getBytes(UTF_8)));
++							bs.setString(1, value);
++
++							tagValueBatch.add(bs);
++					/*m_stringIndexWriteBuffer.addData(ROW_KEY_TAG_VALUES,
++							value, "", now);*/
++						}
++					}
++
++					int columnTime = getColumnName(rowTime, dataPoint.getTimestamp());
++					KDataOutput kDataOutput = new KDataOutput();
++					dataPoint.writeValueToBuffer(kDataOutput);
++			/*m_dataPointWriteBuffer.addData(rowKey, columnTime,
++					kDataOutput.getBytes(), writeTime, ttl);*/
++
++
++					BoundStatement boundStatement = new BoundStatement(m_psInsertData);
++					boundStatement.setBytes(0, DATA_POINTS_ROW_KEY_SERIALIZER.toByteBuffer(rowKey));
++					ByteBuffer b = ByteBuffer.allocate(4);
++					b.putInt(columnTime);
++					b.rewind();
++					boundStatement.setBytes(1, b);
++					boundStatement.setBytes(2, ByteBuffer.wrap(kDataOutput.getBytes()));
++					boundStatement.setInt(3, ttl);
++					//m_session.executeAsync(boundStatement);
++
++					dataPointBatch.add(boundStatement);
++
++					//m_session.executeAsync(m_batchStatement);
++				}
++
++				if (metricNamesBatch.size() != 0)
++					m_session.executeAsync(metricNamesBatch);
++
++				if (tagNameBatch.size() != 0)
++					m_session.executeAsync(tagNameBatch);
++
++				if (tagValueBatch.size() != 0)
++					m_session.executeAsync(tagValueBatch);
++
++				if (rowKeyBatch.size() != 0)
++					m_session.executeAsync(rowKeyBatch);
++
++				m_session.execute(dataPointBatch);
++				m_callBack.complete();
++
++			}
++			catch (Exception e)
++			{
++				logger.error("Error sending data points", e);
++			}
++
++			return null;
++		}
++
++	}
++
++
+ 
+ 	private class FilteredRowKeyIterator implements Iterator<DataPointsRowKey>
+ 	{
+diff --git a/src/main/java/org/kairosdb/util/CongestionExecutorService.java b/src/main/java/org/kairosdb/util/CongestionExecutorService.java
+new file mode 100755
+index 0000000000..a847958940
+--- /dev/null
++++ b/src/main/java/org/kairosdb/util/CongestionExecutorService.java
+@@ -0,0 +1,174 @@
++package org.kairosdb.util;
++
++import com.google.common.base.Stopwatch;
++import com.google.common.collect.ImmutableSortedMap;
++import com.google.common.eventbus.EventBus;
++import org.kairosdb.core.datapoints.DoubleDataPointFactory;
++import org.kairosdb.core.datapoints.DoubleDataPointFactoryImpl;
++import org.kairosdb.events.DataPointEvent;
++
++import javax.inject.Inject;
++import java.util.List;
++import java.util.concurrent.*;
++
++/**
++ Created by bhawkins on 10/27/16.
++ */
++public class CongestionExecutorService extends AbstractExecutorService
++{
++	private final EventBus m_eventBus;
++	private final ExecutorService m_internalExecutor;
++	private final ThreadGroup m_threadGroup;
++	private final CongestionSemaphore m_semaphore;
++	private final CongestionTimer m_congestionTimer;
++	private int m_permitCount = 10;
++
++	@Inject
++	private DoubleDataPointFactory m_dataPointFactory = new DoubleDataPointFactoryImpl();
++
++	@Inject
++	public CongestionExecutorService(EventBus eventBus)
++	{
++		m_eventBus = eventBus;
++		m_congestionTimer = new CongestionTimer(m_permitCount);
++		m_semaphore = new CongestionSemaphore(m_permitCount);
++		m_threadGroup = new ThreadGroup("KairosDynamic");
++		/*m_internalExecutor = Executors.newCachedThreadPool(new ThreadFactory()
++		{
++			@Override
++			public Thread newThread(Runnable r)
++			{
++				Thread t = new Thread(m_threadGroup, "worker");
++				return t;
++			}
++		});*/
++
++		m_internalExecutor = Executors.newCachedThreadPool();
++	}
++
++	@Override
++	public void shutdown()
++	{
++
++	}
++
++	@Override
++	public List<Runnable> shutdownNow()
++	{
++		return null;
++	}
++
++	@Override
++	public boolean isShutdown()
++	{
++		return false;
++	}
++
++	@Override
++	public boolean isTerminated()
++	{
++		return false;
++	}
++
++	@Override
++	public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException
++	{
++		return false;
++	}
++
++	@Override
++	public void execute(Runnable command)
++	{
++		try
++		{
++			//System.out.println("Execute called");
++			m_semaphore.acquire();
++			//System.out.println("Submitting");
++			m_internalExecutor.submit(command);
++			//System.out.println("Done submitting");
++		}
++		catch (InterruptedException e)
++		{
++			e.printStackTrace();
++		}
++	}
++
++	@Override
++	protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable)
++	{
++		//System.out.println("Returning new future");
++		return new DynamicFutureTask<T>(callable);
++	}
++
++
++
++	private class DynamicFutureTask<T> extends FutureTask<T>
++	{
++		private final Stopwatch m_stopwatch;
++
++		public DynamicFutureTask(Callable<T> callable)
++		{
++			super(callable);
++			m_stopwatch = Stopwatch.createUnstarted();
++		}
++
++		@Override
++		public void run()
++		{
++			System.out.println("DynamicFutureTask.run");
++			//Todo start stopwatch
++			m_stopwatch.start();
++			super.run();
++			m_stopwatch.stop();
++
++			//Todo do something with elapsed time
++			CongestionTimer.TimerStat timerStat = m_congestionTimer.reportTaskTime(m_stopwatch.elapsed(TimeUnit.MILLISECONDS));
++
++			m_semaphore.release();
++
++			if (timerStat != null)
++			{
++				System.out.println("Sending stats");
++				long now = System.currentTimeMillis();
++				ImmutableSortedMap<String, String> tags = ImmutableSortedMap.of("host", "test");
++				DataPointEvent dpe = new DataPointEvent("kairosdb.congestion.stats.min", tags,
++						m_dataPointFactory.createDataPoint(now, timerStat.min));
++				m_eventBus.post(dpe);
++
++				dpe = new DataPointEvent("kairosdb.congestion.stats.max", tags,
++						m_dataPointFactory.createDataPoint(now, timerStat.max));
++				m_eventBus.post(dpe);
++
++				dpe = new DataPointEvent("kairosdb.congestion.stats.avg", tags,
++						m_dataPointFactory.createDataPoint(now, timerStat.avg));
++				m_eventBus.post(dpe);
++
++				dpe = new DataPointEvent("kairosdb.congestion.stats.median", tags,
++						m_dataPointFactory.createDataPoint(now, timerStat.median));
++				m_eventBus.post(dpe);
++			}
++
++		}
++
++		@Override
++		public void set(T result)
++		{
++			//Todo Calculate time to run and adjust number of threads
++
++			super.set(result);
++		}
++	}
++
++	private static class CongestionSemaphore extends Semaphore
++	{
++		public CongestionSemaphore(int permits)
++		{
++			super(permits);
++		}
++
++		public void reducePermits(int reduction)
++		{
++			super.reducePermits(reduction);
++		}
++	}
++}
+diff --git a/src/main/java/org/kairosdb/util/CongestionTimer.java b/src/main/java/org/kairosdb/util/CongestionTimer.java
+new file mode 100755
+index 0000000000..3cae341176
+--- /dev/null
++++ b/src/main/java/org/kairosdb/util/CongestionTimer.java
+@@ -0,0 +1,58 @@
++package org.kairosdb.util;
++
++import com.google.common.collect.TreeMultiset;
++import org.apache.commons.math3.stat.descriptive.DescriptiveStatistics;
++
++/**
++ Created by bhawkins on 10/27/16.
++ */
++public class CongestionTimer
++{
++	private int m_taskPerBatch;
++	private final DescriptiveStatistics m_stats;
++
++	public CongestionTimer(int taskPerBatch)
++	{
++		m_taskPerBatch = taskPerBatch;
++		m_stats = new DescriptiveStatistics();
++	}
++
++	public void setTaskPerBatch(int taskPerBatch)
++	{
++		m_taskPerBatch = taskPerBatch;
++	}
++
++	public TimerStat reportTaskTime(long time)
++	{
++		m_stats.addValue(time);
++
++		if (m_stats.getN() == m_taskPerBatch)
++		{
++			TimerStat ts = new TimerStat(m_stats.getMin(), m_stats.getMax(),
++					m_stats.getMean(), m_stats.getPercentile(50));
++
++			m_stats.clear();
++
++			return ts;
++		}
++
++		return null;
++	}
++
++	public static class TimerStat
++	{
++		public final double min;
++		public final double max;
++		public final double avg;
++		public final double median;
++
++
++		public TimerStat(double min, double max, double avg, double median)
++		{
++			this.min = min;
++			this.max = max;
++			this.avg = avg;
++			this.median = median;
++		}
++	}
++}
+diff --git a/src/test/java/org/kairosdb/core/queue/QueueProcessorTest.java b/src/test/java/org/kairosdb/core/queue/QueueProcessorTest.java
+index 3f3ff3b90e..aeee5a1aea 100755
+--- a/src/test/java/org/kairosdb/core/queue/QueueProcessorTest.java
++++ b/src/test/java/org/kairosdb/core/queue/QueueProcessorTest.java
+@@ -2,6 +2,7 @@
+ 
+ import com.google.common.collect.ImmutableSortedMap;
+ import com.google.common.eventbus.EventBus;
++import org.junit.Before;
+ import org.junit.Test;
+ import org.kairosdb.core.DataPoint;
+ import org.kairosdb.core.TestDataPointFactory;
+@@ -9,7 +10,6 @@
+ import org.kairosdb.core.datapoints.LongDataPointFactoryImpl;
+ import org.kairosdb.events.DataPointEvent;
+ import org.mockito.Matchers;
+-import org.testng.annotations.BeforeTest;
+ import se.ugli.bigqueue.BigArray;
+ 
+ import java.util.Arrays;
+@@ -37,7 +37,7 @@ public void execute(Runnable command)
+ 		}
+ 	}
+ 
+-	@BeforeTest
++	@Before
+ 	public void setup()
+ 	{
+ 		m_deliveryThread = null;
+@@ -90,7 +90,7 @@ public void test_eventIsPulledFromMemoryQueue()
+ 		DataPointEventSerializer serializer = new DataPointEventSerializer(new TestDataPointFactory());
+ 		ProcessorHandler processorHandler = mock(ProcessorHandler.class);
+ 
+-		QueueProcessor queueProcessor = new QueueProcessor(eventBus, serializer,
++		QueueProcessor queueProcessor = new QueueProcessor(serializer,
+ 				bigArray, new TestExecutor(), 2, 10, 500);
+ 
+ 		queueProcessor.setProcessorHandler(processorHandler);
+@@ -119,7 +119,7 @@ public void test_eventIsPulledFromMemoryQueueThenBigArray()
+ 		DataPointEventSerializer serializer = new DataPointEventSerializer(new TestDataPointFactory());
+ 		ProcessorHandler processorHandler = mock(ProcessorHandler.class);
+ 
+-		QueueProcessor queueProcessor = new QueueProcessor(eventBus, serializer,
++		QueueProcessor queueProcessor = new QueueProcessor(serializer,
+ 				bigArray, new TestExecutor(), 3, 1, 500);
+ 
+ 		queueProcessor.setProcessorHandler(processorHandler);
+@@ -158,7 +158,7 @@ public void handleEvents(List<DataPointEvent> events, EventCompletionCallBack ev
+ 			}
+ 		};
+ 
+-		QueueProcessor queueProcessor = new QueueProcessor(eventBus, serializer,
++		QueueProcessor queueProcessor = new QueueProcessor(serializer,
+ 				bigArray, new TestExecutor(), 3, 1, -1);
+ 
+ 		queueProcessor.setProcessorHandler(processorHandler);
+@@ -175,6 +175,6 @@ public void handleEvents(List<DataPointEvent> events, EventCompletionCallBack ev
+ 
+ 		verify(bigArray, times(2)).append(eq(serializer.serializeEvent(event)));
+ 		verify(bigArray, times(1)).get(anyLong());
+-		verify(bigArray, times(1)).removeBeforeIndex(eq(2l));
++		verify(bigArray, times(1)).removeBeforeIndex(eq(1l));
+ 	}
+ }

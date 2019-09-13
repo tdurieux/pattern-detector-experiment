@@ -1,0 +1,607 @@
+diff --git a/mypy/checker.py b/mypy/checker.py
+index 9cde2c54cb..98bb35474b 100755
+--- a/mypy/checker.py
++++ b/mypy/checker.py
+@@ -682,7 +682,7 @@ def is_implicit_any(t: Type) -> bool:
+                             and typ.arg_kinds[0] not in [nodes.ARG_STAR, nodes.ARG_STAR2]):
+                         isclass = defn.is_class or defn.name() in ('__new__', '__init_subclass__')
+                         if isclass:
+-                            ref_type = mypy.types.TypeType(ref_type)
++                            ref_type = mypy.types.TypeType.make_normalized(ref_type)
+                         erased = erase_to_bound(arg_type)
+                         if not is_subtype_ignoring_tvars(ref_type, erased):
+                             note = None
+@@ -2741,13 +2741,10 @@ def convert_to_typetype(type_map: TypeMap) -> TypeMap:
+     if type_map is None:
+         return None
+     for expr, typ in type_map.items():
+-        if isinstance(typ, UnionType):
+-            converted_type_map[expr] = UnionType([TypeType(t) for t in typ.items])
+-        elif isinstance(typ, Instance):
+-            converted_type_map[expr] = TypeType(typ)
+-        else:
++        if not isinstance(typ, (UnionType, Instance)):
+             # unknown type; error was likely reported earlier
+             return {}
++        converted_type_map[expr] = TypeType.make_normalized(typ)
+     return converted_type_map
+ 
+ 
+diff --git a/mypy/checkexpr.py b/mypy/checkexpr.py
+index 6e0bb9ff81..0bafb2298e 100755
+--- a/mypy/checkexpr.py
++++ b/mypy/checkexpr.py
+@@ -513,7 +513,7 @@ def check_call(self, callee: Type, args: List[Expression],
+ 
+             if (callee.is_type_obj() and (len(arg_types) == 1)
+                     and is_equivalent(callee.ret_type, self.named_type('builtins.type'))):
+-                callee = callee.copy_modified(ret_type=TypeType(arg_types[0]))
++                callee = callee.copy_modified(ret_type=TypeType.make_normalized(arg_types[0]))
+ 
+             if callable_node:
+                 # Store the inferred callable type.
+@@ -1193,7 +1193,8 @@ def analyze_descriptor_access(self, instance_type: Type, descriptor_type: Type,
+             owner_type = instance_type
+ 
+         _, inferred_dunder_get_type = self.check_call(
+-            dunder_get_type, [TempNode(instance_type), TempNode(TypeType(owner_type))],
++            dunder_get_type,
++            [TempNode(instance_type), TempNode(TypeType.make_normalized(owner_type))],
+             [nodes.ARG_POS, nodes.ARG_POS], context)
+ 
+         if isinstance(inferred_dunder_get_type, AnyType):
+@@ -1570,31 +1571,23 @@ def visit_index_expr_helper(self, e: IndexExpr) -> Type:
+             return self.accept(e.analyzed)
+         left_type = self.accept(e.base)
+         if isinstance(left_type, TupleType) and self.chk.in_checked_function():
+-            # Special case for tuples. They support indexing only by integer
+-            # literals.
++            # Special case for tuples. They return a more specific type when
++            # indexed by an integer literal.
+             index = e.index
+             if isinstance(index, SliceExpr):
+                 return self.visit_tuple_slice_helper(left_type, index)
+ 
+-            ok = False
+-            if isinstance(index, IntExpr):
+-                n = index.value
+-                ok = True
+-            elif isinstance(index, UnaryExpr):
+-                if index.op == '-':
+-                    operand = index.expr
+-                    if isinstance(operand, IntExpr):
+-                        n = len(left_type.items) - operand.value
+-                        ok = True
+-            if ok:
++            n = self._get_value(index)
++            if n is not None:
++                if n < 0:
++                    n += len(left_type.items)
+                 if n >= 0 and n < len(left_type.items):
+                     return left_type.items[n]
+                 else:
+                     self.chk.fail(messages.TUPLE_INDEX_OUT_OF_RANGE, e)
+                     return AnyType()
+             else:
+-                self.chk.fail(messages.TUPLE_INDEX_MUST_BE_AN_INT_LITERAL, e)
+-                return AnyType()
++                return self.nonliteral_tuple_index_helper(left_type, index)
+         elif isinstance(left_type, TypedDictType):
+             return self.visit_typeddict_index_expr(left_type, e.index)
+         elif (isinstance(left_type, CallableType)
+@@ -1613,29 +1606,31 @@ def visit_tuple_slice_helper(self, left_type: TupleType, slic: SliceExpr) -> Typ
+         if slic.begin_index:
+             begin = self._get_value(slic.begin_index)
+             if begin is None:
+-                self.chk.fail(
+-                    messages.TUPLE_SLICE_MUST_BE_AN_INT_LITERAL,
+-                    slic.begin_index)
+-                return AnyType()
++                return self.nonliteral_tuple_index_helper(left_type, slic)
+ 
+         if slic.end_index:
+             end = self._get_value(slic.end_index)
+             if end is None:
+-                self.chk.fail(
+-                    messages.TUPLE_SLICE_MUST_BE_AN_INT_LITERAL,
+-                    slic.end_index)
+-                return AnyType()
++                return self.nonliteral_tuple_index_helper(left_type, slic)
+ 
+         if slic.stride:
+             stride = self._get_value(slic.stride)
+             if stride is None:
+-                self.chk.fail(
+-                    messages.TUPLE_SLICE_MUST_BE_AN_INT_LITERAL,
+-                    slic.stride)
+-                return AnyType()
++                return self.nonliteral_tuple_index_helper(left_type, slic)
+ 
+         return left_type.slice(begin, stride, end)
+ 
++    def nonliteral_tuple_index_helper(self, left_type: TupleType, index: Expression) -> Type:
++        index_type = self.accept(index)
++        expected_type = UnionType.make_union([self.named_type('builtins.int'),
++                                              self.named_type('builtins.slice')])
++        if not self.chk.check_subtype(index_type, expected_type, index,
++                                      messages.INVALID_TUPLE_INDEX_TYPE,
++                                      'actual type', 'expected type'):
++            return AnyType()
++        else:
++            return UnionType.make_simplified_union(left_type.items)
++
+     def _get_value(self, index: Expression) -> Optional[int]:
+         if isinstance(index, IntExpr):
+             return index.value
+diff --git a/mypy/checkmember.py b/mypy/checkmember.py
+index 4525b1446b..66949144ee 100755
+--- a/mypy/checkmember.py
++++ b/mypy/checkmember.py
+@@ -650,7 +650,7 @@ def expand(target: Type) -> Type:
+         ret_type = func.ret_type
+         variables = func.variables
+     if isinstance(original_type, CallableType) and original_type.is_type_obj():
+-        original_type = TypeType(original_type.ret_type)
++        original_type = TypeType.make_normalized(original_type.ret_type)
+     res = func.copy_modified(arg_types=arg_types,
+                              arg_kinds=func.arg_kinds[1:],
+                              arg_names=func.arg_names[1:],
+@@ -665,5 +665,5 @@ def erase_to_bound(t: Type) -> Type:
+         return t.upper_bound
+     if isinstance(t, TypeType):
+         if isinstance(t.item, TypeVarType):
+-            return TypeType(t.item.upper_bound)
++            return TypeType.make_normalized(t.item.upper_bound)
+     return t
+diff --git a/mypy/erasetype.py b/mypy/erasetype.py
+index 49035accf9..910793b6b9 100755
+--- a/mypy/erasetype.py
++++ b/mypy/erasetype.py
+@@ -75,7 +75,7 @@ def visit_union_type(self, t: UnionType) -> Type:
+         return UnionType.make_simplified_union(erased_items)
+ 
+     def visit_type_type(self, t: TypeType) -> Type:
+-        return TypeType(t.item.accept(self), line=t.line)
++        return TypeType.make_normalized(t.item.accept(self), line=t.line)
+ 
+ 
+ def erase_typevars(t: Type, ids_to_erase: Optional[Container[TypeVarId]] = None) -> Type:
+diff --git a/mypy/expandtype.py b/mypy/expandtype.py
+index 1830119194..937ed8b73a 100755
+--- a/mypy/expandtype.py
++++ b/mypy/expandtype.py
+@@ -124,7 +124,7 @@ def visit_type_type(self, t: TypeType) -> Type:
+         # union of instances or Any).  Sadly we can't report errors
+         # here yet.
+         item = t.item.accept(self)
+-        return TypeType(item)
++        return TypeType.make_normalized(item)
+ 
+     def expand_types(self, types: Iterable[Type]) -> List[Type]:
+         a = []  # type: List[Type]
+diff --git a/mypy/join.py b/mypy/join.py
+index 586d281adb..aaaa99fa37 100755
+--- a/mypy/join.py
++++ b/mypy/join.py
+@@ -245,7 +245,7 @@ def visit_partial_type(self, t: PartialType) -> Type:
+ 
+     def visit_type_type(self, t: TypeType) -> Type:
+         if isinstance(self.s, TypeType):
+-            return TypeType(self.join(t.item, self.s.item), line=t.line)
++            return TypeType.make_normalized(self.join(t.item, self.s.item), line=t.line)
+         elif isinstance(self.s, Instance) and self.s.type.fullname() == 'builtins.type':
+             return self.s
+         else:
+diff --git a/mypy/meet.py b/mypy/meet.py
+index e32997fc43..62940b08d6 100755
+--- a/mypy/meet.py
++++ b/mypy/meet.py
+@@ -278,7 +278,7 @@ def visit_type_type(self, t: TypeType) -> Type:
+         if isinstance(self.s, TypeType):
+             typ = self.meet(t.item, self.s.item)
+             if not isinstance(typ, NoneTyp):
+-                typ = TypeType(typ, line=t.line)
++                typ = TypeType.make_normalized(typ, line=t.line)
+             return typ
+         elif isinstance(self.s, Instance) and self.s.type.fullname() == 'builtins.type':
+             return t
+diff --git a/mypy/messages.py b/mypy/messages.py
+index 15f73d1733..d1e07977ff 100755
+--- a/mypy/messages.py
++++ b/mypy/messages.py
+@@ -54,8 +54,7 @@
+ INCOMPATIBLE_TYPES_IN_YIELD_FROM = 'Incompatible types in "yield from"'
+ INCOMPATIBLE_TYPES_IN_STR_INTERPOLATION = 'Incompatible types in string interpolation'
+ MUST_HAVE_NONE_RETURN_TYPE = 'The return type of "{}" must be None'
+-TUPLE_INDEX_MUST_BE_AN_INT_LITERAL = 'Tuple index must be an integer literal'
+-TUPLE_SLICE_MUST_BE_AN_INT_LITERAL = 'Tuple slice must be an integer literal'
++INVALID_TUPLE_INDEX_TYPE = 'Invalid tuple index type'
+ TUPLE_INDEX_OUT_OF_RANGE = 'Tuple index out of range'
+ NEED_ANNOTATION_FOR_VAR = 'Need type annotation for variable'
+ ITERABLE_EXPECTED = 'Iterable expected'
+@@ -192,7 +191,8 @@ def format(self, typ: Type, verbosity: int = 0) -> str:
+             if func.is_type_obj():
+                 # The type of a type object type can be derived from the
+                 # return type (this always works).
+-                return self.format(TypeType(erase_type(func.items()[0].ret_type)), verbosity)
++                return self.format(TypeType.make_normalized(erase_type(func.items()[0].ret_type)),
++                                   verbosity)
+             elif isinstance(func, CallableType):
+                 return_type = strip_quotes(self.format(func.ret_type))
+                 if func.is_ellipsis_args:
+@@ -536,34 +536,59 @@ def incompatible_argument(self, n: int, m: int, callee: CallableType, arg_type:
+         if callee.name == '<list>':
+             name = callee.name[1:-1]
+             n -= 1
++            actual_type_str, expected_type_str = self.format_distinctly(arg_type,
++                                                                        callee.arg_types[0])
+             msg = '{} item {} has incompatible type {}; expected {}'.format(
+-                name.title(), n, self.format_simple(arg_type),
+-                self.format_simple(callee.arg_types[0]))
++                name.title(), n, actual_type_str, expected_type_str)
+         elif callee.name == '<dict>':
+             name = callee.name[1:-1]
+             n -= 1
+             key_type, value_type = cast(TupleType, arg_type).items
+-            expected = cast(TupleType, callee.arg_types[0]).items
++            expected_key_type, expected_value_type = cast(TupleType, callee.arg_types[0]).items
++
++            # don't increase verbosity unless there is need to do so
++            from mypy.subtypes import is_subtype
++            if is_subtype(key_type, expected_key_type):
++                key_type_str = self.format(key_type)
++                expected_key_type_str = self.format(expected_key_type)
++            else:
++                key_type_str, expected_key_type_str = self.format_distinctly(
++                    key_type, expected_key_type)
++            if is_subtype(value_type, expected_value_type):
++                value_type_str = self.format(value_type)
++                expected_value_type_str = self.format(expected_value_type)
++            else:
++                value_type_str, expected_value_type_str = self.format_distinctly(
++                    value_type, expected_value_type)
++
+             msg = '{} entry {} has incompatible type {}: {}; expected {}: {}'.format(
+-                name.title(), n, self.format_simple(key_type), self.format_simple(value_type),
+-                self.format_simple(expected[0]), self.format_simple(expected[1]))
++                name.title(), n, key_type_str, value_type_str,
++                expected_key_type_str, expected_value_type_str)
+         elif callee.name == '<list-comprehension>':
++            actual_type_str, expected_type_str = map(strip_quotes,
++                                                     self.format_distinctly(arg_type,
++                                                                            callee.arg_types[0]))
+             msg = 'List comprehension has incompatible type List[{}]; expected List[{}]'.format(
+-                strip_quotes(self.format(arg_type)),
+-                strip_quotes(self.format_simple(callee.arg_types[0])))
++                actual_type_str, expected_type_str)
+         elif callee.name == '<set-comprehension>':
++            actual_type_str, expected_type_str = map(strip_quotes,
++                                                     self.format_distinctly(arg_type,
++                                                                            callee.arg_types[0]))
+             msg = 'Set comprehension has incompatible type Set[{}]; expected Set[{}]'.format(
+-                strip_quotes(self.format(arg_type)),
+-                strip_quotes(self.format_simple(callee.arg_types[0])))
++                actual_type_str, expected_type_str)
+         elif callee.name == '<dictionary-comprehension>':
++            actual_type_str, expected_type_str = self.format_distinctly(arg_type,
++                                                                        callee.arg_types[n - 1])
+             msg = ('{} expression in dictionary comprehension has incompatible type {}; '
+                    'expected type {}').format(
+                 'Key' if n == 1 else 'Value',
+-                self.format(arg_type),
+-                self.format(callee.arg_types[n - 1]))
++                actual_type_str,
++                expected_type_str)
+         elif callee.name == '<generator>':
++            actual_type_str, expected_type_str = self.format_distinctly(arg_type,
++                                                                        callee.arg_types[0])
+             msg = 'Generator has incompatible item type {}; expected {}'.format(
+-                self.format_simple(arg_type), self.format_simple(callee.arg_types[0]))
++                actual_type_str, expected_type_str)
+         else:
+             try:
+                 expected_type = callee.arg_types[m - 1]
+diff --git a/mypy/semanal.py b/mypy/semanal.py
+index 9722d77644..b46fbc1e73 100755
+--- a/mypy/semanal.py
++++ b/mypy/semanal.py
+@@ -2214,7 +2214,7 @@ def add_method(funcname: str,
+                        is_classmethod: bool = False,
+                        ) -> None:
+             if is_classmethod:
+-                first = [Argument(Var('cls'), TypeType(selftype), None, ARG_POS)]
++                first = [Argument(Var('cls'), TypeType.make_normalized(selftype), None, ARG_POS)]
+             else:
+                 first = [Argument(Var('self'), selftype, None, ARG_POS)]
+             args = first + args
+diff --git a/mypy/test/testtypes.py b/mypy/test/testtypes.py
+index 74a71f4e98..78fa2e1a26 100755
+--- a/mypy/test/testtypes.py
++++ b/mypy/test/testtypes.py
+@@ -580,7 +580,7 @@ def test_type_type(self) -> None:
+         self.assert_join(self.fx.type_b, self.fx.type_any, self.fx.type_any)
+         self.assert_join(self.fx.type_b, self.fx.type_type, self.fx.type_type)
+         self.assert_join(self.fx.type_b, self.fx.type_c, self.fx.type_a)
+-        self.assert_join(self.fx.type_c, self.fx.type_d, TypeType(self.fx.o))
++        self.assert_join(self.fx.type_c, self.fx.type_d, TypeType.make_normalized(self.fx.o))
+         self.assert_join(self.fx.type_type, self.fx.type_any, self.fx.type_type)
+         self.assert_join(self.fx.type_b, self.fx.anyt, self.fx.anyt)
+ 
+diff --git a/mypy/typeanal.py b/mypy/typeanal.py
+index f51e153554..d36ecb98de 100755
+--- a/mypy/typeanal.py
++++ b/mypy/typeanal.py
+@@ -189,7 +189,7 @@ def visit_unbound_type(self, t: UnboundType) -> Type:
+                 if len(t.args) != 1:
+                     self.fail('Type[...] must have exactly one type argument', t)
+                 item = self.anal_type(t.args[0])
+-                return TypeType(item, line=t.line)
++                return TypeType.make_normalized(item, line=t.line)
+             elif fullname == 'typing.ClassVar':
+                 if self.nesting_level > 0:
+                     self.fail('Invalid type: ClassVar nested inside other type', t)
+@@ -384,7 +384,7 @@ def visit_ellipsis_type(self, t: EllipsisType) -> Type:
+         return AnyType()
+ 
+     def visit_type_type(self, t: TypeType) -> Type:
+-        return TypeType(self.anal_type(t.item), line=t.line)
++        return TypeType.make_normalized(self.anal_type(t.item), line=t.line)
+ 
+     def analyze_callable_type(self, t: UnboundType) -> Type:
+         fallback = self.builtin_type('builtins.function')
+diff --git a/mypy/typefixture.py b/mypy/typefixture.py
+index 04714e9982..87ddd06d3e 100755
+--- a/mypy/typefixture.py
++++ b/mypy/typefixture.py
+@@ -145,12 +145,12 @@ def make_type_var(name: str, id: int, values: List[Type], upper_bound: Type,
+         self.lsta = Instance(self.std_listi, [self.a])  # List[A]
+         self.lstb = Instance(self.std_listi, [self.b])  # List[B]
+ 
+-        self.type_a = TypeType(self.a)
+-        self.type_b = TypeType(self.b)
+-        self.type_c = TypeType(self.c)
+-        self.type_d = TypeType(self.d)
+-        self.type_t = TypeType(self.t)
+-        self.type_any = TypeType(self.anyt)
++        self.type_a = TypeType.make_normalized(self.a)
++        self.type_b = TypeType.make_normalized(self.b)
++        self.type_c = TypeType.make_normalized(self.c)
++        self.type_d = TypeType.make_normalized(self.d)
++        self.type_t = TypeType.make_normalized(self.t)
++        self.type_any = TypeType.make_normalized(self.anyt)
+ 
+     # Helper methods
+ 
+diff --git a/mypy/types.py b/mypy/types.py
+index b45d60af3a..d8598554ae 100755
+--- a/mypy/types.py
++++ b/mypy/types.py
+@@ -1190,13 +1190,26 @@ class TypeType(Type):
+     # a generic class instance, a union, Any, a type variable...
+     item = None  # type: Type
+ 
+-    def __init__(self, item: Type, *, line: int = -1, column: int = -1) -> None:
++    def __init__(self, item: Union[Instance, AnyType, TypeVarType, TupleType, NoneTyp,
++                                   CallableType], *, line: int = -1, column: int = -1) -> None:
++        """To ensure Type[Union[A, B]] is always represented as Union[Type[A], Type[B]], item of
++        type UnionType must be handled through make_normalized static method.
++        """
+         super().__init__(line, column)
+         if isinstance(item, CallableType) and item.is_type_obj():
+             self.item = item.fallback
+         else:
+             self.item = item
+ 
++    @staticmethod
++    def make_normalized(item: Type, *, line: int = -1, column: int = -1) -> Type:
++        if isinstance(item, UnionType):
++            return UnionType.make_union(
++                [TypeType.make_normalized(union_item) for union_item in item.items],
++                line=line, column=column
++            )
++        return TypeType(item, line=line, column=column)  # type: ignore
++
+     def accept(self, visitor: 'TypeVisitor[T]') -> T:
+         return visitor.visit_type_type(self)
+ 
+@@ -1204,9 +1217,9 @@ def serialize(self) -> JsonDict:
+         return {'.class': 'TypeType', 'item': self.item.serialize()}
+ 
+     @classmethod
+-    def deserialize(cls, data: JsonDict) -> 'TypeType':
++    def deserialize(cls, data: JsonDict) -> Type:
+         assert data['.class'] == 'TypeType'
+-        return TypeType(deserialize_type(data['item']))
++        return TypeType.make_normalized(deserialize_type(data['item']))
+ 
+ 
+ #
+@@ -1383,7 +1396,7 @@ def visit_overloaded(self, t: Overloaded) -> Type:
+         return Overloaded(items=items)
+ 
+     def visit_type_type(self, t: TypeType) -> Type:
+-        return TypeType(t.item.accept(self), line=t.line, column=t.column)
++        return TypeType.make_normalized(t.item.accept(self), line=t.line, column=t.column)
+ 
+ 
+ class TypeStrVisitor(SyntheticTypeVisitor[str]):
+diff --git a/test-data/unit/check-class-namedtuple.test b/test-data/unit/check-class-namedtuple.test
+index 74db759aac..4b58c247b2 100755
+--- a/test-data/unit/check-class-namedtuple.test
++++ b/test-data/unit/check-class-namedtuple.test
+@@ -542,7 +542,7 @@ class Base(NamedTuple):
+         reveal_type(self.x)  # E: Revealed type is 'builtins.int'
+         self.x = 3  # E: Property "x" defined in "Base" is read-only
+         self[1]  # E: Tuple index out of range
+-        self[T]  # E: Tuple index must be an integer literal
++        reveal_type(self[T])  # E: Revealed type is 'builtins.int'
+         return self.x
+     def bad_override(self) -> int:
+         return self.x
+@@ -571,6 +571,7 @@ reveal_type(Child(1).good_override())  # E: Revealed type is 'builtins.int'
+ reveal_type(Base(1).bad_override())  # E: Revealed type is 'builtins.int'
+ reveal_type(takes_base(Base(1)))  # E: Revealed type is 'builtins.int'
+ reveal_type(takes_base(Child(1)))  # E: Revealed type is 'builtins.int'
++[builtins fixtures/tuple.pyi]
+ 
+ [case testNewNamedTupleIllegalNames]
+ from typing import Callable, NamedTuple
+diff --git a/test-data/unit/check-classes.test b/test-data/unit/check-classes.test
+index c06051cdd1..013d3e2fed 100755
+--- a/test-data/unit/check-classes.test
++++ b/test-data/unit/check-classes.test
+@@ -2184,7 +2184,6 @@ def process(cls: Type[User]):
+ [out]
+ 
+ [case testTypeUsingTypeCClassMethodUnion]
+-# Ideally this would work, but not worth the effort; just don't crash
+ from typing import Type, Union
+ class User:
+     @classmethod
+@@ -2193,11 +2192,11 @@ class User:
+ class ProUser(User): pass
+ class BasicUser(User): pass
+ def process(cls: Type[Union[BasicUser, ProUser]]):
+-    cls.foo()  # E: Type[Union[BasicUser, ProUser]] has no attribute "foo"
++    cls.foo()
+     obj = cls()
+-    cls.bar(obj)  # E: Type[Union[BasicUser, ProUser]] has no attribute "bar"
++    cls.bar(obj)
+     cls.mro()  # Defined in class type
+-    cls.error  # E: Type[Union[BasicUser, ProUser]] has no attribute "error"
++    cls.error  # E: Item "type" of "Union[Type[BasicUser], Type[ProUser]]" has no attribute "error"
+ [builtins fixtures/classmethod.pyi]
+ [out]
+ 
+diff --git a/test-data/unit/check-functions.test b/test-data/unit/check-functions.test
+index fc049053f8..3becbb573e 100755
+--- a/test-data/unit/check-functions.test
++++ b/test-data/unit/check-functions.test
+@@ -335,10 +335,10 @@ def f(x: C) -> C: pass
+ from typing import Any, Callable, List
+ def f(fields: List[Callable[[Any], Any]]): pass
+ class C: pass
+-f([C])  # E: List item 0 has incompatible type
++f([C])  # E: List item 0 has incompatible type Type[C]; expected Callable[[Any], Any]
+ class D:
+     def __init__(self, a, b): pass
+-f([D])  # E: List item 0 has incompatible type
++f([D])  # E: List item 0 has incompatible type Type[D]; expected Callable[[Any], Any]
+ [builtins fixtures/list.pyi]
+ 
+ [case testSubtypingTypeTypeAsCallable]
+diff --git a/test-data/unit/check-isinstance.test b/test-data/unit/check-isinstance.test
+index 825a5557fc..75ebaa081e 100755
+--- a/test-data/unit/check-isinstance.test
++++ b/test-data/unit/check-isinstance.test
+@@ -1443,7 +1443,7 @@ else:
+ [builtins fixtures/isinstancelist.pyi]
+ 
+ 
+-[case testIssubclasDestructuringUnions]
++[case testIssubclasDestructuringUnions1]
+ from typing import Union, List, Tuple, Dict, Type
+ def f(x: Union[Type[int], Type[str], Type[List]]) -> None:
+     if issubclass(x, (str, (int,))):
+@@ -1465,6 +1465,51 @@ def f(x: Union[Type[int], Type[str], Type[List]]) -> None:
+ [builtins fixtures/isinstancelist.pyi]
+ 
+ 
++[case testIssubclasDestructuringUnions2]
++from typing import Union, List, Tuple, Dict, Type
++def f(x: Type[Union[int, str, List]]) -> None:
++    if issubclass(x, (str, (int,))):
++        reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str]]'
++        reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str]'
++        x()[1]  # E: Value of type "Union[int, str]" is not indexable
++    else:
++        reveal_type(x)  # E: Revealed type is 'Type[builtins.list]'
++        reveal_type(x())  # E: Revealed type is 'builtins.list[<nothing>]'
++        x()[1]
++    reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str], Type[builtins.list]]'
++    reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str, builtins.list[<nothing>]]'
++    if issubclass(x, (str, (list,))):
++        reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.str], Type[builtins.list[Any]]]'
++        reveal_type(x())  # E: Revealed type is 'Union[builtins.str, builtins.list[<nothing>]]'
++        x()[1]
++    reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str], Type[builtins.list[Any]]]'
++    reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str, builtins.list[<nothing>]]'
++[builtins fixtures/isinstancelist.pyi]
++
++[case testIssubclasDestructuringUnions3]
++from typing import Union, List, Tuple, Dict, Type
++def f(x: Type[Union[int, str, List]]) -> None:
++    reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str], Type[builtins.list]]'
++    reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str, builtins.list[<nothing>]]'
++    if issubclass(x, (str, (int,))):
++        reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str]]'
++        reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str]'
++        x()[1]  # E: Value of type "Union[int, str]" is not indexable
++    else:
++        reveal_type(x)  # E: Revealed type is 'Type[builtins.list]'
++        reveal_type(x())  # E: Revealed type is 'builtins.list[<nothing>]'
++        x()[1]
++    reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str], Type[builtins.list]]'
++    reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str, builtins.list[<nothing>]]'
++    if issubclass(x, (str, (list,))):
++        reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.str], Type[builtins.list[Any]]]'
++        reveal_type(x())  # E: Revealed type is 'Union[builtins.str, builtins.list[<nothing>]]'
++        x()[1]
++    reveal_type(x)  # E: Revealed type is 'Union[Type[builtins.int], Type[builtins.str], Type[builtins.list[Any]]]'
++    reveal_type(x())  # E: Revealed type is 'Union[builtins.int, builtins.str, builtins.list[<nothing>]]'
++[builtins fixtures/isinstancelist.pyi]
++
++
+ [case testIssubclass]
+ from typing import Type, ClassVar
+ 
+diff --git a/test-data/unit/check-tuples.test b/test-data/unit/check-tuples.test
+index 60e0204e21..fe2180f16e 100755
+--- a/test-data/unit/check-tuples.test
++++ b/test-data/unit/check-tuples.test
+@@ -163,8 +163,8 @@ b = t1[0] # E: Incompatible types in assignment (expression has type "A", variab
+ t1[2]     # E: Tuple index out of range
+ t1[3]     # E: Tuple index out of range
+ t2[1]     # E: Tuple index out of range
+-t1[n]     # E: Tuple index must be an integer literal
+-t3[n:]    # E: Tuple slice must be an integer literal
++reveal_type(t1[n])     # E: Revealed type is 'Union[__main__.A, __main__.B]'
++reveal_type(t3[n:])    # E: Revealed type is 'Union[__main__.A, __main__.B, __main__.C, __main__.D, __main__.E]'
+ b = t1[(0)] # E: Incompatible types in assignment (expression has type "A", variable has type "B")
+ 
+ a = t1[0]
+@@ -925,3 +925,19 @@ f((1,))  # E: Argument 1 to "f" has incompatible type "Tuple[int]"; expected "Tu
+ f(('', ''))  # E: Argument 1 to "f" has incompatible type "Tuple[str, str]"; expected "Tuple[]"
+ f(0)  # E: Argument 1 to "f" has incompatible type "int"; expected "Tuple[]"
+ [builtins fixtures/tuple.pyi]
++
++[case testNonliteralTupleIndex]
++t = (0, "")
++x = 0
++y = ""
++reveal_type(t[x])  # E: Revealed type is 'Union[builtins.int, builtins.str]'
++t[y]  # E: Invalid tuple index type (actual type "str", expected type "Union[int, slice]")
++[builtins fixtures/tuple.pyi]
++
++[case testNonliteralTupleSlice]
++t = (0, "")
++x = 0
++y = ""
++reveal_type(t[x:])  # E: Revealed type is 'Union[builtins.int, builtins.str]'
++t[y:]  # E: Slice index must be an integer or None
++[builtins fixtures/tuple.pyi]
+diff --git a/test-data/unit/fixtures/tuple.pyi b/test-data/unit/fixtures/tuple.pyi
+index 5ffe8be6b8..0e45a77650 100755
+--- a/test-data/unit/fixtures/tuple.pyi
++++ b/test-data/unit/fixtures/tuple.pyi
+@@ -15,8 +15,9 @@ class tuple(Sequence[Tco], Generic[Tco]):
+     def __getitem__(self, x: int) -> Tco: pass
+ class function: pass
+ 
+-# We need int for indexing tuples.
++# We need int and slice for indexing tuples.
+ class int: pass
++class slice: pass
+ class bool: pass
+ class str: pass # For convenience
+ class unicode: pass

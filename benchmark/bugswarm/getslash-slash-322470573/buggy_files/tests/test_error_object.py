@@ -1,0 +1,169 @@
+# pylint: disable=redefined-outer-name,unused-variable
+import json
+import os
+import types
+
+import emport
+
+import dessert
+import pytest
+from slash.core.error import Error
+
+from .utils import without_pyc
+
+
+def test_error_exception_str_repr(error):
+    assert "NotImplementedError" in str(error)
+    assert "NotImplementedError" in repr(error)
+
+
+def test_error_filename(error):
+    assert error.filename == without_pyc(os.path.abspath(__file__))
+
+
+def test_error_func_name(error):
+    assert error.func_name == "func_3"
+
+
+def test_code_string(error):
+    assert error.cause.code_line == "    raise NotImplementedError()"
+    assert error.cause.code_string == """def func_3():
+
+    local_func_3 = global_func_3
+    raise NotImplementedError()\n"""
+
+
+def test_error_exc_info(error):
+    assert error.exc_info is not None
+    assert isinstance(error.exc_info, tuple)
+    assert error.exc_info[0] is NotImplementedError
+    assert isinstance(error.exc_info[1], NotImplementedError)
+    assert isinstance(error.exc_info[2], types.TracebackType)
+
+
+def test_error_forget_exc_info(error):
+    error.forget_exc_info()
+    assert error.exc_info is None
+
+
+def test_error_exc_info_forgotten_by_default(suite, suite_test):
+    suite_test.when_run.error()
+    res = suite.run()[suite_test]
+    [err] = res.get_errors()
+    assert err.exc_info is None
+
+
+def test_error_frame_objects(error):
+    assert error.traceback.frames
+    for f in error.traceback.frames:
+        assert isinstance(f.python_frame, types.FrameType)
+
+
+def test_error_frame_objects_forgotten_by_default(suite, suite_test):
+    suite_test.when_run.error()
+    res = suite.run()[suite_test]
+    [err] = res.get_errors()
+    assert err.traceback.frames
+    for frame in err.traceback.frames:
+        assert frame.python_frame is None
+
+
+def test_to_list(error):
+    serialized = error.traceback.to_list()
+    assert serialized[-3]['func_name'] == 'func_1'
+    # Just make sure that it's serializable
+    json.dumps(serialized)
+
+
+def test_capture_exception_twice_caches_object():
+    try:
+        try:
+            raise RuntimeError()
+        except RuntimeError:
+            err1 = Error.capture_exception()
+            raise
+    except RuntimeError:
+        err2 = Error.capture_exception()
+
+    assert err1 is err2
+
+
+def test_error_is_fatal(error):
+    assert not error.is_fatal()
+
+
+def test_error_mark_fatal(error):
+    rv = error.mark_fatal()
+    assert rv is error
+    assert error.is_fatal()
+
+####
+
+
+@pytest.fixture
+def error():
+    try:
+        func_1()
+    except:
+        return Error.capture_exception()
+    else:
+        assert False, "Did not fail"
+
+
+@pytest.fixture
+def non_exception_error():
+    def func1():
+        return func2()
+
+    def func2():
+        return Error('some_error')
+
+    err = func1()
+    return err
+
+
+global_func_1 = "global_func_1"
+global_func_2 = "global_func_2"
+global_func_3 = "global_func_3"
+
+
+def func_1():
+    local_func_1 = global_func_1
+
+    func_2()
+
+
+def func_2():
+    local_func_2 = global_func_2
+
+    func_3()
+
+
+def func_3():
+
+    local_func_3 = global_func_3
+    raise NotImplementedError()
+
+
+@pytest.fixture
+def assertion_error(tmpdir):
+    filename = tmpdir.join("file.py")
+    filename.write("""
+def f(x):
+    return x
+
+def g(x):
+    return x
+
+def func():
+    assert f(g(1)) == g(f(2))""")
+
+    with dessert.rewrite_assertions_context():
+        module = emport.import_file(str(filename))
+
+    try:
+        module.func()
+    except:
+        return Error.capture_exception()
+    else:
+        assert False, "Did not fail"

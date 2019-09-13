@@ -1,0 +1,149 @@
+diff --git a/doc/release/1.11.0-notes.rst b/doc/release/1.11.0-notes.rst
+index 6de10b5539..1e5f93db4c 100755
+--- a/doc/release/1.11.0-notes.rst
++++ b/doc/release/1.11.0-notes.rst
+@@ -130,6 +130,10 @@ useless computations when printing a masked array.
+ The function now uses the fallocate system call to reserve sufficient
+ diskspace on filesystems that support it.
+ 
++Speed improvement for np.random.shuffle
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++``np.random.shuffle`` is now much faster for 1d ndarrays.
++
+ Changes
+ =======
+ 
+diff --git a/numpy/core/src/multiarray/iterators.c b/numpy/core/src/multiarray/iterators.c
+index 829994b1e5..702f9e21ac 100755
+--- a/numpy/core/src/multiarray/iterators.c
++++ b/numpy/core/src/multiarray/iterators.c
+@@ -1458,8 +1458,8 @@ PyArray_MultiIterFromObjects(PyObject **mps, int n, int nadd, ...)
+     ntot = n + nadd;
+     if (ntot < 2 || ntot > NPY_MAXARGS) {
+         PyErr_Format(PyExc_ValueError,
+-                     "Need between 2 and (%d) "                 \
+-                     "array objects (inclusive).", NPY_MAXARGS);
++                     "Need at least 2 and at most %d "
++                     "array objects.", NPY_MAXARGS);
+         return NULL;
+     }
+     multi = PyArray_malloc(sizeof(PyArrayMultiIterObject));
+@@ -1524,8 +1524,8 @@ PyArray_MultiIterNew(int n, ...)
+ 
+     if (n < 2 || n > NPY_MAXARGS) {
+         PyErr_Format(PyExc_ValueError,
+-                     "Need between 2 and (%d) "                 \
+-                     "array objects (inclusive).", NPY_MAXARGS);
++                     "Need at least 2 and at most %d "
++                     "array objects.", NPY_MAXARGS);
+         return NULL;
+     }
+ 
+@@ -1608,7 +1608,7 @@ arraymultiter_new(PyTypeObject *NPY_UNUSED(subtype), PyObject *args, PyObject *k
+             return NULL;
+         }
+         PyErr_Format(PyExc_ValueError,
+-                     "Need at least two and fewer than (%d) "
++                     "Need at least 2 and at most %d "
+                      "array objects.", NPY_MAXARGS);
+         return NULL;
+     }
+diff --git a/numpy/random/mtrand/mtrand.pyx b/numpy/random/mtrand/mtrand.pyx
+index 16a1674876..cec41377a5 100755
+--- a/numpy/random/mtrand/mtrand.pyx
++++ b/numpy/random/mtrand/mtrand.pyx
+@@ -4977,24 +4977,34 @@ cdef class RandomState:
+             npy_intp i, j, n = len(x)
+             size_t stride, nbytes
+             char* x_ptr
+-            char* buf
++            char* buf_ptr
+ 
+-        # Fast, statically typed path: shuffle the underlying buffer.
+-        # We exclude subclasses as this approach fails e.g. with MaskedArrays.
+-        if type(x) is np.ndarray and x.size:  # Special-case empty arrays.
++        if type(x) is np.ndarray and x.ndim == 1 and x.size:
++            # Fast, statically typed path: shuffle the underlying buffer.
++            # Only for non-empty, 1d objects of class ndarray (subclasses such
++            # as MaskedArrays may not support this approach).
+             x_ptr = NULL + <size_t>x.ctypes.data  # Fool cython's type-checker.
+             stride = x.strides[0]
+             nbytes = x[:1].nbytes
+-            _buf = np.empty_like(x[0])  # GC'd at function exit
+-            buf = NULL + <size_t>_buf.ctypes.data
++            buf = np.empty_like(x[0])  # GC'd at function exit
++            buf_ptr = NULL + <size_t>buf.ctypes.data
+             with self.lock:
+                 for i in reversed(range(1, n)):
+                     j = rk_interval(i, self.internal_state)
+-                    string.memcpy(buf, x_ptr + j * stride, nbytes)
++                    string.memcpy(buf_ptr, x_ptr + j * stride, nbytes)
+                     string.memcpy(x_ptr + j * stride, x_ptr + i * stride, nbytes)
+-                    string.memcpy(x_ptr + i * stride, buf, nbytes)
+-        # Untyped path.
++                    string.memcpy(x_ptr + i * stride, buf_ptr, nbytes)
++        elif isinstance(x, np.ndarray) and x.ndim > 1 and x.size:
++            # Multidimensional ndarrays require a bounce buffer.
++            buf = np.empty_like(x[0])
++            with self.lock:
++                for i in reversed(range(1, n)):
++                    j = rk_interval(i, self.internal_state)
++                    buf[...] = x[j]
++                    x[j] = x[i]
++                    x[i] = buf
+         else:
++            # Untyped path.
+             with self.lock:
+                 for i in reversed(range(1, n)):
+                     j = rk_interval(i, self.internal_state)
+diff --git a/numpy/random/tests/test_random.py b/numpy/random/tests/test_random.py
+index 7604eeb7c4..fe94507564 100755
+--- a/numpy/random/tests/test_random.py
++++ b/numpy/random/tests/test_random.py
+@@ -208,12 +208,13 @@ def test_repeatability(self):
+         assert_(tgt[np.dtype(np.bool).name] == res)
+ 
+ 
+-class TestRandomDist(TestCase):
++class TestRandomDist:
+     # Make sure the random distribution returns the correct value for a
+     # given seed
+ 
+-    def setUp(self):
+-        self.seed = 1234567890
++    @classmethod
++    def setup_class(cls):
++        cls.seed = 1234567890
+ 
+     def test_rand(self):
+         np.random.seed(self.seed)
+@@ -356,15 +357,16 @@ def test_bytes(self):
+ 
+     def test_shuffle(self):
+         # Test lists, arrays (of various dtypes), and multidimensional versions
+-        # of both:
+-        np.random.shuffle(np.array([]))
+-        for conv in [lambda x: x,
++        # of both, c-contiguous or not:
++        for conv in [lambda x: np.array([]),
++                     lambda x: x,
+                      lambda x: np.asarray(x).astype(np.int8),
+                      lambda x: np.asarray(x).astype(np.float32),
+                      lambda x: np.asarray(x).astype(np.complex64),
+                      lambda x: np.asarray(x).astype(object),
+                      lambda x: [(i, i) for i in x],
+-                     lambda x: np.asarray([(i, i) for i in x]),
++                     lambda x: np.asarray([[i, i] for i in x]),
++                     lambda x: np.vstack([x, x]).T,
+                      # gh-4270
+                      lambda x: np.asarray([(i, i) for i in x],
+                                           [("a", object, 1),
+@@ -374,7 +376,7 @@ def test_shuffle(self):
+             np.random.shuffle(alist)
+             actual = alist
+             desired = conv([0, 1, 9, 6, 2, 4, 5, 8, 7, 3])
+-            np.testing.assert_array_equal(actual, desired)
++            yield np.testing.assert_array_equal, actual, desired
+ 
+     def test_shuffle_masked(self):
+         # gh-3263

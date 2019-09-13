@@ -1,0 +1,214 @@
+/*
+ * Copyright (c) 2015-2017, Joyent, Inc. All rights reserved.
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ */
+package com.joyent.manta.client;
+
+import com.joyent.manta.config.IntegrationTestConfigContext;
+import com.joyent.manta.config.ConfigContext;
+import com.joyent.test.util.MantaAssert;
+import com.joyent.test.util.MantaFunction;
+import org.apache.commons.lang3.Validate;
+import org.mockito.MockingDetails;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.testng.Assert;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.Optional;
+import org.testng.annotations.Parameters;
+import org.testng.annotations.Test;
+
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.util.UUID;
+
+import static com.joyent.manta.exception.MantaErrorCode.RESOURCE_NOT_FOUND_ERROR;
+
+/**
+ * Tests for verifying the correct functioning of making remote requests
+ * against Manta directories.
+ *
+ * @author <a href="https://github.com/dekobon">Elijah Zupancic</a>
+ */
+@Test(groups = { "directory" })
+public class MantaClientDirectoriesIT {
+    private static final String TEST_DATA = "EPISODEII_IS_BEST_EPISODE";
+
+    private MantaClient mantaClient;
+
+    private String testPathPrefix;
+
+    private ConfigContext config;
+
+
+    @BeforeClass
+    @Parameters({"usingEncryption"})
+    public void beforeClass(@Optional Boolean usingEncryption) throws IOException {
+
+        // Let TestNG configuration take precedence over environment variables
+        config = new IntegrationTestConfigContext(usingEncryption);
+
+        mantaClient = new MantaClient(config);
+        String testPathBase = String.format("%s/stor/java-manta-integration-tests",
+                config.getMantaHomeDirectory());
+        testPathPrefix = String.format("%s/%s",
+                testPathBase, UUID.randomUUID());
+        mantaClient.putDirectory(testPathBase, true);
+    }
+
+    @AfterClass
+    public void afterClass() throws IOException {
+        if (mantaClient != null) {
+            mantaClient.deleteRecursive(testPathPrefix);
+            mantaClient.closeWithWarning();
+        }
+    }
+
+    @Test
+    public void canCreateDirectory() throws IOException {
+        mantaClient.putDirectory(testPathPrefix);
+
+        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
+        boolean created = mantaClient.putDirectory(dir);
+
+        Assert.assertTrue(created, "Directory was marked as created");
+
+        MantaObject response = mantaClient.head(dir);
+        Assert.assertEquals(dir, response.getPath());
+    }
+
+    @Test
+    public void willReturnFalseWhenWeOverwriteDirectory() throws IOException {
+        mantaClient.putDirectory(testPathPrefix);
+
+        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
+        Assert.assertTrue(mantaClient.putDirectory(dir),
+                "We were unable to create the initial directory");
+
+        boolean result = mantaClient.putDirectory(dir);
+
+        Assert.assertFalse(result, "Expected a false value because we "
+                + "didn't create a new directory");
+    }
+
+    @Test(dependsOnMethods = { "canCreateDirectory" })
+    public void canDeleteDirectory() throws IOException {
+        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
+        mantaClient.putDirectory(dir);
+
+        MantaObject response = mantaClient.head(dir);
+        Assert.assertEquals(dir, response.getPath());
+
+        mantaClient.delete(dir);
+
+        MantaAssert.assertResponseFailureStatusCode(404, RESOURCE_NOT_FOUND_ERROR,
+                (MantaFunction<Object>) () -> mantaClient.get(dir));
+    }
+
+    @Test(dependsOnMethods = { "canCreateDirectory" })
+    public void wontErrorWhenWeCreateOverAnExistingDirectory() throws IOException {
+        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
+        mantaClient.putDirectory(dir);
+        mantaClient.putDirectory(dir);
+        mantaClient.putDirectory(dir);
+
+        MantaObject response = mantaClient.head(dir);
+        Assert.assertEquals(dir, response.getPath());
+    }
+
+    /**
+     * This is somewhat surprising behavior, but this test documents Manta's
+     * behavior. As a user of Manta, you will need to check to see if a
+     * file exists before attempting to write a directory over the top of it.
+     */
+    @Test(dependsOnMethods = { "canCreateDirectory" })
+    public void noErrorWhenWeOverwriteAnExistingFile() throws IOException {
+        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
+        mantaClient.putDirectory(dir);
+
+        String file = String.format("%s/%s", dir, UUID.randomUUID());
+        mantaClient.put(file, TEST_DATA);
+        mantaClient.putDirectory(file);
+    }
+
+    @Test(dependsOnMethods = { "canCreateDirectory" })
+    public void directoryIsMarkedAsSuch() throws IOException {
+        MantaObject dir = mantaClient.head(testPathPrefix);
+        Assert.assertTrue(dir.isDirectory(),
+                String.format("Directory should be marked as such [%s]. "
+                        + "\nResponse: %s", testPathPrefix, dir));
+    }
+
+    @Test(dependsOnMethods = { "wontErrorWhenWeCreateOverAnExistingDirectory" })
+    public void canRecursivelyCreateDirectory() throws IOException {
+        String dir = String.format("%s/%s/%s/%s/%s/%s", testPathPrefix,
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID());
+
+        mantaClient.putDirectory(dir, true);
+
+        MantaObject response = mantaClient.head(dir);
+
+        Assert.assertTrue(response.isDirectory(),
+                String.format("Directory should be marked as such [%s]", testPathPrefix));
+        Assert.assertEquals(dir, response.getPath());
+    }
+
+    public void canSkipAlreadyCreatedDirectories() throws IOException {
+        final String dir = String.format("%s/%s/%s/%s/%s/%s", testPathPrefix,
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                UUID.randomUUID());
+        final String nestedDir = dir + MantaClient.SEPARATOR + UUID.randomUUID().toString();
+
+        final MantaClient clientSpy = Mockito.spy(mantaClient);
+
+        final long putDirCallsInitial = putDirectoryAndCountCalls(clientSpy, dir);
+        final MantaObject response = mantaClient.head(dir);
+        Assert.assertTrue(response.isDirectory(),
+                String.format("Directory should be marked as such [%s]", testPathPrefix));
+        Assert.assertEquals(dir, response.getPath());
+        Assert.assertTrue(0 < putDirCallsInitial,
+                "Initial directory exists but took unexpected number of calls: " + putDirCallsInitial);
+
+        // create another directory within the initial directory so we can compare the number of calls
+        final long putDirCallsNested = putDirectoryAndCountCalls(clientSpy, nestedDir);
+        final MantaObject nestedResponse = mantaClient.head(nestedDir);
+        Assert.assertTrue(nestedResponse.isDirectory(),
+                String.format("Nested directory should be marked as such [%s]", testPathPrefix));
+        Assert.assertEquals(nestedDir, nestedResponse.getPath());
+
+        // verify that created the nested directory took less calls than its parent
+        Assert.assertTrue(putDirCallsNested < putDirCallsInitial);
+    }
+
+    private long putDirectoryAndCountCalls(final MantaClient clientSpy, final String dir) throws IOException {
+        final long putDirBeforeInitialCall = countPutDirectoryCalls(clientSpy);
+        clientSpy.putDirectory(dir, true);
+        return countPutDirectoryCalls(clientSpy) - putDirBeforeInitialCall;
+    }
+
+    // TEST UTILITY METHODS
+
+    private long countPutDirectoryCalls(final MantaClient clientSpy) {
+        final MockingDetails details = Mockito.mockingDetails(clientSpy);
+        Validate.notNull(details, "Object must be a mock or spy");
+
+        return details
+                .getInvocations()
+                .stream()
+                .map(InvocationOnMock::getMethod)
+                .map(Method::getName)
+                .filter(name -> name.equals("putDirectory"))
+                .count();
+    }
+}

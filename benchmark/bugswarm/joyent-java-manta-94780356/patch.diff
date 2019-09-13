@@ -1,0 +1,599 @@
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/HttpHelper.java b/java-manta-client/src/main/java/com/joyent/manta/client/HttpHelper.java
+index 4ae0c41798..eec0470272 100755
+--- a/java-manta-client/src/main/java/com/joyent/manta/client/HttpHelper.java
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/HttpHelper.java
+@@ -18,15 +18,33 @@
+ import static com.joyent.manta.client.MantaUtils.formatPath;
+ 
+ /**
+- * @author Elijah Zupancic
+- * @since 1.0.0
++ * Helper class used for common HTTP operations against the Manta server.
++ *
++ * @author <a href="https://github.com/dekobon">Elijah Zupancic</a>
+  */
+ public class HttpHelper {
++    /**
++     * Logger instance.
++     */
+     private static final Logger LOG = LoggerFactory.getLogger(HttpHelper.class);
+ 
++    /**
++     * Base Manta URL that all paths are appended to.
++     */
+     private final String url;
++
++    /**
++     * Reference to the Google HTTP Client HTTP request creation class.
++     */
+     private final HttpRequestFactory httpRequestFactory;
+ 
++
++    /**
++     * Creates a new instance of the helper class.
++     *
++     * @param url base Manta URL
++     * @param httpRequestFactory request creation class
++     */
+     public HttpHelper(final String url,
+                       final HttpRequestFactory httpRequestFactory) {
+         this.url = url;
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/HttpRequestFactoryProvider.java b/java-manta-client/src/main/java/com/joyent/manta/client/HttpRequestFactoryProvider.java
+index 7534362bec..878a249197 100755
+--- a/java-manta-client/src/main/java/com/joyent/manta/client/HttpRequestFactoryProvider.java
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/HttpRequestFactoryProvider.java
+@@ -68,6 +68,11 @@
+      */
+     private static final int MAX_CONNECTIONS_PER_ROUTE = 200;
+ 
++    /**
++     * Number of times to retry failed requests.
++     */
++    private static final int HTTP_RETRIES = 3;
++
+     /**
+      * The JSON factory instance used by the http library for handling JSON.
+      */
+@@ -146,7 +151,7 @@ private static HttpClient buildHttpClient() {
+         connectionManager.setDefaultMaxPerRoute(MAX_CONNECTIONS_PER_ROUTE);
+ 
+         final DefaultHttpClient defaultHttpClient = new DefaultHttpClient(connectionManager, params);
+-        defaultHttpClient.setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler(3, false));
++        defaultHttpClient.setHttpRequestRetryHandler(new DefaultHttpRequestRetryHandler(HTTP_RETRIES, false));
+ 
+         if (proxySelector != null) {
+             defaultHttpClient.setRoutePlanner(new ProxySelectorRoutePlanner(registry, proxySelector));
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java b/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
+index f5fd703a5a..2f8260a459 100755
+--- a/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
+@@ -581,7 +581,7 @@ public MantaObjectResponse head(final String path) throws IOException {
+      * @throws IOException thrown when there is a problem getting the listing over the network
+      */
+     public Stream<MantaObject> listObjects(final String path) throws IOException {
+-        final MantaDirectoryIterator itr = new MantaDirectoryIterator(this.url,
++        final MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(this.url,
+                 path, httpHelper, MAX_RESULTS);
+         Stream<Map<String, Object>> backingStream =
+                 StreamSupport.stream(Spliterators.spliteratorUnknownSize(
+@@ -1372,7 +1372,7 @@ public MantaJob getJob(final UUID jobId) throws IOException {
+     public Stream<UUID> getAllJobIds() throws IOException {
+         final String path = String.format("%s/jobs", home);
+ 
+-        final MantaDirectoryIterator itr = new MantaDirectoryIterator(this.url,
++        final MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(this.url,
+                 path, httpHelper, MAX_RESULTS);
+         Stream<Map<String, Object>> backingStream =
+                 StreamSupport.stream(Spliterators.spliteratorUnknownSize(
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/MantaDirectoryListingIterator.java b/java-manta-client/src/main/java/com/joyent/manta/client/MantaDirectoryListingIterator.java
+new file mode 100755
+index 0000000000..e8e1d92c75
+--- /dev/null
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/MantaDirectoryListingIterator.java
+@@ -0,0 +1,252 @@
++/**
++ * Copyright (c) 2015, Joyent, Inc. All rights reserved.
++ */
++package com.joyent.manta.client;
++
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.google.api.client.http.GenericUrl;
++import com.google.api.client.http.HttpHeaders;
++import com.google.api.client.http.HttpResponse;
++import com.joyent.manta.exception.MantaObjectException;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.Reader;
++import java.io.UncheckedIOException;
++import java.net.URLEncoder;
++import java.util.Iterator;
++import java.util.Map;
++import java.util.NoSuchElementException;
++import java.util.Objects;
++import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static com.joyent.manta.client.MantaObjectResponse.DIRECTORY_RESPONSE_CONTENT_TYPE;
++import static com.joyent.manta.client.MantaUtils.formatPath;
++
++/**
++ * <p>Class that wraps the paging of directory listing in Manta to a single
++ * continuous iterator.</p>
++ *
++ * <p><a href="https://apidocs.joyent.com/manta/api.html#ListDirectory">
++ * Listing Manta directories</a> is done by getting pages of data with N number
++ * of records per page. Each page of data is requested using a limit (number
++ * of records) and a marker (the last seen item in the list). This class
++ * automates that process and abstracts out the details of the paging process.</p>
++ *
++ * @author <a href="https://github.com/dekobon">Elijah Zupancic</a>
++ */
++public class MantaDirectoryListingIterator implements Iterator<Map<String, Object>>,
++        AutoCloseable {
++    /**
++     * Size of result set requested against the Manta API (2-1024).
++     */
++    private final int pagingSize;
++
++    /**
++     * Base Manta URL that all paths are appended to.
++     */
++    private final String url;
++
++    /**
++     * Path to directory in which we will iterate through its contents.
++     */
++    private final String path;
++
++    /**
++     * HTTP request helper class.
++     */
++    private final HttpHelper httpHelper;
++
++    /**
++     * The total number of lines that we have iterated through.
++     */
++    private final AtomicLong lines = new AtomicLong(0);
++
++    /**
++     * The next line of data that we haven't iterated to yet.
++     */
++    private final AtomicReference<String> nextLine = new AtomicReference<>();
++
++    /**
++     * Flag indicated if we have finished and there is nothing left to iterate.
++     */
++    private final AtomicBoolean finished = new AtomicBoolean(false);
++
++    /**
++     * Jackson JSON parsing instance.
++     */
++    private final ObjectMapper mapper = MantaObjectParser.MAPPER;
++
++    /**
++     * The last marker we used to request against the Manta API.
++     */
++    private volatile String lastMarker;
++
++    /**
++     * The current {@link BufferedReader} instance that wraps the HTTP response
++     * {@link java.io.InputStream} from our most recent request to the API.
++     */
++    private volatile BufferedReader br;
++
++    /**
++     * The most recent response object from the page of data that we are currently
++     * parsing.
++     */
++    private volatile HttpResponse currentResponse;
++
++    /**
++     * Create a new instance of a directory list iterator.
++     *
++     * @param url base Manta URL that all paths are appended to
++     * @param path path to directory in which we will iterate through its contents
++     * @param httpHelper HTTP request helper class
++     * @param pagingSize size of result set requested against the Manta API (2-1024).
++     */
++    public MantaDirectoryListingIterator(final String url,
++                                         final String path,
++                                         final HttpHelper httpHelper,
++                                         final int pagingSize) {
++        Objects.requireNonNull(url, "URL must be present");
++        Objects.requireNonNull(path, "Path must be present");
++        Objects.requireNonNull(httpHelper, "HTTP help must be present");
++
++        this.url = url;
++        this.path = path;
++        this.httpHelper = httpHelper;
++
++        if (pagingSize < 2) {
++            throw new IllegalArgumentException("Paging size must be greater than "
++                    + "1 and less than or equal to 1024");
++        }
++
++        this.pagingSize = pagingSize;
++    }
++
++    /**
++     * Chooses the next reader by opening a HTTP connection to get the next
++     * page of input from the Manta API. If there isn't another page of data
++     * available, we mark ourselves as finished.
++     *
++     * @throws IOException thrown when we can't successfully open an HTTP connection
++     */
++    private synchronized void selectReader() throws IOException {
++        if (lastMarker == null) {
++            String query = String.format("?limit=%d", pagingSize);
++            GenericUrl genericUrl = new GenericUrl(url + formatPath(path)
++                    + query);
++            currentResponse = httpHelper.httpGet(genericUrl, null);
++            HttpHeaders headers = currentResponse.getHeaders();
++
++            if (!headers.getContentType().contentEquals(DIRECTORY_RESPONSE_CONTENT_TYPE)) {
++                String msg = String.format("Expected directory path, but was file path: %s",
++                        path);
++                throw new MantaObjectException(msg);
++            }
++
++            Reader streamReader = new InputStreamReader(currentResponse.getContent(),
++                    "UTF-8");
++            br = new BufferedReader(streamReader);
++        } else {
++            String query = String.format("?limit=%d&marker=%s",
++                    pagingSize, URLEncoder.encode(lastMarker, "UTF-8"));
++            GenericUrl genericUrl = new GenericUrl(url + formatPath(path)
++                + query);
++
++            try {
++                br.close();
++                currentResponse.disconnect();
++            } catch (IOException e) {
++                throw new UncheckedIOException(e);
++            }
++
++            currentResponse = httpHelper.httpGet(genericUrl, null);
++            Reader streamReader = new InputStreamReader(currentResponse.getContent(),
++                    "UTF-8");
++            br = new BufferedReader(streamReader);
++
++            // We read one line to clear it because it is our marker
++            br.readLine();
++        }
++
++        nextLine.set(br.readLine());
++        lines.incrementAndGet();
++
++        // We are done if the first read is a null
++        finished.set(nextLine.get() == null);
++    }
++
++    @Override
++    public boolean hasNext() {
++        if (!finished.get() && nextLine.get() == null) {
++            try {
++                selectReader();
++                return !finished.get();
++            } catch (IOException e) {
++                throw new UncheckedIOException(e);
++            }
++        } else {
++            return !finished.get();
++        }
++    }
++
++    @Override
++    public synchronized Map<String, Object> next() {
++        if (finished.get()) {
++            throw new NoSuchElementException();
++        }
++
++        try {
++            String line = nextLine.getAndSet(br.readLine());
++            lines.incrementAndGet();
++
++            if (line == null) {
++                selectReader();
++
++                if (finished.get()) {
++                    throw new NoSuchElementException();
++                }
++
++                line = nextLine.getAndSet(br.readLine());
++            }
++
++            final Map<String, Object> lookup = mapper.readValue(line,
++                    new TypeReference<Map<String, Object>>() { });
++            final String name = Objects.toString(lookup.get("name"));
++
++            Objects.requireNonNull(name, "Name must be present in JSON input");
++
++            this.lastMarker = name;
++
++            return lookup;
++
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    @Override
++    public void close() {
++        try {
++            if (br != null) {
++                br.close();
++            }
++
++            if (currentResponse != null) {
++                currentResponse.disconnect();
++            }
++        } catch (IOException e) {
++            throw new UncheckedIOException(e);
++        }
++    }
++
++    /**
++     * @return total lines processed
++     */
++    public long getLines() {
++        return lines.get();
++    }
++}
+diff --git a/java-manta-it/src/test/java/com/joyent/manta/client/MantaDirectoryListingIteratorIT.java b/java-manta-it/src/test/java/com/joyent/manta/client/MantaDirectoryListingIteratorIT.java
+new file mode 100755
+index 0000000000..9cc1ce9dd8
+--- /dev/null
++++ b/java-manta-it/src/test/java/com/joyent/manta/client/MantaDirectoryListingIteratorIT.java
+@@ -0,0 +1,235 @@
++/**
++ * Copyright (c) 2015, Joyent, Inc. All rights reserved.
++ */
++package com.joyent.manta.client;
++
++import com.joyent.manta.client.config.TestConfigContext;
++import com.joyent.manta.config.ConfigContext;
++import com.joyent.manta.exception.MantaCryptoException;
++import org.testng.Assert;
++import org.testng.annotations.AfterClass;
++import org.testng.annotations.BeforeClass;
++import org.testng.annotations.Optional;
++import org.testng.annotations.Parameters;
++import org.testng.annotations.Test;
++
++import java.io.IOException;
++import java.util.Map;
++import java.util.NoSuchElementException;
++import java.util.UUID;
++import java.util.concurrent.ConcurrentHashMap;
++
++/**
++ * Tests the proper functioning of the dynamically paging iterator.
++ *
++ * @author <a href="https://github.com/dekobon">Elijah Zupancic</a>
++ */
++public class MantaDirectoryListingIteratorIT {
++    private static final String TEST_DATA = "EPISODEII_IS_BEST_EPISODE";
++
++    private MantaClient mantaClient;
++
++    private String testPathPrefix;
++
++    private ConfigContext config;
++
++    private HttpRequestFactoryProvider httpRequestFactoryProvider;
++
++    private HttpHelper httpHelper;
++
++    @BeforeClass
++    @Parameters({"manta.url", "manta.user", "manta.key_path", "manta.key_id", "manta.timeout"})
++    public void beforeClass(@Optional String mantaUrl,
++                            @Optional String mantaUser,
++                            @Optional String mantaKeyPath,
++                            @Optional String mantaKeyId,
++                            @Optional Integer mantaTimeout)
++            throws IOException, MantaCryptoException {
++
++        // Let TestNG configuration take precedence over environment variables
++        config = new TestConfigContext(
++                mantaUrl, mantaUser, mantaKeyPath, mantaKeyId, mantaTimeout);
++
++        mantaClient = new MantaClient(config);
++        testPathPrefix = String.format("%s/stor/%s",
++                config.getMantaHomeDirectory(), UUID.randomUUID());
++
++        mantaClient.putDirectory(testPathPrefix);
++
++        httpRequestFactoryProvider = mantaClient.getHttpRequestFactoryProvider();
++        httpHelper = new HttpHelper(config.getMantaURL(),
++                httpRequestFactoryProvider.getRequestFactory());
++    }
++
++
++    @AfterClass
++    public void afterClass() throws IOException, MantaCryptoException {
++        if (mantaClient != null) {
++            mantaClient.deleteRecursive(testPathPrefix);
++            mantaClient.closeQuietly();
++        }
++    }
++
++    @Test
++    public void isPagingCorrectly() throws IOException {
++        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
++        mantaClient.putDirectory(dir);
++
++        final int MAX = 30;
++
++        // Add files 1-30
++        for (int i = 1; i <= MAX; i++) {
++            String name = String.format("%05d", i);
++            String path = String.format("%s/%s", dir, name);
++
++            mantaClient.put(path, TEST_DATA);
++        }
++
++        String url = config.getMantaURL();
++
++        try (MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(url,
++                dir, httpHelper, 5)) {
++            // Make sure we can get the first element
++            Assert.assertTrue(itr.hasNext(), "We should have the first element");
++            Map<String, Object> first = itr.next();
++            Assert.assertEquals(first.get("name").toString(), "00001");
++
++            // Scroll forward to the last element
++            for (int i = 2; i < MAX; i++) {
++                Assert.assertTrue(itr.hasNext(), "We should have the next element");
++                Map<String, Object> next = itr.next();
++                Assert.assertEquals(next.get("name").toString(), String.format("%05d", i));
++            }
++
++            // Make sure that we can get the last element
++            Assert.assertTrue(itr.hasNext(), "We should have the last element");
++            Map<String, Object> last = itr.next();
++            Assert.assertEquals(last.get("name").toString(), String.format("%05d", MAX));
++
++            // Make sure that we are at the end of the iteration
++            Assert.assertFalse(itr.hasNext());
++
++            boolean failed = false;
++
++            try {
++                itr.next();
++            } catch (NoSuchElementException e) {
++                failed = true;
++            }
++
++            Assert.assertTrue(failed, "Iterator failed to throw NoSuchElementException");
++        }
++    }
++
++    @Test
++    public void isPagingConcurrentlyCorrectly() throws IOException {
++        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
++        mantaClient.putDirectory(dir);
++
++        final int MAX = 300;
++        final Map<String, Boolean> valuesFound = new ConcurrentHashMap<>(MAX);
++
++        for (int i = 1; i <= MAX; i++) {
++            String name = String.format("%05d", i);
++            String path = String.format("%s/%s", dir, name);
++
++            valuesFound.put(name, false);
++            mantaClient.put(path, TEST_DATA);
++        }
++
++        String url = config.getMantaURL();
++
++        try (MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(url,
++                dir, httpHelper, 10)) {
++
++            Runnable search = () -> {
++                while (itr.hasNext()) {
++                    try {
++                        String name = itr.next().get("name").toString();
++                        valuesFound.replace(name, false, true);
++                    } catch (NoSuchElementException e) {
++                        /* we don't care about these exceptions because it is
++                         * just another thread beating us to the end. */
++                    }
++                }
++            };
++
++            // Start 3 threads that iterate at the same time
++            Thread thread1 = new Thread(search);
++            Thread thread2 = new Thread(search);
++            Thread thread3 = new Thread(search);
++
++            thread1.start();
++            thread2.start();
++            thread3.start();
++
++            // Wait in the current thread for them all to exit
++            while (itr.hasNext()) {
++                Thread.sleep(1000);
++
++                if (!thread1.isAlive() && !thread2.isAlive() && !thread3.isAlive()) {
++                    // one last check
++                    if (itr.hasNext()) {
++                        throw new AssertionError("We are in a dead-lock or a bad state");
++                    }
++                }
++            }
++
++            // Validate that all files were found
++            valuesFound.entrySet().stream().forEach(m -> Assert.assertTrue(m.getValue()));
++        } catch (InterruptedException e) {
++            afterClass();
++        }
++    }
++
++    @Test
++    public void canListEmptyDirectory() throws IOException {
++        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
++        mantaClient.putDirectory(dir);
++
++        String url = config.getMantaURL();
++
++        try (MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(url,
++                dir, httpHelper, 10)) {
++            Assert.assertFalse(itr.hasNext(), "There shouldn't be a next element");
++
++            boolean failed = false;
++
++            try {
++                itr.next();
++            } catch (NoSuchElementException e) {
++                failed = true;
++            }
++
++            Assert.assertTrue(failed, "Iterator failed to throw NoSuchElementException");
++        }
++    }
++
++    @Test
++    public void canListDirectoryUsingSmallPagingSize() throws IOException {
++        String dir = String.format("%s/%s", testPathPrefix, UUID.randomUUID());
++        mantaClient.putDirectory(dir);
++
++        final int MAX = 5;
++
++        // Add files 1-5
++        for (int i = 1; i <= MAX; i++) {
++            String name = String.format("%05d", i);
++            String path = String.format("%s/%s", dir, name);
++
++            mantaClient.put(path, TEST_DATA);
++        }
++
++        String url = config.getMantaURL();
++
++        try (MantaDirectoryListingIterator itr = new MantaDirectoryListingIterator(url,
++                dir, httpHelper, 2)) {
++
++            for (int i = 1; i < MAX; i++) {
++                Assert.assertTrue(itr.hasNext(), "We should have the next element");
++                Map<String, Object> next = itr.next();
++                Assert.assertEquals(next.get("name").toString(), String.format("%05d", i));
++            }
++        }
++    }
++}
+diff --git a/java-manta-it/src/test/resources/testng-it.xml b/java-manta-it/src/test/resources/testng-it.xml
+index 257cc1233d..32e9845676 100755
+--- a/java-manta-it/src/test/resources/testng-it.xml
++++ b/java-manta-it/src/test/resources/testng-it.xml
+@@ -18,7 +18,7 @@
+             <class name="com.joyent.manta.client.MantaClientMetadataIT" />
+             <class name="com.joyent.manta.client.MantaClientJobIT" />
+             <class name="com.joyent.manta.client.MantaHttpHeadersIT" />
+-            <class name="com.joyent.manta.client.MantaDirectoryIteratorIT" />
++            <class name="com.joyent.manta.client.MantaDirectoryListingIteratorIT" />
+         </classes>
+     </test>
+ </suite>

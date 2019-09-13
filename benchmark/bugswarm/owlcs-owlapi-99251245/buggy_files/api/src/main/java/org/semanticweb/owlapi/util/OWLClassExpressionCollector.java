@@ -1,0 +1,222 @@
+/* This file is part of the OWL API.
+ * The contents of this file are subject to the LGPL License, Version 3.0.
+ * Copyright 2014, The University of Manchester
+ * 
+ * This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+ * This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ * You should have received a copy of the GNU General Public License along with this program.  If not, see http://www.gnu.org/licenses/.
+ *
+ * Alternatively, the contents of this file may be used under the terms of the Apache License, Version 2.0 in which case, the provisions of the Apache License Version 2.0 are applicable instead of those above.
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License. */
+package org.semanticweb.owlapi.util;
+
+import static org.semanticweb.owlapi.util.CollectionFactory.createSet;
+import static org.semanticweb.owlapi.util.OWLAPIStreamUtils.asSet;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
+import org.semanticweb.owlapi.model.*;
+
+/**
+ * Collects all of the nested class expression that are used in some OWLObject.
+ * For example, given SubClassOf(ObjectUnionOf(D C) ObjectSomeValuesFrom(R F))
+ * the collector could be used to obtain ObjectUnionOf(D C), D, C,
+ * ObjectSomeValuesFrom(R F), F
+ * 
+ * @author Matthew Horridge, The University of Manchester, Bio-Health
+ *         Informatics Group
+ * @since 3.1.0
+ */
+public class OWLClassExpressionCollector implements
+        OWLObjectVisitorEx<Set<OWLClassExpression>> {
+
+    @Override
+    public Set<OWLClassExpression> doDefault(Object o) {
+        return Collections.<OWLClassExpression> emptySet();
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(SWRLClassAtom node) {
+        return node.getPredicate().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLSubClassOfAxiom axiom) {
+        Set<OWLClassExpression> result = new HashSet<>();
+        result.addAll(axiom.getSubClass().accept(this));
+        result.addAll(axiom.getSuperClass().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLOntology ontology) {
+        return asSet(ontology.logicalAxioms().flatMap(
+                ax -> ax.accept(this).stream()));
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLClass ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectIntersectionOf ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        ce.operands().forEach(op -> result.addAll(op.accept(this)));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectUnionOf ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        ce.operands().forEach(op -> result.addAll(op.accept(this)));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectComplementOf ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getOperand().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectSomeValuesFrom ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getFiller().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectAllValuesFrom ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getFiller().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDisjointClassesAxiom axiom) {
+        return asSet(axiom.classExpressions().flatMap(
+                ce -> ce.accept(this).stream()));
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectHasValue ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataPropertyDomainAxiom axiom) {
+        return axiom.getDomain().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectMinCardinality ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getFiller().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectPropertyDomainAxiom axiom) {
+        return axiom.getDomain().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectExactCardinality ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getFiller().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectMaxCardinality ce) {
+        Set<OWLClassExpression> result = createSet(ce);
+        result.addAll(ce.getFiller().accept(this));
+        return result;
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectHasSelf ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectOneOf ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataSomeValuesFrom ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataAllValuesFrom ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataHasValue ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataMinCardinality ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLObjectPropertyRangeAxiom axiom) {
+        return axiom.getRange().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataExactCardinality ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDataMaxCardinality ce) {
+        return createSet(ce);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDisjointUnionAxiom axiom) {
+        return asSet(axiom.classExpressions().flatMap(
+                ce -> ce.accept(this).stream()));
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLDeclarationAxiom axiom) {
+        return axiom.getEntity().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLClassAssertionAxiom axiom) {
+        return axiom.getClassExpression().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLEquivalentClassesAxiom axiom) {
+        return asSet(axiom.classExpressions().flatMap(
+                ce -> ce.accept(this).stream()));
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(OWLHasKeyAxiom axiom) {
+        return axiom.getClassExpression().accept(this);
+    }
+
+    @Override
+    public Set<OWLClassExpression> visit(SWRLRule rule) {
+        Set<OWLClassExpression> result = new HashSet<>();
+        rule.body().forEach(a -> result.addAll(a.accept(this)));
+        rule.head().forEach(a -> result.addAll(a.accept(this)));
+        return result;
+    }
+}

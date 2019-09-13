@@ -1,0 +1,229 @@
+diff --git a/stagemonitor-core/src/main/java/org/stagemonitor/core/Stagemonitor.java b/stagemonitor-core/src/main/java/org/stagemonitor/core/Stagemonitor.java
+index 621f28d05b..79d4d64b8b 100755
+--- a/stagemonitor-core/src/main/java/org/stagemonitor/core/Stagemonitor.java
++++ b/stagemonitor-core/src/main/java/org/stagemonitor/core/Stagemonitor.java
+@@ -113,12 +113,6 @@ public void run() {
+ 				}
+ 			}));
+ 		}
+-		if (ClassUtils.isNotPresent("org.stagemonitor.requestmonitor.RequestMonitorPlugin")) {
+-			// if the RequestMonitorPlugin is available,
+-			// TypeDefinition caching should only be deactivated after the first request
+-			// if not, deactivate as soon as stagemonitor has started
+-			AgentAttacher.onMostClassesLoaded();
+-		}
+ 	}
+ 
+ 	private static void initializePlugins() {
+diff --git a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AgentAttacher.java b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AgentAttacher.java
+index 7262dc89da..35a2c4b0e1 100755
+--- a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AgentAttacher.java
++++ b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AgentAttacher.java
+@@ -47,7 +47,7 @@
+ 	private static final Logger logger = LoggerFactory.getLogger(AgentAttacher.class);
+ 	private static final String DISPATCHER_CLASS_NAME = "java.lang.stagemonitor.dispatcher.Dispatcher";
+ 	private static final String IGNORED_CLASSLOADERS_KEY = AgentAttacher.class.getName() + "hashCodesOfClassLoadersToIgnore";
+-	private static final DeactivatableCachingBinaryLocator binaryLocator = new DeactivatableCachingBinaryLocator();
++	private static final AutoEvictingCachingBinaryLocator binaryLocator = new AutoEvictingCachingBinaryLocator();
+ 	private static final Runnable NOOP_ON_SHUTDOWN_ACTION = new Runnable() {
+ 		public void run() {
+ 		}
+@@ -90,7 +90,6 @@ public void run() {
+ 				// This ClassLoader is shutting down so don't try to retransform classes of it in the future
+ 				hashCodesOfClassLoadersToIgnore.add(ClassUtils.getIdentityString(AgentAttacher.class.getClassLoader()));
+ 				// it does not harm to clear the caches on shut down once again in case a ClassLoader slipped into the cache
+-				binaryLocator.deactivateCaching();
+ 			}
+ 		};
+ 	}
+@@ -221,17 +220,6 @@ private static boolean isExcluded(StagemonitorByteBuddyTransformer transformer)
+ 		return corePlugin.getExcludedInstrumenters().contains(transformer.getClass().getSimpleName());
+ 	}
+ 
+-	/**
+-	 * This method should be called as soon as most classes are loaded.
+-	 * <p/>
+-	 * It disables caching of {@link net.bytebuddy.description.type.TypeDescription}s which makes further
+-	 * transformations a bit slower but also clears the underlying cache which frees resources.
+-	 */
+-	public static void onMostClassesLoaded() {
+-		TimedElementMatcherDecorator.logMetrics();
+-		binaryLocator.deactivateCaching();
+-	}
+-
+ 	private static class IsIgnoredClassLoaderElementMatcher implements ElementMatcher<ClassLoader> {
+ 		@Override
+ 		public boolean matches(ClassLoader target) {
+diff --git a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/ApplicationClassLoaderMatcher.java b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/ApplicationClassLoaderMatcher.java
+index 111dfcb86e..720dc08756 100755
+--- a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/ApplicationClassLoaderMatcher.java
++++ b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/ApplicationClassLoaderMatcher.java
+@@ -8,13 +8,13 @@
+ import org.stagemonitor.core.util.ClassUtils;
+ 
+ /**
+- * By default, only allows transformation of classes if they are loaded by the same class loader as this class.
++ * Only allows transformation of classes if the target {@link ClassLoader} is able to load {@link Stagemonitor}.
+  * <p/>
+  * This avoids ClassNotFoundExceptions that can happen when instrumenting classes whose class loaders don't have
+  * access to stagemonitor classes, for example the Profiler class.
+  * <p/>
+- * Also, this prevents to transform classes that are loaded by another class loader, for example when multiple
+- * applications are deployed in a single Application Server.
++ * Also, this prevents to transform classes that are loaded by another class loader hierarchy and thus avoids
++ * interfering with other applications which are deployed on the same application server.
+  */
+ public class ApplicationClassLoaderMatcher extends ElementMatcher.Junction.AbstractBase<ClassLoader> {
+ 
+diff --git a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AutoEvictingCachingBinaryLocator.java b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AutoEvictingCachingBinaryLocator.java
+new file mode 100755
+index 0000000000..9fdfaf4703
+--- /dev/null
++++ b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/AutoEvictingCachingBinaryLocator.java
+@@ -0,0 +1,77 @@
++package org.stagemonitor.core.instrument;
++
++import java.security.AccessController;
++import java.security.PrivilegedAction;
++import java.util.concurrent.Executors;
++import java.util.concurrent.TimeUnit;
++
++import net.bytebuddy.agent.builder.AgentBuilder;
++import net.bytebuddy.pool.TypePool;
++import org.stagemonitor.core.util.ExecutorUtils;
++
++/**
++ * This {@link net.bytebuddy.agent.builder.AgentBuilder.BinaryLocator} caches
++ * {@link net.bytebuddy.description.type.TypeDescription}s and clears the cache every minute to avoid memory leaks.
++ * <p/>
++ * Class loader memory leaks are also avoided by using {@link WeakConcurrentMap}.
++ */
++public class AutoEvictingCachingBinaryLocator extends AgentBuilder.BinaryLocator.WithTypePoolCache {
++
++	private final WeakConcurrentMap<ClassLoader, TypePool.CacheProvider> cacheProviders = new WeakConcurrentMap
++			.WithInlinedExpunction<ClassLoader, TypePool.CacheProvider>();
++
++	public AutoEvictingCachingBinaryLocator() {
++		this(TypePool.Default.ReaderMode.EXTENDED);
++	}
++
++	public AutoEvictingCachingBinaryLocator(TypePool.Default.ReaderMode readerMode) {
++		super(readerMode);
++		Executors.newScheduledThreadPool(1, new ExecutorUtils.NamedThreadFactory("type-pool-cache-evicter")).scheduleAtFixedRate(new Runnable() {
++			@Override
++			public void run() {
++				cacheProviders.clear();
++				TimedElementMatcherDecorator.logMetrics();
++			}
++		}, 5, 1, TimeUnit.MINUTES);
++	}
++
++	@Override
++	protected TypePool.CacheProvider locate(ClassLoader classLoader) {
++		classLoader = classLoader == null ? BootstrapClassLoaderMarker.INSTANCE : classLoader;
++		TypePool.CacheProvider cacheProvider = cacheProviders.get(classLoader);
++		while (cacheProvider == null) {
++			cacheProviders.putIfAbsent(classLoader, new TypePool.CacheProvider.Simple());
++			cacheProvider = cacheProviders.get(classLoader);
++		}
++		return cacheProvider;
++	}
++
++	/**
++	 * A marker for the bootstrap class loader which is represented by {@code null}.
++	 */
++	private static class BootstrapClassLoaderMarker extends ClassLoader {
++
++		/**
++		 * A static reference to the a singleton instance of the marker to preserve reference equality.
++		 */
++		protected static final ClassLoader INSTANCE = AccessController.doPrivileged(new CreationAction());
++
++		@Override
++		protected Class<?> loadClass(String name, boolean resolve) {
++			throw new UnsupportedOperationException("This loader is only a non-null marker and is not supposed to be used");
++		}
++
++		/**
++		 * A simple action for creating a bootstrap class loader marker.
++		 */
++		private static class CreationAction implements PrivilegedAction<ClassLoader> {
++
++			@Override
++			public ClassLoader run() {
++				return new BootstrapClassLoaderMarker();
++			}
++		}
++	}
++
++
++}
+diff --git a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/StagemonitorByteBuddyTransformer.java b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/StagemonitorByteBuddyTransformer.java
+index d3f53fa5f6..428694c445 100755
+--- a/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/StagemonitorByteBuddyTransformer.java
++++ b/stagemonitor-core/src/main/java/org/stagemonitor/core/instrument/StagemonitorByteBuddyTransformer.java
+@@ -48,9 +48,9 @@
+ 		return new AgentBuilder.RawMatcher() {
+ 			@Override
+ 			public boolean matches(TypeDescription typeDescription, ClassLoader classLoader, Class<?> classBeingRedefined, ProtectionDomain protectionDomain) {
+-				final boolean matches = timed("classloader", "any", getClassLoaderMatcher()).matches(classLoader) &&
+-						timed("type", "any", getTypeMatcher()).matches(typeDescription) &&
+-						getRawMatcher().matches(typeDescription, classLoader, classBeingRedefined, protectionDomain);
++				final boolean matches = timed("type", transformerName, getTypeMatcher()).matches(typeDescription) &&
++						getRawMatcher().matches(typeDescription, classLoader, classBeingRedefined, protectionDomain) &&
++						timed("classloader", "application", getClassLoaderMatcher()).matches(classLoader);
+ 				if (!matches) {
+ 					onIgnored(typeDescription, classLoader);
+ 				}
+@@ -60,12 +60,7 @@ public boolean matches(TypeDescription typeDescription, ClassLoader classLoader,
+ 	}
+ 
+ 	protected AgentBuilder.RawMatcher getRawMatcher() {
+-		return new AgentBuilder.RawMatcher() {
+-			@Override
+-			public boolean matches(TypeDescription typeDescription, ClassLoader classLoader, Class<?> classBeingRedefined, ProtectionDomain protectionDomain) {
+-				return true;
+-			}
+-		};
++		return NoOpRawMatcher.INSTANCE;
+ 	}
+ 
+ 	protected ElementMatcher.Junction<TypeDescription> getTypeMatcher() {
+@@ -177,4 +172,11 @@ public void onIgnored(TypeDescription typeDescription, ClassLoader classLoader)
+ 		}
+ 	}
+ 
++	private static class NoOpRawMatcher implements AgentBuilder.RawMatcher {
++		public static final NoOpRawMatcher INSTANCE = new NoOpRawMatcher();
++		@Override
++		public boolean matches(TypeDescription typeDescription, ClassLoader classLoader, Class<?> classBeingRedefined, ProtectionDomain protectionDomain) {
++			return true;
++		}
++	}
+ }
+diff --git a/stagemonitor-requestmonitor/src/main/java/org/stagemonitor/requestmonitor/RequestMonitor.java b/stagemonitor-requestmonitor/src/main/java/org/stagemonitor/requestmonitor/RequestMonitor.java
+index 86bd3e55b2..233052c124 100755
+--- a/stagemonitor-requestmonitor/src/main/java/org/stagemonitor/requestmonitor/RequestMonitor.java
++++ b/stagemonitor-requestmonitor/src/main/java/org/stagemonitor/requestmonitor/RequestMonitor.java
+@@ -144,8 +144,6 @@ private RequestMonitor(Configuration configuration, Metric2Registry registry, Re
+ 
+ 		if (!info.firstRequest) {
+ 			trackOverhead(info.overhead1, overhead2);
+-		} else {
+-			AgentAttacher.onMostClassesLoaded();
+ 		}
+ 
+ 		for (Runnable onAfterRequestCallback : onAfterRequestCallbacks) {
+diff --git a/stagemonitor-requestmonitor/src/test/resources/stagemonitor.properties b/stagemonitor-requestmonitor/src/test/resources/stagemonitor.properties
+index 736348a529..4ac28f977a 100755
+--- a/stagemonitor-requestmonitor/src/test/resources/stagemonitor.properties
++++ b/stagemonitor-requestmonitor/src/test/resources/stagemonitor.properties
+@@ -2,7 +2,7 @@ stagemonitor.profiler.minExecutionTimeNanos=0
+ stagemonitor.profiler.minExecutionTimePercent=0
+ stagemonitor.instrument.include=org.stagemonitor.requestmonitor.prof.,\
+   org.stagemonitor.requestmonitor.MultipleAnnotationsAndProfilerTest,\
+-  org.stagemonitor.requestmonitor.MonitorRequestsTransformerTest$TestClass,\
++  org.stagemonitor.requestmonitor.MonitorRequestsTransformerTest,\
+   org.stagemonitor.requestmonitor.ejb.RemoteEjbMonitorTransformerTest$RemoteInterfaceImpl
+ stagemonitor.instrument.exclude=org.stagemonitor.requestmonitor.prof.elasticsearch.ElasticsearchSearchQueryTransformerTest
+ stagemonitor.businessTransaction.namingStrategy=CLASS_NAME_HASH_METHOD_NAME

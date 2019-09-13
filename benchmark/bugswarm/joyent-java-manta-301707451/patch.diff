@@ -1,0 +1,496 @@
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java b/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
+index 0f9d213ef3..b7a2c20c36 100755
+--- a/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/MantaClient.java
+@@ -1431,8 +1431,7 @@ public void putDirectory(final String rawPath,
+             return;
+         }
+ 
+-        new MantaRecursiveDirectoryCreationStrategy.Probe(this)
+-                .create(rawPath, headers);
++        new ProbingDirectoryCreationStrategy(this).create(rawPath, headers);
+     }
+ 
+     /**
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/OptimisticDirectoryCreationStrategy.java b/java-manta-client/src/main/java/com/joyent/manta/client/OptimisticDirectoryCreationStrategy.java
+new file mode 100755
+index 0000000000..c612371001
+--- /dev/null
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/OptimisticDirectoryCreationStrategy.java
+@@ -0,0 +1,57 @@
++/*
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++package com.joyent.manta.client;
++
++import com.joyent.manta.http.MantaHttpHeaders;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
++
++import static com.joyent.manta.util.MantaUtils.prefixPaths;
++
++/**
++ * Directory creation strategy which attempts to create the deepest directories first. In the best case this
++ * would create a single directory when its direct parent exists. In the worst case it will perform twice as many
++ * operations by failing every step from the desired directory to the root, and then working back down to the
++ * desired directory.
++ *
++ * @author <a href="https://github.com/tjcelaya">Tomas Celayac</a>
++ * @since 3.1.7
++ */
++class OptimisticDirectoryCreationStrategy extends RecursiveDirectoryCreationStrategy {
++
++    OptimisticDirectoryCreationStrategy(final MantaClient client) {
++        super(client);
++    }
++
++    public void create(final String rawPath, final MantaHttpHeaders headers) throws IOException {
++        final List<String> ascendingDirectories = Arrays.asList(prefixPaths(rawPath));
++
++        // reverse the list so the deepest directories are attempted first
++        Collections.reverse(ascendingDirectories);
++        final ArrayList<String> failedPuts = new ArrayList<>();
++
++        for (final String intermediateDirectory : ascendingDirectories) {
++            final Boolean createResult = createNewDirectory(intermediateDirectory, headers);
++            if (createResult == null) {
++                failedPuts.add(intermediateDirectory);
++            }
++        }
++
++        // failed puts will have the deepest directories first, reversing it will allow us to work downwards towards
++        // the requested directory
++        Collections.reverse(failedPuts);
++
++        for (final String descendingDirectory : failedPuts) {
++            getClient().putDirectory(descendingDirectory, headers);
++        }
++    }
++}
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/PessimisticDirectoryCreationStrategy.java b/java-manta-client/src/main/java/com/joyent/manta/client/PessimisticDirectoryCreationStrategy.java
+new file mode 100755
+index 0000000000..d4660931b7
+--- /dev/null
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/PessimisticDirectoryCreationStrategy.java
+@@ -0,0 +1,55 @@
++/*
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++package com.joyent.manta.client;
++
++import com.joyent.manta.http.MantaHttpHeaders;
++
++import java.io.IOException;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.Iterator;
++
++import static com.joyent.manta.client.MantaClient.SEPARATOR;
++
++/**
++ * Directory creation strategy which creates all non-system directories every time. Used if timestamp updates are
++ * requested or probing is unnecessary (i.e. 3 PUTs in the worst-case). This is the original implementation of
++ * recursive putDirectory.
++ *
++ * @author <a href="https://github.com/tjcelaya">Tomas Celayac</a>
++ * @since 3.1.7
++ */
++class PessimisticDirectoryCreationStrategy extends RecursiveDirectoryCreationStrategy {
++
++    PessimisticDirectoryCreationStrategy(final MantaClient client) {
++        super(client);
++    }
++
++    public void create(final String rawPath, final MantaHttpHeaders headers) throws IOException {
++        final String[] parts = rawPath.split(SEPARATOR);
++        final Iterator<Path> itr = Paths.get("", parts).iterator();
++        final StringBuilder sb = new StringBuilder(SEPARATOR);
++
++        for (int i = 0; itr.hasNext(); i++) {
++            final String part = itr.next().toString();
++            sb.append(part);
++
++            // This means we aren't in the home nor in the reserved
++            // directory path (stor, public, jobs, etc)
++            if (i > 1) {
++
++                getClient().putDirectory(sb.toString(), headers);
++                incrementOperations();
++            }
++
++            if (itr.hasNext()) {
++                sb.append(SEPARATOR);
++            }
++        }
++    }
++}
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/ProbingDirectoryCreationStrategy.java b/java-manta-client/src/main/java/com/joyent/manta/client/ProbingDirectoryCreationStrategy.java
+new file mode 100755
+index 0000000000..d89c60db4b
+--- /dev/null
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/ProbingDirectoryCreationStrategy.java
+@@ -0,0 +1,135 @@
++/*
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++package com.joyent.manta.client;
++
++import com.joyent.manta.http.MantaHttpHeaders;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++
++import static com.joyent.manta.util.MantaUtils.writeablePrefixPaths;
++
++/**
++ * A strategy for creating directories similar to binary/interpolation search. The general approach is
++ * as follows:
++ *
++ * <ol>
++ *     <li>Build prefix paths to desired directory</li>
++ *     <li>Drop system paths (/USER and /USER/SYSTEM_DIR)</li>
++ *     <li>Set up:
++ *     <li>
++ *         <ol>
++ *             <li><code>idx</code> is the index of the current directory to probe</li>
++ *             <li><code>min</code> is the index of the root-most directory we need to check</li>
++ *             <li><code>max</code> is the index of the deepest directory we need to check</li>
++ *             <li><code>descending</code> whether or not the next probe should be deeper in the hierarchy</li>
++ *         </ol>
++ *     </li>
++ *     <li>Loop the probing phase, updating the above variables along the way:</li>
++ *     <li>
++ *         <ol>
++ *             <li>Choose the directory halfway between the root-most directory that might need to be created
++ *             and the desired directory</li>
++ *             <li>If the directory creation was redundant, update <code>min</code>
++ *             and
++ *             <li>Otherwise, if the directory creation failed, update max to point to the failed probe
++ *             and set <code>descending</code> to true</li>
++ *             <li>Calculate the jump length based on the distance between <code>min</code> and <code>max</code></li>
++ *             <li>Add (or subtract, if descending = false) the jump distance from the current index</li>
++ *         </ol>
++ *     </li>
++ *     <li>Exit the above loop if any of the following conditions are met</li>
++ *     <li>
++ *         <ol>
++ *             <li>The leaf directory was created (this is unlikely)</li>
++ *             <li>The last PUT attempted actually created a new directory (it can have no children)</li>
++ *             <li>The jump distance was zero, i.e. floor((max - min) / 2) == 0 since
++ *             <code>min</code> and <code>max</code> are too close together</li>
++ *         </ol>
++ *     </li>
++ * </ol>
++ *
++ * @author <a href="https://github.com/tjcelaya">Tomas Celayac</a>
++ * @since 3.1.7
++ */
++class ProbingDirectoryCreationStrategy extends RecursiveDirectoryCreationStrategy {
++
++    @SuppressWarnings("checkstyle:JavadocVariable")
++    private static final Logger LOG = LoggerFactory.getLogger(ProbingDirectoryCreationStrategy.class);
++
++    /**
++     * The minimum directory depth beyond {@code /$USER/$SYSTEM_DIR} at which probing is used.
++     */
++    private static final int MIN_PROBE_DEPTH = 3;
++
++    ProbingDirectoryCreationStrategy(final MantaClient client) {
++        super(client);
++    }
++
++    public void create(final String rawPath, final MantaHttpHeaders headers) throws IOException {
++        LOG.info("START  " + rawPath);
++        final String[] paths = writeablePrefixPaths(rawPath);
++
++        if (paths.length < MIN_PROBE_DEPTH) {
++            new PessimisticDirectoryCreationStrategy(getClient()).create(rawPath, headers);
++            return;
++        }
++
++        int min = 0;
++        int max = paths.length - 1;
++        int idx = Math.floorDiv(paths.length, 2);
++
++        while (true) {
++            final String currentPath = paths[idx];
++            final Boolean requiredPut = createNewDirectory(currentPath, headers);
++            incrementOperations();
++
++            // we successfully created the requested directory, who cares if it's redundant?
++            if (requiredPut != null && rawPath.equals(currentPath)) {
++                return;
++            }
++
++            final boolean descending;
++            if (requiredPut == null) {
++                LOG.info("FAILED " + currentPath);
++                descending = false;
++                max = idx;
++            } else if (requiredPut) {
++                LOG.info("REQD   " + currentPath);
++                // stop skipping around and create the remaining directories normally
++                break;
++            } else {
++                LOG.info("REDUN  " + currentPath);
++                descending = true;
++                min = idx;
++            }
++
++            final int jumpDistance = Math.max(1, Math.floorDiv(max - min, 2));
++            LOG.info("JUMP   : " + jumpDistance + " ( min: " + min + ", max: " + max + ", diff: " + (max - min) + " )");
++
++            if (jumpDistance == 0) {
++                break;
++            }
++
++            if (descending) {
++                idx = idx + jumpDistance;
++            } else {
++                idx = idx - jumpDistance;
++            }
++        }
++
++        LOG.info("PROBE FINISH");
++
++        // create remaining directories normally
++        for (; idx < paths.length; idx++) {
++            getClient().putDirectory(paths[idx], headers);
++            incrementOperations();
++        }
++    }
++}
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/client/RecursiveDirectoryCreationStrategy.java b/java-manta-client/src/main/java/com/joyent/manta/client/RecursiveDirectoryCreationStrategy.java
+new file mode 100755
+index 0000000000..98c79ad33d
+--- /dev/null
++++ b/java-manta-client/src/main/java/com/joyent/manta/client/RecursiveDirectoryCreationStrategy.java
+@@ -0,0 +1,85 @@
++/*
++ * Copyright (c) 2017, Joyent, Inc. All rights reserved.
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
++ */
++package com.joyent.manta.client;
++
++import com.joyent.manta.exception.MantaClientHttpResponseException;
++import com.joyent.manta.exception.MantaErrorCode;
++import com.joyent.manta.http.MantaHttpHeaders;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.io.IOException;
++
++/**
++ * Base class for classes which implement recursive directory creation.
++ *
++ * @author <a href="https://github.com/tjcelaya">Tomas Celayac</a>
++ * @since 3.1.7
++ */
++abstract class RecursiveDirectoryCreationStrategy {
++
++    @SuppressWarnings("checkstyle:JavaDocVariable")
++    private static final Logger LOG = LoggerFactory.getLogger(RecursiveDirectoryCreationStrategy.class);
++
++    /**
++     * The client to use when performing operations.
++     */
++    private final MantaClient client;
++
++    /**
++     * The number of PUT operations this instance has performed.
++     */
++    private int operations;
++
++    RecursiveDirectoryCreationStrategy(final MantaClient client) {
++        this.client = client;
++        this.operations = 0;
++    }
++
++    /**
++     * Attempt to create the desired directory recursively.
++     *
++     * @param rawPath    The fully qualified path of the Manta directory.
++     * @param rawHeaders Optional {@link MantaHttpHeaders}. Consult the Manta api for more header information.
++     * @throws IOException If an unexpected error occurs during directory creation.
++     */
++    abstract void create(String rawPath, MantaHttpHeaders headers) throws IOException;
++
++    MantaClient getClient() {
++        return client;
++    }
++
++    void incrementOperations() {
++        operations++;
++    }
++
++    int getOperations() {
++        return operations;
++    }
++
++    /**
++     * Try to create a directory and unpack the error. The Boolean is intentional and acts as a tri-state variable.
++     *
++     * NULL  = creation failed.
++     * TRUE  = a new directory was actually created
++     * FALSE = the directory already existed
++     *
++     * @return whether or not the directory was actually new, or null if it failed to be created
++     */
++    Boolean createNewDirectory(final String path, final MantaHttpHeaders headers) throws IOException {
++        try {
++            return client.putDirectory(path, headers);
++        } catch (final MantaClientHttpResponseException mchre) {
++            if (mchre.getServerCode().equals(MantaErrorCode.DIRECTORY_DOES_NOT_EXIST_ERROR)) {
++                return null;
++            } else {
++                throw mchre;
++            }
++        }
++    }
++}
+diff --git a/java-manta-client/src/main/java/com/joyent/manta/util/MantaUtils.java b/java-manta-client/src/main/java/com/joyent/manta/util/MantaUtils.java
+index 2cf90f4a14..e0ec31bc12 100755
+--- a/java-manta-client/src/main/java/com/joyent/manta/util/MantaUtils.java
++++ b/java-manta-client/src/main/java/com/joyent/manta/util/MantaUtils.java
+@@ -7,8 +7,8 @@
+  */
+ package com.joyent.manta.util;
+ 
+-import io.mikael.urlbuilder.util.Encoder;
+ import io.mikael.urlbuilder.util.Decoder;
++import io.mikael.urlbuilder.util.Encoder;
+ import org.apache.commons.codec.binary.Hex;
+ import org.apache.commons.lang3.BooleanUtils;
+ import org.apache.commons.lang3.StringUtils;
+@@ -19,7 +19,6 @@
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+-import java.io.IOException;
+ import java.lang.reflect.Field;
+ import java.net.InetAddress;
+ import java.nio.charset.StandardCharsets;
+@@ -380,9 +379,8 @@ public static String lastItemInPath(final String path) {
+     /**
+      * Compute the intermediate directories between "/" and {@code rawPath}.
+      *
+-     * @param rawPath
+-     * @return
+-     * @throws IOException
++     * @param rawPath The fully qualified path of the Manta directory.
++     * @return All non-root directories leading to and including rawPath
+      */
+     public static String[] prefixPaths(final String rawPath) {
+         final String[] parts = rawPath.split(SEPARATOR);
+@@ -404,6 +402,13 @@ public static String lastItemInPath(final String path) {
+         return paths;
+     }
+ 
++    /**
++     * Returns intermediate directories between "/" and {@code rawPath}, not including
++     * the user's home folder and or system directories.
++     *
++     * @param rawPath The fully qualified path of the Manta directory.
++     * @return All non-root and non-system directories including rawPath
++     */
+     public static String[] writeablePrefixPaths(final String rawPath) {
+         final String[] paths = prefixPaths(rawPath);
+         return Arrays.copyOfRange(prefixPaths(rawPath), 2, paths.length);
+diff --git a/java-manta-it/src/test/java/com/joyent/manta/client/MantaClientDirectoriesIT.java b/java-manta-it/src/test/java/com/joyent/manta/client/MantaClientDirectoriesIT.java
+index 6086cc9cca..dcdf90d5a4 100755
+--- a/java-manta-it/src/test/java/com/joyent/manta/client/MantaClientDirectoriesIT.java
++++ b/java-manta-it/src/test/java/com/joyent/manta/client/MantaClientDirectoriesIT.java
+@@ -7,14 +7,18 @@
+  */
+ package com.joyent.manta.client;
+ 
+-import com.joyent.manta.config.IntegrationTestConfigContext;
+ import com.joyent.manta.config.ConfigContext;
++import com.joyent.manta.config.IntegrationTestConfigContext;
+ import com.joyent.test.util.MantaAssert;
+ import com.joyent.test.util.MantaFunction;
++import org.apache.commons.lang3.RandomStringUtils;
++import org.apache.commons.lang3.RandomUtils;
+ import org.apache.commons.lang3.Validate;
+ import org.mockito.MockingDetails;
+ import org.mockito.Mockito;
+ import org.mockito.invocation.InvocationOnMock;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.testng.Assert;
+ import org.testng.annotations.AfterClass;
+ import org.testng.annotations.BeforeClass;
+@@ -161,14 +165,33 @@ public void canRecursivelyCreateDirectory() throws IOException {
+         Assert.assertEquals(dir, response.getPath());
+     }
+ 
++    private static final Logger LOG = LoggerFactory.getLogger(MantaClientDirectoriesIT.class);
++
++    @Test(invocationCount = 10)
+     public void canSkipAlreadyCreatedDirectories() throws IOException {
+-        final String dir = String.format("%s/%s/%s/%s/%s/%s", testPathPrefix,
+-                UUID.randomUUID(),
+-                UUID.randomUUID(),
+-                UUID.randomUUID(),
+-                UUID.randomUUID(),
+-                UUID.randomUUID());
+-        final String nestedDir = dir + MantaClient.SEPARATOR + UUID.randomUUID().toString();
++
++        if (!mantaClient.existsAndIsAccessible(testPathPrefix)) {
++            mantaClient.putDirectory(testPathPrefix);
++        }
++
++        final int parentDirDepth = RandomUtils.nextInt(1, 10);
++        final int childAddedDepth = parentDirDepth + RandomUtils.nextInt(1, 10);
++
++        final StringBuilder parentDirBuilder = new StringBuilder(testPathPrefix);
++        for (int i = 0; i < parentDirDepth; i++) {
++            parentDirBuilder
++                    .append(MantaClient.SEPARATOR)
++                    .append(RandomStringUtils.random(3, true, false));
++        }
++        final String dir = parentDirBuilder.toString();
++
++        final StringBuilder childDirBuilder = new StringBuilder(dir);
++        for (int i = 0; i < childAddedDepth; i++) {
++            childDirBuilder
++                    .append(MantaClient.SEPARATOR)
++                    .append(RandomStringUtils.random(3, true, false));
++        }
++        final String nestedDir = childDirBuilder.toString();
+ 
+         final MantaClient clientSpy = Mockito.spy(mantaClient);
+ 
+@@ -188,7 +211,11 @@ public void canSkipAlreadyCreatedDirectories() throws IOException {
+         Assert.assertEquals(nestedDir, nestedResponse.getPath());
+ 
+         // verify that created the nested directory took less calls than its parent
+-        Assert.assertTrue(putDirCallsNested < putDirCallsInitial);
++        final int childFullDepth = parentDirDepth + childAddedDepth;
++        LOG.info("depth (parent): " + parentDirDepth + " (child): " + childFullDepth);
++        LOG.info("calls (parent): " + putDirCallsInitial + " (child): " + putDirCallsNested);
++
++        Assert.assertTrue(putDirCallsNested <= (1 + childFullDepth));
+     }
+ 
+     private long putDirectoryAndCountCalls(final MantaClient clientSpy, final String dir) throws IOException {

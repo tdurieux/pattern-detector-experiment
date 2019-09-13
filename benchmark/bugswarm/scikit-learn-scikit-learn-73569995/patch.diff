@@ -1,0 +1,750 @@
+diff --git a/doc/modules/model_evaluation.rst b/doc/modules/model_evaluation.rst
+index 12548f6a8a..9b0556abb1 100755
+--- a/doc/modules/model_evaluation.rst
++++ b/doc/modules/model_evaluation.rst
+@@ -353,6 +353,23 @@ In the multilabel case with binary label indicators: ::
+     for an example of accuracy score usage using permutations of
+     the dataset.
+ 
++.. _cohen_kappa:
++
++Cohen's kappa
++-------------
++
++The function :func:`cohen_kappa_score` computes Cohen's kappa statistic.
++This measure is intended to compare labelings by different human annotators,
++not a classifier versus a ground truth.
++
++The kappa score (see docstring) is a number between -1 and 1.
++Scores above .8 are generally considered good agreement;
++zero or lower means no agreement (practically random labels).
++
++Kappa scores can be computed for binary or multiclass problems,
++but not for multilabel problems (except by manually computing a per-label score)
++and not for more than two annotators.
++
+ .. _confusion_matrix:
+ 
+ Confusion matrix
+diff --git a/doc/whats_new.rst b/doc/whats_new.rst
+index 61223999d3..49f98211ac 100755
+--- a/doc/whats_new.rst
++++ b/doc/whats_new.rst
+@@ -126,6 +126,9 @@ Bug fixes
+     - All regressors now consistently handle and warn when given ``y`` that is of
+       shape ``(n_samples, 1)``. By `Andreas Müller`_.
+ 
++    - Fix in :class:`cluster.KMeans` cluster reassignment for sparse input by
++      `Lars Buitinck`_.
++
+ API changes summary
+ -------------------
+ 
+diff --git a/sklearn/gaussian_process/gaussian_process.py b/sklearn/gaussian_process/gaussian_process.py
+index 542bf14f28..07f688bc57 100755
+--- a/sklearn/gaussian_process/gaussian_process.py
++++ b/sklearn/gaussian_process/gaussian_process.py
+@@ -718,17 +718,16 @@ def minus_reduced_likelihood_function(log10t):
+                 else:
+                     # Generate a random starting point log10-uniformly
+                     # distributed between bounds
+-                    log10theta0 = np.log10(self.thetaL) \
+-                        + self.random_state.rand(self.theta0.size).reshape(
+-                            self.theta0.shape) * np.log10(self.thetaU
+-                                                          / self.thetaL)
++                    log10theta0 = (np.log10(self.thetaL)
++                                   + self.random_state.rand(*self.theta0.shape)
++                                   * np.log10(self.thetaU / self.thetaL))
+                     theta0 = 10. ** log10theta0
+ 
+                 # Run Cobyla
+                 try:
+                     log10_optimal_theta = \
+                         optimize.fmin_cobyla(minus_reduced_likelihood_function,
+-                                             np.log10(theta0), constraints,
++                                             np.log10(theta0).ravel(), constraints,
+                                              iprint=0)
+                 except ValueError as ve:
+                     print("Optimization failed. Try increasing the ``nugget``")
+diff --git a/sklearn/kernel_ridge.py b/sklearn/kernel_ridge.py
+index 80be07e8a2..2c5ebb8a2c 100755
+--- a/sklearn/kernel_ridge.py
++++ b/sklearn/kernel_ridge.py
+@@ -143,7 +143,8 @@ def fit(self, X, y=None, sample_weight=None):
+         self : returns an instance of self.
+         """
+         # Convert data
+-        X, y = check_X_y(X, y, accept_sparse=("csr", "csc"), multi_output=True)
++        X, y = check_X_y(X, y, accept_sparse=("csr", "csc"), multi_output=True,
++                         y_numeric=True)
+ 
+         K = self._get_kernel(X)
+         alpha = np.atleast_1d(self.alpha)
+diff --git a/sklearn/linear_model/coordinate_descent.py b/sklearn/linear_model/coordinate_descent.py
+index b222fa717d..2026ffab93 100755
+--- a/sklearn/linear_model/coordinate_descent.py
++++ b/sklearn/linear_model/coordinate_descent.py
+@@ -17,12 +17,13 @@
+ from .base import center_data, sparse_center_data
+ from ..utils import check_array, check_X_y, deprecated
+ from ..utils.validation import check_random_state
+-from ..cross_validation import check_cv, column_or_1d
++from ..cross_validation import check_cv
+ from ..externals.joblib import Parallel, delayed
+ from ..externals import six
+ from ..externals.six.moves import xrange
+ from ..utils.extmath import safe_sparse_dot
+ from ..utils.validation import check_is_fitted
++from ..utils.validation import column_or_1d
+ from ..utils import ConvergenceWarning
+ 
+ from . import cd_fast
+diff --git a/sklearn/metrics/__init__.py b/sklearn/metrics/__init__.py
+index 9f90efe32c..501599c464 100755
+--- a/sklearn/metrics/__init__.py
++++ b/sklearn/metrics/__init__.py
+@@ -15,6 +15,7 @@
+ 
+ from .classification import accuracy_score
+ from .classification import classification_report
++from .classification import cohen_kappa_score
+ from .classification import confusion_matrix
+ from .classification import f1_score
+ from .classification import fbeta_score
+diff --git a/sklearn/metrics/classification.py b/sklearn/metrics/classification.py
+index 08acb8524a..1bf9b25338 100755
+--- a/sklearn/metrics/classification.py
++++ b/sklearn/metrics/classification.py
+@@ -266,6 +266,57 @@ def confusion_matrix(y_true, y_pred, labels=None):
+     return CM
+ 
+ 
++def cohen_kappa_score(y1, y2, labels=None):
++    """Cohen's kappa: a statistic that measures inter-annotator agreement.
++
++    This function computes Cohen's kappa [1], a score that expresses the level
++    of agreement between two annotators on a classification problem. It is
++    defined as
++
++    .. math::
++        \kappa = (p_o - p_e) / (1 - p_e)
++
++    where :math:`p_o` is the empirical probability of agreement on the label
++    assigned to any sample (the observed agreement ratio), and :math:`p_e` is
++    the expected agreement when both annotators assign labels randomly.
++    :math:`p_e` is estimated using a per-annotator empirical prior over the
++    class labels [2].
++
++    Parameters
++    ----------
++    y1 : array, shape = [n_samples]
++        Labels assigned by the first annotator.
++
++    y2 : array, shape = [n_samples]
++        Labels assigned by the second annotator. The kappa statistic is
++        symmetric, so swapping ``y1`` and ``y2`` doesn't change the value.
++
++    labels : array, shape = [n_classes], optional
++        List of labels to index the matrix. This may be used to select a
++        subset of labels. If None, all labels that appear at least once in
++        ``y1`` or ``y2`` are used.
++
++    Returns
++    -------
++    kappa : float
++        The kappa statistic, which is a number between -1 and 1. The maximum
++        value means complete agreement; zero or lower means chance agreement.
++
++    References
++    ----------
++    .. [1] J. Cohen (1960). "A coefficient of agreement for nominal scales".
++           Educational and Psychological Measurement 20(1):37-46.
++           doi:10.1177/001316446002000104.
++    .. [2] R. Artstein and M. Poesio (2008). "Inter-coder agreement for
++           computational linguistics". Computational Linguistic 34(4):555-596.
++    """
++    confusion = confusion_matrix(y1, y2, labels=labels)
++    P = confusion / float(confusion.sum())
++    p_observed = np.trace(P)
++    p_expected = np.dot(P.sum(axis=0), P.sum(axis=1))
++    return (p_observed - p_expected) / (1 - p_expected)
++
++
+ def jaccard_similarity_score(y_true, y_pred, normalize=True,
+                              sample_weight=None):
+     """Jaccard similarity coefficient score
+diff --git a/sklearn/metrics/tests/test_classification.py b/sklearn/metrics/tests/test_classification.py
+index 3ac8e40ae8..983b321e5b 100755
+--- a/sklearn/metrics/tests/test_classification.py
++++ b/sklearn/metrics/tests/test_classification.py
+@@ -30,6 +30,7 @@
+ from sklearn.metrics import accuracy_score
+ from sklearn.metrics import average_precision_score
+ from sklearn.metrics import classification_report
++from sklearn.metrics import cohen_kappa_score
+ from sklearn.metrics import confusion_matrix
+ from sklearn.metrics import f1_score
+ from sklearn.metrics import fbeta_score
+@@ -316,6 +317,28 @@ def test(y_true, y_pred):
+          [str(y) for y in y_pred])
+ 
+ 
++def test_cohen_kappa():
++    # These label vectors reproduce the contingency matrix from Artstein and
++    # Poesio (2008), Table 1: np.array([[20, 20], [10, 50]]).
++    y1 = np.array([0] * 40 + [1] * 60)
++    y2 = np.array([0] * 20 + [1] * 20 + [0] * 10 + [1] * 50)
++    kappa = cohen_kappa_score(y1, y2)
++    assert_almost_equal(kappa, .348, decimal=3)
++    assert_equal(kappa, cohen_kappa_score(y2, y1))
++
++    # Add spurious labels and ignore them.
++    y1 = np.append(y1, [2] * 4)
++    y2 = np.append(y2, [2] * 4)
++    assert_equal(cohen_kappa_score(y1, y2, labels=[0, 1]), kappa)
++
++    assert_almost_equal(cohen_kappa_score(y1, y1), 1.)
++
++    # Multiclass example: Artstein and Poesio, Table 4.
++    y1 = np.array([0] * 46 + [1] * 44 + [2] * 10)
++    y2 = np.array([0] * 52 + [1] * 32 + [2] * 16)
++    assert_almost_equal(cohen_kappa_score(y1, y2), .8013, decimal=4)
++
++
+ @ignore_warnings
+ def test_matthews_corrcoef_nan():
+     assert_equal(matthews_corrcoef([0], [1]), 0.0)
+diff --git a/sklearn/metrics/tests/test_common.py b/sklearn/metrics/tests/test_common.py
+index 578f92866a..91e608cce3 100755
+--- a/sklearn/metrics/tests/test_common.py
++++ b/sklearn/metrics/tests/test_common.py
+@@ -26,6 +26,7 @@
+ from sklearn.metrics import accuracy_score
+ from sklearn.metrics import average_precision_score
+ from sklearn.metrics import brier_score_loss
++from sklearn.metrics import cohen_kappa_score
+ from sklearn.metrics import confusion_matrix
+ from sklearn.metrics import coverage_error
+ from sklearn.metrics import explained_variance_score
+@@ -140,6 +141,8 @@
+     "samples_f2_score": partial(fbeta_score, average="samples", beta=2),
+     "samples_precision_score": partial(precision_score, average="samples"),
+     "samples_recall_score": partial(recall_score, average="samples"),
++
++    "cohen_kappa_score": cohen_kappa_score,
+ }
+ 
+ THRESHOLDED_METRICS = {
+@@ -250,6 +253,8 @@
+ 
+     "macro_f0.5_score", "macro_f1_score", "macro_f2_score",
+     "macro_precision_score", "macro_recall_score",
++
++    "cohen_kappa_score",
+ ]
+ 
+ # Metrics with a "normalize" option
+@@ -314,8 +319,9 @@
+     "f1_score", "weighted_f1_score", "micro_f1_score", "macro_f1_score",
+ 
+     "matthews_corrcoef_score", "mean_absolute_error", "mean_squared_error",
+-    "median_absolute_error"
++    "median_absolute_error",
+ 
++    "cohen_kappa_score",
+ ]
+ 
+ # Asymmetric with respect to their input arguments y_true and y_pred
+@@ -340,6 +346,7 @@
+ 
+ # No Sample weight support
+ METRICS_WITHOUT_SAMPLE_WEIGHT = [
++    "cohen_kappa_score",
+     "confusion_matrix",
+     "hamming_loss",
+     "matthews_corrcoef_score",
+diff --git a/sklearn/utils/estimator_checks.py b/sklearn/utils/estimator_checks.py
+index f7f00f3760..42eb057b9d 100755
+--- a/sklearn/utils/estimator_checks.py
++++ b/sklearn/utils/estimator_checks.py
+@@ -871,7 +871,9 @@ def check_supervised_y_2d(name, Estimator):
+         ", ".join([str(w_x) for w_x in w]))
+     if name not in MULTI_OUTPUT:
+         # check that we warned if we don't support multi-output
+-        assert_equal(len(w), 1, msg)
++        assert_greater(len(w), 0, msg)
++        assert_true("DataConversionWarning('A column-vector y"
++                    " was passed when a 1d array was expected" in msg)
+     assert_array_almost_equal(y_pred.ravel(), y_pred_2d.ravel())
+ 
+ 
+diff --git a/sklearn/utils/sparsefuncs_fast.c b/sklearn/utils/sparsefuncs_fast.c
+index 405e68dafc..40f20eafe9 100755
+--- a/sklearn/utils/sparsefuncs_fast.c
++++ b/sklearn/utils/sparsefuncs_fast.c
+@@ -909,13 +909,6 @@ static CYTHON_INLINE int __Pyx_ArgTypeTest(PyObject *obj, PyTypeObject *type, in
+ 
+ static void __Pyx_Raise(PyObject *type, PyObject *value, PyObject *tb, PyObject *cause);
+ 
+-#define __Pyx_PyObject_DelSlice(obj, cstart, cstop, py_start, py_stop, py_slice, has_cstart, has_cstop, wraparound) \
+-    __Pyx_PyObject_SetSlice(obj, (PyObject*)NULL, cstart, cstop, py_start, py_stop, py_slice, has_cstart, has_cstop, wraparound)
+-static CYTHON_INLINE int __Pyx_PyObject_SetSlice(
+-        PyObject* obj, PyObject* value, Py_ssize_t cstart, Py_ssize_t cstop,
+-        PyObject** py_start, PyObject** py_stop, PyObject** py_slice,
+-        int has_cstart, int has_cstop, int wraparound);
+-
+ #define __Pyx_BufPtrCContig2d(type, buf, i0, s0, i1, s1) ((type)((char*)buf + i0 * s0) + i1)
+ #if PY_MAJOR_VERSION >= 3 && !CYTHON_COMPILING_IN_PYPY
+ static PyObject *__Pyx_PyDict_GetItem(PyObject *d, PyObject* key) {
+@@ -1191,7 +1184,7 @@ static char __pyx_k_q[] = "q";
+ static char __pyx_k_Zd[] = "Zd";
+ static char __pyx_k_Zf[] = "Zf";
+ static char __pyx_k_Zg[] = "Zg";
+-static char __pyx_k__8[] = "*";
++static char __pyx_k__7[] = "*";
+ static char __pyx_k_np[] = "np";
+ static char __pyx_k_rX[] = "rX";
+ static char __pyx_k_sp[] = "sp";
+@@ -1258,7 +1251,7 @@ static PyObject *__pyx_n_s_X_data;
+ static PyObject *__pyx_n_s_X_indices;
+ static PyObject *__pyx_n_s_X_indptr;
+ static PyObject *__pyx_n_s_X_rows;
+-static PyObject *__pyx_n_s__8;
++static PyObject *__pyx_n_s__7;
+ static PyObject *__pyx_n_s_asarray;
+ static PyObject *__pyx_n_s_assign_rows_csr;
+ static PyObject *__pyx_kp_s_cannot_assign_d_rows_to_d;
+@@ -1309,25 +1302,24 @@ static PyObject *__pyx_n_s_xrange;
+ static PyObject *__pyx_n_s_zeros;
+ static PyObject *__pyx_n_s_zeros_like;
+ static PyObject *__pyx_float_0_;
+-static PyObject *__pyx_slice_;
++static PyObject *__pyx_tuple_;
+ static PyObject *__pyx_tuple__2;
+ static PyObject *__pyx_tuple__3;
+ static PyObject *__pyx_tuple__4;
+ static PyObject *__pyx_tuple__5;
+ static PyObject *__pyx_tuple__6;
+-static PyObject *__pyx_tuple__7;
+-static PyObject *__pyx_tuple__9;
+-static PyObject *__pyx_tuple__11;
+-static PyObject *__pyx_tuple__13;
+-static PyObject *__pyx_tuple__15;
+-static PyObject *__pyx_tuple__17;
+-static PyObject *__pyx_tuple__19;
+-static PyObject *__pyx_codeobj__10;
+-static PyObject *__pyx_codeobj__12;
+-static PyObject *__pyx_codeobj__14;
+-static PyObject *__pyx_codeobj__16;
+-static PyObject *__pyx_codeobj__18;
+-static PyObject *__pyx_codeobj__20;
++static PyObject *__pyx_tuple__8;
++static PyObject *__pyx_tuple__10;
++static PyObject *__pyx_tuple__12;
++static PyObject *__pyx_tuple__14;
++static PyObject *__pyx_tuple__16;
++static PyObject *__pyx_tuple__18;
++static PyObject *__pyx_codeobj__9;
++static PyObject *__pyx_codeobj__11;
++static PyObject *__pyx_codeobj__13;
++static PyObject *__pyx_codeobj__15;
++static PyObject *__pyx_codeobj__17;
++static PyObject *__pyx_codeobj__19;
+ 
+ /* "sklearn/utils/sparsefuncs_fast.pyx":23
+  * @cython.wraparound(False)
+@@ -3862,7 +3854,7 @@ static PyObject *__pyx_pf_7sklearn_5utils_16sparsefuncs_fast_10assign_rows_csr(C
+  *         raise ValueError("cannot assign %d rows to %d"
+  *                          % (X_rows.shape[0], out_rows.shape[0]))             # <<<<<<<<<<<<<<
+  * 
+- *     out[:] = 0.
++ *     out[out_rows] = 0.
+  */
+     __pyx_t_1 = __Pyx_PyInt_From_Py_intptr_t((__pyx_v_X_rows->dimensions[0])); if (unlikely(!__pyx_t_1)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 287; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+     __Pyx_GOTREF(__pyx_t_1);
+@@ -3903,15 +3895,15 @@ static PyObject *__pyx_pf_7sklearn_5utils_16sparsefuncs_fast_10assign_rows_csr(C
+   /* "sklearn/utils/sparsefuncs_fast.pyx":289
+  *                          % (X_rows.shape[0], out_rows.shape[0]))
+  * 
+- *     out[:] = 0.             # <<<<<<<<<<<<<<
++ *     out[out_rows] = 0.             # <<<<<<<<<<<<<<
+  *     for i in range(X_rows.shape[0]):
+  *         # XXX we could reuse add_row_csr here, but the array slice
+  */
+-  if (__Pyx_PyObject_SetSlice(((PyObject *)__pyx_v_out), __pyx_float_0_, 0, 0, NULL, NULL, &__pyx_slice_, 0, 0, 0) < 0) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 289; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  if (unlikely(PyObject_SetItem(((PyObject *)__pyx_v_out), ((PyObject *)__pyx_v_out_rows), __pyx_float_0_) < 0)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 289; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":290
+  * 
+- *     out[:] = 0.
++ *     out[out_rows] = 0.
+  *     for i in range(X_rows.shape[0]):             # <<<<<<<<<<<<<<
+  *         # XXX we could reuse add_row_csr here, but the array slice
+  *         # is not optimized away.
+@@ -4164,7 +4156,7 @@ static int __pyx_pf_5numpy_7ndarray___getbuffer__(PyArrayObject *__pyx_v_self, P
+  * 
+  *             if ((flags & pybuf.PyBUF_F_CONTIGUOUS == pybuf.PyBUF_F_CONTIGUOUS)
+  */
+-    __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__2, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 218; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++    __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple_, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 218; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+     __Pyx_GOTREF(__pyx_t_3);
+     __Pyx_Raise(__pyx_t_3, 0, 0, 0);
+     __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+@@ -4204,7 +4196,7 @@ static int __pyx_pf_5numpy_7ndarray___getbuffer__(PyArrayObject *__pyx_v_self, P
+  * 
+  *             info.buf = PyArray_DATA(self)
+  */
+-    __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__3, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 222; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++    __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__2, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 222; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+     __Pyx_GOTREF(__pyx_t_3);
+     __Pyx_Raise(__pyx_t_3, 0, 0, 0);
+     __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+@@ -4481,7 +4473,7 @@ static int __pyx_pf_5numpy_7ndarray___getbuffer__(PyArrayObject *__pyx_v_self, P
+  *                 if   t == NPY_BYTE:        f = "b"
+  *                 elif t == NPY_UBYTE:       f = "B"
+  */
+-      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__4, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 260; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__3, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 260; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+       __Pyx_GOTREF(__pyx_t_3);
+       __Pyx_Raise(__pyx_t_3, 0, 0, 0);
+       __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+@@ -5294,7 +5286,7 @@ static CYTHON_INLINE char *__pyx_f_5numpy__util_dtypestring(PyArray_Descr *__pyx
+  * 
+  *         if ((child.byteorder == c'>' and little_endian) or
+  */
+-      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_RuntimeError, __pyx_tuple__5, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 802; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_RuntimeError, __pyx_tuple__4, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 802; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+       __Pyx_GOTREF(__pyx_t_3);
+       __Pyx_Raise(__pyx_t_3, 0, 0, 0);
+       __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+@@ -5346,7 +5338,7 @@ static CYTHON_INLINE char *__pyx_f_5numpy__util_dtypestring(PyArray_Descr *__pyx
+  *             # One could encode it in the format string and have Cython
+  *             # complain instead, BUT: < and > in format strings also imply
+  */
+-      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__6, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 806; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++      __pyx_t_3 = __Pyx_PyObject_Call(__pyx_builtin_ValueError, __pyx_tuple__5, NULL); if (unlikely(!__pyx_t_3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 806; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+       __Pyx_GOTREF(__pyx_t_3);
+       __Pyx_Raise(__pyx_t_3, 0, 0, 0);
+       __Pyx_DECREF(__pyx_t_3); __pyx_t_3 = 0;
+@@ -5447,7 +5439,7 @@ static CYTHON_INLINE char *__pyx_f_5numpy__util_dtypestring(PyArray_Descr *__pyx
+  * 
+  *             # Until ticket #99 is fixed, use integers to avoid warnings
+  */
+-        __pyx_t_4 = __Pyx_PyObject_Call(__pyx_builtin_RuntimeError, __pyx_tuple__7, NULL); if (unlikely(!__pyx_t_4)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 826; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++        __pyx_t_4 = __Pyx_PyObject_Call(__pyx_builtin_RuntimeError, __pyx_tuple__6, NULL); if (unlikely(!__pyx_t_4)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 826; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+         __Pyx_GOTREF(__pyx_t_4);
+         __Pyx_Raise(__pyx_t_4, 0, 0, 0);
+         __Pyx_DECREF(__pyx_t_4); __pyx_t_4 = 0;
+@@ -6044,7 +6036,7 @@ static __Pyx_StringTabEntry __pyx_string_tab[] = {
+   {&__pyx_n_s_X_indices, __pyx_k_X_indices, sizeof(__pyx_k_X_indices), 0, 0, 1, 1},
+   {&__pyx_n_s_X_indptr, __pyx_k_X_indptr, sizeof(__pyx_k_X_indptr), 0, 0, 1, 1},
+   {&__pyx_n_s_X_rows, __pyx_k_X_rows, sizeof(__pyx_k_X_rows), 0, 0, 1, 1},
+-  {&__pyx_n_s__8, __pyx_k__8, sizeof(__pyx_k__8), 0, 0, 1, 1},
++  {&__pyx_n_s__7, __pyx_k__7, sizeof(__pyx_k__7), 0, 0, 1, 1},
+   {&__pyx_n_s_asarray, __pyx_k_asarray, sizeof(__pyx_k_asarray), 0, 0, 1, 1},
+   {&__pyx_n_s_assign_rows_csr, __pyx_k_assign_rows_csr, sizeof(__pyx_k_assign_rows_csr), 0, 0, 1, 1},
+   {&__pyx_kp_s_cannot_assign_d_rows_to_d, __pyx_k_cannot_assign_d_rows_to_d, sizeof(__pyx_k_cannot_assign_d_rows_to_d), 0, 0, 1, 0},
+@@ -6114,17 +6106,6 @@ static int __Pyx_InitCachedConstants(void) {
+   __Pyx_RefNannyDeclarations
+   __Pyx_RefNannySetupContext("__Pyx_InitCachedConstants", 0);
+ 
+-  /* "sklearn/utils/sparsefuncs_fast.pyx":289
+- *                          % (X_rows.shape[0], out_rows.shape[0]))
+- * 
+- *     out[:] = 0.             # <<<<<<<<<<<<<<
+- *     for i in range(X_rows.shape[0]):
+- *         # XXX we could reuse add_row_csr here, but the array slice
+- */
+-  __pyx_slice_ = PySlice_New(Py_None, Py_None, Py_None); if (unlikely(!__pyx_slice_)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 289; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_slice_);
+-  __Pyx_GIVEREF(__pyx_slice_);
+-
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":218
+  *             if ((flags & pybuf.PyBUF_C_CONTIGUOUS == pybuf.PyBUF_C_CONTIGUOUS)
+  *                 and not PyArray_CHKFLAGS(self, NPY_C_CONTIGUOUS)):
+@@ -6132,9 +6113,9 @@ static int __Pyx_InitCachedConstants(void) {
+  * 
+  *             if ((flags & pybuf.PyBUF_F_CONTIGUOUS == pybuf.PyBUF_F_CONTIGUOUS)
+  */
+-  __pyx_tuple__2 = PyTuple_Pack(1, __pyx_kp_u_ndarray_is_not_C_contiguous); if (unlikely(!__pyx_tuple__2)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 218; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__2);
+-  __Pyx_GIVEREF(__pyx_tuple__2);
++  __pyx_tuple_ = PyTuple_Pack(1, __pyx_kp_u_ndarray_is_not_C_contiguous); if (unlikely(!__pyx_tuple_)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 218; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple_);
++  __Pyx_GIVEREF(__pyx_tuple_);
+ 
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":222
+  *             if ((flags & pybuf.PyBUF_F_CONTIGUOUS == pybuf.PyBUF_F_CONTIGUOUS)
+@@ -6143,9 +6124,9 @@ static int __Pyx_InitCachedConstants(void) {
+  * 
+  *             info.buf = PyArray_DATA(self)
+  */
+-  __pyx_tuple__3 = PyTuple_Pack(1, __pyx_kp_u_ndarray_is_not_Fortran_contiguou); if (unlikely(!__pyx_tuple__3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 222; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__3);
+-  __Pyx_GIVEREF(__pyx_tuple__3);
++  __pyx_tuple__2 = PyTuple_Pack(1, __pyx_kp_u_ndarray_is_not_Fortran_contiguou); if (unlikely(!__pyx_tuple__2)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 222; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__2);
++  __Pyx_GIVEREF(__pyx_tuple__2);
+ 
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":260
+  *                 if ((descr.byteorder == c'>' and little_endian) or
+@@ -6154,9 +6135,9 @@ static int __Pyx_InitCachedConstants(void) {
+  *                 if   t == NPY_BYTE:        f = "b"
+  *                 elif t == NPY_UBYTE:       f = "B"
+  */
+-  __pyx_tuple__4 = PyTuple_Pack(1, __pyx_kp_u_Non_native_byte_order_not_suppor); if (unlikely(!__pyx_tuple__4)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 260; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__4);
+-  __Pyx_GIVEREF(__pyx_tuple__4);
++  __pyx_tuple__3 = PyTuple_Pack(1, __pyx_kp_u_Non_native_byte_order_not_suppor); if (unlikely(!__pyx_tuple__3)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 260; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__3);
++  __Pyx_GIVEREF(__pyx_tuple__3);
+ 
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":802
+  * 
+@@ -6165,9 +6146,9 @@ static int __Pyx_InitCachedConstants(void) {
+  * 
+  *         if ((child.byteorder == c'>' and little_endian) or
+  */
+-  __pyx_tuple__5 = PyTuple_Pack(1, __pyx_kp_u_Format_string_allocated_too_shor); if (unlikely(!__pyx_tuple__5)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 802; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__5);
+-  __Pyx_GIVEREF(__pyx_tuple__5);
++  __pyx_tuple__4 = PyTuple_Pack(1, __pyx_kp_u_Format_string_allocated_too_shor); if (unlikely(!__pyx_tuple__4)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 802; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__4);
++  __Pyx_GIVEREF(__pyx_tuple__4);
+ 
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":806
+  *         if ((child.byteorder == c'>' and little_endian) or
+@@ -6176,9 +6157,9 @@ static int __Pyx_InitCachedConstants(void) {
+  *             # One could encode it in the format string and have Cython
+  *             # complain instead, BUT: < and > in format strings also imply
+  */
+-  __pyx_tuple__6 = PyTuple_Pack(1, __pyx_kp_u_Non_native_byte_order_not_suppor); if (unlikely(!__pyx_tuple__6)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 806; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__6);
+-  __Pyx_GIVEREF(__pyx_tuple__6);
++  __pyx_tuple__5 = PyTuple_Pack(1, __pyx_kp_u_Non_native_byte_order_not_suppor); if (unlikely(!__pyx_tuple__5)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 806; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__5);
++  __Pyx_GIVEREF(__pyx_tuple__5);
+ 
+   /* "../../../../usr/local/lib/python2.7/dist-packages/Cython/Includes/numpy/__init__.pxd":826
+  *             t = child.type_num
+@@ -6187,9 +6168,9 @@ static int __Pyx_InitCachedConstants(void) {
+  * 
+  *             # Until ticket #99 is fixed, use integers to avoid warnings
+  */
+-  __pyx_tuple__7 = PyTuple_Pack(1, __pyx_kp_u_Format_string_allocated_too_shor_2); if (unlikely(!__pyx_tuple__7)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 826; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__7);
+-  __Pyx_GIVEREF(__pyx_tuple__7);
++  __pyx_tuple__6 = PyTuple_Pack(1, __pyx_kp_u_Format_string_allocated_too_shor_2); if (unlikely(!__pyx_tuple__6)) {__pyx_filename = __pyx_f[1]; __pyx_lineno = 826; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__6);
++  __Pyx_GIVEREF(__pyx_tuple__6);
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":23
+  * @cython.wraparound(False)
+@@ -6198,10 +6179,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *     """L2 norm of each row in CSR matrix X."""
+  *     cdef:
+  */
+-  __pyx_tuple__9 = PyTuple_Pack(10, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_norms, __pyx_n_s_data, __pyx_n_s_indices, __pyx_n_s_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__9)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 23; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__9);
+-  __Pyx_GIVEREF(__pyx_tuple__9);
+-  __pyx_codeobj__10 = (PyObject*)__Pyx_PyCode_New(1, 0, 10, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__9, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csr_row_norms, 23, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__10)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 23; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__8 = PyTuple_Pack(10, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_norms, __pyx_n_s_data, __pyx_n_s_indices, __pyx_n_s_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__8)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 23; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__8);
++  __Pyx_GIVEREF(__pyx_tuple__8);
++  __pyx_codeobj__9 = (PyObject*)__Pyx_PyCode_New(1, 0, 10, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__8, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csr_row_norms, 23, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__9)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 23; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":51
+  * @cython.wraparound(False)
+@@ -6210,10 +6191,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *     """Compute mean and variance along axis 0 on a CSR matrix
+  * 
+  */
+-  __pyx_tuple__11 = PyTuple_Pack(12, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_i, __pyx_n_s_non_zero, __pyx_n_s_col_ind, __pyx_n_s_diff, __pyx_n_s_means, __pyx_n_s_variances, __pyx_n_s_counts); if (unlikely(!__pyx_tuple__11)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 51; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__11);
+-  __Pyx_GIVEREF(__pyx_tuple__11);
+-  __pyx_codeobj__12 = (PyObject*)__Pyx_PyCode_New(1, 0, 12, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__11, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csr_mean_variance_axis0, 51, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__12)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 51; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__10 = PyTuple_Pack(12, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_i, __pyx_n_s_non_zero, __pyx_n_s_col_ind, __pyx_n_s_diff, __pyx_n_s_means, __pyx_n_s_variances, __pyx_n_s_counts); if (unlikely(!__pyx_tuple__10)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 51; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__10);
++  __Pyx_GIVEREF(__pyx_tuple__10);
++  __pyx_codeobj__11 = (PyObject*)__Pyx_PyCode_New(1, 0, 12, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__10, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csr_mean_variance_axis0, 51, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__11)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 51; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":114
+  * @cython.wraparound(False)
+@@ -6222,10 +6203,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *     """Compute mean and variance along axis 0 on a CSC matrix
+  * 
+  */
+-  __pyx_tuple__13 = PyTuple_Pack(14, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_counts, __pyx_n_s_startptr, __pyx_n_s_endptr, __pyx_n_s_diff, __pyx_n_s_means, __pyx_n_s_variances); if (unlikely(!__pyx_tuple__13)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 114; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__13);
+-  __Pyx_GIVEREF(__pyx_tuple__13);
+-  __pyx_codeobj__14 = (PyObject*)__Pyx_PyCode_New(1, 0, 14, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__13, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csc_mean_variance_axis0, 114, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__14)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 114; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__12 = PyTuple_Pack(14, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_counts, __pyx_n_s_startptr, __pyx_n_s_endptr, __pyx_n_s_diff, __pyx_n_s_means, __pyx_n_s_variances); if (unlikely(!__pyx_tuple__12)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 114; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__12);
++  __Pyx_GIVEREF(__pyx_tuple__12);
++  __pyx_codeobj__13 = (PyObject*)__Pyx_PyCode_New(1, 0, 14, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__12, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_csc_mean_variance_axis0, 114, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__13)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 114; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":177
+  * @cython.wraparound(False)
+@@ -6234,10 +6215,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *     """Inplace row normalize using the l1 norm"""
+  *     cdef unsigned int n_samples = X.shape[0]
+  */
+-  __pyx_tuple__15 = PyTuple_Pack(9, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__15)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 177; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__15);
+-  __Pyx_GIVEREF(__pyx_tuple__15);
+-  __pyx_codeobj__16 = (PyObject*)__Pyx_PyCode_New(1, 0, 9, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__15, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_inplace_csr_row_normalize_l1, 177, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__16)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 177; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__14 = PyTuple_Pack(9, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__14)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 177; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__14);
++  __Pyx_GIVEREF(__pyx_tuple__14);
++  __pyx_codeobj__15 = (PyObject*)__Pyx_PyCode_New(1, 0, 9, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__14, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_inplace_csr_row_normalize_l1, 177, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__15)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 177; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":212
+  * @cython.wraparound(False)
+@@ -6246,10 +6227,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *     """Inplace row normalize using the l2 norm"""
+  *     cdef unsigned int n_samples = X.shape[0]
+  */
+-  __pyx_tuple__17 = PyTuple_Pack(9, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__17)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 212; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__17);
+-  __Pyx_GIVEREF(__pyx_tuple__17);
+-  __pyx_codeobj__18 = (PyObject*)__Pyx_PyCode_New(1, 0, 9, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__17, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_inplace_csr_row_normalize_l2, 212, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__18)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 212; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__16 = PyTuple_Pack(9, __pyx_n_s_X, __pyx_n_s_n_samples, __pyx_n_s_n_features, __pyx_n_s_X_data, __pyx_n_s_X_indices, __pyx_n_s_X_indptr, __pyx_n_s_i, __pyx_n_s_j, __pyx_n_s_sum); if (unlikely(!__pyx_tuple__16)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 212; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__16);
++  __Pyx_GIVEREF(__pyx_tuple__16);
++  __pyx_codeobj__17 = (PyObject*)__Pyx_PyCode_New(1, 0, 9, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__16, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_inplace_csr_row_normalize_l2, 212, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__17)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 212; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+ 
+   /* "sklearn/utils/sparsefuncs_fast.pyx":261
+  * @cython.boundscheck(False)
+@@ -6258,10 +6239,10 @@ static int __Pyx_InitCachedConstants(void) {
+  *                     np.ndarray[np.npy_intp, ndim=1] X_rows,
+  *                     np.ndarray[np.npy_intp, ndim=1] out_rows,
+  */
+-  __pyx_tuple__19 = PyTuple_Pack(11, __pyx_n_s_X, __pyx_n_s_X_rows, __pyx_n_s_out_rows, __pyx_n_s_out, __pyx_n_s_i, __pyx_n_s_ind, __pyx_n_s_j, __pyx_n_s_rX, __pyx_n_s_data, __pyx_n_s_indices, __pyx_n_s_indptr); if (unlikely(!__pyx_tuple__19)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 261; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+-  __Pyx_GOTREF(__pyx_tuple__19);
+-  __Pyx_GIVEREF(__pyx_tuple__19);
+-  __pyx_codeobj__20 = (PyObject*)__Pyx_PyCode_New(4, 0, 11, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__19, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_assign_rows_csr, 261, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__20)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 261; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __pyx_tuple__18 = PyTuple_Pack(11, __pyx_n_s_X, __pyx_n_s_X_rows, __pyx_n_s_out_rows, __pyx_n_s_out, __pyx_n_s_i, __pyx_n_s_ind, __pyx_n_s_j, __pyx_n_s_rX, __pyx_n_s_data, __pyx_n_s_indices, __pyx_n_s_indptr); if (unlikely(!__pyx_tuple__18)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 261; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
++  __Pyx_GOTREF(__pyx_tuple__18);
++  __Pyx_GIVEREF(__pyx_tuple__18);
++  __pyx_codeobj__19 = (PyObject*)__Pyx_PyCode_New(4, 0, 11, 0, 0, __pyx_empty_bytes, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_tuple__18, __pyx_empty_tuple, __pyx_empty_tuple, __pyx_kp_s_home_larsb_src_scikit_learn_skl, __pyx_n_s_assign_rows_csr, 261, __pyx_empty_bytes); if (unlikely(!__pyx_codeobj__19)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 261; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+   __Pyx_RefNannyFinishContext();
+   return 0;
+   __pyx_L1_error:;
+@@ -6397,9 +6378,9 @@ PyMODINIT_FUNC PyInit_sparsefuncs_fast(void)
+  */
+   __pyx_t_1 = PyList_New(1); if (unlikely(!__pyx_t_1)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 11; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+   __Pyx_GOTREF(__pyx_t_1);
+-  __Pyx_INCREF(__pyx_n_s__8);
+-  __Pyx_GIVEREF(__pyx_n_s__8);
+-  PyList_SET_ITEM(__pyx_t_1, 0, __pyx_n_s__8);
++  __Pyx_INCREF(__pyx_n_s__7);
++  __Pyx_GIVEREF(__pyx_n_s__7);
++  PyList_SET_ITEM(__pyx_t_1, 0, __pyx_n_s__7);
+   __pyx_t_2 = __Pyx_Import(__pyx_n_s_scipy_sparse, __pyx_t_1, -1); if (unlikely(!__pyx_t_2)) {__pyx_filename = __pyx_f[0]; __pyx_lineno = 11; __pyx_clineno = __LINE__; goto __pyx_L1_error;}
+   __Pyx_GOTREF(__pyx_t_2);
+   __Pyx_DECREF(__pyx_t_1); __pyx_t_1 = 0;
+@@ -7682,104 +7663,6 @@ static void __Pyx_Raise(PyObject *type, PyObject *value, PyObject *tb, PyObject
+ }
+ #endif
+ 
+-static CYTHON_INLINE int __Pyx_PyObject_SetSlice(PyObject* obj, PyObject* value,
+-        Py_ssize_t cstart, Py_ssize_t cstop,
+-        PyObject** _py_start, PyObject** _py_stop, PyObject** _py_slice,
+-        int has_cstart, int has_cstop, CYTHON_UNUSED int wraparound) {
+-#if CYTHON_COMPILING_IN_CPYTHON
+-    PyMappingMethods* mp;
+-#if PY_MAJOR_VERSION < 3
+-    PySequenceMethods* ms = Py_TYPE(obj)->tp_as_sequence;
+-    if (likely(ms && ms->sq_ass_slice)) {
+-        if (!has_cstart) {
+-            if (_py_start && (*_py_start != Py_None)) {
+-                cstart = __Pyx_PyIndex_AsSsize_t(*_py_start);
+-                if ((cstart == (Py_ssize_t)-1) && PyErr_Occurred()) goto bad;
+-            } else
+-                cstart = 0;
+-        }
+-        if (!has_cstop) {
+-            if (_py_stop && (*_py_stop != Py_None)) {
+-                cstop = __Pyx_PyIndex_AsSsize_t(*_py_stop);
+-                if ((cstop == (Py_ssize_t)-1) && PyErr_Occurred()) goto bad;
+-            } else
+-                cstop = PY_SSIZE_T_MAX;
+-        }
+-        if (wraparound && unlikely((cstart < 0) | (cstop < 0)) && likely(ms->sq_length)) {
+-            Py_ssize_t l = ms->sq_length(obj);
+-            if (likely(l >= 0)) {
+-                if (cstop < 0) {
+-                    cstop += l;
+-                    if (cstop < 0) cstop = 0;
+-                }
+-                if (cstart < 0) {
+-                    cstart += l;
+-                    if (cstart < 0) cstart = 0;
+-                }
+-            } else {
+-                if (PyErr_ExceptionMatches(PyExc_OverflowError))
+-                    PyErr_Clear();
+-                else
+-                    goto bad;
+-            }
+-        }
+-        return ms->sq_ass_slice(obj, cstart, cstop, value);
+-    }
+-#endif
+-    mp = Py_TYPE(obj)->tp_as_mapping;
+-    if (likely(mp && mp->mp_ass_subscript))
+-#endif
+-    {
+-        int result;
+-        PyObject *py_slice, *py_start, *py_stop;
+-        if (_py_slice) {
+-            py_slice = *_py_slice;
+-        } else {
+-            PyObject* owned_start = NULL;
+-            PyObject* owned_stop = NULL;
+-            if (_py_start) {
+-                py_start = *_py_start;
+-            } else {
+-                if (has_cstart) {
+-                    owned_start = py_start = PyInt_FromSsize_t(cstart);
+-                    if (unlikely(!py_start)) goto bad;
+-                } else
+-                    py_start = Py_None;
+-            }
+-            if (_py_stop) {
+-                py_stop = *_py_stop;
+-            } else {
+-                if (has_cstop) {
+-                    owned_stop = py_stop = PyInt_FromSsize_t(cstop);
+-                    if (unlikely(!py_stop)) {
+-                        Py_XDECREF(owned_start);
+-                        goto bad;
+-                    }
+-                } else
+-                    py_stop = Py_None;
+-            }
+-            py_slice = PySlice_New(py_start, py_stop, Py_None);
+-            Py_XDECREF(owned_start);
+-            Py_XDECREF(owned_stop);
+-            if (unlikely(!py_slice)) goto bad;
+-        }
+-#if CYTHON_COMPILING_IN_CPYTHON
+-        result = mp->mp_ass_subscript(obj, py_slice, value);
+-#else
+-        result = value ? PyObject_SetItem(obj, py_slice, value) : PyObject_DelItem(obj, py_slice);
+-#endif
+-        if (!_py_slice) {
+-            Py_DECREF(py_slice);
+-        }
+-        return result;
+-    }
+-    PyErr_Format(PyExc_TypeError,
+-        "'%.200s' object does not support slice %.10s",
+-        Py_TYPE(obj)->tp_name, value ? "assignment" : "deletion");
+-bad:
+-    return -1;
+-}
+-
+ static CYTHON_INLINE void __Pyx_RaiseTooManyValuesError(Py_ssize_t expected) {
+     PyErr_Format(PyExc_ValueError,
+                  "too many values to unpack (expected %" CYTHON_FORMAT_SSIZE_T "d)", expected);

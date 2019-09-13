@@ -1,0 +1,212 @@
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/Call.java b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+index b0118d3134..10585f0fa6 100755
+--- a/okhttp/src/main/java/com/squareup/okhttp/Call.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/Call.java
+@@ -76,7 +76,7 @@ public Response execute() throws IOException {
+     }
+     try {
+       client.getDispatcher().executed(this);
+-      Response result = getResponseWithInterceptorChain();
++      Response result = getResponseWithInterceptorChain(false);
+       if (result == null) throw new IOException("Canceled");
+       return result;
+     } finally {
+@@ -102,11 +102,15 @@ Object tag() {
+    * @throws IllegalStateException when the call has already been executed.
+    */
+   public void enqueue(Callback responseCallback) {
++    enqueue(responseCallback, false);
++  }
++
++  void enqueue(Callback responseCallback, boolean forWebSocket) {
+     synchronized (this) {
+       if (executed) throw new IllegalStateException("Already Executed");
+       executed = true;
+     }
+-    client.getDispatcher().enqueue(new AsyncCall(responseCallback));
++    client.getDispatcher().enqueue(new AsyncCall(responseCallback, forWebSocket));
+   }
+ 
+   /**
+@@ -124,10 +128,12 @@ public boolean isCanceled() {
+ 
+   final class AsyncCall extends NamedRunnable {
+     private final Callback responseCallback;
++    private final boolean forWebSocket;
+ 
+-    private AsyncCall(Callback responseCallback) {
++    private AsyncCall(Callback responseCallback, boolean forWebSocket) {
+       super("OkHttp %s", originalRequest.urlString());
+       this.responseCallback = responseCallback;
++      this.forWebSocket = forWebSocket;
+     }
+ 
+     String host() {
+@@ -153,7 +159,7 @@ Call get() {
+     @Override protected void execute() {
+       boolean signalledCallback = false;
+       try {
+-        Response response = getResponseWithInterceptorChain();
++        Response response = getResponseWithInterceptorChain(forWebSocket);
+         if (canceled) {
+           signalledCallback = true;
+           responseCallback.onFailure(originalRequest, new IOException("Canceled"));
+@@ -188,17 +194,20 @@ private String toLoggableString() {
+     }
+   }
+ 
+-  private Response getResponseWithInterceptorChain() throws IOException {
+-    return new ApplicationInterceptorChain(0, originalRequest).proceed(originalRequest);
++  private Response getResponseWithInterceptorChain(boolean forWebSocket) throws IOException {
++    Interceptor.Chain chain = new ApplicationInterceptorChain(0, originalRequest, forWebSocket);
++    return chain.proceed(originalRequest);
+   }
+ 
+   class ApplicationInterceptorChain implements Interceptor.Chain {
+     private final int index;
+     private final Request request;
++    private final boolean forWebSocket;
+ 
+-    ApplicationInterceptorChain(int index, Request request) {
++    ApplicationInterceptorChain(int index, Request request, boolean forWebSocket) {
+       this.index = index;
+       this.request = request;
++      this.forWebSocket = forWebSocket;
+     }
+ 
+     @Override public Connection connection() {
+@@ -212,11 +221,12 @@ private Response getResponseWithInterceptorChain() throws IOException {
+     @Override public Response proceed(Request request) throws IOException {
+       if (index < client.interceptors().size()) {
+         // There's another interceptor in the chain. Call that.
+-        ApplicationInterceptorChain chain = new ApplicationInterceptorChain(index + 1, request);
++        ApplicationInterceptorChain chain =
++            new ApplicationInterceptorChain(index + 1, request, forWebSocket);
+         return client.interceptors().get(index).intercept(chain);
+       } else {
+         // No more interceptors. Do HTTP.
+-        return getResponse(request, false);
++        return getResponse(request, forWebSocket);
+       }
+     }
+   }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java b/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
+index 5f98dfe3cd..d476946dab 100755
+--- a/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/OkHttpClient.java
+@@ -120,6 +120,11 @@
+         connection.connectAndSetOwner(client, owner, request);
+       }
+ 
++      @Override
++      public void callEnqueue(Call call, Callback responseCallback, boolean forWebSocket) {
++        call.enqueue(responseCallback, forWebSocket);
++      }
++
+       @Override public void callEngineReleaseConnection(Call call) throws IOException {
+         call.engine.releaseConnection();
+       }
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java b/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
+index 45e3bf3f52..3b70b80929 100755
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/Internal.java
+@@ -16,6 +16,7 @@
+ package com.squareup.okhttp.internal;
+ 
+ import com.squareup.okhttp.Call;
++import com.squareup.okhttp.Callback;
+ import com.squareup.okhttp.Connection;
+ import com.squareup.okhttp.ConnectionPool;
+ import com.squareup.okhttp.Headers;
+@@ -69,6 +70,7 @@ public abstract void connectAndSetOwner(OkHttpClient client, Connection connecti
+       HttpEngine owner, Request request) throws IOException;
+ 
+   // TODO delete the following when web sockets move into the main package.
++  public abstract void callEnqueue(Call call, Callback responseCallback, boolean forWebSocket);
+   public abstract void callEngineReleaseConnection(Call call) throws IOException;
+   public abstract Connection callEngineGetConnection(Call call);
+   public abstract void connectionSetOwner(Connection connection, Object owner);
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketCall.java b/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketCall.java
+index e4f2be635f..951e645ce6 100755
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketCall.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketCall.java
+@@ -108,7 +108,7 @@ protected WebSocketCall(OkHttpClient client, Request request, Random random) {
+    * @throws IllegalStateException when the call has already been executed.
+    */
+   public void enqueue(final WebSocketListener listener) {
+-    call.enqueue(new Callback() {
++    Callback responseCallback = new Callback() {
+       @Override public void onResponse(Response response) throws IOException {
+         // Exceptions thrown by this method will be propagated to onFailure below.
+         createWebSocket(response, listener);
+@@ -117,7 +117,9 @@ public void enqueue(final WebSocketListener listener) {
+       @Override public void onFailure(Request request, IOException e) {
+         listener.onFailure(e);
+       }
+-    });
++    };
++    // TODO call.enqueue(responseCallback, true);
++    Internal.instance.callEnqueue(call, responseCallback, true);
+   }
+ 
+   /** Cancels the request, if possible. Requests that are already complete cannot be canceled. */
+diff --git a/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketListener.java b/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketListener.java
+index cbb58ea393..b75f9c43e1 100755
+--- a/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketListener.java
++++ b/okhttp/src/main/java/com/squareup/okhttp/internal/ws/WebSocketListener.java
+@@ -25,7 +25,7 @@
+ // TODO move to public API!
+ /** Listener for server-initiated messages on a connected {@link WebSocket}. */
+ public interface WebSocketListener {
+-  void onOpen(Response response, WebSocket webSocket);
++  void onOpen(Response response, WebSocket webSocket) throws IOException;
+ 
+   /**
+    * Called when a server message is received. The {@code type} indicates whether the
+diff --git a/samples/guide/src/main/java/com/squareup/okhttp/recipes/WebSocketEcho.java b/samples/guide/src/main/java/com/squareup/okhttp/recipes/WebSocketEcho.java
+index 45a8b4d870..0d2af27071 100755
+--- a/samples/guide/src/main/java/com/squareup/okhttp/recipes/WebSocketEcho.java
++++ b/samples/guide/src/main/java/com/squareup/okhttp/recipes/WebSocketEcho.java
+@@ -2,10 +2,10 @@
+ 
+ import com.squareup.okhttp.OkHttpClient;
+ import com.squareup.okhttp.Request;
++import com.squareup.okhttp.Response;
+ import com.squareup.okhttp.internal.ws.WebSocket;
+ import com.squareup.okhttp.internal.ws.WebSocketCall;
+ import com.squareup.okhttp.internal.ws.WebSocketListener;
+-import com.squareup.okhttp.internal.ws.WebSocketResponse;
+ import java.io.IOException;
+ import okio.Buffer;
+ import okio.BufferedSource;
+@@ -24,13 +24,13 @@ private void run() throws IOException {
+     Request request = new Request.Builder()
+         .url("ws://echo.websocket.org")
+         .build();
+-    WebSocketCall call = WebSocketCall.newWebSocketCall(client, request);
+-    WebSocketResponse webSocketResponse = call.execute(this);
+-    if (webSocketResponse.response().code() != 101) {
+-      System.err.println("Unable to connect to websocket: " + webSocketResponse.response());
+-    }
++    WebSocketCall.newWebSocketCall(client, request).enqueue(this);
++
++    // Trigger shutdown of the dispatcher's executor so this process can exit cleanly.
++    client.getDispatcher().getExecutorService().shutdown();
++  }
+ 
+-    WebSocket webSocket = webSocketResponse.webSocket();
++  @Override public void onOpen(Response response, WebSocket webSocket) throws IOException {
+     webSocket.sendMessage(TEXT, new Buffer().writeUtf8("Hello..."));
+     webSocket.sendMessage(TEXT, new Buffer().writeUtf8("...World!"));
+     webSocket.sendMessage(BINARY, new Buffer().writeInt(0xdeadbeef));
+@@ -51,6 +51,10 @@ private void run() throws IOException {
+     payload.close();
+   }
+ 
++  @Override public void onPong(Buffer payload) {
++    System.out.println("PONG: " + payload.readUtf8());
++  }
++
+   @Override public void onClose(int code, String reason) {
+     System.out.println("CLOSE: " + code + " " + reason);
+   }

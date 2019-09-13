@@ -1,0 +1,1100 @@
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/BaragonAgentServiceModule.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/BaragonAgentServiceModule.java
+index ee1967d589..e70111b429 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/BaragonAgentServiceModule.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/BaragonAgentServiceModule.java
+@@ -48,6 +48,7 @@
+   public static final String AGENT_LOCK_TIMEOUT_MS = "baragon.agent.lock.timeoutMs";
+   public static final String DEFAULT_TEMPLATE_NAME = "default";
+   public static final String BARAGON_AGENT_HTTP_CLIENT = "baragon.agent.http.client";
++  public static final String CONFIG_ERROR_MESSAGE = "baragon.agent.config.error.message";
+ 
+ 
+   @Override
+@@ -165,11 +166,19 @@ public ReentrantLock providesAgentLock() {
+     return new AtomicReference<>();
+   }
+ 
++  @Provides
++  @Singleton
++  @Named(CONFIG_ERROR_MESSAGE)
++  public AtomicReference<Optional<String>> providesConfigErrorMessage() {
++    return new AtomicReference<>();
++  }
++
++
+   @Provides
+   @Singleton
+   @Named(AGENT_SCHEDULED_EXECUTOR)
+   public ScheduledExecutorService providesScheduledExecutor() {
+-    return Executors.newScheduledThreadPool(1);
++    return Executors.newScheduledThreadPool(2);
+   }
+ 
+   @Provides
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/config/BaragonAgentConfiguration.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/config/BaragonAgentConfiguration.java
+index abb322bf50..7d4858b902 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/config/BaragonAgentConfiguration.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/config/BaragonAgentConfiguration.java
+@@ -87,6 +87,9 @@
+   @JsonProperty("stateFile")
+   private Optional<String> stateFile = Optional.absent();
+ 
++  @JsonProperty("configCheckIntervalSecs")
++  private int configCheckIntervalSecs = 60;
++
+   public HttpClientConfiguration getHttpClientConfiguration() {
+     return httpClientConfiguration;
+   }
+@@ -226,4 +229,12 @@ public void setMaxNotifyServiceAttempts(int maxNotifyServiceAttempts) {
+   public void setStateFile(Optional<String> stateFile) {
+     this.stateFile = stateFile;
+   }
++
++  public int getConfigCheckIntervalSecs() {
++    return configCheckIntervalSecs;
++  }
++
++  public void setConfigCheckIntervalSecs(int configCheckIntervalSecs) {
++    this.configCheckIntervalSecs = configCheckIntervalSecs;
++  }
+ }
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/healthcheck/ConfigChecker.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/healthcheck/ConfigChecker.java
+new file mode 100755
+index 0000000000..cd415fe24f
+--- /dev/null
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/healthcheck/ConfigChecker.java
+@@ -0,0 +1,33 @@
++package com.hubspot.baragon.agent.healthcheck;
++
++import java.util.concurrent.atomic.AtomicReference;
++
++import com.google.common.base.Optional;
++import com.google.inject.Inject;
++import com.google.inject.name.Named;
++import com.hubspot.baragon.agent.BaragonAgentServiceModule;
++import com.hubspot.baragon.agent.lbs.LocalLbAdapter;
++import com.hubspot.baragon.exceptions.InvalidConfigException;
++
++public class ConfigChecker implements Runnable {
++
++  private final LocalLbAdapter adapter;
++  private final AtomicReference<Optional<String>> errorMessage;
++
++  @Inject
++  public ConfigChecker(LocalLbAdapter adapter,
++                       @Named(BaragonAgentServiceModule.CONFIG_ERROR_MESSAGE) AtomicReference<Optional<String>> errorMessage) {
++    this.adapter = adapter;
++    this.errorMessage = errorMessage;
++  }
++
++  @Override
++  public void run() {
++    try {
++      adapter.checkConfigs();
++      errorMessage.set(Optional.<String>absent());
++    } catch (InvalidConfigException e) {
++      errorMessage.set(Optional.of(e.getMessage()));
++    }
++  }
++}
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/lbs/FilesystemConfigHelper.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/lbs/FilesystemConfigHelper.java
+index 204fdd2095..add9bc72b8 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/lbs/FilesystemConfigHelper.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/lbs/FilesystemConfigHelper.java
+@@ -48,7 +48,7 @@ public FilesystemConfigHelper(LbConfigGenerator configGenerator,
+     this.agentLockTimeoutMs = agentLockTimeoutMs;
+   }
+ 
+-  public void remove(BaragonService service, boolean reloadConfigs) throws LbAdapterExecuteException, IOException {
++  public void remove(BaragonService service) throws LbAdapterExecuteException, IOException {
+     for (String filename : configGenerator.getConfigPathsForProject(service)) {
+       File file = new File(filename);
+       if (!file.exists()) {
+@@ -59,10 +59,6 @@ public void remove(BaragonService service, boolean reloadConfigs) throws LbAdapt
+         throw new RuntimeException(String.format("Failed to remove %s for %s", filename, service.getServiceId()));
+       }
+     }
+-
+-    if (reloadConfigs) {
+-      adapter.reloadConfigs();
+-    }
+   }
+ 
+   public void checkAndReload() throws InvalidConfigException, LbAdapterExecuteException, IOException, InterruptedException, LockTimeoutException {
+@@ -109,14 +105,14 @@ public void bootstrapApply(ServiceContext context, Collection<BaragonConfigFile>
+       if (previousConfigsExist) {
+         restoreConfigs(service);
+       } else {
+-        remove(service, false);
++        remove(service);
+       }
+       throw Throwables.propagate(e);
+     }
+     LOG.info(String.format("Apply finished for %s", service.getServiceId()));
+   }
+ 
+-  public void apply(ServiceContext context, Optional<BaragonService> maybeOldService, boolean revertOnFailure) throws InvalidConfigException, LbAdapterExecuteException, IOException, MissingTemplateException, InterruptedException, LockTimeoutException  {
++  public void apply(ServiceContext context, Optional<BaragonService> maybeOldService, boolean revertOnFailure, boolean noReload, boolean noValidate) throws InvalidConfigException, LbAdapterExecuteException, IOException, MissingTemplateException, InterruptedException, LockTimeoutException {
+     final BaragonService service = context.getService();
+     final BaragonService oldService = maybeOldService.or(service);
+ 
+@@ -149,14 +145,22 @@ public void apply(ServiceContext context, Optional<BaragonService> maybeOldServi
+         writeConfigs(newConfigs);
+         //If the new service id for this base path is different, remove the configs for the old service id
+         if (oldServiceExists && !oldService.getServiceId().equals(service.getServiceId())) {
+-          remove(oldService, false);
++          remove(oldService);
+         }
+       } else {
+-        remove(service, false);
++        remove(service);
+       }
+ 
+-      adapter.checkConfigs();
+-      adapter.reloadConfigs();
++      if (!noValidate) {
++        adapter.checkConfigs();
++      } else {
++        LOG.debug("Not validating configs due to 'noValidate' specified in request");
++      }
++      if (!noReload) {
++        adapter.reloadConfigs();
++      } else {
++        LOG.debug("Not reloading configs due to 'noReload' specified in request");
++      }
+     } catch (Exception e) {
+       LOG.error(String.format("Caught exception while writing configs for %s, reverting to backups!", service.getServiceId()), e);
+ 
+@@ -168,7 +172,7 @@ public void apply(ServiceContext context, Optional<BaragonService> maybeOldServi
+         if (previousConfigsExist) {
+           restoreConfigs(service);
+         } else {
+-          remove(service, false);
++          remove(service);
+         }
+       }
+ 
+@@ -181,25 +185,32 @@ public void apply(ServiceContext context, Optional<BaragonService> maybeOldServi
+     LOG.info(String.format("Apply finished for %s", service.getServiceId()));
+   }
+ 
+-  public void delete(BaragonService service, Optional<BaragonService> maybeOldService) throws InvalidConfigException, LbAdapterExecuteException, IOException, MissingTemplateException, InterruptedException, LockTimeoutException {
++  public void delete(BaragonService service, Optional<BaragonService> maybeOldService, boolean noReload, boolean noValidate) throws InvalidConfigException, LbAdapterExecuteException, IOException, MissingTemplateException, InterruptedException, LockTimeoutException {
+     final boolean oldServiceExists = (maybeOldService.isPresent() && configsExist(maybeOldService.get()));
+     final boolean previousConfigsExist = configsExist(service);
+ 
+-    if (!agentLock.tryLock(agentLockTimeoutMs, TimeUnit.MILLISECONDS)) {
+-      throw new LockTimeoutException("Timed out waiting to acquire lock");
+-    }
+-
+-    try {
+-      if (previousConfigsExist) {
+-        backupConfigs(service);
+-        remove(service, false);
+-      }
+-      if (oldServiceExists && !maybeOldService.get().equals(service)) {
+-        backupConfigs(maybeOldService.get());
+-        remove(maybeOldService.get(), false);
+-      }
+-      adapter.checkConfigs();
+-      adapter.reloadConfigs();
++        if (!agentLock.tryLock(agentLockTimeoutMs, TimeUnit.MILLISECONDS)) {
++          throw new LockTimeoutException("Timed out waiting to acquire lock");
++        }
++     try {
++       if (previousConfigsExist) {
++         backupConfigs(service);
++         remove(service);
++       }
++       if (oldServiceExists && !maybeOldService.get().equals(service)) {
++         backupConfigs(maybeOldService.get());
++         remove(maybeOldService.get());
++       }
++       if (!noValidate) {
++         adapter.checkConfigs();
++       } else {
++         LOG.debug("Not validating configs due to 'noValidate' specified in request");
++       }
++       if (!noReload) {
++         adapter.reloadConfigs();
++       } else {
++         LOG.debug("Not reloading configs due to 'noReload' specified in request");
++       }
+     } catch (Exception e) {
+       LOG.error(String.format("Caught exception while deleting configs for %s, reverting to backups!", service.getServiceId()), e);
+       if (oldServiceExists && !maybeOldService.get().equals(service)) {
+@@ -208,13 +219,13 @@ public void delete(BaragonService service, Optional<BaragonService> maybeOldServ
+       if (previousConfigsExist) {
+         restoreConfigs(service);
+       } else {
+-        remove(service, false);
++        remove(service);
+       }
+ 
+       throw Throwables.propagate(e);
+      } finally {
+       agentLock.unlock();
+-    }
++     }
+   }
+ 
+   private void writeConfigs(Collection<BaragonConfigFile> files) {
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managed/BootstrapManaged.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managed/BootstrapManaged.java
+index 1cb2857f1b..53ee1e5d52 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managed/BootstrapManaged.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managed/BootstrapManaged.java
+@@ -29,6 +29,7 @@
+ import com.google.inject.name.Named;
+ import com.hubspot.baragon.agent.BaragonAgentServiceModule;
+ import com.hubspot.baragon.agent.config.BaragonAgentConfiguration;
++import com.hubspot.baragon.agent.healthcheck.ConfigChecker;
+ import com.hubspot.baragon.agent.lbs.BootstrapFileChecker;
+ import com.hubspot.baragon.agent.lbs.FilesystemConfigHelper;
+ import com.hubspot.baragon.agent.workers.AgentHeartbeatWorker;
+@@ -68,10 +69,12 @@
+   private final AgentHeartbeatWorker agentHeartbeatWorker;
+   private final BaragonWorkerDatastore workerDatastore;
+   private final HttpClient httpClient;
++  private final ConfigChecker configChecker;
+ 
+   private static final String SERVICE_CHECKIN_URL_FORMAT = "%s/checkin/%s/%s";
+ 
+   private ScheduledFuture<?> requestWorkerFuture = null;
++  private ScheduledFuture<?> configCheckerFuture = null;
+ 
+   @Inject
+   public BootstrapManaged(BaragonStateDatastore stateDatastore,
+@@ -83,6 +86,7 @@ public BootstrapManaged(BaragonStateDatastore stateDatastore,
+                           FilesystemConfigHelper configHelper,
+                           AgentHeartbeatWorker agentHeartbeatWorker,
+                           BaragonAgentMetadata baragonAgentMetadata,
++                          ConfigChecker configChecker,
+                           @Named(BaragonAgentServiceModule.AGENT_SCHEDULED_EXECUTOR) ScheduledExecutorService executorService,
+                           @Named(BaragonAgentServiceModule.AGENT_LEADER_LATCH) LeaderLatch leaderLatch,
+                           @Named(BaragonAgentServiceModule.BARAGON_AGENT_HTTP_CLIENT) HttpClient httpClient) {
+@@ -98,6 +102,7 @@ public BootstrapManaged(BaragonStateDatastore stateDatastore,
+     this.workerDatastore = workerDatastore;
+     this.authDatastore = authDatastore;
+     this.httpClient = httpClient;
++    this.configChecker = configChecker;
+   }
+ 
+   private void applyCurrentConfigs() {
+@@ -167,6 +172,9 @@ public void start() throws Exception {
+     LOG.info("Starting agent heartbeat...");
+     requestWorkerFuture = executorService.scheduleAtFixedRate(agentHeartbeatWorker, 0, configuration.getHeartbeatIntervalSeconds(), TimeUnit.SECONDS);
+ 
++    LOG.info("Starting config checker");
++    configCheckerFuture = executorService.scheduleAtFixedRate(configChecker, 0, configuration.getConfigCheckIntervalSecs(), TimeUnit.SECONDS);
++
+     if (configuration.getStateFile().isPresent()) {
+       LOG.info("Writing state file...");
+       writeStateFile();
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managers/AgentRequestManager.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managers/AgentRequestManager.java
+index e3d27255de..8978faaa68 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managers/AgentRequestManager.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/managers/AgentRequestManager.java
+@@ -95,7 +95,7 @@ private Response reload() throws Exception {
+ 
+   private Response delete(BaragonRequest request, Optional<BaragonService> maybeOldService) throws Exception {
+     try {
+-      configHelper.delete(request.getLoadBalancerService(), maybeOldService);
++      configHelper.delete(request.getLoadBalancerService(), maybeOldService, request.isNoReload(), request.isNoValidate());
+       return Response.ok().build();
+     } catch (Exception e) {
+       return Response.status(Response.Status.BAD_REQUEST).entity(e.getMessage()).build();
+@@ -106,7 +106,7 @@ private Response apply(BaragonRequest request, Optional<BaragonService> maybeOld
+     final ServiceContext update = getApplyContext(request);
+     triggerTesting();
+     try {
+-      configHelper.apply(update, maybeOldService, true);
++      configHelper.apply(update, maybeOldService, true, request.isNoReload(), request.isNoValidate());
+     } catch (Exception e) {
+       return Response.status(Response.Status.BAD_REQUEST).entity(e.getMessage()).build();
+     }
+@@ -126,7 +126,7 @@ private Response revert(BaragonRequest request, Optional<BaragonService> maybeOl
+ 
+     LOG.info(String.format("Reverting to %s", update));
+     try {
+-      configHelper.apply(update, Optional.<BaragonService>absent(), false);
++      configHelper.apply(update, Optional.<BaragonService>absent(), false, request.isNoReload(), request.isNoValidate());
+     } catch (MissingTemplateException e) {
+       if (serviceDidNotPreviouslyExist(maybeOldService)) {
+         return Response.ok().build();
+diff --git a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/resources/StatusResource.java b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/resources/StatusResource.java
+index 422a16af2f..14d71d86e9 100755
+--- a/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/resources/StatusResource.java
++++ b/BaragonAgentService/src/main/java/com/hubspot/baragon/agent/resources/StatusResource.java
+@@ -2,9 +2,11 @@
+ 
+ import java.util.concurrent.atomic.AtomicReference;
+ 
++import javax.ws.rs.DefaultValue;
+ import javax.ws.rs.GET;
+ import javax.ws.rs.Path;
+ import javax.ws.rs.Produces;
++import javax.ws.rs.QueryParam;
+ import javax.ws.rs.core.MediaType;
+ 
+ import com.google.common.base.Optional;
+@@ -30,6 +32,7 @@
+   private final AtomicReference<String> mostRecentRequestId;
+   private final AtomicReference<ConnectionState> connectionState;
+   private final BaragonAgentMetadata agentMetadata;
++  private final AtomicReference<Optional<String>> errorMessage;
+ 
+   @Inject
+   public StatusResource(LocalLbAdapter adapter,
+@@ -37,32 +40,35 @@ public StatusResource(LocalLbAdapter adapter,
+                         BaragonAgentMetadata agentMetadata,
+                         @Named(BaragonAgentServiceModule.AGENT_LEADER_LATCH) LeaderLatch leaderLatch,
+                         @Named(BaragonAgentServiceModule.AGENT_MOST_RECENT_REQUEST_ID) AtomicReference<String> mostRecentRequestId,
+-                        @Named(BaragonDataModule.BARAGON_ZK_CONNECTION_STATE) AtomicReference<ConnectionState> connectionState) {
++                        @Named(BaragonDataModule.BARAGON_ZK_CONNECTION_STATE) AtomicReference<ConnectionState> connectionState,
++                        @Named(BaragonAgentServiceModule.CONFIG_ERROR_MESSAGE) AtomicReference<Optional<String>> errorMessage) {
+     this.adapter = adapter;
+     this.loadBalancerConfiguration = loadBalancerConfiguration;
+     this.leaderLatch = leaderLatch;
+     this.mostRecentRequestId = mostRecentRequestId;
+     this.connectionState = connectionState;
+     this.agentMetadata = agentMetadata;
++    this.errorMessage = errorMessage;
+   }
+ 
+   @GET
+   @NoAuth
+-  public BaragonAgentStatus getStatus() {
+-    boolean validConfigs = true;
+-    Optional<String> errorMessage = Optional.absent();
+-
+-    try {
+-      adapter.checkConfigs();
+-    } catch (InvalidConfigException e) {
+-      validConfigs = false;
+-      errorMessage = Optional.of(e.getMessage());
++  public BaragonAgentStatus getStatus(@DefaultValue("false") @QueryParam("skipCache") boolean skipCache) {
++    if (skipCache) {
++      try {
++        adapter.checkConfigs();
++        errorMessage.set(Optional.<String>absent());
++      } catch (InvalidConfigException e) {
++        errorMessage.set(Optional.of(e.getMessage()));
++      }
+     }
+ 
+     final ConnectionState currentConnectionState = connectionState.get();
+ 
+     final String connectionStateString = currentConnectionState == null ? "UNKNOWN" : currentConnectionState.name();
+ 
+-    return new BaragonAgentStatus(loadBalancerConfiguration.getName(), validConfigs, errorMessage, leaderLatch.hasLeadership(), mostRecentRequestId.get(), connectionStateString, agentMetadata);
++    Optional<String> currentErrorMessage = errorMessage.get();
++
++    return new BaragonAgentStatus(loadBalancerConfiguration.getName(), !currentErrorMessage.isPresent(), currentErrorMessage, leaderLatch.hasLeadership(), mostRecentRequestId.get(), connectionStateString, agentMetadata);
+   }
+ }
+diff --git a/BaragonCore/src/main/java/com/hubspot/baragon/exceptions/LockTimeoutException.java b/BaragonCore/src/main/java/com/hubspot/baragon/exceptions/LockTimeoutException.java
+index 0acd763e52..a653c00dfa 100755
+--- a/BaragonCore/src/main/java/com/hubspot/baragon/exceptions/LockTimeoutException.java
++++ b/BaragonCore/src/main/java/com/hubspot/baragon/exceptions/LockTimeoutException.java
+@@ -4,4 +4,4 @@
+   public LockTimeoutException(String message) {
+     super(message);
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequest.java b/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequest.java
+index 5baa93b6a6..a0ccb3b981 100755
+--- a/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequest.java
++++ b/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequest.java
+@@ -36,6 +36,12 @@
+ 
+   private final List<UpstreamInfo> replaceUpstreams;
+ 
++  @NotNull
++  private final boolean noValidate;
++
++  @NotNull
++  private final boolean noReload;
++
+   @JsonCreator
+   public BaragonRequest(@JsonProperty("loadBalancerRequestId") String loadBalancerRequestId,
+                         @JsonProperty("loadBalancerService") BaragonService loadBalancerService,
+@@ -43,7 +49,9 @@ public BaragonRequest(@JsonProperty("loadBalancerRequestId") String loadBalancer
+                         @JsonProperty("removeUpstreams") List<UpstreamInfo> removeUpstreams,
+                         @JsonProperty("replaceUpstreams") List<UpstreamInfo> replaceUpstreams,
+                         @JsonProperty("replaceServiceId") Optional<String> replaceServiceId,
+-                        @JsonProperty("action") Optional<RequestAction> action) {
++                        @JsonProperty("action") Optional<RequestAction> action,
++                        @JsonProperty("noValidate") boolean noValidate,
++                        @JsonProperty("noReload") boolean noReload) {
+     this.loadBalancerRequestId = loadBalancerRequestId;
+     this.loadBalancerService = loadBalancerService;
+     this.addUpstreams = addRequestId(addUpstreams, loadBalancerRequestId);
+@@ -51,14 +59,21 @@ public BaragonRequest(@JsonProperty("loadBalancerRequestId") String loadBalancer
+     this.replaceServiceId = replaceServiceId;
+     this.action = action;
+     this.replaceUpstreams = Objects.firstNonNull(replaceUpstreams, Collections.<UpstreamInfo>emptyList());
++    this.noValidate = Objects.firstNonNull(noValidate, false);
++    this.noReload = noReload;
++
++  }
++
++  public BaragonRequest(String loadBalancerRequestId, BaragonService loadBalancerService, List<UpstreamInfo> addUpstreams, List<UpstreamInfo> removeUpstreams, List<UpstreamInfo> replaceUpstreams, Optional<String> replaceServiceId, Optional<RequestAction> action) {
++    this(loadBalancerRequestId, loadBalancerService, addUpstreams, removeUpstreams, replaceUpstreams, replaceServiceId, action, false, false);
+   }
+ 
+   public BaragonRequest(String loadBalancerRequestId, BaragonService loadBalancerService, List<UpstreamInfo> addUpstreams, List<UpstreamInfo> removeUpstreams) {
+-    this(loadBalancerRequestId, loadBalancerService, addUpstreams, removeUpstreams, Collections.<UpstreamInfo>emptyList(),Optional.<String>absent(), Optional.of(RequestAction.UPDATE));
++    this(loadBalancerRequestId, loadBalancerService, addUpstreams, removeUpstreams, Collections.<UpstreamInfo>emptyList(),Optional.<String>absent(), Optional.of(RequestAction.UPDATE), false, false);
+   }
+ 
+   public BaragonRequest(String loadBalancerRequestId, BaragonService loadBalancerService, List<UpstreamInfo> addUpstreams, List<UpstreamInfo> removeUpstreams, Optional<String> replaceServiceId) {
+-    this(loadBalancerRequestId, loadBalancerService, addUpstreams, removeUpstreams, Collections.<UpstreamInfo>emptyList(), replaceServiceId, Optional.of(RequestAction.UPDATE));
++    this(loadBalancerRequestId, loadBalancerService, addUpstreams, removeUpstreams, Collections.<UpstreamInfo>emptyList(), replaceServiceId, Optional.of(RequestAction.UPDATE), false, false);
+   }
+ 
+   public String getLoadBalancerRequestId() {
+@@ -110,6 +125,14 @@ private UpstreamInfo addRequestId(UpstreamInfo upstream, String requestId) {
+     }
+   }
+ 
++  public boolean isNoValidate() {
++    return noValidate;
++  }
++
++  public boolean isNoReload() {
++    return noReload;
++  }
++
+   @Override
+   public String toString() {
+     return "BaragonRequest [" +
+@@ -119,6 +142,8 @@ public String toString() {
+         ", removeUpstreams=" + removeUpstreams +
+         ", replaceServiceId=" + replaceServiceId +
+         ", action=" + action +
++        ", noValidate=" + noValidate +
++        ", noReload=" + noReload +
+         ']';
+   }
+ 
+@@ -151,6 +176,12 @@ public boolean equals(Object o) {
+     if (!action.equals(request.getAction())) {
+       return false;
+     }
++    if (!noValidate == request.noValidate) {
++      return false;
++    }
++    if (!noReload == request.noReload) {
++      return false;
++    }
+ 
+     return true;
+   }
+@@ -163,6 +194,8 @@ public int hashCode() {
+     result = 31 * result + removeUpstreams.hashCode();
+     result = 31 * result + replaceServiceId.hashCode();
+     result = 31 * result + action.hashCode();
++    result = 31 * result + (noValidate ? 1 : 0);
++    result = 31 * result + (noReload ? 1 : 0);
+     return result;
+   }
+ }
+diff --git a/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequestKey.java b/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequestKey.java
+new file mode 100755
+index 0000000000..ed2a1e09f8
+--- /dev/null
++++ b/BaragonCore/src/main/java/com/hubspot/baragon/models/BaragonRequestKey.java
+@@ -0,0 +1,60 @@
++package com.hubspot.baragon.models;
++
++public class BaragonRequestKey implements Comparable<BaragonRequestKey> {
++  private final String requestId;
++  private final long updatedAt;
++
++  public BaragonRequestKey(String requestId, long updatedAt) {
++    this.requestId = requestId;
++    this.updatedAt = updatedAt;
++  }
++
++  public String getRequestId() {
++    return requestId;
++  }
++
++  public long getUpdatedAt() {
++    return updatedAt;
++  }
++
++  @Override
++  public int compareTo(BaragonRequestKey o) {
++    return Long.compare(updatedAt, o.updatedAt);
++  }
++
++  @Override
++  public boolean equals(Object o) {
++    if (this == o) {
++      return true;
++    }
++    if (o == null || getClass() != o.getClass()) {
++      return false;
++    }
++
++    BaragonRequestKey that = (BaragonRequestKey) o;
++
++    if (updatedAt != that.updatedAt) {
++      return false;
++    }
++    if (requestId != null ? !requestId.equals(that.requestId) : that.requestId != null) {
++      return false;
++    }
++
++    return true;
++  }
++
++  @Override
++  public int hashCode() {
++    int result = requestId != null ? requestId.hashCode() : 0;
++    result = 31 * result + (int) (updatedAt ^ (updatedAt >>> 32));
++    return result;
++  }
++
++  @Override
++  public String toString() {
++    return "BaragonRequestKey{" +
++      "requestId='" + requestId + '\'' +
++      ", updatedAt=" + updatedAt +
++      '}';
++  }
++}
+diff --git a/BaragonData/src/main/java/com/hubspot/baragon/data/BaragonResponseHistoryDatastore.java b/BaragonData/src/main/java/com/hubspot/baragon/data/BaragonResponseHistoryDatastore.java
+index 5fc8f56b6f..4b447e3ae8 100755
+--- a/BaragonData/src/main/java/com/hubspot/baragon/data/BaragonResponseHistoryDatastore.java
++++ b/BaragonData/src/main/java/com/hubspot/baragon/data/BaragonResponseHistoryDatastore.java
+@@ -2,10 +2,12 @@
+ 
+ import java.util.Collections;
+ import java.util.Date;
++import java.util.Iterator;
+ import java.util.List;
+ 
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.google.common.base.Optional;
++import com.google.common.collect.Iterables;
+ import com.google.common.collect.Lists;
+ import com.google.inject.Inject;
+ import com.google.inject.Singleton;
+@@ -42,14 +44,14 @@ public void addResponse(String serviceId, String requestId, BaragonResponse resp
+     return readFromZk(String.format(RESPONSE_HISTORY_FORMAT, serviceId, requestId), BaragonResponse.class);
+   }
+ 
+-  public List<BaragonResponse> getResponsesForService(String serviceId) {
++  public List<BaragonResponse> getResponsesForService(String serviceId, int limit) {
+     final List<String> nodes = getChildren(String.format(RESPONSE_HISTORIES_FOR_SERVICE_FORMAT, serviceId));
+-    final List<BaragonResponse> responses = Lists.newArrayListWithCapacity(nodes.size());
+-    for (String node : nodes) {
++    final List<BaragonResponse> responses = Lists.newArrayListWithCapacity(Math.min(nodes.size(), limit));
++    for (String requestId : nodes.subList(0, Math.min(nodes.size(), limit))) {
+       try {
+-        responses.addAll(readFromZk(String.format(RESPONSE_HISTORY_FORMAT, serviceId, node), BaragonResponse.class).asSet());
++        responses.addAll(readFromZk(String.format(RESPONSE_HISTORY_FORMAT, serviceId, requestId), BaragonResponse.class).asSet());
+       } catch (Exception e) {
+-        LOG.error(String.format("Could not fetch info for group %s due to error %s", node, e));
++        LOG.error(String.format("Could not fetch info for group %s due to error %s", requestId, e));
+       }
+     }
+     return responses;
+diff --git a/BaragonService/src/main/docker/baragon.yaml b/BaragonService/src/main/docker/baragon.yaml
+index 90da835b4a..720be99a68 100755
+--- a/BaragonService/src/main/docker/baragon.yaml
++++ b/BaragonService/src/main/docker/baragon.yaml
+@@ -12,6 +12,7 @@ history:
+   purgeOldRequestsAfterDays: 1
+   purgeWhenDateNotFound: true
+   purgeEveryHours: 1
++  maxRequestsPerService: 5
+ 
+ zookeeper:
+   quorum: localhost:2181
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/config/HistoryConfiguration.java b/BaragonService/src/main/java/com/hubspot/baragon/service/config/HistoryConfiguration.java
+index ad2d21dfdb..c6acf01a6d 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/config/HistoryConfiguration.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/config/HistoryConfiguration.java
+@@ -27,6 +27,12 @@
+   @Min(1)
+   int purgeEveryHours = 24;
+ 
++  @JsonProperty("maxRequestsPerService")
++  int maxRequestsPerService = 1000;
++
++  @JsonProperty("maxResponsesToFetch")
++  int maxResponsesToFetch = 1000;
++
+   public boolean isEnabled() {
+     return enabled;
+   }
+@@ -74,4 +80,20 @@ public int getPurgeEveryHours() {
+   public void setPurgeEveryHours(int purgeEveryHours) {
+     this.purgeEveryHours = purgeEveryHours;
+   }
++
++  public int getMaxRequestsPerService() {
++    return maxRequestsPerService;
++  }
++
++  public void setMaxRequestsPerService(int maxRequestsPerService) {
++    this.maxRequestsPerService = maxRequestsPerService;
++  }
++
++  public int getMaxResponsesToFetch() {
++    return maxResponsesToFetch;
++  }
++
++  public void setMaxResponsesToFetch(int maxResponsesToFetch) {
++    this.maxResponsesToFetch = maxResponsesToFetch;
++  }
+ }
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/managed/BaragonManaged.java b/BaragonService/src/main/java/com/hubspot/baragon/service/managed/BaragonManaged.java
+index b0c39527ad..ec7c80da43 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/managed/BaragonManaged.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/managed/BaragonManaged.java
+@@ -1,7 +1,9 @@
+ package com.hubspot.baragon.service.managed;
+ 
++import java.util.Map;
+ import java.util.Set;
+ import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ import javax.inject.Named;
+ 
+@@ -27,11 +29,13 @@
+   private final BaragonConfiguration config;
+   private final BaragonAuthDatastore authDatastore;
+   private final Set<AbstractLatchListener> listeners;
++  private final AtomicReference<Map<String, BaragonAuthKey>> authKeys;
+ 
+   @Inject
+   public BaragonManaged(Set<AbstractLatchListener> listeners,
+                         @Named(BaragonServiceModule.BARAGON_SERVICE_SCHEDULED_EXECUTOR) ScheduledExecutorService executorService,
+                         @Named(BaragonDataModule.BARAGON_SERVICE_LEADER_LATCH) LeaderLatch leaderLatch,
++                        @Named(BaragonDataModule.BARAGON_AUTH_KEY_MAP) AtomicReference<Map<String, BaragonAuthKey>> authKeys,
+                         BaragonConfiguration config,
+                         BaragonAuthDatastore authDatastore) {
+     this.listeners = listeners;
+@@ -39,6 +43,7 @@ public BaragonManaged(Set<AbstractLatchListener> listeners,
+     this.leaderLatch = leaderLatch;
+     this.config = config;
+     this.authDatastore = authDatastore;
++    this.authKeys = authKeys;
+   }
+ 
+   @Override
+@@ -47,6 +52,7 @@ public void start() throws Exception {
+       if (!authDatastore.getAuthKeyInfo(config.getAuthConfiguration().getKey().get()).isPresent()) {
+         authDatastore.addAuthKey(new BaragonAuthKey(config.getAuthConfiguration().getKey().get(), "baragon", System.currentTimeMillis(), Optional.<Long>absent()));
+       }
++      authKeys.set(authDatastore.getAuthKeyMap());
+     }
+     for (AbstractLatchListener listener : listeners) {
+       if (listener.isEnabled()) {
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/managers/RequestManager.java b/BaragonService/src/main/java/com/hubspot/baragon/service/managers/RequestManager.java
+index 8579db0524..60986c16ac 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/managers/RequestManager.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/managers/RequestManager.java
+@@ -26,6 +26,7 @@
+ import com.hubspot.baragon.models.InternalStatesMap;
+ import com.hubspot.baragon.models.QueuedRequestId;
+ import com.hubspot.baragon.models.RequestAction;
++import com.hubspot.baragon.service.config.BaragonConfiguration;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+@@ -37,16 +38,21 @@
+   private final BaragonStateDatastore stateDatastore;
+   private final BaragonAgentResponseDatastore agentResponseDatastore;
+   private final BaragonResponseHistoryDatastore responseHistoryDatastore;
++  private final BaragonConfiguration configuration;
+ 
+   @Inject
+-  public RequestManager(BaragonRequestDatastore requestDatastore, BaragonLoadBalancerDatastore loadBalancerDatastore,
+-                        BaragonStateDatastore stateDatastore, BaragonAgentResponseDatastore agentResponseDatastore,
+-                        BaragonResponseHistoryDatastore responseHistoryDatastore) {
++  public RequestManager(BaragonRequestDatastore requestDatastore,
++                        BaragonLoadBalancerDatastore loadBalancerDatastore,
++                        BaragonStateDatastore stateDatastore,
++                        BaragonAgentResponseDatastore agentResponseDatastore,
++                        BaragonResponseHistoryDatastore responseHistoryDatastore,
++                        BaragonConfiguration configuration) {
+     this.requestDatastore = requestDatastore;
+     this.loadBalancerDatastore = loadBalancerDatastore;
+     this.stateDatastore = stateDatastore;
+     this.agentResponseDatastore = agentResponseDatastore;
+     this.responseHistoryDatastore = responseHistoryDatastore;
++    this.configuration = configuration;
+   }
+ 
+   public Optional<BaragonRequest> getRequest(String requestId) {
+@@ -84,7 +90,7 @@ public void removeQueuedRequest(QueuedRequestId queuedRequestId) {
+         }
+       }
+     }
+-    responses.addAll(responseHistoryDatastore.getResponsesForService(serviceId));
++    responses.addAll(responseHistoryDatastore.getResponsesForService(serviceId, configuration.getHistoryConfiguration().getMaxResponsesToFetch()));
+     return responses;
+   }
+ 
+@@ -197,6 +203,10 @@ public BaragonResponse enqueueRequest(BaragonRequest request) throws RequestAlre
+       }
+     }
+ 
++    if (request.isNoReload() && request.getAction().isPresent() && request.getAction().get().equals(RequestAction.RELOAD)) {
++      throw new InvalidRequestActionException("You can not specify 'noReload' on a request with action 'RELOAD'");
++    }
++
+     if (!request.getReplaceUpstreams().isEmpty() && (!request.getAddUpstreams().isEmpty() || !request.getRemoveUpstreams().isEmpty())) {
+       throw new InvalidUpstreamsException("If overrideUpstreams is specified, addUpstreams and removeUpstreams mustbe empty");
+     }
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/managers/ServiceManager.java b/BaragonService/src/main/java/com/hubspot/baragon/service/managers/ServiceManager.java
+index ae8e639b1f..af5c861625 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/managers/ServiceManager.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/managers/ServiceManager.java
+@@ -44,12 +44,12 @@ public ServiceManager(BaragonStateDatastore stateDatastore, RequestManager reque
+     }
+   }
+ 
+-  public BaragonResponse enqueueReloadServiceConfigs(String serviceId) {
++  public BaragonResponse enqueueReloadServiceConfigs(String serviceId, boolean noValidate) {
+     String requestId = String.format("%s-%s-%s", serviceId, System.currentTimeMillis(), "RELOAD");
+     Optional<BaragonService> maybeService = stateDatastore.getService(serviceId);
+     if (maybeService.isPresent()) {
+       try {
+-        return requestManager.enqueueRequest(buildReloadRequest(maybeService.get(), requestId));
++        return requestManager.enqueueRequest(buildReloadRequest(maybeService.get(), requestId, noValidate));
+       } catch (Exception e) {
+         return BaragonResponse.failure(requestId, e.getMessage());
+       }
+@@ -58,12 +58,12 @@ public BaragonResponse enqueueReloadServiceConfigs(String serviceId) {
+     }
+   }
+ 
+-  public BaragonResponse enqueueRemoveService(String serviceId) {
++  public BaragonResponse enqueueRemoveService(String serviceId, boolean noValidate, boolean noReload) {
+     String requestId = String.format("%s-%s-%s", serviceId, System.currentTimeMillis(), "DELETE");
+     Optional<BaragonService> maybeService = stateDatastore.getService(serviceId);
+     if (maybeService.isPresent()) {
+       try {
+-        return requestManager.enqueueRequest(buildRemoveRequest(maybeService.get(), requestId));
++        return requestManager.enqueueRequest(buildRemoveRequest(maybeService.get(), requestId, noValidate, noReload));
+       } catch (Exception e) {
+         return BaragonResponse.failure(requestId, e.getMessage());
+       }
+@@ -72,15 +72,15 @@ public BaragonResponse enqueueRemoveService(String serviceId) {
+     }
+   }
+ 
+-  private BaragonRequest buildRemoveRequest(BaragonService service, String requestId) throws Exception {
++  private BaragonRequest buildRemoveRequest(BaragonService service, String requestId, boolean noValidate, boolean noReload) throws Exception {
+     List<UpstreamInfo> empty = Collections.emptyList();
+     List<UpstreamInfo> remove;
+     remove =  new ArrayList<>(stateDatastore.getUpstreamsMap(service.getServiceId()).values());
+-    return new BaragonRequest(requestId, service, empty, remove, empty, Optional.<String>absent(), Optional.of(RequestAction.DELETE));
++    return new BaragonRequest(requestId, service, empty, remove, empty, Optional.<String>absent(), Optional.of(RequestAction.DELETE), noValidate, noReload);
+   }
+ 
+-  private BaragonRequest buildReloadRequest(BaragonService service, String requestId) {
++  private BaragonRequest buildReloadRequest(BaragonService service, String requestId, boolean noValidate) {
+     List<UpstreamInfo> empty = Collections.emptyList();
+-    return new BaragonRequest(requestId, service, empty, empty, empty, Optional.<String>absent(), Optional.of(RequestAction.RELOAD));
++    return new BaragonRequest(requestId, service, empty, empty, empty, Optional.<String>absent(), Optional.of(RequestAction.RELOAD), noValidate, false);
+   }
+ }
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/resources/StateResource.java b/BaragonService/src/main/java/com/hubspot/baragon/service/resources/StateResource.java
+index 8ca409bae0..cf9686f21e 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/resources/StateResource.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/resources/StateResource.java
+@@ -3,11 +3,13 @@
+ import java.util.Collection;
+ 
+ import javax.ws.rs.DELETE;
++import javax.ws.rs.DefaultValue;
+ import javax.ws.rs.GET;
+ import javax.ws.rs.POST;
+ import javax.ws.rs.Path;
+ import javax.ws.rs.PathParam;
+ import javax.ws.rs.Produces;
++import javax.ws.rs.QueryParam;
+ import javax.ws.rs.core.MediaType;
+ 
+ import com.google.common.base.Optional;
+@@ -43,13 +45,13 @@ public StateResource(ServiceManager serviceManager) {
+ 
+   @POST
+   @Path("/{serviceId}/reload")
+-  public BaragonResponse reloadConfigs(@PathParam("serviceId") String serviceId) {
+-    return serviceManager.enqueueReloadServiceConfigs(serviceId);
++  public BaragonResponse reloadConfigs(@PathParam("serviceId") String serviceId, @DefaultValue("false") @QueryParam("noValidate") boolean noValidate) {
++    return serviceManager.enqueueReloadServiceConfigs(serviceId, noValidate);
+   }
+ 
+   @DELETE
+   @Path("/{serviceId}")
+-  public BaragonResponse removeService(@PathParam("serviceId") String serviceId) {
+-    return serviceManager.enqueueRemoveService(serviceId);
++  public BaragonResponse removeService(@PathParam("serviceId") String serviceId, @DefaultValue("false") @QueryParam("noValidate") boolean noValidate, @DefaultValue("false") @QueryParam("noReload") boolean noReload) {
++    return serviceManager.enqueueRemoveService(serviceId, noValidate, noReload);
+   }
+ }
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/worker/BaragonRequestWorker.java b/BaragonService/src/main/java/com/hubspot/baragon/service/worker/BaragonRequestWorker.java
+index aa81b5c0f1..048eef5759 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/worker/BaragonRequestWorker.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/worker/BaragonRequestWorker.java
+@@ -87,12 +87,12 @@ private InternalRequestStates handleState(InternalRequestStates currentState, Ba
+           return InternalRequestStates.INVALID_REQUEST_NOOP;
+         }
+ 
+-//        for (String loadBalancerGroup : request.getLoadBalancerService().getLoadBalancerGroups()) {
+-//          if (agentManager.hasNoAgents(loadBalancerGroup)) {
+-//            requestManager.setRequestMessage(request.getLoadBalancerRequestId(), String.format("Invalid request due to no agents present for group: %s", loadBalancerGroup));
+-//            return InternalRequestStates.INVALID_REQUEST_NOOP;
+-//          }
+-//        }
++        for (String loadBalancerGroup : request.getLoadBalancerService().getLoadBalancerGroups()) {
++          if (agentManager.hasNoAgents(loadBalancerGroup)) {
++            requestManager.setRequestMessage(request.getLoadBalancerRequestId(), String.format("Invalid request due to no agents present for group: %s", loadBalancerGroup));
++            return InternalRequestStates.INVALID_REQUEST_NOOP;
++          }
++        }
+ 
+         requestManager.lockBasePaths(request);
+ 
+diff --git a/BaragonService/src/main/java/com/hubspot/baragon/service/worker/RequestPurgingWorker.java b/BaragonService/src/main/java/com/hubspot/baragon/service/worker/RequestPurgingWorker.java
+index df30f2a7d3..050f7cc507 100755
+--- a/BaragonService/src/main/java/com/hubspot/baragon/service/worker/RequestPurgingWorker.java
++++ b/BaragonService/src/main/java/com/hubspot/baragon/service/worker/RequestPurgingWorker.java
+@@ -1,15 +1,25 @@
+ package com.hubspot.baragon.service.worker;
+ 
++import java.io.Serializable;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
++import java.util.TreeMap;
+ import java.util.concurrent.TimeUnit;
+ 
+ import com.google.common.base.Optional;
++import com.google.common.collect.Iterables;
+ import com.google.inject.Inject;
+ import com.hubspot.baragon.data.BaragonAgentResponseDatastore;
+ import com.hubspot.baragon.data.BaragonRequestDatastore;
+ import com.hubspot.baragon.data.BaragonResponseHistoryDatastore;
+ import com.hubspot.baragon.data.BaragonStateDatastore;
+ import com.hubspot.baragon.models.BaragonRequest;
++import com.hubspot.baragon.models.BaragonRequestKey;
+ import com.hubspot.baragon.models.BaragonResponse;
+ import com.hubspot.baragon.models.InternalRequestStates;
+ import com.hubspot.baragon.models.InternalStatesMap;
+@@ -50,6 +60,7 @@ public void run() {
+       cleanUpActiveRequests(referenceTime);
+       if (configuration.getHistoryConfiguration().isPurgeOldRequests() && !Thread.interrupted()) {
+         purgeHistoricalRequests(referenceTime);
++        trimNumRequestsPerService();
+       }
+     } catch (Exception e) {
+       LOG.error("Caught exception during old request purging", e);
+@@ -139,4 +150,39 @@ private void purgeHistoricalRequests(long referenceTime) {
+   private boolean shouldPurge(Optional<Long> maybeUpdatedAt, long referenceTime) {
+     return (maybeUpdatedAt.isPresent() && maybeUpdatedAt.get() < referenceTime) || (!maybeUpdatedAt.isPresent() && configuration.getHistoryConfiguration().isPurgeWhenDateNotFound());
+   }
++
++  private void trimNumRequestsPerService() {
++    LOG.debug("Checking for services with too many requests");
++    for (String serviceId : responseHistoryDatastore.getServiceIds()) {
++      if (!serviceId.equals("requestIdMapping")) {
++        try {
++          List<String> requestIds = responseHistoryDatastore.getRequestIdsForService(serviceId);
++          if (requestIds.size() > configuration.getHistoryConfiguration().getMaxRequestsPerService()) {
++            removeOldestRequestIds(serviceId, requestIds);
++          }
++        } catch (Exception e) {
++          LOG.error(String.format("Caught exception purging old requests for service %s", serviceId), e);
++        }
++      }
++    }
++  }
++
++  private void removeOldestRequestIds(String serviceId, List<String> requestIds) {
++    LOG.debug(String.format("Service %s has %s requests, over limit of %s, will remove oldest requests", serviceId, requestIds.size(), configuration.getHistoryConfiguration().getMaxRequestsPerService()));
++    List<BaragonRequestKey> requestKeyList = new ArrayList<>();
++    for (String requestId : requestIds) {
++      Optional<Long> maybeUpdatedAt = responseHistoryDatastore.getRequestUpdatedAt(serviceId, requestId);
++      if (maybeUpdatedAt.isPresent()) {
++        requestKeyList.add(new BaragonRequestKey(requestId, maybeUpdatedAt.get()));
++      } else {
++        if (configuration.getHistoryConfiguration().isPurgeWhenDateNotFound()) {
++          responseHistoryDatastore.deleteResponse(serviceId, requestId);
++        }
++      }
++    }
++    Collections.sort(requestKeyList);
++    for (BaragonRequestKey requestKey : requestKeyList.subList(configuration.getHistoryConfiguration().getMaxRequestsPerService(), requestKeyList.size())) {
++      responseHistoryDatastore.deleteResponse(serviceId, requestKey.getRequestId());
++    }
++  }
+ }
+diff --git a/BaragonUI/app/models/Service.coffee b/BaragonUI/app/models/Service.coffee
+index a1c7d2dd61..ba006f4e67 100755
+--- a/BaragonUI/app/models/Service.coffee
++++ b/BaragonUI/app/models/Service.coffee
+@@ -12,6 +12,16 @@ class Service extends Model
+     removeUpstreamTemplate: require '../templates/vex/removeUpstream'
+     removeUpstreamsSuccessTemplate: require '../templates/vex/removeUpstreamsSuccess'
+ 
++    noReloadNoValidateInput: """
++            <input name="validate" type="checkbox" checked> Validate new configuration after applying changes</input>
++            <br>
++            <input name="reload" type="checkbox" checked> Reload configuration after applying changes</input>
++        """
++
++    noValidateInput: """
++            <input name="validate" type="checkbox" checked> Validate configuration before reloading</input>
++        """
++
+     initialize: ({ @serviceId }) ->
+ 
+     ignoreAttributes: ['splitLbGroups', 'splitOwners', 'splitUpstreams']
+@@ -26,22 +36,22 @@ class Service extends Model
+             data.active = true
+         data
+ 
+-    delete: =>
++    delete: (noValidate, noReload) =>
+         $.ajax
+-            url: "#{ @url() }?authkey=#{ localStorage.getItem 'baragonAuthKey' }"
++            url: "#{ @url() }?authkey=#{ localStorage.getItem 'baragonAuthKey' }&noValidate=#{ noValidate }&noReload=#{ noReload }"
+             type: "DELETE"
+             success: (data) =>
+                 console.dir(data)
+                 @set('request', data.loadBalancerRequestId)
+ 
+-    reload: =>
++    reload: (noValidate) =>
+         $.ajax
+-            url: "#{ @url() }/reload?authkey=#{ localStorage.getItem 'baragonAuthKey' }"
++            url: "#{ @url() }/reload?authkey=#{ localStorage.getItem 'baragonAuthKey' }&noValidate=#{ noValidate }"
+             type: "POST"
+             success: (data) =>
+                 @set('request', data.loadBalancerRequestId)
+ 
+-    undo: =>
++    undo: (noValidate, noReload) =>
+         this.fetch({
+             success: =>
+                 requestId = @requestId()
+@@ -54,7 +64,9 @@ class Service extends Model
+                         serviceBasePath: @attributes.service.serviceBasePath
+                         loadBalancerGroups: @attributes.service.loadBalancerGroups
+                     addUpstreams: []
+-                    removeUpstreams: @attributes.upstreams
++                    removeUpstreams: @attributes.upstreams,
++                    noValidate: noValidate,
++                    noReload: noReload
+                 }
+                 $.ajax
+                     url: "#{ config.apiRoot }/request?authkey=#{ localStorage.getItem 'baragonAuthKey' }"
+@@ -63,7 +75,7 @@ class Service extends Model
+                     data: JSON.stringify(serviceData)
+         })
+ 
+-    remove: (upstream) =>
++    remove: (upstream, noValidate, noReload) =>
+         this.fetch({
+             success: =>
+                 requestId = @requestId()
+@@ -78,6 +90,8 @@ class Service extends Model
+                         options: @attributes.options
+                     addUpstreams: []
+                     removeUpstreams: [{upstream: upstream, request: requestId}]
++                    noValidate: noValidate,
++                    noReload: noReload
+                 }
+                 $.ajax
+                     url: "#{ config.apiRoot }/request?authkey=#{ localStorage.getItem 'baragonAuthKey' }"
+@@ -92,6 +106,7 @@ class Service extends Model
+     promptDelete: (callback) =>
+         vex.dialog.confirm
+             message: @deleteTemplate {@serviceId}
++            input: @noReloadNoValidateInput
+             buttons: [
+                 $.extend {}, vex.dialog.buttons.YES,
+                     text: 'DELETE',
+@@ -100,7 +115,9 @@ class Service extends Model
+             ]
+             callback: (data) =>
+                 return if data is false
+-                @delete().done callback
++                noValidate = (!data.validate or data.validate != 'on')
++                noReload = (!data.reload or data.reload != 'on')
++                @delete(noValidate, noReload).done callback
+ 
+     promptDeleteSuccess: (callback) =>
+         vex.dialog.confirm
+@@ -116,6 +133,7 @@ class Service extends Model
+     promptReloadConfigs: (callback) =>
+         vex.dialog.confirm
+             message: @reloadTemplate {@serviceId}
++            input: @noValidateInput
+             buttons: [
+                 $.extend {}, vex.dialog.buttons.YES,
+                     text: 'RELOAD',
+@@ -124,7 +142,8 @@ class Service extends Model
+             ]
+             callback: (data) =>
+                 return if data is false
+-                @reload().done callback
++                noValidate = (!data.validate or data.validate != 'on')
++                @reload(noValidate).done callback
+ 
+     promptReloadConfigsSuccess: (callback) =>
+         vex.dialog.confirm
+@@ -140,6 +159,7 @@ class Service extends Model
+     promptRemoveUpstreams: (callback) =>
+         vex.dialog.confirm
+             message: @removeUpstreamsTemplate {@serviceId}
++            input: @noReloadNoValidateInput
+             buttons: [
+                 $.extend {}, vex.dialog.buttons.YES,
+                     text: 'REMOVE',
+@@ -148,7 +168,9 @@ class Service extends Model
+             ]
+             callback: (data) =>
+                 return if data is false
+-                @undo().done callback
++                noValidate = (!data.validate or data.validate != 'on')
++                noReload = (!data.reload or data.reload != 'on')
++                @undo(noValidate, noReload).done callback
+ 
+     promptRemoveUpstreamsSuccess: (callback) =>
+         vex.dialog.confirm
+@@ -164,6 +186,7 @@ class Service extends Model
+     promptRemoveUpstream: (upstream, callback) =>
+         vex.dialog.confirm
+             message: @removeUpstreamTemplate {upstream: upstream}
++            input: @noReloadNoValidateInput
+             buttons: [
+                 $.extend {}, vex.dialog.buttons.YES,
+                     text: 'REMOVE',
+@@ -172,6 +195,8 @@ class Service extends Model
+             ]
+             callback: (data) =>
+                 return if data is false
+-                @remove(upstream).done callback
++                noValidate = (!data.validate or data.validate != 'on')
++                noReload = (!data.reload or data.reload != 'on')
++                @remove(upstream, noValidate, noReload).done callback
+ 
+ module.exports = Service

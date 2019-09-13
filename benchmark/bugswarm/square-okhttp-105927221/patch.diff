@@ -1,0 +1,989 @@
+diff --git a/mockwebserver/src/main/java/okhttp3/internal/HeldCertificate.java b/mockwebserver/src/main/java/okhttp3/internal/HeldCertificate.java
+new file mode 100755
+index 0000000000..ce79c2817d
+--- /dev/null
++++ b/mockwebserver/src/main/java/okhttp3/internal/HeldCertificate.java
+@@ -0,0 +1,125 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3.internal;
++
++import java.math.BigInteger;
++import java.security.GeneralSecurityException;
++import java.security.KeyPair;
++import java.security.KeyPairGenerator;
++import java.security.SecureRandom;
++import java.security.Security;
++import java.security.cert.X509Certificate;
++import java.util.Date;
++import java.util.UUID;
++import javax.security.auth.x500.X500Principal;
++import org.bouncycastle.jce.provider.BouncyCastleProvider;
++import org.bouncycastle.x509.X509V3CertificateGenerator;
++
++/**
++ * A certificate and its private key. This can be used on the server side by HTTPS servers, or on
++ * the client side to verify those HTTPS servers. A held certificate can also be used to sign other
++ * held certificates, as done in practice by certificate authorities.
++ */
++public final class HeldCertificate {
++  public final X509Certificate certificate;
++  public final KeyPair keyPair;
++
++  public HeldCertificate(X509Certificate certificate, KeyPair keyPair) {
++    this.certificate = certificate;
++    this.keyPair = keyPair;
++  }
++
++  public static final class Builder {
++    static {
++      Security.addProvider(new BouncyCastleProvider());
++    }
++
++    private final long duration = 1000L * 60 * 60 * 24; // One day.
++    private String hostname;
++    private String serialNumber = "1";
++    private KeyPair keyPair;
++    private HeldCertificate issuedBy;
++
++    public Builder serialNumber(String serialNumber) {
++      this.serialNumber = serialNumber;
++      return this;
++    }
++
++    /**
++     * Set this certificate's hostname. This is the CN (common name) in the certificate. Will be a
++     * random string if no value is provided.
++     */
++    public Builder hostname(String hostname) {
++      this.hostname = hostname;
++      return this;
++    }
++
++    public Builder keyPair(KeyPair keyPair) {
++      this.keyPair = keyPair;
++      return this;
++    }
++
++    /**
++     * Set the certificate that signs this certificate. If unset, a self-signed certificate will be
++     * generated.
++     */
++    public Builder issuedBy(HeldCertificate signedBy) {
++      this.issuedBy = signedBy;
++      return this;
++    }
++
++    public HeldCertificate build() throws GeneralSecurityException {
++      // Subject, public & private keys for this certificate.
++      KeyPair heldKeyPair = keyPair != null
++          ? keyPair
++          : generateKeyPair();
++      X500Principal subject = hostname != null
++          ? new X500Principal("CN=" + hostname)
++          : new X500Principal("CN=" + UUID.randomUUID());
++
++      // Subject, public & private keys for this certificate's signer. It may be self signed!
++      KeyPair signedByKeyPair;
++      X500Principal signedByPrincipal;
++      if (issuedBy != null) {
++        signedByKeyPair = issuedBy.keyPair;
++        signedByPrincipal = issuedBy.certificate.getSubjectX500Principal();
++      } else {
++        signedByKeyPair = heldKeyPair;
++        signedByPrincipal = subject;
++      }
++
++      // Generate & sign the certificate.
++      long now = System.currentTimeMillis();
++      X509V3CertificateGenerator generator = new X509V3CertificateGenerator();
++      generator.setSerialNumber(new BigInteger(serialNumber));
++      generator.setIssuerDN(signedByPrincipal);
++      generator.setNotBefore(new Date(now));
++      generator.setNotAfter(new Date(now + duration));
++      generator.setSubjectDN(subject);
++      generator.setPublicKey(heldKeyPair.getPublic());
++      generator.setSignatureAlgorithm("SHA256WithRSAEncryption");
++      X509Certificate certificate = generator.generateX509Certificate(
++          signedByKeyPair.getPrivate(), "BC");
++      return new HeldCertificate(certificate, heldKeyPair);
++    }
++
++    public KeyPair generateKeyPair() throws GeneralSecurityException {
++      KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA", "BC");
++      keyPairGenerator.initialize(1024, new SecureRandom());
++      return keyPairGenerator.generateKeyPair();
++    }
++  }
++}
+diff --git a/mockwebserver/src/main/java/okhttp3/internal/SslContextBuilder.java b/mockwebserver/src/main/java/okhttp3/internal/SslContextBuilder.java
+index 9c7eb40153..facbaa45e3 100755
+--- a/mockwebserver/src/main/java/okhttp3/internal/SslContextBuilder.java
++++ b/mockwebserver/src/main/java/okhttp3/internal/SslContextBuilder.java
+@@ -13,29 +13,19 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
+-
+ package okhttp3.internal;
+ 
+ import java.io.IOException;
+ import java.io.InputStream;
+-import java.math.BigInteger;
+ import java.net.InetAddress;
+ import java.net.UnknownHostException;
+ import java.security.GeneralSecurityException;
+-import java.security.KeyPair;
+-import java.security.KeyPairGenerator;
+ import java.security.KeyStore;
+ import java.security.SecureRandom;
+-import java.security.Security;
+ import java.security.cert.Certificate;
+-import java.security.cert.X509Certificate;
+-import java.util.Date;
+ import javax.net.ssl.KeyManagerFactory;
+ import javax.net.ssl.SSLContext;
+ import javax.net.ssl.TrustManagerFactory;
+-import javax.security.auth.x500.X500Principal;
+-import org.bouncycastle.jce.provider.BouncyCastleProvider;
+-import org.bouncycastle.x509.X509V3CertificateGenerator;
+ 
+ /**
+  * Constructs an SSL context for testing. This uses Bouncy Castle to generate a self-signed
+@@ -45,16 +35,8 @@
+  * instances where possible.
+  */
+ public final class SslContextBuilder {
+-  static {
+-    Security.addProvider(new BouncyCastleProvider());
+-  }
+-
+-  private static final long ONE_DAY_MILLIS = 1000L * 60 * 60 * 24;
+   private static SSLContext localhost; // Lazily initialized.
+-
+   private final String hostName;
+-  private long notBefore = System.currentTimeMillis();
+-  private long notAfter = System.currentTimeMillis() + ONE_DAY_MILLIS;
+ 
+   /**
+    * @param hostName the subject of the host. For TLS this should be the domain name that the client
+@@ -79,17 +61,19 @@ public static synchronized SSLContext localhost() {
+   }
+ 
+   public SSLContext build() throws GeneralSecurityException {
+-    char[] password = "password".toCharArray();
+-
+-    // Generate public and private keys and use them to make a self-signed certificate.
+-    KeyPair keyPair = generateKeyPair();
+-    X509Certificate certificate = selfSignedCertificate(keyPair, "1");
++    // Generate a self-signed cert for the server to serve and the client to trust.
++    HeldCertificate heldCertificate = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .hostname(hostName)
++        .build();
+ 
+-    // Put 'em in a key store.
++    // Put the certificate in a key store.
++    char[] password = "password".toCharArray();
+     KeyStore keyStore = newEmptyKeyStore(password);
+-    Certificate[] certificateChain = {certificate};
+-    keyStore.setKeyEntry("private", keyPair.getPrivate(), password, certificateChain);
+-    keyStore.setCertificateEntry("cert", certificate);
++    Certificate[] certificateChain = {heldCertificate.certificate};
++    keyStore.setKeyEntry("private",
++        heldCertificate.keyPair.getPrivate(), password, certificateChain);
++    keyStore.setCertificateEntry("cert", heldCertificate.certificate);
+ 
+     // Wrap it up in an SSL context.
+     KeyManagerFactory keyManagerFactory =
+@@ -104,32 +88,6 @@ public SSLContext build() throws GeneralSecurityException {
+     return sslContext;
+   }
+ 
+-  public KeyPair generateKeyPair() throws GeneralSecurityException {
+-    KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA", "BC");
+-    keyPairGenerator.initialize(1024, new SecureRandom());
+-    return keyPairGenerator.generateKeyPair();
+-  }
+-
+-  /**
+-   * Generates a certificate for {@code hostName} containing {@code keyPair}'s public key, signed by
+-   * {@code keyPair}'s private key.
+-   */
+-  @SuppressWarnings("deprecation") // use the old Bouncy Castle APIs to reduce dependencies.
+-  public X509Certificate selfSignedCertificate(KeyPair keyPair, String serialNumber)
+-      throws GeneralSecurityException {
+-    X509V3CertificateGenerator generator = new X509V3CertificateGenerator();
+-    X500Principal issuer = new X500Principal("CN=" + hostName);
+-    X500Principal subject = new X500Principal("CN=" + hostName);
+-    generator.setSerialNumber(new BigInteger(serialNumber));
+-    generator.setIssuerDN(issuer);
+-    generator.setNotBefore(new Date(notBefore));
+-    generator.setNotAfter(new Date(notAfter));
+-    generator.setSubjectDN(subject);
+-    generator.setPublicKey(keyPair.getPublic());
+-    generator.setSignatureAlgorithm("SHA256WithRSAEncryption");
+-    return generator.generateX509Certificate(keyPair.getPrivate(), "BC");
+-  }
+-
+   private KeyStore newEmptyKeyStore(char[] password) throws GeneralSecurityException {
+     try {
+       KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+diff --git a/okhttp-tests/src/test/java/okhttp3/CertificateAuthorityCouncilTest.java b/okhttp-tests/src/test/java/okhttp3/CertificateAuthorityCouncilTest.java
+new file mode 100755
+index 0000000000..c3bf41098f
+--- /dev/null
++++ b/okhttp-tests/src/test/java/okhttp3/CertificateAuthorityCouncilTest.java
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2016 Square, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package okhttp3;
++
++import java.security.cert.Certificate;
++import java.util.ArrayList;
++import java.util.List;
++import javax.net.ssl.SSLPeerUnverifiedException;
++import okhttp3.internal.HeldCertificate;
++import okhttp3.internal.tls.CertificateAuthorityCouncil;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++
++public final class CertificateAuthorityCouncilTest {
++  @Test public void normalizeSingleSelfSignedCertificate() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(root), council.normalizeCertificateChain(list(root)));
++  }
++
++  @Test public void normalizeUnknownSelfSignedCertificate() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil();
++
++    try {
++      council.normalizeCertificateChain(list(root));
++      fail();
++    } catch (SSLPeerUnverifiedException expected) {
++    }
++  }
++
++  @Test public void orderedChainOfCertificatesWithRoot() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(certA)
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(certB, certA, root),
++        council.normalizeCertificateChain(list(certB, certA, root)));
++  }
++
++  @Test public void orderedChainOfCertificatesWithoutRoot() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(certA)
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(certB, certA, root),
++        council.normalizeCertificateChain(list(certB, certA))); // Root is added!
++  }
++
++  @Test public void unorderedChainOfCertificatesWithRoot() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(certA)
++        .build();
++    HeldCertificate certC = new HeldCertificate.Builder()
++        .serialNumber("4")
++        .issuedBy(certB)
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(certC, certB, certA, root),
++        council.normalizeCertificateChain(list(certC, certA, root, certB)));
++  }
++
++  @Test public void unorderedChainOfCertificatesWithoutRoot() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(certA)
++        .build();
++    HeldCertificate certC = new HeldCertificate.Builder()
++        .serialNumber("4")
++        .issuedBy(certB)
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(certC, certB, certA, root),
++        council.normalizeCertificateChain(list(certC, certA, certB)));
++  }
++
++  @Test public void unrelatedCertificatesAreOmitted() throws Exception {
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(certA)
++        .build();
++    HeldCertificate certUnnecessary = new HeldCertificate.Builder()
++        .serialNumber("4")
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(root.certificate);
++    assertEquals(list(certB, certA, root),
++        council.normalizeCertificateChain(list(certB, certUnnecessary, certA, root)));
++  }
++
++  @Test public void unnecessaryTrustedCertificatesAreOmitted() throws Exception {
++    HeldCertificate superRoot = new HeldCertificate.Builder()
++        .serialNumber("1")
++        .build();
++    HeldCertificate root = new HeldCertificate.Builder()
++        .serialNumber("2")
++        .issuedBy(superRoot)
++        .build();
++    HeldCertificate certA = new HeldCertificate.Builder()
++        .serialNumber("3")
++        .issuedBy(root)
++        .build();
++    HeldCertificate certB = new HeldCertificate.Builder()
++        .serialNumber("4")
++        .issuedBy(certA)
++        .build();
++
++    CertificateAuthorityCouncil council = new CertificateAuthorityCouncil(
++        superRoot.certificate, root.certificate);
++    assertEquals(list(certB, certA, root),
++        council.normalizeCertificateChain(list(certB, certA, root, superRoot)));
++  }
++
++  private List<Certificate> list(HeldCertificate... heldCertificates) {
++    List<Certificate> result = new ArrayList<>();
++    for (HeldCertificate heldCertificate : heldCertificates) {
++      result.add(heldCertificate.certificate);
++    }
++    return result;
++  }
++}
+diff --git a/okhttp-tests/src/test/java/okhttp3/CertificatePinnerTest.java b/okhttp-tests/src/test/java/okhttp3/CertificatePinnerTest.java
+index cdfe9b0f09..b088f8c141 100755
+--- a/okhttp-tests/src/test/java/okhttp3/CertificatePinnerTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/CertificatePinnerTest.java
+@@ -16,11 +16,9 @@
+ package okhttp3;
+ 
+ import java.security.GeneralSecurityException;
+-import java.security.KeyPair;
+-import java.security.cert.X509Certificate;
+ import java.util.Set;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+-import okhttp3.internal.SslContextBuilder;
++import okhttp3.internal.HeldCertificate;
+ import okio.ByteString;
+ import org.junit.Test;
+ 
+@@ -32,39 +30,35 @@
+ import static org.junit.Assert.fail;
+ 
+ public final class CertificatePinnerTest {
+-  static SslContextBuilder sslContextBuilder;
++  static HeldCertificate certA1;
++  static String certA1Pin;
++  static ByteString certA1PinBase64;
+ 
+-  static KeyPair keyPairA;
+-  static X509Certificate keypairACertificate1;
+-  static String keypairACertificate1Pin;
+-  static ByteString keypairACertificate1PinBase64;
++  static HeldCertificate certB1;
++  static String certB1Pin;
++  static ByteString certB1PinBase64;
+ 
+-  static KeyPair keyPairB;
+-  static X509Certificate keypairBCertificate1;
+-  static String keypairBCertificate1Pin;
+-  static ByteString keypairBCertificate1PinBase64;
+-
+-  static KeyPair keyPairC;
+-  static X509Certificate keypairCCertificate1;
+-  static String keypairCCertificate1Pin;
++  static HeldCertificate certC1;
++  static String certC1Pin;
+ 
+   static {
+     try {
+-      sslContextBuilder = new SslContextBuilder("example.com");
+-
+-      keyPairA = sslContextBuilder.generateKeyPair();
+-      keypairACertificate1 = sslContextBuilder.selfSignedCertificate(keyPairA, "1");
+-      keypairACertificate1Pin = CertificatePinner.pin(keypairACertificate1);
+-      keypairACertificate1PinBase64 = pinToBase64(keypairACertificate1Pin);
+-
+-      keyPairB = sslContextBuilder.generateKeyPair();
+-      keypairBCertificate1 = sslContextBuilder.selfSignedCertificate(keyPairB, "1");
+-      keypairBCertificate1Pin = CertificatePinner.pin(keypairBCertificate1);
+-      keypairBCertificate1PinBase64 = pinToBase64(keypairBCertificate1Pin);
+-
+-      keyPairC = sslContextBuilder.generateKeyPair();
+-      keypairCCertificate1 = sslContextBuilder.selfSignedCertificate(keyPairC, "1");
+-      keypairCCertificate1Pin = CertificatePinner.pin(keypairCCertificate1);
++      certA1 = new HeldCertificate.Builder()
++          .serialNumber("100")
++          .build();
++      certA1Pin = CertificatePinner.pin(certA1.certificate);
++      certA1PinBase64 = pinToBase64(certA1Pin);
++
++      certB1 = new HeldCertificate.Builder()
++          .serialNumber("200")
++          .build();
++      certB1Pin = CertificatePinner.pin(certB1.certificate);
++      certB1PinBase64 = pinToBase64(certB1Pin);
++
++      certC1 = new HeldCertificate.Builder()
++          .serialNumber("300")
++          .build();
++      certC1Pin = CertificatePinner.pin(certC1.certificate);
+     } catch (GeneralSecurityException e) {
+       throw new AssertionError(e);
+     }
+@@ -94,40 +88,46 @@ static ByteString pinToBase64(String pin) {
+ 
+   /** Multiple certificates generated from the same keypair have the same pin. */
+   @Test public void sameKeypairSamePin() throws Exception {
+-    X509Certificate keypairACertificate2 = sslContextBuilder.selfSignedCertificate(keyPairA, "2");
+-    String keypairACertificate2Pin = CertificatePinner.pin(keypairACertificate2);
++    HeldCertificate heldCertificateA2 = new HeldCertificate.Builder()
++        .keyPair(certA1.keyPair)
++        .serialNumber("101")
++        .build();
++    String keypairACertificate2Pin = CertificatePinner.pin(heldCertificateA2.certificate);
+ 
+-    X509Certificate keypairBCertificate2 = sslContextBuilder.selfSignedCertificate(keyPairB, "2");
+-    String keypairBCertificate2Pin = CertificatePinner.pin(keypairBCertificate2);
++    HeldCertificate heldCertificateB2 = new HeldCertificate.Builder()
++        .keyPair(certB1.keyPair)
++        .serialNumber("201")
++        .build();
++    String keypairBCertificate2Pin = CertificatePinner.pin(heldCertificateB2.certificate);
+ 
+-    assertTrue(keypairACertificate1Pin.equals(keypairACertificate2Pin));
+-    assertTrue(keypairBCertificate1Pin.equals(keypairBCertificate2Pin));
+-    assertFalse(keypairACertificate1Pin.equals(keypairBCertificate1Pin));
++    assertTrue(certA1Pin.equals(keypairACertificate2Pin));
++    assertTrue(certB1Pin.equals(keypairBCertificate2Pin));
++    assertFalse(certA1Pin.equals(certB1Pin));
+   }
+ 
+   @Test public void successfulCheck() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("example.com", keypairACertificate1Pin)
++        .add("example.com", certA1Pin)
+         .build();
+ 
+-    certificatePinner.check("example.com", keypairACertificate1);
++    certificatePinner.check("example.com", certA1.certificate);
+   }
+ 
+   @Test public void successfulMatchAcceptsAnyMatchingCertificate() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("example.com", keypairBCertificate1Pin)
++        .add("example.com", certB1Pin)
+         .build();
+ 
+-    certificatePinner.check("example.com", keypairACertificate1, keypairBCertificate1);
++    certificatePinner.check("example.com", certA1.certificate, certB1.certificate);
+   }
+ 
+   @Test public void unsuccessfulCheck() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("example.com", keypairACertificate1Pin)
++        .add("example.com", certA1Pin)
+         .build();
+ 
+     try {
+-      certificatePinner.check("example.com", keypairBCertificate1);
++      certificatePinner.check("example.com", certB1.certificate);
+       fail();
+     } catch (SSLPeerUnverifiedException expected) {
+     }
+@@ -135,52 +135,52 @@ static ByteString pinToBase64(String pin) {
+ 
+   @Test public void multipleCertificatesForOneHostname() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("example.com", keypairACertificate1Pin, keypairBCertificate1Pin)
++        .add("example.com", certA1Pin, certB1Pin)
+         .build();
+ 
+-    certificatePinner.check("example.com", keypairACertificate1);
+-    certificatePinner.check("example.com", keypairBCertificate1);
++    certificatePinner.check("example.com", certA1.certificate);
++    certificatePinner.check("example.com", certB1.certificate);
+   }
+ 
+   @Test public void multipleHostnamesForOneCertificate() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("example.com", keypairACertificate1Pin)
+-        .add("www.example.com", keypairACertificate1Pin)
++        .add("example.com", certA1Pin)
++        .add("www.example.com", certA1Pin)
+         .build();
+ 
+-    certificatePinner.check("example.com", keypairACertificate1);
+-    certificatePinner.check("www.example.com", keypairACertificate1);
++    certificatePinner.check("example.com", certA1.certificate);
++    certificatePinner.check("www.example.com", certA1.certificate);
+   }
+ 
+   @Test public void absentHostnameMatches() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder().build();
+-    certificatePinner.check("example.com", keypairACertificate1);
++    certificatePinner.check("example.com", certA1.certificate);
+   }
+ 
+   @Test public void successfulCheckForWildcardHostname() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
++        .add("*.example.com", certA1Pin)
+         .build();
+ 
+-    certificatePinner.check("a.example.com", keypairACertificate1);
++    certificatePinner.check("a.example.com", certA1.certificate);
+   }
+ 
+   @Test public void successfulMatchAcceptsAnyMatchingCertificateForWildcardHostname()
+       throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairBCertificate1Pin)
++        .add("*.example.com", certB1Pin)
+         .build();
+ 
+-    certificatePinner.check("a.example.com", keypairACertificate1, keypairBCertificate1);
++    certificatePinner.check("a.example.com", certA1.certificate, certB1.certificate);
+   }
+ 
+   @Test public void unsuccessfulCheckForWildcardHostname() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
++        .add("*.example.com", certA1Pin)
+         .build();
+ 
+     try {
+-      certificatePinner.check("a.example.com", keypairBCertificate1);
++      certificatePinner.check("a.example.com", certB1.certificate);
+       fail();
+     } catch (SSLPeerUnverifiedException expected) {
+     }
+@@ -188,33 +188,33 @@ static ByteString pinToBase64(String pin) {
+ 
+   @Test public void multipleCertificatesForOneWildcardHostname() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin, keypairBCertificate1Pin)
++        .add("*.example.com", certA1Pin, certB1Pin)
+         .build();
+ 
+-    certificatePinner.check("a.example.com", keypairACertificate1);
+-    certificatePinner.check("a.example.com", keypairBCertificate1);
++    certificatePinner.check("a.example.com", certA1.certificate);
++    certificatePinner.check("a.example.com", certB1.certificate);
+   }
+ 
+   @Test public void successfulCheckForOneHostnameWithWildcardAndDirectCertificate()
+       throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
+-        .add("a.example.com", keypairBCertificate1Pin)
++        .add("*.example.com", certA1Pin)
++        .add("a.example.com", certB1Pin)
+         .build();
+ 
+-    certificatePinner.check("a.example.com", keypairACertificate1);
+-    certificatePinner.check("a.example.com", keypairBCertificate1);
++    certificatePinner.check("a.example.com", certA1.certificate);
++    certificatePinner.check("a.example.com", certB1.certificate);
+   }
+ 
+   @Test public void unsuccessfulCheckForOneHostnameWithWildcardAndDirectCertificate()
+       throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
+-        .add("a.example.com", keypairBCertificate1Pin)
++        .add("*.example.com", certA1Pin)
++        .add("a.example.com", certB1Pin)
+         .build();
+ 
+     try {
+-      certificatePinner.check("a.example.com", keypairCCertificate1);
++      certificatePinner.check("a.example.com", certC1.certificate);
+       fail();
+     } catch (SSLPeerUnverifiedException expected) {
+     }
+@@ -222,12 +222,11 @@ static ByteString pinToBase64(String pin) {
+ 
+   @Test public void successfulFindMatchingPins() {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("first.com", keypairACertificate1Pin, keypairBCertificate1Pin)
+-        .add("second.com", keypairCCertificate1Pin)
++        .add("first.com", certA1Pin, certB1Pin)
++        .add("second.com", certC1Pin)
+         .build();
+ 
+-    Set<ByteString> expectedPins =
+-        setOf(keypairACertificate1PinBase64, keypairBCertificate1PinBase64);
++    Set<ByteString> expectedPins = setOf(certA1PinBase64, certB1PinBase64);
+     Set<ByteString> matchedPins = certificatePinner.findMatchingPins("first.com");
+ 
+     assertEquals(expectedPins, matchedPins);
+@@ -235,13 +234,12 @@ static ByteString pinToBase64(String pin) {
+ 
+   @Test public void successfulFindMatchingPinsForWildcardAndDirectCertificates() {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
+-        .add("a.example.com", keypairBCertificate1Pin)
+-        .add("b.example.com", keypairCCertificate1Pin)
++        .add("*.example.com", certA1Pin)
++        .add("a.example.com", certB1Pin)
++        .add("b.example.com", certC1Pin)
+         .build();
+ 
+-    Set<ByteString> expectedPins =
+-        setOf(keypairACertificate1PinBase64, keypairBCertificate1PinBase64);
++    Set<ByteString> expectedPins = setOf(certA1PinBase64, certB1PinBase64);
+     Set<ByteString> matchedPins = certificatePinner.findMatchingPins("a.example.com");
+ 
+     assertEquals(expectedPins, matchedPins);
+@@ -249,7 +247,7 @@ static ByteString pinToBase64(String pin) {
+ 
+   @Test public void wildcardHostnameShouldNotMatchThroughDot() throws Exception {
+     CertificatePinner certificatePinner = new CertificatePinner.Builder()
+-        .add("*.example.com", keypairACertificate1Pin)
++        .add("*.example.com", certA1Pin)
+         .build();
+ 
+     assertNull(certificatePinner.findMatchingPins("example.com"));
+diff --git a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+index b864383364..3c48c74732 100755
+--- a/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
++++ b/okhttp-tests/src/test/java/okhttp3/URLConnectionTest.java
+@@ -34,6 +34,7 @@
+ import java.net.URL;
+ import java.net.URLConnection;
+ import java.net.UnknownHostException;
++import java.security.SecureRandom;
+ import java.security.cert.CertificateException;
+ import java.security.cert.X509Certificate;
+ import java.util.ArrayList;
+@@ -58,6 +59,7 @@
+ import javax.net.ssl.X509TrustManager;
+ import okhttp3.internal.DoubleInetAddressDns;
+ import okhttp3.internal.Internal;
++import okhttp3.internal.Platform;
+ import okhttp3.internal.RecordingAuthenticator;
+ import okhttp3.internal.RecordingOkAuthenticator;
+ import okhttp3.internal.SingleInetAddressDns;
+@@ -2303,9 +2305,9 @@ private void testRedirect(boolean temporary, String method) throws Exception {
+ 
+   @Test public void httpsWithCustomTrustManager() throws Exception {
+     RecordingHostnameVerifier hostnameVerifier = new RecordingHostnameVerifier();
+-    RecordingTrustManager trustManager = new RecordingTrustManager();
++    RecordingTrustManager trustManager = new RecordingTrustManager(sslContext);
+     SSLContext sc = SSLContext.getInstance("TLS");
+-    sc.init(null, new TrustManager[] {trustManager}, new java.security.SecureRandom());
++    sc.init(null, new TrustManager[] {trustManager}, new SecureRandom());
+ 
+     urlFactory.setClient(urlFactory.client().newBuilder()
+         .hostnameVerifier(hostnameVerifier)
+@@ -2321,8 +2323,7 @@ private void testRedirect(boolean temporary, String method) throws Exception {
+     assertContent("DEF", urlFactory.open(url));
+     assertContent("GHI", urlFactory.open(url));
+ 
+-    assertEquals(Arrays.asList("verify " + server.getHostName()),
+-        hostnameVerifier.calls);
++    assertEquals(Arrays.asList("verify " + server.getHostName()), hostnameVerifier.calls);
+     assertEquals(Arrays.asList("checkServerTrusted [CN=" + server.getHostName() + " 1]"),
+         trustManager.calls);
+   }
+@@ -3535,9 +3536,14 @@ public abstract HttpURLConnection connect(
+ 
+   private static class RecordingTrustManager implements X509TrustManager {
+     private final List<String> calls = new ArrayList<String>();
++    private final X509TrustManager delegate;
++
++    public RecordingTrustManager(SSLContext sslContext) {
++      this.delegate = Platform.get().trustManager(sslContext.getSocketFactory());
++    }
+ 
+     public X509Certificate[] getAcceptedIssuers() {
+-      return new X509Certificate[] {};
++      return delegate.getAcceptedIssuers();
+     }
+ 
+     public void checkClientTrusted(X509Certificate[] chain, String authType)
+diff --git a/okhttp/src/main/java/okhttp3/CertificatePinner.java b/okhttp/src/main/java/okhttp3/CertificatePinner.java
+index d759217ea3..4c56d6c140 100755
+--- a/okhttp/src/main/java/okhttp3/CertificatePinner.java
++++ b/okhttp/src/main/java/okhttp3/CertificatePinner.java
+@@ -25,7 +25,6 @@
+ import java.util.Set;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+ import okhttp3.internal.Util;
+-import okhttp3.internal.tls.CertificateAuthorityCouncil;
+ import okio.ByteString;
+ 
+ import static java.util.Collections.unmodifiableSet;
+@@ -129,11 +128,9 @@
+   public static final CertificatePinner DEFAULT = new Builder().build();
+ 
+   private final Map<String, Set<ByteString>> hostnameToPins;
+-  private final CertificateAuthorityCouncil certificateAuthorityCouncil;
+ 
+   private CertificatePinner(Builder builder) {
+-    this.hostnameToPins = Util.immutableMap(builder.hostnameToPins);
+-    this.certificateAuthorityCouncil = builder.certificateAuthorityCouncil;
++    hostnameToPins = Util.immutableMap(builder.hostnameToPins);
+   }
+ 
+   /**
+@@ -146,9 +143,6 @@ private CertificatePinner(Builder builder) {
+    */
+   public void check(String hostname, List<Certificate> peerCertificates)
+       throws SSLPeerUnverifiedException {
+-    if (certificateAuthorityCouncil != null) {
+-      peerCertificates = certificateAuthorityCouncil.normalizeCertificateChain(peerCertificates);
+-    }
+ 
+     Set<ByteString> pins = findMatchingPins(hostname);
+ 
+@@ -214,10 +208,6 @@ public void check(String hostname, Certificate... peerCertificates)
+     return wildcardPins;
+   }
+ 
+-  Builder newBuilder() {
+-    return new Builder(this);
+-  }
+-
+   /**
+    * Returns the SHA-1 of {@code certificate}'s public key. This uses the mechanism Moxie
+    * Marlinspike describes in <a href="https://github.com/moxie0/AndroidPinning">Android
+@@ -237,20 +227,6 @@ private static ByteString sha1(X509Certificate x509Certificate) {
+   /** Builds a configured certificate pinner. */
+   public static final class Builder {
+     private final Map<String, Set<ByteString>> hostnameToPins = new LinkedHashMap<>();
+-    private CertificateAuthorityCouncil certificateAuthorityCouncil;
+-
+-    public Builder() {
+-    }
+-
+-    Builder(CertificatePinner certificatePinner) {
+-      this.hostnameToPins.putAll(certificatePinner.hostnameToPins);
+-      this.certificateAuthorityCouncil = certificatePinner.certificateAuthorityCouncil;
+-    }
+-
+-    Builder certificateAuthorityCouncil(CertificateAuthorityCouncil certificateAuthorityCouncil) {
+-      this.certificateAuthorityCouncil = certificateAuthorityCouncil;
+-      return this;
+-    }
+ 
+     /**
+      * Pins certificates for {@code hostname}.
+diff --git a/okhttp/src/main/java/okhttp3/OkHttpClient.java b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+index e8a1395c43..3b2fa79aeb 100755
+--- a/okhttp/src/main/java/okhttp3/OkHttpClient.java
++++ b/okhttp/src/main/java/okhttp3/OkHttpClient.java
+@@ -36,7 +36,6 @@
+ import okhttp3.internal.Util;
+ import okhttp3.internal.http.StreamAllocation;
+ import okhttp3.internal.io.RealConnection;
+-import okhttp3.internal.tls.CertificateAuthorityCouncil;
+ import okhttp3.internal.tls.OkHostnameVerifier;
+ 
+ /**
+@@ -133,7 +132,7 @@ public void apply(ConnectionSpec tlsConfiguration, SSLSocket sslSocket, boolean
+   final InternalCache internalCache;
+   final SocketFactory socketFactory;
+   final SSLSocketFactory sslSocketFactory;
+-  final CertificateAuthorityCouncil certificateAuthorityCouncil;
++  final X509TrustManager trustManager;
+   final HostnameVerifier hostnameVerifier;
+   final CertificatePinner certificatePinner;
+   final Authenticator proxyAuthenticator;
+@@ -180,21 +179,18 @@ private OkHttpClient(Builder builder) {
+         throw new AssertionError(); // The system has no TLS. Just give up.
+       }
+     }
+-    if (sslSocketFactory != null && builder.certificateAuthorityCouncil == null) {
+-      X509TrustManager trustManager = Platform.get().trustManager(sslSocketFactory);
++    if (this.sslSocketFactory != null) {
++      this.trustManager = Platform.get().trustManager(sslSocketFactory);
+       if (trustManager == null) {
+         throw new IllegalStateException("Unable to extract the trust manager on " + Platform.get()
+             + ", sslSocketFactory is " + sslSocketFactory.getClass());
+       }
+-      this.certificateAuthorityCouncil = new CertificateAuthorityCouncil(trustManager);
+     } else {
+-      this.certificateAuthorityCouncil = builder.certificateAuthorityCouncil;
++      this.trustManager = null;
+     }
+ 
+     this.hostnameVerifier = builder.hostnameVerifier;
+-    this.certificatePinner = builder.certificatePinner.newBuilder()
+-        .certificateAuthorityCouncil(certificateAuthorityCouncil)
+-        .build();
++    this.certificatePinner = builder.certificatePinner;
+     this.proxyAuthenticator = builder.proxyAuthenticator;
+     this.authenticator = builder.authenticator;
+     this.connectionPool = builder.connectionPool;
+@@ -340,7 +336,6 @@ public Builder newBuilder() {
+     InternalCache internalCache;
+     SocketFactory socketFactory;
+     SSLSocketFactory sslSocketFactory;
+-    CertificateAuthorityCouncil certificateAuthorityCouncil;
+     HostnameVerifier hostnameVerifier;
+     CertificatePinner certificatePinner;
+     Authenticator proxyAuthenticator;
+@@ -388,7 +383,6 @@ public Builder() {
+       this.cache = okHttpClient.cache;
+       this.socketFactory = okHttpClient.socketFactory;
+       this.sslSocketFactory = okHttpClient.sslSocketFactory;
+-      this.certificateAuthorityCouncil = okHttpClient.certificateAuthorityCouncil;
+       this.hostnameVerifier = okHttpClient.hostnameVerifier;
+       this.certificatePinner = okHttpClient.certificatePinner;
+       this.proxyAuthenticator = okHttpClient.proxyAuthenticator;
+@@ -526,7 +520,6 @@ public Builder socketFactory(SocketFactory socketFactory) {
+     public Builder sslSocketFactory(SSLSocketFactory sslSocketFactory) {
+       if (sslSocketFactory == null) throw new NullPointerException("sslSocketFactory == null");
+       this.sslSocketFactory = sslSocketFactory;
+-      this.certificateAuthorityCouncil = null;
+       return this;
+     }
+ 
+diff --git a/okhttp/src/main/java/okhttp3/internal/tls/CertificateAuthorityCouncil.java b/okhttp/src/main/java/okhttp3/internal/tls/CertificateAuthorityCouncil.java
+index 287b7bbe3d..4891f9ac8a 100755
+--- a/okhttp/src/main/java/okhttp3/internal/tls/CertificateAuthorityCouncil.java
++++ b/okhttp/src/main/java/okhttp3/internal/tls/CertificateAuthorityCouncil.java
+@@ -27,7 +27,6 @@
+ import java.util.List;
+ import java.util.Map;
+ import javax.net.ssl.SSLPeerUnverifiedException;
+-import javax.net.ssl.X509TrustManager;
+ import javax.security.auth.x500.X500Principal;
+ 
+ /**
+@@ -40,15 +39,15 @@
+ public final class CertificateAuthorityCouncil {
+   private final Map<X500Principal, List<X509Certificate>> subjectToCaCerts = new LinkedHashMap<>();
+ 
+-  public CertificateAuthorityCouncil(X509TrustManager trustManager) {
+-    for (X509Certificate caCert : trustManager.getAcceptedIssuers()) {
++  public CertificateAuthorityCouncil(X509Certificate... caCerts) {
++    for (X509Certificate caCert : caCerts) {
+       X500Principal subject = caCert.getSubjectX500Principal();
+-      List<X509Certificate> caCerts = subjectToCaCerts.get(subject);
+-      if (caCerts == null) {
+-        caCerts = new ArrayList<>(1);
+-        subjectToCaCerts.put(subject, caCerts);
++      List<X509Certificate> subjectCaCerts = subjectToCaCerts.get(subject);
++      if (subjectCaCerts == null) {
++        subjectCaCerts = new ArrayList<>(1);
++        subjectToCaCerts.put(subject, subjectCaCerts);
+       }
+-      caCerts.add(caCert);
++      subjectCaCerts.add(caCert);
+     }
+   }
+ 
+@@ -75,10 +74,14 @@ public CertificateAuthorityCouncil(X509TrustManager trustManager) {
+     while (true) {
+       X509Certificate toVerify = (X509Certificate) result.get(result.size() - 1);
+ 
+-      // If this cert has been signed by a trusted CA cert, we're done.
++      // If this cert has been signed by a trusted CA cert, we're done. Add the trusted CA
++      // certificate to the end of the chain, unless it's already present. (That would happen if the
++      // first certificate in the chain is itself a self-signed and trusted CA certificate.)
+       X509Certificate caCert = findByIssuerAndSignature(toVerify);
+       if (caCert != null) {
+-        result.add(caCert);
++        if (result.size() > 1 || !toVerify.equals(caCert)) {
++          result.add(caCert);
++        }
+         return result;
+       }
+ 
+@@ -100,10 +103,10 @@ public CertificateAuthorityCouncil(X509TrustManager trustManager) {
+   /** Returns the trusted CA certificate that signed {@code cert}. */
+   private X509Certificate findByIssuerAndSignature(X509Certificate cert) {
+     X500Principal issuer = cert.getIssuerX500Principal();
+-    List<X509Certificate> caCerts = subjectToCaCerts.get(issuer);
+-    if (caCerts == null) return null;
++    List<X509Certificate> subjectCaCerts = subjectToCaCerts.get(issuer);
++    if (subjectCaCerts == null) return null;
+ 
+-    for (X509Certificate caCert : caCerts) {
++    for (X509Certificate caCert : subjectCaCerts) {
+       PublicKey publicKey = caCert.getPublicKey();
+       try {
+         cert.verify(publicKey);

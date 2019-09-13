@@ -1,0 +1,275 @@
+diff --git a/okhttp-android-support/src/test/java/okhttp3/internal/huc/ResponseCacheTest.java b/okhttp-android-support/src/test/java/okhttp3/internal/huc/ResponseCacheTest.java
+index a533b919b7..90864623b8 100755
+--- a/okhttp-android-support/src/test/java/okhttp3/internal/huc/ResponseCacheTest.java
++++ b/okhttp-android-support/src/test/java/okhttp3/internal/huc/ResponseCacheTest.java
+@@ -190,6 +190,9 @@ private void assertCached(boolean shouldPut, int responseCode) throws Exception
+       mockResponse.addHeader("Proxy-Authenticate: Basic realm=\"protected area\"");
+     } else if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+       mockResponse.addHeader("WWW-Authenticate: Basic realm=\"protected area\"");
++    } else if (responseCode == HttpURLConnection.HTTP_NO_CONTENT
++        || responseCode == HttpURLConnection.HTTP_RESET) {
++      mockResponse.setBody(""); // We forbid bodies for 204 and 205.
+     }
+     server.enqueue(mockResponse);
+ 
+diff --git a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/BufferedRequestBody.java b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/BufferedRequestBody.java
+index 57e3ec4717..b4b2f68347 100755
+--- a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/BufferedRequestBody.java
++++ b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/BufferedRequestBody.java
+@@ -16,11 +16,9 @@
+ package okhttp3.internal.huc;
+ 
+ import java.io.IOException;
+-import java.io.OutputStream;
+-import okhttp3.MediaType;
++import okhttp3.Request;
+ import okio.Buffer;
+ import okio.BufferedSink;
+-import okio.Timeout;
+ 
+ /**
+  * This request body involves an application thread only. First all bytes are written to the buffer.
+@@ -32,29 +30,30 @@
+  */
+ final class BufferedRequestBody extends OutputStreamRequestBody {
+   final Buffer buffer = new Buffer();
+-  final long expectedContentLength;
+-  final OutputStream outputStream;
++  long contentLength = -1L;
+ 
+   BufferedRequestBody(long expectedContentLength) {
+-    this.expectedContentLength = expectedContentLength;
+-    this.outputStream = newOutputStream(expectedContentLength, buffer);
++    initOutputStream(buffer, expectedContentLength);
+   }
+ 
+-  @Override OutputStream outputStream() {
+-    return outputStream;
+-  }
+-
+-  @Override Timeout timeout() {
+-    return Timeout.NONE;
+-  }
+-
+-  @Override public MediaType contentType() {
+-    return null; // We let the caller provide this in a regular header.
++  @Override public long contentLength() throws IOException {
++    return contentLength;
+   }
+ 
+-  @Override public long contentLength() throws IOException {
+-    outputStream.close(); // Lock in the current size!
+-    return buffer.size();
++  /**
++   * Now that we've buffered the entire request body, update the request headers and the body
++   * itself. This happens late to enable HttpURLConnection users to complete the socket connection
++   * before sending request body bytes.
++   */
++  @Override public Request prepareToSendRequest(Request request) throws IOException {
++    if (request.header("Content-Length") != null) return request;
++
++    outputStream().close();
++    contentLength = buffer.size();
++    return request.newBuilder()
++        .removeHeader("Transfer-Encoding")
++        .header("Content-Length", Long.toString(buffer.size()))
++        .build();
+   }
+ 
+   @Override public void writeTo(BufferedSink sink) throws IOException {
+diff --git a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
+index 55754ad70e..d96c7e298d 100755
+--- a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
++++ b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/HttpURLConnectionImpl.java
+@@ -257,7 +257,9 @@ private static String responseSourceHeader(Response response) {
+     if (requestBody instanceof StreamedRequestBody) {
+       connect();
+       networkInterceptor.proceed();
+-    } else if (executed) {
++    }
++
++    if (requestBody.isClosed()) {
+       throw new ProtocolException("cannot write request body after response has been read");
+     }
+ 
+@@ -579,6 +581,13 @@ public void proceed() {
+     }
+ 
+     @Override public Response intercept(Chain chain) throws IOException {
++      Request request = chain.request();
++
++      // Double-check the URL filter to prevent redirects from hitting filtered URLs.
++      if (urlFilter != null) {
++        urlFilter.checkURLPermitted(request.url().url());
++      }
++
+       synchronized (HttpURLConnectionImpl.this) {
+         connectPending = false;
+         proxy = chain.connection().route().proxy();
+@@ -594,7 +603,13 @@ public void proceed() {
+         }
+       }
+ 
+-      Response response = chain.proceed(chain.request());
++      // Try to lock in the Content-Length before transmitting the request body.
++      if (request.body() instanceof OutputStreamRequestBody) {
++        OutputStreamRequestBody requestBody = (OutputStreamRequestBody) request.body();
++        request = requestBody.prepareToSendRequest(request);
++      }
++
++      Response response = chain.proceed(request);
+ 
+       synchronized (HttpURLConnectionImpl.this) {
+         networkResponse = response;
+diff --git a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/OutputStreamRequestBody.java b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/OutputStreamRequestBody.java
+index 8abe5f6095..602ca024bc 100755
+--- a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/OutputStreamRequestBody.java
++++ b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/OutputStreamRequestBody.java
+@@ -18,6 +18,8 @@
+ import java.io.IOException;
+ import java.io.OutputStream;
+ import java.net.ProtocolException;
++import okhttp3.MediaType;
++import okhttp3.Request;
+ import okhttp3.RequestBody;
+ import okio.BufferedSink;
+ import okio.Timeout;
+@@ -29,17 +31,19 @@
+  * stream.
+  */
+ public abstract class OutputStreamRequestBody extends RequestBody {
+-  abstract OutputStream outputStream();
+-  abstract Timeout timeout();
+-
+-  /**
+-   * Returns a new output stream that writes to {@code sink}. If {@code expectedContentLength} is
+-   * not -1, then exactly that many bytes must be written to the stream before it is closed.
+-   */
+-  static OutputStream newOutputStream(final long expectedContentLength, final BufferedSink sink) {
+-    return new OutputStream() {
+-      long bytesReceived;
+-      boolean closed;
++  private Timeout timeout;
++  private long expectedContentLength;
++  private OutputStream outputStream;
++  boolean closed;
++
++  protected void initOutputStream(final BufferedSink sink, final long expectedContentLength) {
++    this.timeout = sink.timeout();
++    this.expectedContentLength = expectedContentLength;
++
++    // An output stream that writes to sink. If expectedContentLength is not -1, then this expects
++    // exactly that many bytes to be written.
++    this.outputStream = new OutputStream() {
++      private long bytesReceived;
+ 
+       @Override public void write(int b) throws IOException {
+         write(new byte[] {(byte) b}, 0, 1);
+@@ -74,4 +78,28 @@ static OutputStream newOutputStream(final long expectedContentLength, final Buff
+       }
+     };
+   }
++
++  public final OutputStream outputStream() {
++    return outputStream;
++  }
++
++  public final Timeout timeout() {
++    return timeout;
++  }
++
++  public final boolean isClosed() {
++    return closed;
++  }
++
++  @Override public long contentLength() throws IOException {
++    return expectedContentLength;
++  }
++
++  @Override public final MediaType contentType() {
++    return null; // Let the caller provide this in a regular header.
++  }
++
++  public Request prepareToSendRequest(Request request) throws IOException {
++    return request;
++  }
+ }
+diff --git a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/StreamedRequestBody.java b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/StreamedRequestBody.java
+index defa3c8b4d..128ad55164 100755
+--- a/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/StreamedRequestBody.java
++++ b/okhttp-urlconnection/src/main/java/okhttp3/internal/huc/StreamedRequestBody.java
+@@ -16,40 +16,21 @@
+ package okhttp3.internal.huc;
+ 
+ import java.io.IOException;
+-import java.io.OutputStream;
+-import okhttp3.MediaType;
+ import okhttp3.internal.http.OneShotRequestBody;
+ import okhttp3.internal.io.Pipe;
+ import okio.Buffer;
+ import okio.BufferedSink;
+ import okio.Okio;
+-import okio.Timeout;
+ 
++/**
++ * This request body streams bytes from an application thread to an OkHttp dispatcher thread via a
++ * pipe. Because the data is not buffered it can only be transmitted once.
++ */
+ final class StreamedRequestBody extends OutputStreamRequestBody implements OneShotRequestBody {
+-  final Pipe pipe = new Pipe(8192);
+-  final BufferedSink sink = Okio.buffer(pipe.sink);
+-  final long expectedContentLength;
+-  final OutputStream outputStream;
++  private final Pipe pipe = new Pipe(8192);
+ 
+   StreamedRequestBody(long expectedContentLength) {
+-    this.expectedContentLength = expectedContentLength;
+-    this.outputStream = newOutputStream(expectedContentLength, sink);
+-  }
+-
+-  @Override OutputStream outputStream() {
+-    return outputStream;
+-  }
+-
+-  @Override Timeout timeout() {
+-    return sink.timeout();
+-  }
+-
+-  @Override public MediaType contentType() {
+-    return null; // We let the caller provide this in a regular header.
+-  }
+-
+-  @Override public long contentLength() throws IOException {
+-    return expectedContentLength;
++    initOutputStream(Okio.buffer(pipe.sink), expectedContentLength);
+   }
+ 
+   @Override public void writeTo(BufferedSink sink) throws IOException {
+diff --git a/okhttp-urlconnection/src/test/java/okhttp3/OkUrlFactoryTest.java b/okhttp-urlconnection/src/test/java/okhttp3/OkUrlFactoryTest.java
+index 985e545c7f..5eb0f7e0fc 100755
+--- a/okhttp-urlconnection/src/test/java/okhttp3/OkUrlFactoryTest.java
++++ b/okhttp-urlconnection/src/test/java/okhttp3/OkUrlFactoryTest.java
+@@ -207,8 +207,7 @@ public void checkURLPermitted(URL url) throws IOException {
+       HttpsURLConnection httpsConnection = (HttpsURLConnection) factory.open(destination);
+       httpsConnection.getInputStream();
+       fail("Connection was successful");
+-    } catch (IOException e) {
+-      assertEquals("Blocked", e.getMessage());
++    } catch (IOException expected) {
+     }
+   }
+ 
+diff --git a/okhttp-urlconnection/src/test/java/okhttp3/UrlConnectionCacheTest.java b/okhttp-urlconnection/src/test/java/okhttp3/UrlConnectionCacheTest.java
+index 693af67443..1665ae325f 100755
+--- a/okhttp-urlconnection/src/test/java/okhttp3/UrlConnectionCacheTest.java
++++ b/okhttp-urlconnection/src/test/java/okhttp3/UrlConnectionCacheTest.java
+@@ -174,6 +174,9 @@ private void assertCached(boolean shouldPut, int responseCode) throws Exception
+       response.addHeader("Proxy-Authenticate: Basic realm=\"protected area\"");
+     } else if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+       response.addHeader("WWW-Authenticate: Basic realm=\"protected area\"");
++    } else if (responseCode == HttpURLConnection.HTTP_NO_CONTENT
++        || responseCode == HttpURLConnection.HTTP_RESET) {
++      response.setBody(""); // We forbid bodies for 204 and 205.
+     }
+     server.enqueue(response);
+ 

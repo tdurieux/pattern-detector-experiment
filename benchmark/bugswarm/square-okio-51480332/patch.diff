@@ -1,0 +1,171 @@
+diff --git a/okio/src/main/java/okio/Buffer.java b/okio/src/main/java/okio/Buffer.java
+index 9600149364..d6483f9862 100755
+--- a/okio/src/main/java/okio/Buffer.java
++++ b/okio/src/main/java/okio/Buffer.java
+@@ -413,7 +413,56 @@ public byte getByte(long pos) {
+   @Override public long readDecimalLong() {
+     if (size == 0) throw new IllegalStateException("size == 0");
+ 
+-    throw new UnsupportedOperationException("Not implemented.");
++    // This value is always built negatively in order to accommodate Long.MIN_VALUE.
++    long value = 0;
++    int seen = 0;
++    boolean negative = false;
++
++    long overflowZone = Long.MIN_VALUE / 10;
++    long overflowDigit = (Long.MIN_VALUE % 10) + 1;
++
++    outer: do {
++      Segment segment = head;
++
++      byte[] data = segment.data;
++      int pos = segment.pos;
++      int limit = segment.limit;
++
++      for (; pos < limit; pos++, seen++) {
++        byte b = data[pos];
++        if (b >= '0' && b <= '9') {
++          int digit = '0' - b;
++
++          // Detect when the digit would cause an overflow.
++          if (value < overflowZone || value == overflowZone && digit < overflowDigit) {
++            Buffer buffer = new Buffer().writeDecimalLong(value).writeByte(b);
++            if (!negative) buffer.readByte(); // Skip negative sign.
++            throw new NumberFormatException("Number too large: " + buffer.readUtf8());
++          }
++          value *= 10;
++          value += digit;
++        } else if (b == '-' && seen == 0) {
++          negative = true;
++          overflowDigit -= 1;
++        } else {
++          if (seen == 0) {
++            throw new NumberFormatException(
++                "Expected leading [0-9] or '-' character but was 0x" + Integer.toHexString(b));
++          }
++          break outer;
++        }
++      }
++
++      if (pos == limit) {
++        head = segment.pop();
++        SegmentPool.INSTANCE.recycle(segment);
++      } else {
++        segment.pos = pos;
++      }
++    } while (head != null);
++
++    size -= seen;
++    return negative ? value : -value;
+   }
+ 
+   @Override public long readHexadecimalUnsignedLong() {
+@@ -421,9 +470,8 @@ public byte getByte(long pos) {
+ 
+     long value = 0;
+     int seen = 0;
+-    boolean done = false;
+ 
+-    do {
++    outer: do {
+       Segment segment = head;
+ 
+       byte[] data = segment.data;
+@@ -441,8 +489,11 @@ public byte getByte(long pos) {
+         } else if (b >= 'A' && b <= 'F') {
+           digit = b - 'A' + 10; // We never write uppercase, but we support reading it.
+         } else {
+-          done = true;
+-          break;
++          if (seen == 0) {
++            throw new NumberFormatException(
++                "Expected leading [0-9a-fA-F] character but was 0x" + Integer.toHexString(b));
++          }
++          break outer;
+         }
+ 
+         if (++seen > 16) {
+@@ -460,14 +511,7 @@ public byte getByte(long pos) {
+       } else {
+         segment.pos = pos;
+       }
+-    } while (!done && head != null);
+-
+-    if (seen == 0) {
+-      assert head != null; // Head is only null after seen is greater than zero.
+-      throw new NumberFormatException(
+-          "Expected leading [0-9a-fA-F] character but was 0x" + Integer.toHexString(
+-              head.data[head.pos]));
+-    }
++    } while (head != null);
+ 
+     size -= seen;
+     return value;
+diff --git a/okio/src/main/java/okio/RealBufferedSource.java b/okio/src/main/java/okio/RealBufferedSource.java
+index ed2bc4e9dd..fdc02eee80 100755
+--- a/okio/src/main/java/okio/RealBufferedSource.java
++++ b/okio/src/main/java/okio/RealBufferedSource.java
+@@ -234,12 +234,48 @@ public RealBufferedSource(Source source) {
+   }
+ 
+   @Override public long readDecimalLong() throws IOException {
+-    request(20);
++    int pos = 0;
++    while (true) {
++      if (!request(pos + 1)) {
++        break; // No more data.
++      }
++      byte b = buffer.getByte(pos);
++      if ((b < '0' || b > '9') && (pos != 0 || b != '-')) {
++        break; // Non-digit, or non-leading negative sign.
++      }
++      pos += 1;
++      if (pos > 20) {
++        throw new NumberFormatException("Number too large: " + buffer.readUtf8());
++      }
++    }
++    if (pos == 0) {
++      throw new NumberFormatException("Expected leading [0-9] or '-' character but was 0x"
++          + Integer.toHexString(buffer.getByte(0)));
++    }
++
+     return buffer.readDecimalLong();
+   }
+ 
+   @Override public long readHexadecimalUnsignedLong() throws IOException {
+-    request(16);
++    int pos = 0;
++    while (true) {
++      if (!request(pos + 1)) {
++        break; // No more data.
++      }
++      byte b = buffer.getByte(pos);
++      if ((b < '0' || b > '9') && (b < 'a' || b > 'f') && (b < 'A' || b > 'F')) {
++        break; // Non-digit, or non-leading negative sign.
++      }
++      pos += 1;
++      if (pos > 16) {
++        throw new NumberFormatException("Number too large: " + buffer.readUtf8());
++      }
++    }
++    if (pos == 0) {
++      throw new NumberFormatException("Expected leading [0-9a-fA-F] character but was 0x"
++          + Integer.toHexString(buffer.getByte(0)));
++    }
++
+     return buffer.readHexadecimalUnsignedLong();
+   }
+ 
+diff --git a/okio/src/test/java/okio/BufferedSourceTest.java b/okio/src/test/java/okio/BufferedSourceTest.java
+index 064cf155f7..8e42ab2d77 100755
+--- a/okio/src/test/java/okio/BufferedSourceTest.java
++++ b/okio/src/test/java/okio/BufferedSourceTest.java
+@@ -577,7 +577,7 @@ private void assertLongDecimalString(String s) throws IOException {
+       source.readDecimalLong();
+       fail();
+     } catch (NumberFormatException e) {
+-      assertEquals("Expected leading [0-9] character but was 0x20", e.getMessage());
++      assertEquals("Expected leading [0-9] or '-' character but was 0x20", e.getMessage());
+     }
+   }
+ }
